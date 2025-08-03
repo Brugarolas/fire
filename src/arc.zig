@@ -1,5 +1,3 @@
-// Copyright (c) 2023 Cyber (See LICENSE)
-
 /// Runtime memory management with ARC (sharded per-thread locals + cycle GC).
 const std = @import("std");
 const builtin = @import("builtin");

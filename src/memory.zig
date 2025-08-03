@@ -96,7 +96,7 @@ pub fn ValueManager(comptime NameT: type, comptime ValueT: type) type {
         // Layered map operations.
         // =======================
         pub fn pushLayer(self: *Self) !void {
-            var map = std.AutoHashMapUnmanaged(NameT, ValueT){};
+            const map = std.AutoHashMapUnmanaged(NameT, ValueT){};
             try self.layers.append(self.alloc, map);
         }
 
@@ -110,7 +110,7 @@ pub fn ValueManager(comptime NameT: type, comptime ValueT: type) type {
         pub fn define(self: *Self, name: NameT, value: ValueT) !void {
             if (self.layers.items.len == 0) try self.pushLayer();
             var top = &self.layers.items[self.layers.items.len - 1];
-            var gop = try top.getOrPut(self.alloc, name);
+            const gop = try top.getOrPut(self.alloc, name);
             gop.value_ptr.* = value;
         }
 

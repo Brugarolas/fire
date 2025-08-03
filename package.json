@@ -1,0 +1,12 @@
+{
+    "name": "napalm-lang",
+    "version": "0.1.0",
+    "description": "Build, test, and benchmark system for Napalm scripting programming language",
+    "main": "index.js",
+    "type": "module",
+    "scripts": {
+        "zig::run": "zig build run"
+    },
+    "author": "Andrés Brugarolas Martínez",
+    "license": "MIT"
+}

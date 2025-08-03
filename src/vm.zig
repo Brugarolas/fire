@@ -96,11 +96,21 @@ fn unaryApply(op: UnaryOp, a: Value) Value {
             else => .Undefined,
         },
         .Rol => switch (a) {
-            .Number => |n| .{ .Number = @as(f64, @floatFromInt(std.math.rotl(u64, @as(u64, @bitCast(i64, @intFromFloat(n))), 1))) },
+            .Number => |n| {
+                const i: i64 = @intFromFloat(n);
+                const u: u64 = @as(u64, @bitCast(i));
+                const r = std.math.rotl(u64, u, 1);
+                return .{ .Number = @floatFromInt(r) };
+            },
             else => .Undefined,
         },
         .Ror => switch (a) {
-            .Number => |n| .{ .Number = @as(f64, @floatFromInt(std.math.rotr(u64, @as(u64, @bitCast(i64, @intFromFloat(n))), 1))) },
+            .Number => |n| {
+                const i: i64 = @intFromFloat(n);
+                const u: u64 = @as(u64, @bitCast(i));
+                const r = std.math.rotr(u64, u, 1);
+                return .{ .Number = @floatFromInt(r) };
+            },
             else => .Undefined,
         },
         .Await => a, // placeholder
@@ -122,7 +132,10 @@ fn valueIdentical(a: Value, b: Value) bool {
 
 fn binaryApply(op: BinaryOp, a: Value, b: Value) Value {
     switch (op) {
-        .Add => if (a == .Number and b == .Number) return .{ .Number = a.Number + b.Number } else return .Undefined,
+        .Add => {
+            if (a == .Number and b == .Number) return .{ .Number = a.Number + b.Number };
+            return .Undefined;
+        },
         .Sub => if (a == .Number and b == .Number) return .{ .Number = a.Number - b.Number } else return .Undefined,
         .Mul => if (a == .Number and b == .Number) return .{ .Number = a.Number * b.Number } else return .Undefined,
         .Div => if (a == .Number and b == .Number) return .{ .Number = a.Number / b.Number } else return .Undefined,
@@ -144,10 +157,34 @@ fn binaryApply(op: BinaryOp, a: Value, b: Value) Value {
             const bi: i64 = @intFromFloat(b.Number);
             return .{ .Number = @floatFromInt(ai ^ bi) };
         } else return .Undefined,
-        .Shl => if (a == .Number and b == .Number) return .{ .Number = @floatFromInt(@as(i64, @intFromFloat(a.Number)) << @intCast(u6, @as(i64, @intFromFloat(b.Number)))) } else return .Undefined,
-        .Shr => if (a == .Number and b == .Number) return .{ .Number = @floatFromInt(@as(i64, @intFromFloat(a.Number)) >> @intCast(u6, @as(i64, @intFromFloat(b.Number)))) } else return .Undefined,
-        .Sar => if (a == .Number and b == .Number) return .{ .Number = @floatFromInt(@as(i64, @intFromFloat(a.Number)) >> @intCast(u6, @as(i64, @intFromFloat(b.Number)))) } else return .Undefined,
-        .Sal => if (a == .Number and b == .Number) return .{ .Number = @floatFromInt(@as(i64, @intFromFloat(a.Number)) << @intCast(u6, @as(i64, @intFromFloat(b.Number)))) } else return .Undefined,
+
+        // Shifts
+        .Shl => if (a == .Number and b == .Number) {
+            const ai: i64 = @intFromFloat(a.Number);
+            const sh: u6 = @intCast(@as(u6, @intFromFloat(b.Number)));
+            return .{ .Number = @floatFromInt(ai << sh) };
+        } else return .Undefined,
+
+        // logical right shift (unsigned)
+        .Shr => if (a == .Number and b == .Number) {
+            const au: u64 = @as(u64, @bitCast(@as(i64, @intFromFloat(a.Number))));
+            const sh: u6 = @intCast(@as(u6, @intFromFloat(b.Number)));
+            return .{ .Number = @floatFromInt(au >> sh) };
+        } else return .Undefined,
+
+        // arithmetic right shift (signed)
+        .Sar => if (a == .Number and b == .Number) {
+            const ai: i64 = @intFromFloat(a.Number);
+            const sh: u6 = @intCast(@as(u6, @intFromFloat(b.Number)));
+            return .{ .Number = @floatFromInt(ai >> sh) };
+        } else return .Undefined,
+
+        // sal == shl for our purposes
+        .Sal => if (a == .Number and b == .Number) {
+            const ai: i64 = @intFromFloat(a.Number);
+            const sh: u6 = @intCast(@as(u6, @intFromFloat(b.Number)));
+            return .{ .Number = @floatFromInt(ai << sh) };
+        } else return .Undefined,
 
         .AndBool => return .{ .Boolean = truthy(a) and truthy(b) },
         .OrBool => return .{ .Boolean = truthy(a) or truthy(b) },
@@ -331,12 +368,12 @@ pub fn compile(alloc: Alloc, code_in: []const ir.InstructionMHIR) !Program {
             }
 
             // Emit a NodeBlock over owned[start .. start+count)
-            var nb = NodeBlock{ .ops = owned[start .. start + count] };
+            const nb = NodeBlock{ .ops = owned[start .. start + count] };
             nodes[used].inner = try Node.fromCallable(alloc, nb);
             used += 1;
         } else {
             // Emit an explicit barrier node (helps debug and preserves positions)
-            var nb = NodeBarrier{ .idx = i };
+            const nb = NodeBarrier{ .idx = i };
             nodes[used].inner = try Node.fromCallable(alloc, nb);
             used += 1;
             i += 1;
