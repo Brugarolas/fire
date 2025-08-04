@@ -1,452 +1,266 @@
 const std = @import("std");
 
-/// A small-buffer-optimized, type-erased callable.
-/// - Sig: the exact function signature (no varargs, monomorphic)
-/// - MaxSize / MaxAlign: inline storage constraints
-pub fn Function(comptime Sig: type, comptime MaxSize: usize, comptime MaxAlign: usize) type {
-    const FnInfo = @typeInfo(Sig);
-    comptime {
-        if (FnInfo != .Fn) @compileError("Function: Sig must be a function type");
-        if (FnInfo.Fn.is_var_args) @compileError("Function: varargs not supported");
-        if (FnInfo.Fn.return_type == null) @compileError("Function: Sig must have a return type");
-        if (MaxAlign == 0 or (MaxAlign & (MaxAlign - 1)) != 0)
-            @compileError("Function: MaxAlign must be a non-zero power of two");
-    }
-
-    const Ret_ = FnInfo.Fn.return_type.?;
-    const ArgsTuple_ = std.meta.ArgsTuple(Sig);
+/// FwdFn: fat function pointer with optional owned storage (SBO).
+/// Sig: exact function signature (no varargs).
+/// MaxInline / MaxAlign: inline storage budget for functors.
+pub fn FwdFn(comptime Sig: type, comptime MaxInline: usize, comptime MaxAlign: usize) type {
+    const ArgsTuple = std.meta.ArgsTuple(Sig);
+    const Ret = blk: {
+        const TI = @typeInfo(Sig);
+        if (TI == .Function) break :blk TI.Function.return_type.?;
+        if (TI == .Fn)       break :blk TI.Fn.return_type.?;
+        @compileError("FwdFn: Sig must be a function type");
+    };
+    const Invoker = fn (*anyopaque, ArgsTuple) Ret;
 
     const Storage = union(enum) {
         none,
-        inline_: struct { bytes: [MaxSize]u8 align(MaxAlign) },
+        inline: struct { bytes: [MaxInline]u8 align(MaxAlign) },
         heap: *anyopaque,
-    };
-
-    const VTable = struct {
-        invoke: *const fn (ctx: *anyopaque, args: ArgsTuple_) Ret_,
-        clone_into: *const fn (dest: *Storage, src: *const Storage, alloc: std.mem.Allocator) anyerror!void,
-        destroy: *const fn (src: *Storage, alloc: std.mem.Allocator) void,
-
-        is_inline: bool,
-        size: usize,
-        align_: u32,
-        type_id: *const anyopaque,
     };
 
     return struct {
         pub const Self = @This();
 
-        pub const Ret = Ret_;
-        pub const ArgsTuple = ArgsTuple_;
+        // -- dynamic call surface --
+        invoker: *const Invoker = undefined,
+        ctx: *anyopaque = undefined,
 
-        vtable: ?*const VTable = null,
+        // -- ownership / clone info (shallow copy) --
         storage: Storage = .none,
-
-        // When heap is used, we capture the allocator to make deinit safe.
+        size: usize = 0,
+        align: u32 = 0,
+        is_inline: bool = true,
         heap_alloc: ?std.mem.Allocator = null,
 
-        // Cached context pointer for fast invoke.
-        ctx: ?*anyopaque = null,
+        // optional destructor specialized for the functor type
+        dtor: ?*const fn (*anyopaque) void = null,
 
-        // Unique type-id token: one address per concrete F.
-        inline fn typeIdOf() *const anyopaque {
-            const Tag = struct {
-                fn sentinel() void {}
-            };
-            return @as(*const anyopaque, @ptrCast(&Tag.sentinel));
-        }
+        // ================= lifecycle =================
+        pub fn initNull() Self { return .{ .invoker = undefined, .ctx = undefined, .storage = .none }; }
 
-        // ========== Lifecycle ==========
-
-        pub fn initNull() Self {
-            return .{};
-        }
-
-        inline fn setCtxForCurrentStorage(self: *Self) void {
-            if (self.vtable == null) {
-                self.ctx = null;
-                return;
-            }
-            switch (self.storage) {
-                .inline_ => |*inl| self.ctx = @as(*anyopaque, @ptrCast(&inl.bytes)),
-                .heap => |p| self.ctx = @as(*anyopaque, @ptrCast(p)),
-                .none => self.ctx = null,
-            }
-        }
-
-        /// Idempotent. If heap-backed, it uses the captured allocator by default.
+        /// Idempotent. If heap-backed, uses captured allocator unless one is provided.
         pub fn deinit(self: *Self, maybe_alloc: ?std.mem.Allocator) void {
-            const vt = self.vtable orelse {
-                self.* = .{};
-                return;
-            };
-            const used_alloc = if (!vt.is_inline)
-                (self.heap_alloc orelse maybe_alloc orelse
-                    @panic("Function.deinit: missing allocator for heap storage"))
-            else
-                (maybe_alloc orelse std.heap.page_allocator);
-
-            vt.destroy(&self.storage, used_alloc);
-            self.* = .{};
+            switch (self.storage) {
+                .none => {},
+                .inline => {
+                    if (self.dtor) |d| d(self.ctx);
+                },
+                .heap => |ptr| {
+                    if (self.dtor) |d| d(self.ctx);
+                    const alloc = self.heap_alloc orelse maybe_alloc orelse
+                        @panic("FwdFn.deinit: missing allocator for heap functor");
+                    const base: [*]align(@alignCast(self.align)) u8 =
+                        @ptrCast([*]align(@as(u29, self.align)) u8, ptr);
+                    alloc.free(base[0..self.size]);
+                },
+            }
+            self.* = Self.initNull();
         }
 
-        /// Move out (leaves `self` null).
+        /// Move (leaves self null).
         pub fn move(self: *Self) Self {
             const out = self.*;
-            self.* = .{};
+            self.* = Self.initNull();
             return out;
         }
 
-        /// Swap two callables.
-        pub fn swap(a: *Self, b: *Self) void {
-            const tv = a.vtable;
-            const ts = a.storage;
-            const ta = a.heap_alloc;
-            const tc = a.ctx;
-            a.vtable = b.vtable;
-            a.storage = b.storage;
-            a.heap_alloc = b.heap_alloc;
-            a.ctx = b.ctx;
-            b.vtable = tv;
-            b.storage = ts;
-            b.heap_alloc = ta;
-            b.ctx = tc;
-        }
-
-        /// Clone using given allocator; captures it if the representation is heap.
+        /// Clone shallowly. Heap-backed copies allocate a new buffer with the same bytes.
         pub fn clone(self: *const Self, alloc: std.mem.Allocator) !Self {
-            var out: Self = .{};
-            if (self.vtable) |vt| {
-                try vt.clone_into(&out.storage, &self.storage, alloc);
-                out.vtable = vt;
-                if (!vt.is_inline) out.heap_alloc = alloc;
-                out.setCtxForCurrentStorage(); // ensure ctx is valid
+            var out = Self.initNull();
+            out.invoker = self.invoker;
+            out.dtor = self.dtor;
+            out.size = self.size;
+            out.align = self.align;
+            out.is_inline = self.is_inline;
+
+            switch (self.storage) {
+                .none => {
+                    out.storage = .none;
+                    out.ctx = @ptrFromInt(0);
+                    out.heap_alloc = null;
+                },
+                .inline => |*src| {
+                    var s: Storage = .{ .inline = .{ .bytes = undefined } };
+                    const dp = &s.inline.bytes;
+                    const sp = &src.bytes;
+                    @memcpy(dp[0..self.size], sp[0..self.size]);
+                    out.storage = s;
+                    out.ctx = @ptrCast(*anyopaque, @ptrFromInt(@intFromPtr(&out.storage.inline.bytes)));
+                    out.heap_alloc = null;
+                },
+                .heap => |p| {
+                    const np = try alloc.alignedAlloc(u8, self.align, self.size);
+                    const dstp = np.ptr;
+                    const srcp: [*]align(@alignCast(self.align)) u8 =
+                        @ptrCast([*]align(@as(u29, self.align)) u8, p);
+                    @memcpy(dstp[0..self.size], srcp[0..self.size]);
+                    out.storage = .{ .heap = @ptrCast(*anyopaque, dstp) };
+                    out.ctx = @ptrCast(*anyopaque, dstp);
+                    out.heap_alloc = alloc;
+                },
             }
             return out;
         }
 
-        // ========== Invocation ==========
-
-        /// Main entry: pass arguments as the exact ArgsTuple (e.g., .{a, b}).
+        // ================= invocation =================
         pub fn apply(self: *const Self, args: ArgsTuple) Ret {
-            const vt = self.vtable orelse @panic("Function.apply: not set");
-            const c = self.ctx orelse @panic("Function.apply: ctx not set");
-            return vt.invoke(c, args);
+            return self.invoker(self.ctx, args);
         }
 
-        /// Ergonomic helper: same as `apply`, but validated at comptime.
+        /// Ergonomic wrapper with compile-time args type check.
         pub fn call(self: *const Self, args: anytype) Ret {
             comptime {
                 if (@TypeOf(args) != ArgsTuple)
-                    @compileError("Function.call expects an ArgsTuple matching Sig");
+                    @compileError("FwdFn.call: expected ArgsTuple for Sig");
             }
             return self.apply(args);
         }
 
-        /// Zero-arg convenience when Sig has no params.
-        pub fn call0(self: *const Self) Ret {
+        // ================= constructors =================
+
+        /// Store a function pointer inline and call it via a tiny invoker.
+        pub fn fromFn(fp: Sig) Self {
             comptime {
-                if (FnInfo.Fn.params.len != 0)
-                    @compileError("Function.call0 only valid for zero-arg signatures");
+                if (@sizeOf(Sig) > MaxInline or @alignOf(Sig) > MaxAlign)
+                    @compileError("FwdFn.fromFn: MaxInline/MaxAlign too small for Sig pointer");
             }
-            return self.apply(.{});
-        }
+            const Inv = struct {
+                fn call(ctx: *anyopaque, args: ArgsTuple) Ret {
+                    const p = @ptrCast(*Sig, @alignCast(@alignOf(Sig), ctx));
+                    return @call(.auto, p.*, args);
+                }
+            }.call;
 
-        // ========== Introspection / diagnostics ==========
+            var s: Storage = .{ .inline = .{ .bytes = undefined } };
+            const dst = @ptrCast(*Sig, @alignCast(@alignOf(Sig), &s.inline.bytes));
+            dst.* = fp;
 
-        pub fn isSet(self: *const Self) bool {
-            return self.vtable != null;
-        }
-        pub fn isInline(self: *const Self) bool {
-            const vt = self.vtable orelse return false;
-            return vt.is_inline;
-        }
-        pub fn payloadSize(self: *const Self) ?usize {
-            return if (self.vtable) |vt| vt.size else null;
-        }
-        pub fn payloadAlign(self: *const Self) ?u32 {
-            return if (self.vtable) |vt| vt.align_ else null;
-        }
-        pub fn isType(self: *const Self) bool {
-            if (self.vtable) |vt| return vt.type_id == typeIdOf();
-            return false;
-        }
-
-        /// Returns non-owning pointer to inline payload when it *is* inline of type F.
-        pub fn tryInlineAs(self: *Self, comptime F: type) ?*F {
-            const vt = self.vtable orelse return null;
-            if (!vt.is_inline or vt.type_id != typeIdOf()) return null;
-            return @as(*F, @ptrCast(&self.storage.inline_.bytes));
-        }
-
-        // ========== Constructors ==========
-
-        /// From a function pointer exactly matching Sig (stored inline).
-        pub fn fromFn(fnptr: Sig) Self {
-            comptime {
-                if (@sizeOf(Sig) > MaxSize or @alignOf(Sig) > MaxAlign)
-                    @compileError("Function.fromFn: MaxSize/MaxAlign too small for function pointer");
-            }
-            const VT = vtableForFnPtr();
-            var s: Storage = .{ .inline_ = .{ .bytes = undefined } };
-            const dst = @as(*Sig, @ptrCast(&s.inline_.bytes));
-            dst.* = fnptr;
-
-            var self: Self = .{
-                .vtable = &VT,
+            return .{
+                .invoker = Inv,
+                .ctx = @ptrCast(*anyopaque, @alignCast(@alignOf(Sig), &s.inline.bytes)),
                 .storage = s,
+                .size = @sizeOf(Sig),
+                .align = @alignOf(Sig),
+                .is_inline = true,
                 .heap_alloc = null,
-                .ctx = null,
+                .dtor = null,
             };
-            self.setCtxForCurrentStorage();
-            return self;
         }
 
-        /// From a callable `F`:
-        ///   - If `F` is `fn` and matches Sig, delegates to fromFn.
-        ///   - Else requires `pub fn call(self: *F, ...) Sig`.
-        ///   - Inline if fits SBO, else heap-alloc (capturing `alloc`).
+        /// Accept any type `F` that has `pub fn call(self: *F, ...) Sig`.
+        /// Stores inline if it fits, else heap with captured allocator.
         pub fn fromCallable(alloc: std.mem.Allocator, f: anytype) !Self {
             const F = @TypeOf(f);
-            const ti = @typeInfo(F);
 
-            if (ti == .Fn) {
-                comptime {
-                    if (@TypeOf(f) != Sig)
-                        @compileError("fromCallable: function pointer must match Sig exactly");
+            // The thunk will fail to compile if F.call doesn't match Sig
+            const Inv = thunkCall(F);
+
+            const Dtor: ?*const fn (*anyopaque) void = if (@hasDecl(F, "deinit")) struct {
+                fn destroy(ctx: *anyopaque) void {
+                    const self = @ptrCast(*F, @alignCast(@alignOf(F), ctx));
+                    self.deinit();
                 }
-                return Self.fromFn(f);
-            }
+            }.destroy else null;
 
-            comptime checkCallSignature(F);
-
-            const fits_inline = (@sizeOf(F) <= MaxSize) and (@alignOf(F) <= MaxAlign);
+            const fits_inline = (@sizeOf(F) <= MaxInline) and (@alignOf(F) <= MaxAlign);
 
             if (fits_inline) {
-                const VT = vtableForInlineFunctor(F);
-                var s: Storage = .{ .inline_ = .{ .bytes = undefined } };
-                const dst = @as(*F, @ptrCast(&s.inline_.bytes));
+                var s: Storage = .{ .inline = .{ .bytes = undefined } };
+                const dst = @ptrCast(*F, @alignCast(@alignOf(F), &s.inline.bytes));
                 dst.* = f;
 
-                var self: Self = .{
-                    .vtable = &VT,
+                return .{
+                    .invoker = Inv,
+                    .ctx = @ptrCast(*anyopaque, @alignCast(@alignOf(F), &s.inline.bytes)),
                     .storage = s,
+                    .size = @sizeOf(F),
+                    .align = @alignOf(F),
+                    .is_inline = true,
                     .heap_alloc = null,
-                    .ctx = null,
+                    .dtor = Dtor,
                 };
-                self.setCtxForCurrentStorage();
-                return self;
             } else {
-                const VT = vtableForHeapFunctor(F);
                 const buf = try alloc.alignedAlloc(u8, @alignOf(F), @sizeOf(F));
-                const p = @as(*F, @ptrCast(buf.ptr));
+                const p = @ptrCast(*F, buf.ptr);
                 p.* = f;
 
-                var self: Self = .{
-                    .vtable = &VT,
-                    .storage = .{ .heap = @as(*anyopaque, @ptrCast(p)) },
+                return .{
+                    .invoker = Inv,
+                    .ctx = @ptrCast(*anyopaque, p),
+                    .storage = .{ .heap = @ptrCast(*anyopaque, p) },
+                    .size = @sizeOf(F),
+                    .align = @alignOf(F),
+                    .is_inline = false,
                     .heap_alloc = alloc,
-                    .ctx = null,
+                    .dtor = Dtor,
                 };
-                self.setCtxForCurrentStorage();
-                return self;
             }
         }
 
-        // ========== Compile-time checking ==========
-
-        fn checkCallSignature(comptime F: type) void {
-            comptime {
-                if (!@hasDecl(F, "call"))
-                    @compileError("Callable type must have `pub fn call(self: *F, ...) Sig`");
-            }
-            const TI = @typeInfo(@TypeOf(F.call));
-            if (TI != .Fn) @compileError("F.call must be a function");
-
-            const finfo = TI.Fn;
-            if (finfo.params.len == 0) @compileError("F.call must be: fn(self: *F, ...)");
-            const self_param = finfo.params[0].type orelse
-                @compileError("F.call cannot be generic");
-            const self_ti = @typeInfo(self_param);
-            if (self_ti != .Pointer or self_ti.Pointer.size != .One or self_ti.Pointer.child != F)
-                @compileError("F.call first parameter must be *F or *const F");
-
-            // args
-            const SigArgs = FnInfo.Fn.params;
-            if (SigArgs.len != finfo.params.len - 1)
-                @compileError("F.call argument count mismatch with Sig");
-            inline for (SigArgs, 0..) |p, i| {
-                const want = p.type orelse @compileError("Sig cannot be generic");
-                const got = finfo.params[i + 1].type orelse @compileError("F.call must be monomorphic");
-                if (got != want) @compileError("F.call param type mismatch");
-            }
-            // return type
-            const got_ret = finfo.return_type orelse @compileError("F.call must return a value");
-            if (got_ret != Ret_) @compileError("F.call return type mismatch");
-        }
-
-        // ========== VTABLES (no ctx_of anymore) ==========
-
-        fn vtableForFnPtr() VTable {
-            const Invoke = struct {
-                fn invoke(ctx: *anyopaque, args: ArgsTuple) Ret {
-                    const f = @as(*Sig, @ptrCast(@alignCast(ctx)));
-                    return @call(.auto, f.*, args);
+        // ================ helpers ================
+        /// Generate a thunk that calls `F.call(self: *F, ...) Sig`.
+        fn thunkCall(comptime F: type) *const Invoker {
+            return struct {
+                fn call(ctx: *anyopaque, args: ArgsTuple) Ret {
+                    const self = @ptrCast(*F, @alignCast(@alignOf(F), ctx));
+                    return @call(.auto, F.call, .{ self } ++ args);
                 }
-            };
-            return .{
-                .invoke = Invoke.invoke,
-                .clone_into = struct {
-                    fn clone_into(dest: *Storage, src: *const Storage, _: std.mem.Allocator) !void {
-                        dest.* = .{ .inline_ = .{ .bytes = undefined } };
-                        const sp = &src.inline_.bytes;
-                        const dp = &dest.inline_.bytes;
-                        const n: usize = @sizeOf(Sig);
-                        @memcpy(dp[0..n], sp[0..n]);
-                    }
-                }.clone_into,
-                .destroy = struct {
-                    fn destroy(_: *Storage, _: std.mem.Allocator) void {}
-                }.destroy,
-                .is_inline = true,
-                .size = @sizeOf(Sig),
-                .align_ = @alignOf(Sig),
-                .type_id = typeIdOf(),
-            };
+            }.call;
         }
 
-        fn vtableForInlineFunctor(comptime F: type) VTable {
-            const Invoke = struct {
-                fn invoke(ctx: *anyopaque, args: ArgsTuple) Ret {
-                    const selfp = @as(*F, @ptrCast(@alignCast(ctx)));
-                    return @call(.auto, F.call, .{selfp} ++ args);
-                }
-            };
-            return .{
-                .invoke = Invoke.invoke,
-                .clone_into = struct {
-                    fn clone_into(dest: *Storage, src: *const Storage, _: std.mem.Allocator) !void {
-                        dest.* = .{ .inline_ = .{ .bytes = undefined } };
-                        const sp = &src.inline_.bytes;
-                        const dp = &dest.inline_.bytes;
-                        const n: usize = @sizeOf(F);
-                        @memcpy(dp[0..n], sp[0..n]);
-                    }
-                }.clone_into,
-                .destroy = struct {
-                    fn destroy(src: *Storage, _: std.mem.Allocator) void {
-                        if (@hasDecl(F, "deinit")) {
-                            const p = @as(*F, @ptrCast(&src.inline_.bytes));
-                            p.deinit();
-                        }
-                    }
-                }.destroy,
-                .is_inline = true,
-                .size = @sizeOf(F),
-                .align_ = @alignOf(F),
-                .type_id = typeIdOf(),
-            };
+        // some light introspection for diagnostics (fast and simple)
+        pub fn isSet(self: *const Self) bool {
+            return self.storage != .none;
         }
-
-        fn vtableForHeapFunctor(comptime F: type) VTable {
-            const Invoke = struct {
-                fn invoke(ctx: *anyopaque, args: ArgsTuple) Ret {
-                    const selfp = @as(*F, @ptrCast(@alignCast(ctx)));
-                    return @call(.auto, F.call, .{selfp} ++ args);
-                }
-            };
-            return .{
-                .invoke = Invoke.invoke,
-                .clone_into = struct {
-                    fn clone_into(dest: *Storage, src: *const Storage, alloc: std.mem.Allocator) !void {
-                        const np = try alloc.alignedAlloc(u8, @alignOf(F), @sizeOf(F));
-                        const dstp = @as(*F, @ptrCast(np.ptr));
-                        const srcp = @as(*F, @ptrCast(src.heap));
-                        dstp.* = srcp.*; // shallow copy
-                        dest.* = .{ .heap = @as(*anyopaque, @ptrCast(dstp)) };
-                    }
-                }.clone_into,
-                .destroy = struct {
-                    fn destroy(src: *Storage, alloc: std.mem.Allocator) void {
-                        if (@hasDecl(F, "deinit")) {
-                            const p = @as(*F, @ptrCast(src.heap));
-                            p.deinit();
-                        }
-                        const base: [*]align(@alignOf(F)) u8 =
-                            @as([*]align(@alignOf(F)) u8, @ptrCast(src.heap));
-                        alloc.free(base[0..@sizeOf(F)]);
-                    }
-                }.destroy,
-                .is_inline = false,
-                .size = @sizeOf(F),
-                .align_ = @alignOf(F),
-                .type_id = typeIdOf(),
-            };
-        }
+        pub fn isInline(self: *const Self) bool { return self.is_inline; }
+        pub fn payloadSize(self: *const Self) usize { return self.size; }
+        pub fn payloadAlign(self: *const Self) u32 { return self.align; }
     };
 }
 
-/// A small wrapper that chains Functions and tail-calls to `next` if set.
-pub fn ChainedFunction(comptime Sig: type, comptime MaxSize: usize, comptime MaxAlign: usize) type {
-    const Fn = Function(Sig, MaxSize, MaxAlign);
+/// Chain: singly-linked chain of FwdFn nodes.
+/// Provides both recursive `apply` and fast iterative `run` (no recursion).
+pub fn Chain(comptime Sig: type, comptime MaxInline: usize, comptime MaxAlign: usize) type {
+    const Fn = FwdFn(Sig, MaxInline, MaxAlign);
     return struct {
         pub const Self = @This();
-        pub const Ret = Fn.Ret;
-        pub const ArgsTuple = Fn.ArgsTuple;
+        pub const ArgsTuple = std.meta.ArgsTuple(Sig);
+        pub const Ret = blk: {
+            const TI = @typeInfo(Sig);
+            if (TI == .Function) break :blk TI.Function.return_type.?;
+            if (TI == .Fn)       break :blk TI.Fn.return_type.?;
+            @compileError("Chain: Sig must be a function type");
+        };
 
         inner: Fn = Fn.initNull(),
         next: ?*const Self = null,
 
-        pub fn initNull() Self {
-            return .{};
-        }
-        pub fn initWith(fnptr: Sig) Self {
-            return .{ .inner = Fn.fromFn(fnptr), .next = null };
-        }
-        pub fn fromCallable(alloc: std.mem.Allocator, f: anytype) !Self {
-            return .{ .inner = try Fn.fromCallable(alloc, f), .next = null };
-        }
+        pub fn initNull() Self { return .{}; }
+        pub fn setNext(self: *Self, nxt: *const Self) void { self.next = nxt; }
+        pub fn last(self: *const Self) *const Self { var c: *const Self = self; while (c.next) |n| c = n; return c; }
+        pub fn append(self: *Self, nxt: *const Self) *const Self { const tail = self.last(); @constCast(tail).next = nxt; return nxt; }
 
         pub fn deinit(self: *Self, maybe_alloc: ?std.mem.Allocator) void {
             self.inner.deinit(maybe_alloc);
             self.* = .{};
         }
 
-        pub fn setNext(self: *Self, nxt: *const Self) void {
-            self.next = nxt;
-        }
-
-        pub fn last(self: *const Self) *const Self {
-            var cur: *const Self = self;
-            while (cur.next) |n| cur = n;
-            return cur;
-        }
-        pub fn append(self: *Self, nxt: *const Self) *const Self {
-            const tail = self.last();
-            const mw = @constCast(tail);
-            mw.next = nxt;
-            return nxt;
-        }
-
-        /// Tail-call: if next exists, tail-call it; else return inner's result.
+        /// Tail-call style; may recurse through the chain (fine for short chains).
         pub fn apply(self: *const Self, args: ArgsTuple) Ret {
-            const r = self.inner.apply(args);
-            if (self.next) |n| return @call(.always_tail, apply, .{ n, args });
-            return r;
+            if (self.next) |n| return n.apply(args);
+            return self.inner.apply(args);
         }
 
-        /// Run inner (discard result) then tail-call next if present; otherwise return inner.
-        pub fn applyAndThen(self: *const Self, args: ArgsTuple) Ret {
-            if (self.next) |n| {
-                _ = self.inner.apply(args);
-                return n.apply(args);
-            } else {
-                return self.inner.apply(args);
+        /// Fast iterative runner; executes every node in order; returns last Ret.
+        pub fn run(head: *const Self, args: ArgsTuple) Ret {
+            var cur: ?*const Self = head;
+            var last: Ret = undefined;
+            while (cur) |n| {
+                last = n.inner.apply(args);
+                cur = n.next;
             }
-        }
-
-        pub fn isSet(self: *const Self) bool {
-            return self.inner.isSet();
+            return last;
         }
     };
 }

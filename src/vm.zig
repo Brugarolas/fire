@@ -21,13 +21,13 @@ pub const VM = struct {
 
     alloc: Alloc,
     vals: ValueStore, // registers + layered maps
-    out: std.io.AnyWriter, // where Print writes
+    out: std.fs.File.Writer,
 
-    pub fn init(alloc: Alloc, writer: anytype) !Self {
+    pub fn init(alloc: Alloc, writer: std.fs.File.Writer) !Self {
         return .{
             .alloc = alloc,
             .vals = try ValueStore.init(alloc, .Undefined),
-            .out = std.io.anyWriter(writer),
+            .out = writer,
         };
     }
 
@@ -200,7 +200,7 @@ fn binaryApply(op: BinaryOp, a: Value, b: Value) Value {
     }
 }
 
-fn printValue(w: std.io.AnyWriter, v: Value) !void {
+fn printValue(w: anytype, v: Value) !void {
     switch (v) {
         .Undefined => try w.print("undefined\n", .{}),
         .Null => try w.print("null\n", .{}),

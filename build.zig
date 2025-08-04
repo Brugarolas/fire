@@ -19,10 +19,12 @@ pub fn build(b: *std.Build) void {
     const mod_ir = b.addModule("ir", .{ .root_source_file = b.path("src/ir.zig") });
     const mod_memory = b.addModule("memory", .{ .root_source_file = b.path("src/memory.zig") });
     const mod_function = b.addModule("function", .{ .root_source_file = b.path("src/function.zig") });
+    const mod_layered_map = b.addModule("layered_map", .{ .root_source_file = b.path("src/layered_map.zig") });
 
     mod_vm.addImport("ir", mod_ir);
     mod_vm.addImport("memory", mod_memory);
     mod_vm.addImport("function", mod_function);
+    mod_vm.addImport("layered_map", mod_layered_map);
 
     // ---- Executable ---------------------------------------------------------
     const exe = b.addExecutable(.{
@@ -37,6 +39,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("ir", mod_ir);
     exe.root_module.addImport("memory", mod_memory);
     exe.root_module.addImport("function", mod_function);
+    exe.root_module.addImport("layered_map", mod_layered_map);
     //exe.root_module.addOptions("build_options", build_opts);
 
     b.installArtifact(exe);
@@ -60,6 +63,7 @@ pub fn build(b: *std.Build) void {
     lib.root_module.addImport("ir", mod_ir);
     lib.root_module.addImport("memory", mod_memory);
     lib.root_module.addImport("function", mod_function);
+    lib.root_module.addImport("layered_map", mod_layered_map);
     //lib.root_module.addOptions("build_options", build_opts);
 
     b.installArtifact(lib);
@@ -76,6 +80,7 @@ pub fn build(b: *std.Build) void {
     unit_tests.root_module.addImport("memory", mod_memory);
     unit_tests.root_module.addImport("vm", mod_vm);
     unit_tests.root_module.addImport("function", mod_function);
+    unit_tests.root_module.addImport("layered_map", mod_layered_map);
     //unit_tests.root_module.addOptions("build_options", build_opts);
 
     const test_run = b.addRunArtifact(unit_tests);
