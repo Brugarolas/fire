@@ -7,7 +7,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    const stdout_writer = std.io.getStdOut().writer(); // <- const
+    const stdout_writer = std.io.CountingWriter(std.Io.Writer.Discarding);
 
     var vm = try vm_mod.VM.init(alloc, stdout_writer);
     defer vm.deinit();

@@ -1,7 +1,7 @@
 const std = @import("std");
 const ir = @import("ir");
 const mem = @import("memory");
-const fnkit = @import("function"); // exposes Function / ChainedFunction
+const fnkit = @import("function");
 
 // ---- Short aliases from IR ----
 const Value = ir.ValueMHIR;
@@ -43,6 +43,8 @@ pub const VM = struct {
         self.vals.popLayer();
     }
 };
+
+// =====================================
 
 // We key layered variables by VariableId (u32) for this first slice.
 const ValueStore = mem.ValueManager(VariableId, Value);
@@ -265,7 +267,8 @@ const NodeBarrier = struct {
 // Direct-threaded nodes (no opcode switch)
 // =====================================
 const Sig = fn (*VM) void;
-const Node = fnkit.ChainedFunction(Sig, 64, 8);
+const Node = fnkit.Chain(Sig, 64, 8);
+const FnSBO = fnkit.FwdFn(Sig, 64, 8);
 
 pub const Program = struct {
     nodes: []Node,
