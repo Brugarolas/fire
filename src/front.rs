@@ -307,11 +307,24 @@ impl<'src> Parser<'src> {
         let mut functions = Vec::new();
 
         while self.i < self.toks.len() {
-            if self.matches(&Tok::Fn) {
-                functions.push(self.fn_def()?);
-            } else {
-                return Err(self.err_here("expected 'fn'"));
+            // Synchronize: skip anything that's not a 'fn' (e.g., comments that weren't skipped,
+            // stray punctuation, accidental tokens, etc.).
+            while self.i < self.toks.len() && !self.check(&Tok::Fn) {
+                self.i += 1;
             }
+            if self.i >= self.toks.len() {
+                break;
+            }
+
+            // Consume 'fn' and parse a function definition.
+            self.i += 1; // eat Tok::Fn
+            functions.push(self.fn_def()?);
+        }
+
+        if functions.is_empty() {
+            // If nothing parsed, report a clean error near the start.
+            let span = if self.toks.is_empty() { 0..0 } else { self.toks[0].span.clone() };
+            return Err(ParseError { msg: "expected 'fn'".into(), span });
         }
 
         Ok(Program { functions })
