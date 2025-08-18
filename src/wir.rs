@@ -1,3 +1,4 @@
+// wir.rs
 //! WIR — Wren IR (mid–high level, SSA, speculation-friendly)
 //!
 //! This is a single-file “real code” skeleton you can drop into a new Rust
@@ -533,14 +534,16 @@ impl<'m> Builder<'m> {
     }
 
     pub fn push_node(&mut self, kind: Inst, ty: Option<Type>, res_count: u8, effect_in: bool) -> (InstId, Vec<ValueId>) {
-        let id = InstId(self.func.nodes.len() as u32);
-        let effect_in_val = if effect_in {
-            Some(self.ensure_effect_in())
-        } else { None };
+        let effect_in_val = if effect_in { Some(self.ensure_effect_in()) } else { None };
         let effect_out_val = if kind.produces_effect_out() {
             Some(self.new_effect_value(EffectKind::from_inst(&kind)))
         } else { None };
 
+        // Now it’s safe to allocate this node’s ID
+        let id = InstId(self.func.nodes.len() as u32);
+
+        // Reserve result ValueIds *after* any effect_out was created,
+        // so numbering lines up with `self.func.values.len()`.
         let mut results = Vec::new();
         for r in 0..res_count {
             let vid = ValueId(self.func.values.len() as u32 + r as u32);

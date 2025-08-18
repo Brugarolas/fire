@@ -1,3 +1,4 @@
+// front.rs
 //! frontend.rs — Logos-based tokenizer + hand-rolled parser → WIR lowerer
 //!
 //! This is a real, compiling Rust module that provides:
@@ -60,10 +61,15 @@ use crate::wir::{
 /// -------------------------
 
 #[derive(Logos, Debug, Clone, PartialEq)]
-#[regex(skip r"[ \t\r\n\f]+")]
-#[regex(skip r"//[^\n]*")]
-#[regex(skip r"/\*([^*]|\*[^/])*\*/")]
 pub enum Tok {
+    // --- Skips (must come before '/' token) ---
+    #[regex(r"[ \t\r\n\f]+", logos::skip)]
+    _Ws,
+    #[regex(r"//[^\n]*", logos::skip)]
+    _LineComment,
+    #[regex(r"/\*([^*]|\*[^/])*\*/", logos::skip)]
+    _BlockComment,
+
     // Keywords
     #[token("fn")] Fn,
     #[token("var")] Var,
@@ -305,26 +311,31 @@ impl<'src> Parser<'src> {
 
     pub fn program(&mut self) -> PResult<Program> {
         let mut functions = Vec::new();
+        let mut toplevel_stmts: Vec<Stmt> = Vec::new();
 
         while self.i < self.toks.len() {
-            // Synchronize: skip anything that's not a 'fn' (e.g., comments that weren't skipped,
-            // stray punctuation, accidental tokens, etc.).
-            while self.i < self.toks.len() && !self.check(&Tok::Fn) {
-                self.i += 1;
-            }
-            if self.i >= self.toks.len() {
-                break;
+            // Allow stray semicolons at the top level.
+            if self.matches(&Tok::Semi) {
+                continue;
             }
 
-            // Consume 'fn' and parse a function definition.
-            self.i += 1; // eat Tok::Fn
-            functions.push(self.fn_def()?);
+            if self.check(&Tok::Fn) {
+                // consume `fn` and parse a function definition
+                self.i += 1;
+                functions.push(self.fn_def()?);
+            } else {
+                // parse a regular statement at top level (e.g. `print(…) ;`)
+                let stmt = self.stmt()?;
+                toplevel_stmts.push(stmt);
+            }
         }
 
-        if functions.is_empty() {
-            // If nothing parsed, report a clean error near the start.
-            let span = if self.toks.is_empty() { 0..0 } else { self.toks[0].span.clone() };
-            return Err(ParseError { msg: "expected 'fn'".into(), span });
+        if !toplevel_stmts.is_empty() {
+            functions.push(FuncDecl {
+                name: "__toplevel__".to_string(),
+                params: Vec::new(),
+                body: Block { stmts: toplevel_stmts },
+            });
         }
 
         Ok(Program { functions })
@@ -363,6 +374,12 @@ impl<'src> Parser<'src> {
     }
 
     fn stmt(&mut self) -> PResult<Stmt> {
+        // Allow empty statements (`;`) anywhere a statement is expected
+        // (including top level). Treat as a no-op expression stmt.
+        if self.matches(&Tok::Semi) {
+            return Ok(Stmt::Expr(Expr::LitInt(0)));
+        }
+
         if self.matches(&Tok::Var) {
             let name = match self.next().tok {
                 Tok::Ident(s) => s,
@@ -389,7 +406,6 @@ impl<'src> Parser<'src> {
             let init = if self.matches(&Tok::Semi) {
                 None
             } else if self.matches(&Tok::Var) {
-                // var-decl inside for
                 let name = match self.next().tok {
                     Tok::Ident(s) => s,
                     _ => return Err(self.err_here("expected identifier after 'var'")),
@@ -402,12 +418,16 @@ impl<'src> Parser<'src> {
                 self.expect(Tok::Semi, "expected ';' after init")?;
                 Some(Box::new(Stmt::Expr(e)))
             };
-            let cond = if self.matches(&Tok::Semi) { None } else {
+            let cond = if self.matches(&Tok::Semi) {
+                None
+            } else {
                 let e = self.expr()?;
                 self.expect(Tok::Semi, "expected ';' after cond")?;
                 Some(e)
             };
-            let step = if self.matches(&Tok::RParen) { None } else {
+            let step = if self.matches(&Tok::RParen) {
+                None
+            } else {
                 let e = self.expr()?;
                 self.expect(Tok::RParen, "expected ')' after step")?;
                 Some(e)
@@ -634,9 +654,11 @@ impl<'m> Lowerer<'m> {
         let param_tys = fdecl.params.iter().map(|_| Type::Int32).collect::<Vec<_>>();
         let ret_tys = vec![Type::Int32];
 
-        // Build the function in a short inner scope so the &mut Module borrow ends
-        // before we push `func` into `self.module`.
-        let func = {
+        // Clone function map so we can use the free helpers without borrowing `self`.
+        let funcs_snapshot = self.funcs.clone();
+
+        // Build the function body
+        let mut func = {
             let mut b = Builder::new(self.module, &fdecl.name, param_tys, ret_tys);
 
             // Locals: parameter names → SSA values
@@ -645,11 +667,11 @@ impl<'m> Lowerer<'m> {
                 locals.insert(name.clone(), b.param(i));
             }
 
-            // Local field table: avoid touching self.module while builder holds &mut Module.
+            // Per-function field table (don’t touch self.module while builder is live)
             let mut fields: std::collections::HashMap<String, FieldId> = Default::default();
             let mut next_field: u32 = 0;
 
-            lower_block_free(&mut b, &mut locals, &mut fields, &mut next_field, &fdecl.body)?;
+            lower_block_free(&mut b, &mut locals, &mut fields, &mut next_field, &fdecl.body, &funcs_snapshot)?;
 
             // Fallthrough default return 0
             let zero = b.const_i32(0);
@@ -658,7 +680,9 @@ impl<'m> Lowerer<'m> {
             b.finish()
         };
 
+        // *** IMPORTANT: give the function a unique, stable id that matches Module order ***
         let fid = FuncId(self.module.funcs.len() as u32);
+        func.id = fid; // <- this prevents duplicate wir_f_0 etc.
         self.module.funcs.push(func);
         Ok(fid)
     }
@@ -791,12 +815,8 @@ impl<'m> Lowerer<'m> {
         use BinOp::*;
         use Inst::*;
         match e {
-            Expr::LitInt(i) => {
-                Ok(b.const_i32(*i))
-            }
-            Expr::LitF64(f) => {
-                Ok(b.const_f64(*f)) // returns f64; later we’d box or coerce as needed
-            }
+            Expr::LitInt(i) => Ok(b.const_i32(*i)),
+            Expr::LitF64(f) => Ok(b.const_f64(*f)),
             Expr::LitBool(v) => {
                 let (_nid, res) = b.push_node(Inst::Const(Constant::Bool(*v)), Some(Type::Bool), 1, false);
                 Ok(res[0])
@@ -809,24 +829,28 @@ impl<'m> Lowerer<'m> {
                 let (_nid, res) = b.push_node(Inst::Const(Constant::Str(s.clone())), Some(Type::Str), 1, false);
                 Ok(res[0])
             }
-            Expr::Ident(name) => {
-                locals.get(name).copied().ok_or_else(|| LowerError::UnknownVar(name.clone()))
-            }
+            Expr::Ident(name) => locals
+                .get(name)
+                .copied()
+                .ok_or_else(|| LowerError::UnknownVar(name.clone())),
             Expr::Group(inner) => self.lower_expr(b, locals, inner),
 
             Expr::Unary { op, e } => {
                 let v = self.lower_expr(b, locals, e)?;
                 match op {
                     UnOp::Neg => {
-                        // Assume i32 for demo
                         let zero = b.const_i32(0);
                         Ok(b.int_bin(IntBinOp::Sub, zero, v))
                     }
                     UnOp::Pos => Ok(v),
                     UnOp::Not => {
-                        // not x -> x == false
                         let (_nid, falsev) = b.push_node(Inst::Const(Constant::Bool(false)), Some(Type::Bool), 1, false);
-                        let (_nid, res) = b.push_node(Inst::CmpInt { kind: crate::wir::CmpKind::Eq, a: v, b: falsev[0] }, Some(Type::Bool), 1, false);
+                        let (_nid, res) = b.push_node(
+                            Inst::CmpInt { kind: crate::wir::CmpKind::Eq, a: v, b: falsev[0] },
+                            Some(Type::Bool),
+                            1,
+                            false,
+                        );
                         Ok(res[0])
                     }
                 }
@@ -842,7 +866,6 @@ impl<'m> Lowerer<'m> {
                     Div => Ok(b.int_bin(IntBinOp::DivS, va, vb)),
                     Rem => Ok(b.int_bin(IntBinOp::RemS, va, vb)),
                     Eq | Ne | Lt | Le | Gt | Ge => {
-                        use crate::wir::CmpKind::*;
                         let kind = match *op {
                             BinOp::Eq => crate::wir::CmpKind::Eq,
                             BinOp::Ne => crate::wir::CmpKind::Ne,
@@ -850,29 +873,24 @@ impl<'m> Lowerer<'m> {
                             BinOp::Le => crate::wir::CmpKind::Le,
                             BinOp::Gt => crate::wir::CmpKind::Gt,
                             BinOp::Ge => crate::wir::CmpKind::Ge,
-                            _ => unreachable!("non-comparison BinOp in comparison position: {:?}", op),
+                            _ => unreachable!(),
                         };
-                        let (_nid, res) = b.push_node(Inst::CmpInt { kind, a: va, b: vb }, Some(Type::Bool), 1, false);
+                        let (_nid, res) = b.push_node(
+                            Inst::CmpInt { kind, a: va, b: vb },
+                            Some(Type::Bool),
+                            1,
+                            false,
+                        );
                         Ok(res[0])
                     }
                     And | Or => {
-                        // Cheap short-circuit desugaring:
-                        // We’ll create a tiny diamond and phi-like selection by blocks
                         let then_b = b.block();
                         let else_b = b.block();
                         let cont = b.block();
 
-                        // Evaluate left
-                        let lv = va;
-                        // branch
-                        if *op == And {
-                            b.branch(lv, then_b, else_b);
-                        } else {
-                            // Or
-                            b.branch(lv, else_b, then_b); // if true, skip rhs (true || rhs == true)
-                        }
+                        if *op == And { b.branch(va, then_b, else_b); }
+                        else { b.branch(va, else_b, then_b); }
 
-                        // Then: compute rhs (for And) or produce true (for Or)
                         b.position_at(then_b);
                         let tval = if *op == And {
                             self.lower_expr(b, locals, bb)?
@@ -882,7 +900,6 @@ impl<'m> Lowerer<'m> {
                         };
                         b.jump(cont, &[tval]);
 
-                        // Else: compute default (for And: false; for Or: rhs)
                         b.position_at(else_b);
                         let eval_else = if *op == And {
                             let (_nid, res) = b.push_node(Inst::Const(Constant::Bool(false)), Some(Type::Bool), 1, false);
@@ -892,7 +909,6 @@ impl<'m> Lowerer<'m> {
                         };
                         b.jump(cont, &[eval_else]);
 
-                        // Continuation with one param
                         b.position_at(cont);
                         let resv = b.add_block_param(cont, Type::Bool);
                         Ok(resv)
@@ -903,16 +919,10 @@ impl<'m> Lowerer<'m> {
             Expr::Assign(lv, rhs) => {
                 let rv = self.lower_expr(b, locals, rhs)?;
                 match &**lv {
-                    LValue::Ident(name) => {
-                        locals.insert(name.clone(), rv);
-                        Ok(rv)
-                    }
+                    LValue::Ident(name) => { locals.insert(name.clone(), rv); Ok(rv) }
                     LValue::GetProp { recv, name } => {
                         let obj = self.lower_expr(b, locals, recv)?;
-                        // For demo, assume known shape and a single field table; in practice,
-                        // you'd keep a symbol→FieldId table and a shape guard.
                         let field = self.intern_field(name);
-                        // effectful store with expected: None (unknown)
                         let (_nid, _res) = b.push_node(
                             Inst::StoreField { obj, field, val: rv, expected: None },
                             Some(Type::Top),
@@ -937,14 +947,38 @@ impl<'m> Lowerer<'m> {
             }
 
             Expr::Call { callee, args } => {
-                // Recognize builtin `list(n)` -> AllocArray(len=n)
                 if let Expr::Ident(name) = &**callee {
+                    // Builtin: list(n)
                     if name == "list" {
                         if args.len() != 1 { return Err(LowerError::NotLowerable("list() expects 1 arg")); }
                         let len = self.lower_expr(b, locals, &args[0])?;
-                        let (_nid, res) = b.push_node(Inst::AllocArray { elem_hint: Some(Type::Int32), len }, Some(Type::Array(Box::new(Some(Type::Int32)))), 1, true);
+                        let (_nid, res) = b.push_node(
+                            Inst::AllocArray { elem_hint: Some(Type::Int32), len },
+                            Some(Type::Array(Box::new(Some(Type::Int32)))),
+                            1,
+                            true,
+                        );
                         return Ok(res[0]);
                     }
+
+                    // Builtin: print(x) -> CallNative("wir_print_i64", [x])
+                    if name == "print" {
+                        if args.len() != 1 { return Err(LowerError::NotLowerable("print() expects 1 arg")); }
+                        let v = self.lower_expr(b, locals, &args[0])?;
+                        let (_nid, res) = b.push_node(
+                            Inst::CallNative {
+                                name: "wir_print_i64".into(),
+                                args: vec![v],
+                                pure: false,      // printing has effects
+                                can_throw: false, // our tiny print won't throw
+                            },
+                            Some(Type::Int32),
+                            1,
+                            true,
+                        );
+                        return Ok(res[0]);
+                    }
+
                     // Direct call to known function
                     if let Some(fid) = self.funcs.get(name).copied() {
                         let mut argv = Vec::with_capacity(args.len());
@@ -958,7 +992,6 @@ impl<'m> Lowerer<'m> {
                         return Ok(res[0]);
                     }
                 }
-                // Otherwise: treat as dynamic (IC later). For now, not lowered.
                 Err(LowerError::NotLowerable("dynamic calls not yet implemented"))
             }
 
@@ -1001,9 +1034,10 @@ fn lower_block_free<'m>(
     fields: &mut std::collections::HashMap<String, FieldId>,
     next_field: &mut u32,
     blk: &Block,
+    funcs: &std::collections::HashMap<String, FuncId>,
 ) -> LResult<()> {
     for s in &blk.stmts {
-        lower_stmt_free(b, locals, fields, next_field, s)?;
+        lower_stmt_free(b, locals, fields, next_field, s, funcs)?;
     }
     Ok(())
 }
@@ -1014,30 +1048,31 @@ fn lower_stmt_free<'m>(
     fields: &mut std::collections::HashMap<String, FieldId>,
     next_field: &mut u32,
     s: &Stmt,
+    funcs: &std::collections::HashMap<String, FuncId>,
 ) -> LResult<()> {
     match s {
         Stmt::Var { name, init } => {
             let val = if let Some(e) = init {
-                lower_expr_free(b, locals, fields, next_field, e)?
+                lower_expr_free(b, locals, fields, next_field, e, funcs)?
             } else {
                 b.const_i32(0)
             };
             locals.insert(name.clone(), val);
         }
         Stmt::If { cond, then_b, else_b } => {
-            let c = lower_expr_free(b, locals, fields, next_field, cond)?;
+            let c = lower_expr_free(b, locals, fields, next_field, cond, funcs)?;
             let then_id = b.block();
             let else_id = b.block();
             let cont = b.block();
             b.branch(c, then_id, else_id);
 
             b.position_at(then_id);
-            lower_block_free(b, locals, fields, next_field, then_b)?;
+            lower_block_free(b, locals, fields, next_field, then_b, funcs)?;
             b.jump(cont, &[]);
 
             b.position_at(else_id);
             if let Some(e) = else_b {
-                lower_block_free(b, locals, fields, next_field, e)?;
+                lower_block_free(b, locals, fields, next_field, e, funcs)?;
             }
             b.jump(cont, &[]);
 
@@ -1050,18 +1085,18 @@ fn lower_stmt_free<'m>(
 
             b.jump(head, &[]);
             b.position_at(head);
-            let c = lower_expr_free(b, locals, fields, next_field, cond)?;
+            let c = lower_expr_free(b, locals, fields, next_field, cond, funcs)?;
             b.branch(c, body_b, exit);
 
             b.position_at(body_b);
-            lower_block_free(b, locals, fields, next_field, body)?;
+            lower_block_free(b, locals, fields, next_field, body, funcs)?;
             b.jump(head, &[]);
 
             b.position_at(exit);
         }
         Stmt::For { init, cond, step, body } => {
             if let Some(init_s) = init {
-                lower_stmt_free(b, locals, fields, next_field, init_s)?;
+                lower_stmt_free(b, locals, fields, next_field, init_s, funcs)?;
             }
             let head = b.block();
             let body_b = b.block();
@@ -1070,23 +1105,17 @@ fn lower_stmt_free<'m>(
             b.jump(head, &[]);
             b.position_at(head);
             let c = if let Some(e) = cond {
-                lower_expr_free(b, locals, fields, next_field, e)?
+                lower_expr_free(b, locals, fields, next_field, e, funcs)?
             } else {
-                // true
-                let (_nid, res) = b.push_node(
-                    Inst::Const(Constant::Bool(true)),
-                    Some(Type::Bool),
-                    1,
-                    false,
-                );
+                let (_nid, res) = b.push_node(Inst::Const(Constant::Bool(true)), Some(Type::Bool), 1, false);
                 res[0]
             };
             b.branch(c, body_b, exit);
 
             b.position_at(body_b);
-            lower_block_free(b, locals, fields, next_field, body)?;
+            lower_block_free(b, locals, fields, next_field, body, funcs)?;
             if let Some(step_e) = step {
-                let _ = lower_expr_free(b, locals, fields, next_field, step_e)?;
+                let _ = lower_expr_free(b, locals, fields, next_field, step_e, funcs)?;
             }
             b.jump(head, &[]);
 
@@ -1094,7 +1123,7 @@ fn lower_stmt_free<'m>(
         }
         Stmt::Return(e) => {
             if let Some(expr) = e {
-                let v = lower_expr_free(b, locals, fields, next_field, expr)?;
+                let v = lower_expr_free(b, locals, fields, next_field, expr, funcs)?;
                 b.ret(&[v]);
             } else {
                 let z = b.const_i32(0);
@@ -1102,7 +1131,7 @@ fn lower_stmt_free<'m>(
             }
         }
         Stmt::Expr(e) => {
-            let _ = lower_expr_free(b, locals, fields, next_field, e)?;
+            let _ = lower_expr_free(b, locals, fields, next_field, e, funcs)?;
         }
     }
     Ok(())
@@ -1114,6 +1143,7 @@ fn lower_expr_free<'m>(
     fields: &mut std::collections::HashMap<String, FieldId>,
     next_field: &mut u32,
     e: &Expr,
+    funcs: &std::collections::HashMap<String, FuncId>,
 ) -> LResult<ValueId> {
     use BinOp::*;
     use Inst::*;
@@ -1137,10 +1167,10 @@ fn lower_expr_free<'m>(
             .get(name)
             .copied()
             .ok_or_else(|| LowerError::UnknownVar(name.clone())),
-        Expr::Group(inner) => lower_expr_free(b, locals, fields, next_field, inner),
+        Expr::Group(inner) => lower_expr_free(b, locals, fields, next_field, inner, funcs),
 
         Expr::Unary { op, e } => {
-            let v = lower_expr_free(b, locals, fields, next_field, e)?;
+            let v = lower_expr_free(b, locals, fields, next_field, e, funcs)?;
             match op {
                 UnOp::Neg => {
                     let zero = b.const_i32(0);
@@ -1148,14 +1178,9 @@ fn lower_expr_free<'m>(
                 }
                 UnOp::Pos => Ok(v),
                 UnOp::Not => {
-                    let (_nid, falsev) =
-                        b.push_node(Inst::Const(Constant::Bool(false)), Some(Type::Bool), 1, false);
+                    let (_nid, falsev) = b.push_node(Inst::Const(Constant::Bool(false)), Some(Type::Bool), 1, false);
                     let (_nid, res) = b.push_node(
-                        Inst::CmpInt {
-                            kind: crate::wir::CmpKind::Eq,
-                            a: v,
-                            b: falsev[0],
-                        },
+                        Inst::CmpInt { kind: crate::wir::CmpKind::Eq, a: v, b: falsev[0] },
                         Some(Type::Bool),
                         1,
                         false,
@@ -1166,8 +1191,8 @@ fn lower_expr_free<'m>(
         }
 
         Expr::Binary { op, a, b: bb } => {
-            let va = lower_expr_free(b, locals, fields, next_field, a)?;
-            let vb = lower_expr_free(b, locals, fields, next_field, bb)?;
+            let va = lower_expr_free(b, locals, fields, next_field, a, funcs)?;
+            let vb = lower_expr_free(b, locals, fields, next_field, bb, funcs)?;
             match op {
                 Add => Ok(b.int_bin(IntBinOp::Add, va, vb)),
                 Sub => Ok(b.int_bin(IntBinOp::Sub, va, vb)),
@@ -1176,14 +1201,13 @@ fn lower_expr_free<'m>(
                 Rem => Ok(b.int_bin(IntBinOp::RemS, va, vb)),
 
                 Eq | Ne | Lt | Le | Gt | Ge => {
-                    use crate::wir::CmpKind as KC;
                     let kind = match *op {
-                        BinOp::Eq => KC::Eq,
-                        BinOp::Ne => KC::Ne,
-                        BinOp::Lt => KC::Lt,
-                        BinOp::Le => KC::Le,
-                        BinOp::Gt => KC::Gt,
-                        BinOp::Ge => KC::Ge,
+                        BinOp::Eq => crate::wir::CmpKind::Eq,
+                        BinOp::Ne => crate::wir::CmpKind::Ne,
+                        BinOp::Lt => crate::wir::CmpKind::Lt,
+                        BinOp::Le => crate::wir::CmpKind::Le,
+                        BinOp::Gt => crate::wir::CmpKind::Gt,
+                        BinOp::Ge => crate::wir::CmpKind::Ge,
                         _ => unreachable!(),
                     };
                     let (_nid, res) = b.push_node(
@@ -1200,29 +1224,24 @@ fn lower_expr_free<'m>(
                     let else_b = b.block();
                     let cont = b.block();
 
-                    if *op == And {
-                        b.branch(va, then_b, else_b);
-                    } else {
-                        b.branch(va, else_b, then_b);
-                    }
+                    if *op == And { b.branch(va, then_b, else_b); }
+                    else { b.branch(va, else_b, then_b); }
 
                     b.position_at(then_b);
                     let tval = if *op == And {
-                        lower_expr_free(b, locals, fields, next_field, bb)?
+                        lower_expr_free(b, locals, fields, next_field, bb, funcs)?
                     } else {
-                        let (_nid, res) =
-                            b.push_node(Inst::Const(Constant::Bool(true)), Some(Type::Bool), 1, false);
+                        let (_nid, res) = b.push_node(Inst::Const(Constant::Bool(true)), Some(Type::Bool), 1, false);
                         res[0]
                     };
                     b.jump(cont, &[tval]);
 
                     b.position_at(else_b);
                     let eval_else = if *op == And {
-                        let (_nid, res) =
-                            b.push_node(Inst::Const(Constant::Bool(false)), Some(Type::Bool), 1, false);
+                        let (_nid, res) = b.push_node(Inst::Const(Constant::Bool(false)), Some(Type::Bool), 1, false);
                         res[0]
                     } else {
-                        lower_expr_free(b, locals, fields, next_field, bb)?
+                        lower_expr_free(b, locals, fields, next_field, bb, funcs)?
                     };
                     b.jump(cont, &[eval_else]);
 
@@ -1234,22 +1253,14 @@ fn lower_expr_free<'m>(
         }
 
         Expr::Assign(lv, rhs) => {
-            let rv = lower_expr_free(b, locals, fields, next_field, rhs)?;
+            let rv = lower_expr_free(b, locals, fields, next_field, rhs, funcs)?;
             match &**lv {
-                LValue::Ident(name) => {
-                    locals.insert(name.clone(), rv);
-                    Ok(rv)
-                }
+                LValue::Ident(name) => { locals.insert(name.clone(), rv); Ok(rv) }
                 LValue::GetProp { recv, name } => {
-                    let obj = lower_expr_free(b, locals, fields, next_field, recv)?;
+                    let obj = lower_expr_free(b, locals, fields, next_field, recv, funcs)?;
                     let field = intern_field_local(fields, next_field, name);
                     let (_nid, _res) = b.push_node(
-                        Inst::StoreField {
-                            obj,
-                            field,
-                            val: rv,
-                            expected: None,
-                        },
+                        Inst::StoreField { obj, field, val: rv, expected: None },
                         Some(Type::Top),
                         1,
                         true,
@@ -1257,26 +1268,15 @@ fn lower_expr_free<'m>(
                     Ok(rv)
                 }
                 LValue::Index { recv, index } => {
-                    let arr = lower_expr_free(b, locals, fields, next_field, recv)?;
-                    let idx = lower_expr_free(b, locals, fields, next_field, index)?;
+                    let arr = lower_expr_free(b, locals, fields, next_field, recv, funcs)?;
+                    let idx = lower_expr_free(b, locals, fields, next_field, index, funcs)?;
                     let len = {
-                        let (_nid, res) =
-                            b.push_node(Inst::ArrayLen(arr), Some(Type::Int32), 1, false);
+                        let (_nid, res) = b.push_node(Inst::ArrayLen(arr), Some(Type::Int32), 1, false);
                         res[0]
                     };
                     let deopt = b.deopt_point("store_idx_oob");
-                    let _ = b.push_node(
-                        Inst::GuardBounds { idx, len, deopt },
-                        Some(Type::Top),
-                        1,
-                        true,
-                    );
-                    let (_nid, _res) = b.push_node(
-                        Inst::StoreElem { arr, idx, val: rv },
-                        Some(Type::Top),
-                        1,
-                        true,
-                    );
+                    let _ = b.push_node(Inst::GuardBounds { idx, len, deopt }, Some(Type::Top), 1, true);
+                    let (_nid, _res) = b.push_node(Inst::StoreElem { arr, idx, val: rv }, Some(Type::Top), 1, true);
                     Ok(rv)
                 }
             }
@@ -1284,51 +1284,76 @@ fn lower_expr_free<'m>(
 
         Expr::Call { callee, args } => {
             if let Expr::Ident(name) = &**callee {
+                // list(n)
                 if name == "list" {
                     if args.len() != 1 {
                         return Err(LowerError::NotLowerable("list() expects 1 arg"));
                     }
-                    let len = lower_expr_free(b, locals, fields, next_field, &args[0])?;
+                    let len = lower_expr_free(b, locals, fields, next_field, &args[0], funcs)?;
                     let (_nid, res) = b.push_node(
-                        Inst::AllocArray {
-                            elem_hint: Some(Type::Int32),
-                            len,
-                        },
+                        Inst::AllocArray { elem_hint: Some(Type::Int32), len },
                         Some(Type::Array(Box::new(Some(Type::Int32)))),
                         1,
                         true,
                     );
                     return Ok(res[0]);
                 }
-                // (Direct calls to known funcs can be re-added later if you pass a func table here.)
+
+                // print(x)
+                if name == "print" {
+                    if args.len() != 1 {
+                        return Err(LowerError::NotLowerable("print() expects 1 arg"));
+                    }
+                    let v = lower_expr_free(b, locals, fields, next_field, &args[0], funcs)?;
+                    let (_nid, res) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_print_i64".into(),
+                            args: vec![v],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::Int32),
+                        1,
+                        true,
+                    );
+                    return Ok(res[0]);
+                }
+
+                // Direct call if the function name is known.
+                if let Some(&fid) = funcs.get(name) {
+                    let mut argv = Vec::with_capacity(args.len());
+                    for a in args {
+                        argv.push(lower_expr_free(b, locals, fields, next_field, a, funcs)?);
+                    }
+                    let (_nid, res) = b.push_node(
+                        Inst::CallDirect { conv: crate::wir::CallConv::Fast, callee: fid, args: argv },
+                        Some(Type::Int32),
+                        1,
+                        true,
+                    );
+                    return Ok(res[0]);
+                }
             }
             Err(LowerError::NotLowerable("dynamic calls not yet implemented"))
         }
 
         Expr::GetProp { recv, name } => {
-            let obj = lower_expr_free(b, locals, fields, next_field, recv)?;
+            let obj = lower_expr_free(b, locals, fields, next_field, recv, funcs)?;
             let field = intern_field_local(fields, next_field, name);
-            let (_nid, res) =
-                b.push_node(Inst::LoadField { obj, field, expected: None }, None, 1, false);
+            let (_nid, res) = b.push_node(Inst::LoadField { obj, field, expected: None }, None, 1, false);
             Ok(res[0])
         }
 
         Expr::Index { recv, index } => {
-            let arr = lower_expr_free(b, locals, fields, next_field, recv)?;
-            let idx = lower_expr_free(b, locals, fields, next_field, index)?;
+            let arr = lower_expr_free(b, locals, fields, next_field, recv, funcs)?;
+            let idx = lower_expr_free(b, locals, fields, next_field, index, funcs)?;
             let len = {
                 let (_nid, res) = b.push_node(Inst::ArrayLen(arr), Some(Type::Int32), 1, false);
                 res[0]
             };
             let deopt = b.deopt_point("load_idx_oob");
-            let _ = b.push_node(
-                Inst::GuardBounds { idx, len, deopt },
-                Some(Type::Top),
-                1,
-                true,
-            );
-            let (_nid, res) =
-                b.push_node(Inst::LoadElem { arr, idx }, Some(Type::Int32), 1, false);
+            let _ = b.push_node(Inst::GuardBounds { idx, len, deopt }, Some(Type::Top), 1, true);
+            let (_nid, res) = b.push_node(Inst::LoadElem { arr, idx }, Some(Type::Int32), 1, false);
             Ok(res[0])
         }
     }

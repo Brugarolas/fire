@@ -5,126 +5,79 @@ mod runtime;
 // mod optimizer; // not used yet, but keep for future pipeline
 mod jit;
 
-use std::env;
-use std::fs;
-
 fn default_script() -> &'static str {
-    // Keep it straight-line (no calls/branches) to match current JIT support.
     r#"
-        // A tiny program with one function; JIT will run this by name.
         fn add2(a, b) {
             return a + b;
         }
+
+        // top-level runs without mandatory main
+        print(add2(2, 3)); // expect 5
     "#
 }
 
 fn main() {
-    // -------- 1) Load source --------
-    let args: Vec<String> = env::args().collect();
-    let (src, from_file) = if args.len() > 1 {
-        let path = &args[1];
-        let content = fs::read_to_string(path).expect("failed to read source file");
-        (content, true)
-    } else {
-        (default_script().to_string(), false)
-    };
-
-    if !from_file {
-        println!("(no file provided) Using built-in demo script:\n{}\n", src);
-    }
-
-    // -------- 2) Parse to AST --------
-    let mut parser = front::Parser::new(&src);
-    let prog = match parser.program() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "Parse error: {} at byte range {:?}",
-                e.msg, e.span
-            );
-            std::process::exit(1);
-        }
-    };
-
-    // -------- 3) Lower to WIR --------
-    let mut module = wir::Module::new();
-    let mut lowerer = front::Lowerer::new(&mut module);
-    let fids = match lowerer.lower_program(&prog) {
-        Ok(ids) => ids,
-        Err(e) => {
-            eprintln!("Lowering error: {:?}", e);
-            std::process::exit(1);
-        }
-    };
-
-    // Pick a function to run:
-    //   Preference order:
-    //     - a function named "main" (if present, 0-arg straight-line!)
-    //     - else a function named "add2"
-    //     - else the first function
-    let mut pick_idx: usize = 0;
-    if let Some((i, _)) = prog
-        .functions
-        .iter()
-        .enumerate()
-        .find(|(_, f)| f.name == "main")
-    {
-        pick_idx = i;
-    } else if let Some((i, _)) = prog
-        .functions
-        .iter()
-        .enumerate()
-        .find(|(_, f)| f.name == "add2")
-    {
-        pick_idx = i;
-    }
-
-    let fid = fids[pick_idx];
-    let fun = &module.funcs[fid.0 as usize];
-
-    println!(
-        "Selected function: {} (id={:?}) with {} params",
-        prog.functions[pick_idx].name,
-        fid,
-        fun.sig.params.len()
-    );
-
-    // -------- 4) JIT compile --------
-    let mut jit = jit::JIT::default();
-    let fptr = match jit.compile(fun) {
-        Ok(fp) => fp,
-        Err(e) => {
-            eprintln!("JIT compile error: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    // -------- 5) Build argv and run --------
-    // Our demo ABI: argv = *const i64, argc = usize, returns i64.
-    // Provide a couple of demo args; unused ones are ignored.
-    let argv: Vec<i64> = match prog.functions[pick_idx].name.as_str() {
-        "add2" => vec![21, 21],     // expect 42
-        "main" => vec![],           // only if your main is straight-line and has 0 params
-        _ => {
-            // Fill with zeros based on parsed parameter count
-            let n = prog.functions[pick_idx].params.len();
-            if n == 0 {
-                vec![]
-            } else if n == 1 {
-                vec![10]
-            } else if n == 2 {
-                vec![3, 39]
-            } else {
-                vec![0; n]
+    // 1) Load source
+    let args: Vec<String> = std::env::args().collect();
+    let src = if args.len() > 1 {
+        match std::fs::read_to_string(&args[1]) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Failed to read {}: {e}. Falling back to built-in demo.", args[1]);
+                default_script().to_string()
             }
         }
+    } else {
+        println!("(no file provided) Using built-in demo script:\n\n{}", default_script());
+        default_script().to_string()
     };
 
-    let ret: i64 = unsafe { fptr(argv.as_ptr(), argv.len()) };
+    // 2) Parse
+    let mut p = front::Parser::new(&src);
+    let prog = match p.program() {
+        Ok(pr) => pr,
+        Err(e) => { eprintln!("Parse error: {} at byte range {:?}", e.msg, e.span); return; }
+    };
 
+    // 3) Lower to WIR
+    let mut module = wir::Module::new();
+    let mut lowerer = front::Lowerer::new(&mut module);
+    if let Err(e) = lowerer.lower_program(&prog) {
+        eprintln!("Lowering error: {:?}", e);
+        return;
+    }
+
+    // 4) JIT compile ALL functions
+    let mut jit = jit::JIT::default();
+    let mut fptrs = std::collections::HashMap::new();
+    for f in &module.funcs {
+        match jit.compile(f) {
+            Ok(fp) => { fptrs.insert(f.sig.name.clone(), fp); }
+            Err(e) => { eprintln!("JIT compile error in {}: {}", f.sig.name, e); return; }
+        }
+    }
+
+    // 5) Pick entrypoint: prefer __toplevel__, else main, else first parsed fn
+    let entry_name = if module.funcs.iter().any(|f| f.sig.name == "__toplevel__") {
+        "__toplevel__".to_string()
+    } else if module.funcs.iter().any(|f| f.sig.name == "main") {
+        "main".to_string()
+    } else if !prog.functions.is_empty() {
+        prog.functions[0].name.clone()
+    } else {
+        eprintln!("No functions to run.");
+        return;
+    };
+
+    let entry_fun = module.funcs.iter().find(|f| f.sig.name == entry_name).unwrap();
     println!(
-        "Program returned: {} (0x{:x})",
-        ret,
-        ret as u64
+        "Selected function: {} (id={:?}) with {} params",
+        entry_fun.sig.name, entry_fun.id, entry_fun.sig.params.len()
     );
+
+    // 6) Build argv and run (ABI: (argv_ptr, argc) -> i64)
+    let argv: Vec<i64> = vec![0; entry_fun.sig.params.len()];
+    let fptr = *fptrs.get(&entry_name).unwrap();
+    let ret: i64 = unsafe { fptr(argv.as_ptr(), argv.len()) };
+    println!("Program returned: {} (0x{:x})", ret, ret as u64);
 }

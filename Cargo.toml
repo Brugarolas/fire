@@ -7,10 +7,10 @@ edition = "2024"
 once_cell = "1.21.3"
 hashbrown = "0.15.4"
 logos = "0.15.0"
-tokio = { version = "1.46.1", features = ["full", "rt-multi-thread", "macros"] }
 trc = "1.2.4"
 hybrid-rc = "0.6.0"
 smallvec = "1.15.1" # Small vectors for small collections, faster
+smolvec = "1.0.0" # Small vector optimization, flexible to save in heap when too many elements
 parking_lot = "0.12.4" # Concurrency primitives
 log = "0.4.27" # Log tracing
 tracing = "0.1.41" # Log tracing
@@ -25,14 +25,25 @@ lasso = "0.7.3" # String interning
 chumsky = "0.10.1" # Parser combinators
 archery = "1.2.1" # Faster Arc
 triomphe = "0.1.14" # Faster Arc
+smallnum = "0.4.1" # Small optimization for numbers
+small-map = "0.1.3" # Small map optimization
+smallbox = "0.8.8" # Small Box<T> optimization
+small-uuid = "0.2.4" # Fast generation of UUIDs
+time = "0.3.41" # Date and time handling
+stringzilla = "3.12.6" # Fast string handling
+compact_str = "0.9.0" # String drop-in replacement
+rclite = "0.2.7" # Optimized Rc for memory usage
+zallocator = "0.5.1" # Zero-cost allocator for small allocations
 
 # Disable default logging feature – it is large and not needed in PocketScript
 mmtk = { git = "https://github.com/mmtk/mmtk-core.git", default-features = false, features = [
     # use Gen‑Immix plan (needs RO‑space + Immix mature space)
     "ro_space", "immix_non_moving",
 ]} #git = "https://github.com/mmtk/mmtk-core.git", #version = "0.31"
-
+bumpalo = "3.19.0"
 mimalloc = "0.1.47"
+
+tokio = { version = "1.46.1", features = ["full", "rt-multi-thread", "macros"] }
 
 cranelift = "0.121.2"
 cranelift-module = "0.121.2"
