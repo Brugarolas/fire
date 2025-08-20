@@ -828,60 +828,74 @@ impl<'m> Lowerer<'m> {
                 let c = self.lower_expr_bool(b, locals, cond)?;
 
                 // Create blocks
-                let then_id = b.block();
-                let else_id = b.block();
-                let cont_id = b.block();
+                let then_id  = b.block();
+                let else_id  = b.block();
+                let then_end = b.block();
+                let else_end = b.block();
+                let cont_id  = b.block();
 
-                // Branch
+                // Split
                 b.branch(c, then_id, else_id);
 
                 // Snapshot incoming locals
-                let locals_in = locals.clone();
+                let incoming = locals.clone();
 
-                // Lower THEN
+                // THEN arm
                 b.position_at(then_id);
-                let mut locals_then = locals_in.clone();
+                let mut locals_then = incoming.clone();
                 self.lower_block(b, &mut locals_then, then_b)?;
-                // (no jump yet)
+                if !b.current_block_terminated() {
+                    b.jump(then_end, &[]);
+                }
+                b.position_at(then_end);
 
-                // Lower ELSE
+                // ELSE arm
                 b.position_at(else_id);
-                let mut locals_else = locals_in.clone();
+                let mut locals_else = incoming.clone();
                 if let Some(eb) = else_b {
                     self.lower_block(b, &mut locals_else, eb)?;
                 }
-                // (no jump yet)
+                if !b.current_block_terminated() {
+                    b.jump(else_end, &[]);
+                }
+                b.position_at(else_end);
 
-                // Build phis only for variables that existed *before* the if
-                let mut phi_for: BTreeMap<String, ValueId> = BTreeMap::new();
-                let mut then_args: Vec<ValueId> = Vec::new();
-                let mut else_args: Vec<ValueId> = Vec::new();
-
-                for (name, &v_in) in locals_in.iter() {
-                    let v_then = *locals_then.get(name).unwrap_or(&v_in);
-                    let v_else = *locals_else.get(name).unwrap_or(&v_in);
-                    if v_then != v_else {
-                        // (Keep it simple: Int32; you can refine with real types later.)
-                        let phi_vid = b.add_block_param(cont_id, Type::Int32);
-                        phi_for.insert(name.clone(), phi_vid);
-                        then_args.push(v_then);
-                        else_args.push(v_else);
+                // Figure out which names need a phi (changed in either arm)
+                let mut phi_vars: Vec<String> = Vec::new();
+                for (name, &vin) in incoming.iter() {
+                    let vt = *locals_then.get(name).unwrap_or(&vin);
+                    let ve = *locals_else.get(name).unwrap_or(&vin);
+                    if vt != ve {
+                        phi_vars.push(name.clone());
                     }
                 }
+                phi_vars.sort(); // deterministic order
 
-                // Now terminate branches with the correct jump args
-                b.position_at(then_id);
-                b.jump(cont_id, &then_args);
-
-                b.position_at(else_id);
-                b.jump(cont_id, &else_args);
-
-                // Merge
-                b.position_at(cont_id);
-                for (name, phi_vid) in phi_for {
-                    locals.insert(name, phi_vid);
+                // Create block params on `cont` and build jump arg tuples
+                let mut phi_params = Vec::with_capacity(phi_vars.len());
+                for _ in &phi_vars {
+                    phi_params.push(b.add_block_param(cont_id, crate::wir::Type::Int32));
                 }
-            }
+                let mut args_then = Vec::with_capacity(phi_vars.len());
+                let mut args_else = Vec::with_capacity(phi_vars.len());
+                for name in &phi_vars {
+                    let vin = *incoming.get(name).unwrap();
+                    args_then.push(*locals_then.get(name).unwrap_or(&vin));
+                    args_else.push(*locals_else.get(name).unwrap_or(&vin));
+                }
+
+    // Landings → cont (same arity on both edges)
+    b.position_at(then_end);
+    b.jump(cont_id, &args_then);
+    b.position_at(else_end);
+    b.jump(cont_id, &args_else);
+
+    // Continue at merge and rebind merged locals
+    b.position_at(cont_id);
+    for (i, name) in phi_vars.iter().enumerate() {
+        locals.insert(name.clone(), phi_params[i]);
+    }
+}
             Stmt::While { cond, body } => {
                 let head = b.block();
                 let body_b = b.block();
@@ -961,7 +975,6 @@ impl<'m> Lowerer<'m> {
         e: &Expr,
     ) -> LResult<ValueId> {
         use BinOp::*;
-        use Inst::*;
         match e {
             Expr::LitInt(i) => Ok(b.const_i32(*i)),
             Expr::LitF64(f) => Ok(b.const_f64(*f)),
@@ -1111,14 +1124,17 @@ impl<'m> Lowerer<'m> {
 
                     // Builtin: print(x) -> CallNative("wir_print_i64", [x])
                     if name == "print" {
-                        if args.len() != 1 { return Err(LowerError::NotLowerable("print() expects 1 arg")); }
+                        if args.len() != 1 {
+                            return Err(LowerError::NotLowerable("print() expects 1 arg"));
+                        }
+                        let is_str_lit = matches!(args[0], Expr::Str(_));
                         let v = self.lower_expr(b, locals, &args[0])?;
                         let (_nid, res) = b.push_node(
                             Inst::CallNative {
-                                name: "wir_print_i64".into(),
+                                name: if is_str_lit { "wir_print_str".into() } else { "wir_print_i64".into() },
                                 args: vec![v],
-                                pure: false,      // printing has effects
-                                can_throw: false, // our tiny print won't throw
+                                pure: false,
+                                can_throw: false,
                             },
                             Some(Type::Int32),
                             1,
@@ -1208,62 +1224,77 @@ fn lower_stmt_free<'m>(
             locals.insert(name.clone(), val);
         }
         Stmt::If { cond, then_b, else_b } => {
-            // Evaluate condition once (free version)
+            // Evaluate condition
             let c = lower_expr_free(b, locals, fields, next_field, cond, funcs)?;
 
-            // Create blocks
-            let then_id = b.block();
-            let else_id = b.block();
-            let cont_id = b.block();
+            // Blocks
+            let then_id  = b.block();
+            let else_id  = b.block();
+            let then_end = b.block();
+            let else_end = b.block();
+            let cont_id  = b.block();
 
-            // Branch
             b.branch(c, then_id, else_id);
 
             // Snapshot incoming locals
-            let locals_in = locals.clone();
+            let incoming = locals.clone();
 
-            // THEN
+            // THEN arm
             b.position_at(then_id);
-            let mut locals_then = locals_in.clone();
+            let mut locals_then = incoming.clone();
             lower_block_free(b, &mut locals_then, fields, next_field, then_b, funcs)?;
-            // (no jump yet)
+            if !b.current_block_terminated() {
+                b.jump(then_end, &[]);
+            }
+            b.position_at(then_end);
 
-            // ELSE
+            // ELSE arm
             b.position_at(else_id);
-            let mut locals_else = locals_in.clone();
+            let mut locals_else = incoming.clone();
             if let Some(eb) = else_b {
                 lower_block_free(b, &mut locals_else, fields, next_field, eb, funcs)?;
             }
-            // (no jump yet)
+            if !b.current_block_terminated() {
+                b.jump(else_end, &[]);
+            }
+            b.position_at(else_end);
 
-            // Build phis only for variables present at entry
-            use std::collections::BTreeMap;
-            let mut phi_for: BTreeMap<String, ValueId> = BTreeMap::new();
-            let mut then_args: Vec<ValueId> = Vec::new();
-            let mut else_args: Vec<ValueId> = Vec::new();
-
-            for (name, &v_in) in locals_in.iter() {
-                let v_then = *locals_then.get(name).unwrap_or(&v_in);
-                let v_else = *locals_else.get(name).unwrap_or(&v_in);
-                if v_then != v_else {
-                    let phi_vid = b.add_block_param(cont_id, Type::Int32);
-                    phi_for.insert(name.clone(), phi_vid);
-                    then_args.push(v_then);
-                    else_args.push(v_else);
+            // Compute phi set
+            let mut phi_vars: Vec<String> = Vec::new();
+            for (name, &vin) in incoming.iter() {
+                let vt = *locals_then.get(name).unwrap_or(&vin);
+                let ve = *locals_else.get(name).unwrap_or(&vin);
+                if vt != ve {
+                    phi_vars.push(name.clone());
                 }
             }
+            phi_vars.sort();
 
-            // Finish branches
-            b.position_at(then_id);
-            b.jump(cont_id, &then_args);
+            // Add block params on cont
+            let mut phi_params = Vec::with_capacity(phi_vars.len());
+            for _ in &phi_vars {
+                phi_params.push(b.add_block_param(cont_id, crate::wir::Type::Int32));
+            }
 
-            b.position_at(else_id);
-            b.jump(cont_id, &else_args);
+            // Build arg tuples
+            let mut args_then = Vec::with_capacity(phi_vars.len());
+            let mut args_else = Vec::with_capacity(phi_vars.len());
+            for name in &phi_vars {
+                let vin = *incoming.get(name).unwrap();
+                args_then.push(*locals_then.get(name).unwrap_or(&vin));
+                args_else.push(*locals_else.get(name).unwrap_or(&vin));
+            }
 
-            // Merge
+            // Landings → cont
+            b.position_at(then_end);
+            b.jump(cont_id, &args_then);
+            b.position_at(else_end);
+            b.jump(cont_id, &args_else);
+
+            // Merge bindings
             b.position_at(cont_id);
-            for (name, phi_vid) in phi_for {
-                locals.insert(name, phi_vid);
+            for (i, name) in phi_vars.iter().enumerate() {
+                locals.insert(name.clone(), phi_params[i]);
             }
         }
         Stmt::While { cond, body } => {
@@ -1623,10 +1654,11 @@ fn lower_expr_free<'m>(
                     if args.len() != 1 {
                         return Err(LowerError::NotLowerable("print() expects 1 arg"));
                     }
+                    let is_str_lit = matches!(args[0], Expr::Str(_));
                     let v = lower_expr_free(b, locals, fields, next_field, &args[0], funcs)?;
                     let (_nid, res) = b.push_node(
                         Inst::CallNative {
-                            name: "wir_print_i64".into(),
+                            name: if is_str_lit { "wir_print_str".into() } else { "wir_print_i64".into() },
                             args: vec![v],
                             pure: false,
                             can_throw: false,

@@ -19,22 +19,26 @@ pub type JitFnPtr = unsafe extern "C" fn(*const i64, usize) -> i64;
 pub struct JIT {
     module: JITModule,
     fctx: FunctionBuilderContext,
+    keep_alive: Vec<std::ffi::CString>, // keep CString storage alive for compiled code
 }
 
 impl Default for JIT {
     fn default() -> Self {
-        // JITBuilder::new returns Result in 0.121.x
         let mut jb = cranelift_jit::JITBuilder::new(cranelift_module::default_libcall_names())
             .expect("JITBuilder::new");
 
-        // Register runtime symbols we can import and call.
         unsafe extern "C" {
             fn wir_print_i64(x: i64) -> i64;
+            fn wir_print_str(p: *const std::os::raw::c_char) -> i64;
         }
         unsafe {
             jb.symbol(
                 "wir_print_i64",
                 wir_print_i64 as *const extern "C" fn(i64) -> i64 as *const u8,
+            );
+            jb.symbol(
+                "wir_print_str",
+                wir_print_str as *const extern "C" fn(*const std::os::raw::c_char) -> i64 as *const u8,
             );
         }
 
@@ -42,6 +46,7 @@ impl Default for JIT {
         Self {
             module,
             fctx: cranelift_frontend::FunctionBuilderContext::new(),
+            keep_alive: Vec::new(), // <-- add this field (see next step)
         }
     }
 }
@@ -103,8 +108,15 @@ impl JIT {
                 Constant::F64(f)   => fb.ins().iconst(types::I64, (*f).to_bits() as i64),
                 Constant::Bool(b)  => fb.ins().iconst(types::I64, if *b { 1 } else { 0 }),
                 Constant::Null     => fb.ins().iconst(types::I64, 0),
-                // Do NOT trap here; emitting after a trap would panic. Just stub to 0.
-                Constant::Str(_)   => fb.ins().iconst(types::I64, 0),
+
+                // NEW: turn WIR string constant into a stable C string pointer
+                Constant::Str(s)   => {
+                    let cstr = std::ffi::CString::new(s.as_str()).unwrap();
+                    let ptr = cstr.as_ptr() as i64;
+                    // Keep the CString alive for as long as the JIT instance lives
+                    self.keep_alive.push(cstr);
+                    fb.ins().iconst(types::I64, ptr)
+                }
             }
         };
 
@@ -487,6 +499,27 @@ fn trap_unsupported(fb: &mut FunctionBuilder, _what: &str) {
     let code = TrapCode::unwrap_user(0xE0);
     fb.ins().trap(code);
 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_print_i64(x: i64) -> i64 {
+    println!("{}", x);
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_print_str(p: *const std::os::raw::c_char) -> i64 {
+    use std::ffi::CStr;
+    if p.is_null() {
+        println!("(null)");
+        return 0;
+    }
+    unsafe {
+        let s = CStr::from_ptr(p).to_string_lossy();
+        println!("{}", s);
+    }
+    0
+}
+
 
 // --- DEBUG HELPERS (fixed) ---------------------------------------------------
 fn dump_value_kind(values: &Vec<WirValue>, id: ValueId) -> &'static str {

@@ -594,6 +594,22 @@ impl<'m> Builder<'m> {
         None
     }
 
+    pub fn current_block_terminated(&self) -> bool {
+        let blk = self.func.blocks.iter().find(|b| b.id == self.cur_block).unwrap();
+        if let Some(&last) = blk.insts.last() {
+            use crate::wir::Inst;
+            matches!(
+                self.func.nodes[last.0 as usize].kind,
+                Inst::Return(_)
+                    | Inst::Branch { .. }
+                    | Inst::Jump(_, _)
+                    | Inst::Throw(_)
+            )
+        } else {
+            false
+        }
+    }
+
     fn new_effect_value(&mut self, kind: EffectKind) -> ValueId {
         let vid = ValueId(self.func.values.len() as u32);
         self.func.values.push(Value {
