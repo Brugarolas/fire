@@ -4,3 +4,9 @@ fn add2(a, b) {
 }
 
 print(add2(2, 3)); // expect 5
+
+var x = 0;
+while (x < 10) {
+    x += 1;
+}
+print(x); // expect 10

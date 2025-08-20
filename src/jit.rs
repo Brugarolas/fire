@@ -7,6 +7,7 @@ use cranelift::prelude::*;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module as _};
+use cranelift::codegen::ir::instructions::BlockArg;
 
 use crate::wir::{
     Constant, Function as WirFunction, Inst, IntBinOp, Value as WirValue, ValueDef, ValueId,
@@ -82,6 +83,7 @@ impl JIT {
 
         let mut vmap = ValueMap::new();
         let mut terminated = false;
+        let mut saw_any_return = false;
 
         // Bind WIR params for this function to loads from argv[i].
         let param_count = fun.sig.params.len();
@@ -106,13 +108,35 @@ impl JIT {
             }
         };
 
+        // --- Precreate one CLIF block per WIR block ---
+        let mut clif_of = Vec::with_capacity(fun.blocks.len());
+        for blk in &fun.blocks {
+            let ebb = if blk.id == fun.entry { entry } else { fb.create_block() };
+            clif_of.push(ebb);
+
+            if blk.id != fun.entry {
+                for &vid in &blk.params {
+                    let p = fb.append_block_param(ebb, types::I64);
+                    vmap.bind(vid, p);
+                }
+            }
+        }
+
         // ---- naïve linear pass over all blocks in order
         for (bid, block) in fun.blocks.iter().enumerate() {
             eprintln!("  [block] visiting block #{bid} with {} insts", block.insts.len());
-            for nid in &block.insts {
-                eprintln!("  [nodes] processing nid={:?}", nid);
 
-                if terminated { break; }
+            let cur_ebb = clif_of[bid];
+            if bid != fun.entry.0 as usize {
+                fb.switch_to_block(cur_ebb);
+            }
+
+            let mut block_terminated = false;
+
+            for nid in &block.insts {
+                if block_terminated || terminated { break; }
+
+                eprintln!("  [nodes] processing nid={:?}", nid);
 
                 let node = &fun.nodes[nid.0 as usize];
                 let res_count = node.results.len();
@@ -244,23 +268,6 @@ impl JIT {
 
                         let call = fb.ins().call(callee_ref, &[argv_ptr, argc]);
 
-                        // Bind ALL results from the call instruction
-                        if !node.results.is_empty() {
-                            // Get the first result value if available
-                            let result_value = if let Some(&value) = fb.inst_results(call).get(0) {
-                                value
-                            } else {
-                                // Create zero constant if no result was produced
-                                fb.ins().iconst(types::I64, 0)
-                            };
-
-                            // Bind the first result
-                            vmap.bind(node.results[0], result_value);
-                            eprintln!("           bind result {:?} from CallDirect", node.results[0]);
-                        } else {
-                            eprintln!("           WARNING: CallDirect had res_count=0; no value bound");
-                        }
-
                         // IMPORTANT: Bind the produced result if WIR says there is one.
                         if res_count >= 1 {
                             let r = fb.inst_results(call)[0];
@@ -307,16 +314,36 @@ impl JIT {
                         }
                     }
 
-                    Inst::Return(vals) => {
-                        eprintln!("[JIT] Return {:?}", vals);
+                    Inst::Jump(to, args) => {
+                        let dst = clif_of[to.0 as usize];
+                        // Build BlockArgs (BlockArg::from(Value))
+                        let mut bargs: Vec<BlockArg> = Vec::with_capacity(args.len());
+                        for &a in args {
+                            let v = vmap.get_or_emit(a, &mut fb, args_base, fun);
+                            bargs.push(BlockArg::from(v));
+                        }
+                        fb.ins().jump(dst, &bargs[..]); // expects &BlockArg, not &Value
+                        block_terminated = true;
+                    }
 
+                    Inst::Branch { cond, then_b, else_b } => {
+                        let c = vmap.get_or_emit(*cond, &mut fb, args_base, fun);
+                        // Our booleans are 0/1; brif treats non-zero as true.
+                        fb.ins().brif(c,
+                            clif_of[then_b.0 as usize], &[] as &[BlockArg],
+                            clif_of[else_b.0 as usize], &[] as &[BlockArg]);
+                        block_terminated = true;
+                    }
+
+                    Inst::Return(vals) => {
                         let ret = if vals.is_empty() {
                             fb.ins().iconst(types::I64, 0)
                         } else {
                             vmap.get_or_emit(vals[0], &mut fb, args_base, fun)
                         };
                         fb.ins().return_(&[ret]);
-                        terminated = true;
+                        block_terminated = true;
+                        saw_any_return = true;     // <-- add this
                     }
 
                     // benign markers
@@ -353,7 +380,9 @@ impl JIT {
             if terminated { break; }
         }
 
-        if !terminated {
+        if !saw_any_return {
+            let tail = fb.create_block();
+            fb.switch_to_block(tail);
             let zero = fb.ins().iconst(types::I64, 0);
             fb.ins().return_(&[zero]);
         }

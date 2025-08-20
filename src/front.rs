@@ -48,6 +48,7 @@
 //! Note: this is deliberately small to keep it readable, but fully functional.
 
 use logos::Logos;
+use std::collections::BTreeSet;
 
 // Bring in the WIR types from your other file/module.
 use crate::wir::{
@@ -102,6 +103,11 @@ pub enum Tok {
     #[token(">=")] GtEq,
     #[token("&&")] AndAnd,
     #[token("||")] OrOr,
+    #[token("+=")] PlusEq,
+    #[token("-=")] MinusEq,
+    #[token("*=")] StarEq,
+    #[token("/=")] SlashEq,
+    #[token("%=")] PercentEq,
     #[token("=")] Eq,
     #[token("<")] Lt,
     #[token(">")] Gt,
@@ -454,18 +460,46 @@ impl<'src> Parser<'src> {
 
     fn parse_assign(&mut self) -> PResult<Expr> {
         let mut left = self.parse_or()?;
-        if self.matches(&Tok::Eq) {
-            // Transform left into an LValue if possible
+
+        // Which assignment operator (if any) did we see?
+        // Try the multi-char ones first.
+        let op = if self.matches(&Tok::PlusEq)    { Some(("PlusEq",  BinOp::Add)) }
+            else if self.matches(&Tok::MinusEq)       { Some(("MinusEq", BinOp::Sub)) }
+            else if self.matches(&Tok::StarEq)        { Some(("StarEq",  BinOp::Mul)) }
+            else if self.matches(&Tok::SlashEq)       { Some(("SlashEq", BinOp::Div)) }
+            else if self.matches(&Tok::PercentEq)     { Some(("PercentEq", BinOp::Rem)) }
+            else if self.matches(&Tok::Eq)            { Some(("Eq",      // plain '='
+                                                        // dummy op, won't be used
+                                                        BinOp::Add)) }
+            else { None };
+
+        if let Some((kind, bop)) = op {
+            // Turn `left` into an LValue
             let lv = match left {
-                Expr::Ident(s) => LValue::Ident(s),
-                Expr::GetProp { recv, name } => LValue::GetProp { recv: *recv, name },
-                Expr::Index { recv, index } => LValue::Index { recv: *recv, index: *index },
+                Expr::Ident(s)                      => LValue::Ident(s),
+                Expr::GetProp { recv, name }        => LValue::GetProp { recv: *recv, name },
+                Expr::Index   { recv, index }       => LValue::Index   { recv: *recv, index: *index },
                 _ => return Err(self.err_here("invalid assignment target")),
             };
+
+            // Parse the RHS (right-associative)
             let rhs = self.parse_assign()?;
-            left = Expr::Assign(Box::new(lv), Box::new(rhs));
+
+            // For compound op, synthesize:  lv = (lv_expr <op> rhs)
+            let final_rhs = if kind == "Eq" {
+                rhs
+            } else {
+                Expr::Binary {
+                    op: bop,
+                    a: Box::new(lvalue_to_expr(&lv)),
+                    b: Box::new(rhs),
+                }
+            };
+
+            Ok(Expr::Assign(Box::new(lv), Box::new(final_rhs)))
+        } else {
+            Ok(left)
         }
-        Ok(left)
     }
 
     fn parse_or(&mut self) -> PResult<Expr> {
@@ -1083,16 +1117,45 @@ fn lower_stmt_free<'m>(
             let body_b = b.block();
             let exit = b.block();
 
-            b.jump(head, &[]);
+            // 1) Which locals are mutated in the loop body?
+            let mut_names = collect_mut_locals_in_block(body)
+                .into_iter()
+                .filter(|name| locals.contains_key(name)) // only loop-carried, pre-existing locals
+                .collect::<Vec<_>>();
+
+            // 2) Snapshot initial values in a stable order
+            let init_args: Vec<ValueId> = mut_names.iter()
+                .map(|n| *locals.get(n).expect("known local"))
+                .collect();
+
+            // 3) Create header params (phis) and jump into head with initial values
+            let phi_vals: Vec<ValueId> = mut_names.iter()
+                .map(|_| b.add_block_param(head, Type::Int32))
+                .collect();
+
+            b.jump(head, &init_args);
+
+            // 4) In header, the current values of mutated locals are the phis
             b.position_at(head);
+            for (name, p) in mut_names.iter().zip(phi_vals.iter()) {
+                locals.insert(name.clone(), *p);
+            }
             let c = lower_expr_free(b, locals, fields, next_field, cond, funcs)?;
             b.branch(c, body_b, exit);
 
+            // 5) Body: compute new values, then back-edge with the updated tuple
             b.position_at(body_b);
             lower_block_free(b, locals, fields, next_field, body, funcs)?;
-            b.jump(head, &[]);
+            let back_args: Vec<ValueId> = mut_names.iter()
+                .map(|n| *locals.get(n).expect("local after body"))
+                .collect();
+            b.jump(head, &back_args);
 
+            // 6) Exit: after the loop, the value of each mutated local is the header phi
             b.position_at(exit);
+            for (name, p) in mut_names.into_iter().zip(phi_vals.into_iter()) {
+                locals.insert(name, p);
+            }
         }
         Stmt::For { init, cond, step, body } => {
             if let Some(init_s) = init {
@@ -1135,6 +1198,74 @@ fn lower_stmt_free<'m>(
         }
     }
     Ok(())
+}
+
+fn lvalue_to_expr(lv: &LValue) -> Expr {
+    match lv {
+        LValue::Ident(s) => Expr::Ident(s.clone()),
+        LValue::GetProp { recv, name } =>
+            Expr::GetProp { recv: Box::new(recv.clone()), name: name.clone() },
+        LValue::Index { recv, index } =>
+            Expr::Index { recv: Box::new(recv.clone()), index: Box::new(index.clone()) },
+    }
+}
+
+fn collect_mut_locals_in_expr(e: &Expr, out: &mut BTreeSet<String>) {
+    match e {
+        Expr::Assign(lv, rhs) => {
+            if let LValue::Ident(name) = &**lv {
+                out.insert(name.clone());
+            }
+            collect_mut_locals_in_expr(rhs, out);
+        }
+        Expr::Binary { a, b, .. } => {
+            collect_mut_locals_in_expr(a, out);
+            collect_mut_locals_in_expr(b, out);
+        }
+        Expr::Unary { e, .. } => collect_mut_locals_in_expr(e, out),
+        Expr::Call { callee, args } => {
+            collect_mut_locals_in_expr(callee, out);
+            for a in args { collect_mut_locals_in_expr(a, out); }
+        }
+        Expr::GetProp { recv, .. } => collect_mut_locals_in_expr(recv, out),
+        Expr::Index { recv, index } => {
+            collect_mut_locals_in_expr(recv, out);
+            collect_mut_locals_in_expr(index, out);
+        }
+        Expr::Group(e) => collect_mut_locals_in_expr(e, out),
+        _ => {}
+    }
+}
+
+fn collect_mut_locals_in_stmt(s: &Stmt, out: &mut BTreeSet<String>) {
+    match s {
+        Stmt::Expr(e) => collect_mut_locals_in_expr(e, out),
+        Stmt::Var { .. } => {} // vars declared inside the loop are not loop-carried
+        Stmt::If { cond, then_b, else_b } => {
+            collect_mut_locals_in_expr(cond, out);
+            for st in &then_b.stmts { collect_mut_locals_in_stmt(st, out); }
+            if let Some(eb) = else_b {
+                for st in &eb.stmts { collect_mut_locals_in_stmt(st, out); }
+            }
+        }
+        Stmt::While { cond, body } => {
+            collect_mut_locals_in_expr(cond, out);
+            for st in &body.stmts { collect_mut_locals_in_stmt(st, out); }
+        }
+        Stmt::For { init, cond, step, body } => {
+            if let Some(i) = init.as_deref() { collect_mut_locals_in_stmt(i, out); }
+            if let Some(c) = cond { collect_mut_locals_in_expr(c, out); }
+            if let Some(s) = step { collect_mut_locals_in_expr(s, out); }
+            for st in &body.stmts { collect_mut_locals_in_stmt(st, out); }
+        }
+        Stmt::Return(e) => { if let Some(e) = e { collect_mut_locals_in_expr(e, out); } }
+    }
+}
+
+fn collect_mut_locals_in_block(b: &Block) -> Vec<String> {
+    let mut set = BTreeSet::new();
+    for s in &b.stmts { collect_mut_locals_in_stmt(s, &mut set); }
+    set.into_iter().collect() // stable order
 }
 
 fn lower_expr_free<'m>(
