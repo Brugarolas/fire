@@ -1158,15 +1158,41 @@ fn lower_stmt_free<'m>(
             }
         }
         Stmt::For { init, cond, step, body } => {
+            // 0) Run init
             if let Some(init_s) = init {
                 lower_stmt_free(b, locals, fields, next_field, init_s, funcs)?;
             }
-            let head = b.block();
-            let body_b = b.block();
-            let exit = b.block();
 
-            b.jump(head, &[]);
+            // 1) Blocks
+            let head   = b.block();
+            let body_b = b.block();
+            let exit   = b.block();
+
+            // 2) Loop-carried locals: mutated in body or step & already exist
+            use std::collections::BTreeSet;
+            let mut mutated_set: BTreeSet<String> = BTreeSet::new();
+            for st in &body.stmts { collect_mut_locals_in_stmt(st, &mut mutated_set); }
+            if let Some(step_e) = step { collect_mut_locals_in_expr(step_e, &mut mutated_set); }
+            let mut_names: Vec<String> = mutated_set.into_iter()
+                .filter(|n| locals.contains_key(n))
+                .collect();
+
+            // 3) Snapshot initial tuple & create header phis (i32 for now)
+            let init_args: Vec<ValueId> = mut_names.iter()
+                .map(|n| *locals.get(n).unwrap())
+                .collect();
+            let phi_vals: Vec<ValueId> = mut_names.iter()
+                .map(|_| b.add_block_param(head, Type::Int32))
+                .collect();
+
+            // Enter header
+            b.jump(head, &init_args);
+
+            // 4) Header: bind locals to phis, check condition
             b.position_at(head);
+            for (name, p) in mut_names.iter().zip(phi_vals.iter()) {
+                locals.insert(name.clone(), *p);
+            }
             let c = if let Some(e) = cond {
                 lower_expr_free(b, locals, fields, next_field, e, funcs)?
             } else {
@@ -1175,14 +1201,22 @@ fn lower_stmt_free<'m>(
             };
             b.branch(c, body_b, exit);
 
+            // 5) Body, then optional step, then backedge with updated tuple
             b.position_at(body_b);
             lower_block_free(b, locals, fields, next_field, body, funcs)?;
             if let Some(step_e) = step {
                 let _ = lower_expr_free(b, locals, fields, next_field, step_e, funcs)?;
             }
-            b.jump(head, &[]);
+            let back_args: Vec<ValueId> = mut_names.iter()
+                .map(|n| *locals.get(n).unwrap())
+                .collect();
+            b.jump(head, &back_args);
 
+            // 6) Exit: final values are the header phis
             b.position_at(exit);
+            for (name, p) in mut_names.into_iter().zip(phi_vals.into_iter()) {
+                locals.insert(name, p);
+            }
         }
         Stmt::Return(e) => {
             if let Some(expr) = e {

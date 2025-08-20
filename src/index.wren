@@ -10,3 +10,9 @@ while (x < 10) {
     x += 1;
 }
 print(x); // expect 10
+
+var y = 0;
+for (var i = 0; i < 5; i += 1) {
+    y += i;
+}
+print(y); // expect 10
