@@ -48,7 +48,7 @@
 //! Note: this is deliberately small to keep it readable, but fully functional.
 
 use logos::Logos;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 // Bring in the WIR types from your other file/module.
 use crate::wir::{
@@ -75,6 +75,7 @@ pub enum Tok {
     #[token("fn")] Fn,
     #[token("var")] Var,
     #[token("if")] If,
+    #[token("unless")] Unless,
     #[token("else")] Else,
     #[token("while")] While,
     #[token("for")] For,
@@ -399,7 +400,81 @@ impl<'src> Parser<'src> {
             let cond = self.expr()?;
             self.expect(Tok::RParen, "expected ')'")?;
             let then_b = self.block()?;
-            let else_b = if self.matches(&Tok::Else) { Some(self.block()?) } else { None };
+
+            // else { … } | else if (…) { … } | else unless (…) { … }
+            let else_b = if self.matches(&Tok::Else) {
+                if self.matches(&Tok::If) || self.matches(&Tok::Unless) {
+                    // Was it "else unless"?
+                    let negated = if self.toks[self.i - 1].tok == Tok::Unless { true } else { false };
+
+                    self.expect(Tok::LParen, "expected '('")?;
+                    let mut cond2 = self.expr()?;
+                    self.expect(Tok::RParen, "expected ')'")?;
+                    if negated {
+                        cond2 = Expr::Unary { op: UnOp::Not, e: Box::new(cond2) };
+                    }
+                    let then2 = self.block()?;
+
+                    // Optional trailing else after the else-if/unless chain
+                    let tail_else = if self.matches(&Tok::Else) {
+                        Some(self.block()?)
+                    } else {
+                        None
+                    };
+
+                    // Desugar into: else { if (cond2) then2 else tail_else }
+                    Some(Block {
+                        stmts: vec![Stmt::If { cond: cond2, then_b: then2, else_b: tail_else }]
+                    })
+                } else {
+                    // Plain "else { … }"
+                    Some(self.block()?)
+                }
+            } else {
+                None
+            };
+
+            Ok(Stmt::If { cond, then_b, else_b })
+        } else if self.matches(&Tok::Unless) {
+            // unless (cond) { then } [ else { ... } | else if (...) { ... } | else unless (...) { ... } ]
+            self.expect(Tok::LParen, "expected '('")?;
+            let cond0 = self.expr()?;
+            self.expect(Tok::RParen, "expected ')'")?;
+            let cond = Expr::Unary { op: UnOp::Not, e: Box::new(cond0) };
+            let then_b = self.block()?;
+
+            // else { … } | else if (…) { … } | else unless (…) { … }
+            let else_b = if self.matches(&Tok::Else) {
+                // “else if …” or “else unless …”
+                if self.matches(&Tok::If) || self.matches(&Tok::Unless) {
+                    let was_unless = matches!(self.toks[self.i - 1].tok, Tok::Unless);
+                    self.expect(Tok::LParen, "expected '('")?;
+                    let mut cond2 = self.expr()?;
+                    self.expect(Tok::RParen, "expected ')'")?;
+                    if was_unless {
+                        cond2 = Expr::Unary { op: UnOp::Not, e: Box::new(cond2) };
+                    }
+                    let then2 = self.block()?;
+
+                    // Optional trailing else after the else-if/unless
+                    let tail_else = if self.matches(&Tok::Else) {
+                        Some(self.block()?)
+                    } else {
+                        None
+                    };
+
+                    // Desugar into: else { if (cond2) then2 else tail_else }
+                    Some(Block {
+                        stmts: vec![Stmt::If { cond: cond2, then_b: then2, else_b: tail_else }],
+                    })
+                } else {
+                    // Plain "else { … }"
+                    Some(self.block()?)
+                }
+            } else {
+                None
+            };
+
             Ok(Stmt::If { cond, then_b, else_b })
         } else if self.matches(&Tok::While) {
             self.expect(Tok::LParen, "expected '('")?;
@@ -749,24 +824,63 @@ impl<'m> Lowerer<'m> {
                 locals.insert(name.clone(), val);
             }
             Stmt::If { cond, then_b, else_b } => {
+                // Evaluate condition once
                 let c = self.lower_expr_bool(b, locals, cond)?;
+
+                // Create blocks
                 let then_id = b.block();
                 let else_id = b.block();
-                let cont = b.block();
+                let cont_id = b.block();
+
+                // Branch
                 b.branch(c, then_id, else_id);
 
-                // then
+                // Snapshot incoming locals
+                let locals_in = locals.clone();
+
+                // Lower THEN
                 b.position_at(then_id);
-                self.lower_block(b, locals, then_b)?;
-                b.jump(cont, &[]);
+                let mut locals_then = locals_in.clone();
+                self.lower_block(b, &mut locals_then, then_b)?;
+                // (no jump yet)
 
-                // else
+                // Lower ELSE
                 b.position_at(else_id);
-                if let Some(e) = else_b { self.lower_block(b, locals, e)?; }
-                b.jump(cont, &[]);
+                let mut locals_else = locals_in.clone();
+                if let Some(eb) = else_b {
+                    self.lower_block(b, &mut locals_else, eb)?;
+                }
+                // (no jump yet)
 
-                // cont
-                b.position_at(cont);
+                // Build phis only for variables that existed *before* the if
+                let mut phi_for: BTreeMap<String, ValueId> = BTreeMap::new();
+                let mut then_args: Vec<ValueId> = Vec::new();
+                let mut else_args: Vec<ValueId> = Vec::new();
+
+                for (name, &v_in) in locals_in.iter() {
+                    let v_then = *locals_then.get(name).unwrap_or(&v_in);
+                    let v_else = *locals_else.get(name).unwrap_or(&v_in);
+                    if v_then != v_else {
+                        // (Keep it simple: Int32; you can refine with real types later.)
+                        let phi_vid = b.add_block_param(cont_id, Type::Int32);
+                        phi_for.insert(name.clone(), phi_vid);
+                        then_args.push(v_then);
+                        else_args.push(v_else);
+                    }
+                }
+
+                // Now terminate branches with the correct jump args
+                b.position_at(then_id);
+                b.jump(cont_id, &then_args);
+
+                b.position_at(else_id);
+                b.jump(cont_id, &else_args);
+
+                // Merge
+                b.position_at(cont_id);
+                for (name, phi_vid) in phi_for {
+                    locals.insert(name, phi_vid);
+                }
             }
             Stmt::While { cond, body } => {
                 let head = b.block();
@@ -1094,23 +1208,63 @@ fn lower_stmt_free<'m>(
             locals.insert(name.clone(), val);
         }
         Stmt::If { cond, then_b, else_b } => {
+            // Evaluate condition once (free version)
             let c = lower_expr_free(b, locals, fields, next_field, cond, funcs)?;
+
+            // Create blocks
             let then_id = b.block();
             let else_id = b.block();
-            let cont = b.block();
+            let cont_id = b.block();
+
+            // Branch
             b.branch(c, then_id, else_id);
 
+            // Snapshot incoming locals
+            let locals_in = locals.clone();
+
+            // THEN
             b.position_at(then_id);
-            lower_block_free(b, locals, fields, next_field, then_b, funcs)?;
-            b.jump(cont, &[]);
+            let mut locals_then = locals_in.clone();
+            lower_block_free(b, &mut locals_then, fields, next_field, then_b, funcs)?;
+            // (no jump yet)
+
+            // ELSE
+            b.position_at(else_id);
+            let mut locals_else = locals_in.clone();
+            if let Some(eb) = else_b {
+                lower_block_free(b, &mut locals_else, fields, next_field, eb, funcs)?;
+            }
+            // (no jump yet)
+
+            // Build phis only for variables present at entry
+            use std::collections::BTreeMap;
+            let mut phi_for: BTreeMap<String, ValueId> = BTreeMap::new();
+            let mut then_args: Vec<ValueId> = Vec::new();
+            let mut else_args: Vec<ValueId> = Vec::new();
+
+            for (name, &v_in) in locals_in.iter() {
+                let v_then = *locals_then.get(name).unwrap_or(&v_in);
+                let v_else = *locals_else.get(name).unwrap_or(&v_in);
+                if v_then != v_else {
+                    let phi_vid = b.add_block_param(cont_id, Type::Int32);
+                    phi_for.insert(name.clone(), phi_vid);
+                    then_args.push(v_then);
+                    else_args.push(v_else);
+                }
+            }
+
+            // Finish branches
+            b.position_at(then_id);
+            b.jump(cont_id, &then_args);
 
             b.position_at(else_id);
-            if let Some(e) = else_b {
-                lower_block_free(b, locals, fields, next_field, e, funcs)?;
-            }
-            b.jump(cont, &[]);
+            b.jump(cont_id, &else_args);
 
-            b.position_at(cont);
+            // Merge
+            b.position_at(cont_id);
+            for (name, phi_vid) in phi_for {
+                locals.insert(name, phi_vid);
+            }
         }
         Stmt::While { cond, body } => {
             let head = b.block();
