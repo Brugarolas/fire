@@ -40,3 +40,8 @@ if (x == 0) {
     x = x - 1;
 }
 print(x); // expect 4
+
+print("===== Lambda functions =====");
+print((fn (a, b) { return a + b; })(2, 3));      // 5
+print((|x| x + 1)(41));                  // 42
+print((|a, b| { return a*b; })(6, 7));   // 42

@@ -1,7 +1,7 @@
 // src/jit.rs
 //! jit.rs — Cranelift JIT for WIR (Cranelift 0.121.x compatible)
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 use cranelift::prelude::*;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};

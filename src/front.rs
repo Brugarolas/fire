@@ -49,6 +49,7 @@
 
 use logos::Logos;
 use std::collections::{BTreeMap, BTreeSet};
+use hashbrown::HashMap;
 
 // Bring in the WIR types from your other file/module.
 use crate::wir::{
@@ -109,6 +110,7 @@ pub enum Tok {
     #[token("*=")] StarEq,
     #[token("/=")] SlashEq,
     #[token("%=")] PercentEq,
+    #[token("|")] Pipe,
     #[token("=")] Eq,
     #[token("<")] Lt,
     #[token(">")] Gt,
@@ -201,6 +203,7 @@ pub enum Expr {
     GetProp { recv: Box<Expr>, name: String },
     Index { recv: Box<Expr>, index: Box<Expr> },
     Group(Box<Expr>),
+    FnLit { params: Vec<String>, body: Block },
 }
 
 #[derive(Debug, Clone)]
@@ -378,6 +381,22 @@ impl<'src> Parser<'src> {
             stmts.push(self.stmt()?);
         }
         Ok(Block { stmts })
+    }
+
+    fn parse_param_list(&mut self) -> PResult<Vec<String>> {
+        let mut params = Vec::new();
+        if !self.matches(&Tok::RParen) {
+            loop {
+                let name = match self.next().tok {
+                    Tok::Ident(s) => s,
+                    _ => return Err(self.err_here("expected parameter name")),
+                };
+                params.push(name);
+                if self.matches(&Tok::RParen) { break; }
+                self.expect(Tok::Comma, "expected ',' in parameter list")?;
+            }
+        }
+        Ok(params)
     }
 
     fn stmt(&mut self) -> PResult<Stmt> {
@@ -713,10 +732,208 @@ impl<'src> Parser<'src> {
                 self.expect(Tok::RParen, "expected ')'")?;
                 Ok(Expr::Group(Box::new(e)))
             }
+            Tok::Fn => {
+                // Stage #1: only the anonymous form inside expressions.
+                // Expect '(' immediately (no name allowed here).
+                self.expect(Tok::LParen, "expected '(' after 'fn' in function literal")?;
+                let params = self.parse_param_list()?;
+                let body = self.block()?;
+                Ok(Expr::FnLit { params, body })
+            }
+            Tok::Pipe => {
+                // parse `|x, y|`
+                let mut params = Vec::new();
+                if !self.matches(&Tok::Pipe) {
+                    loop {
+                        let name = match self.next().tok {
+                            Tok::Ident(s) => s,
+                            _ => return Err(self.err_here("expected parameter name")),
+                        };
+                        params.push(name);
+                        if self.matches(&Tok::Pipe) { break; }
+                        self.expect(Tok::Comma, "expected ',' in lambda params")?;
+                    }
+                }
+                // body: either { block } or a single expression (implicitly returned)
+                if self.check(&Tok::LBrace) {
+                    let body = self.block()?;
+                    Ok(Expr::FnLit { params, body })
+                } else {
+                    // expression-body -> synthesize a block with an implicit return
+                    let expr = self.expr()?;
+                    let body = Block { stmts: vec![Stmt::Return(Some(expr))] };
+                    Ok(Expr::FnLit { params, body })
+                }
+            }
             _ => Err(ParseError { msg: "unexpected token".into(), span: t.span }),
         }
     }
 }
+
+fn hoist_fn_lits_program(prog: &Program) -> Program {
+    use BTreeSet;
+
+    let mut used: BTreeSet<String> =
+        prog.functions.iter().map(|f| f.name.clone()).collect();
+    let mut counter: u32 = 0;
+
+    fn fresh(used: &mut BTreeSet<String>, counter: &mut u32) -> String {
+        loop {
+            let name = format!("__lam_{}", *counter);
+            *counter += 1;
+            if used.insert(name.clone()) { return name; }
+        }
+    }
+
+    // Rewriters that accumulate *per-function* hoists in `new_funcs_out`
+    fn rw_block(
+        b: &Block,
+        used: &mut BTreeSet<String>,
+        counter: &mut u32,
+        new_funcs_out: &mut Vec<FuncDecl>,
+    ) -> Block {
+        Block {
+            stmts: b.stmts.iter()
+                .map(|s| rw_stmt(s, used, counter, new_funcs_out))
+                .collect()
+        }
+    }
+
+    fn rw_stmt(
+        s: &Stmt,
+        used: &mut BTreeSet<String>,
+        counter: &mut u32,
+        new_funcs_out: &mut Vec<FuncDecl>,
+    ) -> Stmt {
+        match s {
+            Stmt::Var { name, init } => Stmt::Var {
+                name: name.clone(),
+                init: init.as_ref().map(|e| rw_expr(e, used, counter, new_funcs_out)),
+            },
+            Stmt::If { cond, then_b, else_b } => Stmt::If {
+                cond: rw_expr(cond, used, counter, new_funcs_out),
+                then_b: rw_block(then_b, used, counter, new_funcs_out),
+                else_b: else_b.as_ref().map(|b| rw_block(b, used, counter, new_funcs_out)),
+            },
+            Stmt::While { cond, body } => Stmt::While {
+                cond: rw_expr(cond, used, counter, new_funcs_out),
+                body: rw_block(body, used, counter, new_funcs_out),
+            },
+            Stmt::For { init, cond, step, body } => Stmt::For {
+                init: init.as_deref().map(|i| Box::new(rw_stmt(i, used, counter, new_funcs_out))),
+                cond: cond.as_ref().map(|e| rw_expr(e, used, counter, new_funcs_out)),
+                step: step.as_ref().map(|e| rw_expr(e, used, counter, new_funcs_out)),
+                body: rw_block(body, used, counter, new_funcs_out),
+            },
+            Stmt::Return(e) =>
+                Stmt::Return(e.as_ref().map(|x| rw_expr(x, used, counter, new_funcs_out))),
+            Stmt::Expr(e) => Stmt::Expr(rw_expr(e, used, counter, new_funcs_out)),
+        }
+    }
+
+    fn rw_lvalue(
+        lv: &LValue,
+        used: &mut BTreeSet<String>,
+        counter: &mut u32,
+        new_funcs_out: &mut Vec<FuncDecl>,
+    ) -> LValue {
+        match lv {
+            LValue::Ident(s) => LValue::Ident(s.clone()),
+            LValue::GetProp { recv, name } =>
+                LValue::GetProp { recv: rw_expr(recv, used, counter, new_funcs_out), name: name.clone() },
+            LValue::Index { recv, index } =>
+                LValue::Index { recv: rw_expr(recv, used, counter, new_funcs_out), index: rw_expr(index, used, counter, new_funcs_out) },
+        }
+    }
+
+    fn rw_expr(
+        e: &Expr,
+        used: &mut BTreeSet<String>,
+        counter: &mut u32,
+        new_funcs_out: &mut Vec<FuncDecl>,
+    ) -> Expr {
+        match e {
+            Expr::Assign(lv, rhs) =>
+                Expr::Assign(Box::new(rw_lvalue(lv, used, counter, new_funcs_out)), Box::new(rw_expr(rhs, used, counter, new_funcs_out))),
+
+            Expr::Binary { op, a, b } =>
+                Expr::Binary { op: *op, a: Box::new(rw_expr(a, used, counter, new_funcs_out)), b: Box::new(rw_expr(b, used, counter, new_funcs_out)) },
+
+            Expr::Unary { op, e } =>
+                Expr::Unary { op: *op, e: Box::new(rw_expr(e, used, counter, new_funcs_out)) },
+
+            Expr::Call { callee, args } => {
+                // First, rewrite the callee recursively.
+                let callee_rw = rw_expr(callee, used, counter, new_funcs_out);
+
+                // Peel a possible Group to see the real callee.
+                let maybe_inner = match &callee_rw {
+                    Expr::FnLit { .. } => Some(&callee_rw),
+                    Expr::Group(g) if matches!(&**g, Expr::FnLit { .. }) => Some(&**g),
+                    _ => None,
+                };
+
+                let new_callee = if let Some(inner) = maybe_inner {
+                    // Hoist the fn literal to a fresh top-level symbol.
+                    if let Expr::FnLit { params, body } = inner {
+                        let name = fresh(used, counter);
+                        new_funcs_out.push(FuncDecl {
+                            name: name.clone(),
+                            params: params.clone(),
+                            body: body.clone(),
+                        });
+                        Expr::Ident(name)
+                    } else {
+                        unreachable!()
+                    }
+                } else {
+                    callee_rw
+                };
+
+                Expr::Call {
+                    callee: Box::new(new_callee),
+                    args: args.iter().map(|a| rw_expr(a, used, counter, new_funcs_out)).collect(),
+                }
+            }
+
+            Expr::GetProp { recv, name } =>
+                Expr::GetProp { recv: Box::new(rw_expr(recv, used, counter, new_funcs_out)), name: name.clone() },
+
+            Expr::Index { recv, index } =>
+                Expr::Index { recv: Box::new(rw_expr(recv, used, counter, new_funcs_out)), index: Box::new(rw_expr(index, used, counter, new_funcs_out)) },
+
+            Expr::Group(g) => Expr::Group(Box::new(rw_expr(g, used, counter, new_funcs_out))),
+
+            // Standalone FnLit stays (Stage #1: not allowed unless called immediately).
+            Expr::FnLit { params, body } =>
+                Expr::FnLit { params: params.clone(), body: body.clone() },
+
+            // terminals
+            Expr::LitInt(_) | Expr::LitF64(_) | Expr::LitBool(_) | Expr::LitNull |
+            Expr::Str(_) | Expr::Ident(_) => e.clone(),
+        }
+    }
+
+    // Build the final function list, inserting each function’s hoists
+    // *before* that function.
+    let mut out_funcs = Vec::new();
+    for f in &prog.functions {
+        let mut hoisted_for_f = Vec::<FuncDecl>::new();
+        let body = rw_block(&f.body, &mut used, &mut counter, &mut hoisted_for_f);
+
+        // Insert the hoisted lambdas first (so they get lower FuncIds),
+        // then the function that uses them.
+        out_funcs.extend(hoisted_for_f.into_iter());
+        out_funcs.push(FuncDecl {
+            name: f.name.clone(),
+            params: f.params.clone(),
+            body,
+        });
+    }
+
+    Program { functions: out_funcs }
+}
+
 
 /// -------------------------
 /// LOWERING (AST → WIR)
@@ -734,7 +951,7 @@ type LResult<T> = Result<T, LowerError>;
 pub struct Lowerer<'m> {
     module: &'m mut Module,
     // function registry (very simple)
-    funcs: std::collections::HashMap<String, FuncId>,
+    funcs: HashMap<String, FuncId>,
 }
 
 impl<'m> Lowerer<'m> {
@@ -743,13 +960,17 @@ impl<'m> Lowerer<'m> {
     }
 
     pub fn lower_program(&mut self, prog: &Program) -> LResult<Vec<FuncId>> {
-        // Predeclare function IDs
+        // Hoist immediately-invoked lambdas to top-level functions first.
+        let prog = hoist_fn_lits_program(prog);
+
+        // Predeclare function IDs (including hoisted lambdas)
+        self.funcs.clear();
         for (i, f) in prog.functions.iter().enumerate() {
-            // In a real system, FuncId would be allocated by a module; we’ll use index `i` as placeholder.
             let id = FuncId(i as u32);
             self.funcs.insert(f.name.clone(), id);
         }
-        // Lower each function
+
+        // Lower each function using the *free* helpers to avoid borrow conflicts.
         let mut out = Vec::new();
         for f in &prog.functions {
             let id = self.lower_fn(f)?;
@@ -759,39 +980,41 @@ impl<'m> Lowerer<'m> {
     }
 
     fn lower_fn(&mut self, fdecl: &FuncDecl) -> LResult<FuncId> {
-        // Surface types are dynamic; we pick Int32 for the demo.
         let param_tys = fdecl.params.iter().map(|_| Type::Int32).collect::<Vec<_>>();
-        let ret_tys = vec![Type::Int32];
+        let ret_tys   = vec![Type::Int32];
 
-        // Clone function map so we can use the free helpers without borrowing `self`.
+        // Snapshot the function table for free lowerers
         let funcs_snapshot = self.funcs.clone();
 
-        // Build the function body
+        // Build the function while the builder holds &mut Module, but never borrow `self` again until `finish()`.
         let mut func = {
             let mut b = Builder::new(self.module, &fdecl.name, param_tys, ret_tys);
 
-            // Locals: parameter names → SSA values
-            let mut locals: std::collections::HashMap<String, ValueId> = Default::default();
+            // Locals = params
+            let mut locals: HashMap<String, ValueId> = Default::default();
             for (i, name) in fdecl.params.iter().enumerate() {
                 locals.insert(name.clone(), b.param(i));
             }
 
-            // Per-function field table (don’t touch self.module while builder is live)
-            let mut fields: std::collections::HashMap<String, FieldId> = Default::default();
+            // Per-function field table for lowering
+            let mut fields: HashMap<String, FieldId> = Default::default();
             let mut next_field: u32 = 0;
 
-            lower_block_free(&mut b, &mut locals, &mut fields, &mut next_field, &fdecl.body, &funcs_snapshot)?;
+            // FREE lowerer (no &mut self borrow)
+            lower_block_free(
+                &mut b, &mut locals, &mut fields, &mut next_field, &fdecl.body, &funcs_snapshot
+            )?;
 
-            // Fallthrough default return 0
+            // Default fallthrough return
             let zero = b.const_i32(0);
             b.ret(&[zero]);
 
             b.finish()
         };
 
-        // *** IMPORTANT: give the function a unique, stable id that matches Module order ***
+        // Now the builder is dropped; we can touch `self.module` again.
         let fid = FuncId(self.module.funcs.len() as u32);
-        func.id = fid; // <- this prevents duplicate wir_f_0 etc.
+        func.id = fid;
         self.module.funcs.push(func);
         Ok(fid)
     }
@@ -799,7 +1022,7 @@ impl<'m> Lowerer<'m> {
     fn lower_block(
         &mut self,
         b: &mut Builder<'m>,
-        locals: &mut std::collections::HashMap<String, ValueId>,
+        locals: &mut HashMap<String, ValueId>,
         blk: &Block,
     ) -> LResult<()> {
         for s in &blk.stmts {
@@ -808,10 +1031,66 @@ impl<'m> Lowerer<'m> {
         Ok(())
     }
 
+    fn lower_inline_fn_to_function(
+        &mut self,
+        params: &[String],
+        body: &Block,
+    ) -> LResult<FuncId> {
+        // All params are i32 for now; one i32 return (demo)
+        let param_tys = params.iter().map(|_| Type::Int32).collect::<Vec<_>>();
+        let ret_tys   = vec![Type::Int32];
+
+        // Synthetic unique-ish name
+        let name = format!("__lam_{}", self.module.funcs.len());
+
+        // Snapshot the function table for free-lowering
+        let funcs_snapshot = self.funcs.clone();
+
+        // --- Build while holding &mut Module, but don't borrow &mut self inside
+        let mut func = {
+            let mut b = Builder::new(self.module, &name, param_tys, ret_tys);
+
+            // locals = params
+            let mut locals = HashMap::<String, ValueId>::new();
+            for (i, p) in params.iter().enumerate() {
+                locals.insert(p.clone(), b.param(i));
+            }
+
+            // per-function field table for free-lowering
+            let mut fields: HashMap<String, FieldId> = Default::default();
+            let mut next_field: u32 = 0;
+
+            // Lower body using FREE helpers (no &mut self while Builder holds &mut Module)
+            lower_block_free(
+                &mut b,
+                &mut locals,
+                &mut fields,
+                &mut next_field,
+                body,
+                &funcs_snapshot,
+            )?;
+
+            // default fallthrough return 0
+            let zero = b.const_i32(0);
+            b.ret(&[zero]);
+
+            b.finish()
+        }; // <- Builder dropped here; &mut Module borrow ends
+
+        // --- Now safe to mutate self.module again
+        let fid = FuncId(self.module.funcs.len() as u32);
+        func.id = fid;
+        self.module.funcs.push(func);
+        // optional: register the symbol so direct calls by name work later
+        self.funcs.insert(name, fid);
+
+        Ok(fid)
+    }
+
     fn lower_stmt(
         &mut self,
         b: &mut Builder<'m>,
-        locals: &mut std::collections::HashMap<String, ValueId>,
+        locals: &mut HashMap<String, ValueId>,
         s: &Stmt,
     ) -> LResult<()> {
         match s {
@@ -884,18 +1163,18 @@ impl<'m> Lowerer<'m> {
                     args_else.push(*locals_else.get(name).unwrap_or(&vin));
                 }
 
-    // Landings → cont (same arity on both edges)
-    b.position_at(then_end);
-    b.jump(cont_id, &args_then);
-    b.position_at(else_end);
-    b.jump(cont_id, &args_else);
+                // Landings → cont (same arity on both edges)
+                b.position_at(then_end);
+                b.jump(cont_id, &args_then);
+                b.position_at(else_end);
+                b.jump(cont_id, &args_else);
 
-    // Continue at merge and rebind merged locals
-    b.position_at(cont_id);
-    for (i, name) in phi_vars.iter().enumerate() {
-        locals.insert(name.clone(), phi_params[i]);
-    }
-}
+                // Continue at merge and rebind merged locals
+                b.position_at(cont_id);
+                for (i, name) in phi_vars.iter().enumerate() {
+                    locals.insert(name.clone(), phi_params[i]);
+                }
+            }
             Stmt::While { cond, body } => {
                 let head = b.block();
                 let body_b = b.block();
@@ -961,7 +1240,7 @@ impl<'m> Lowerer<'m> {
     fn lower_expr_bool(
         &mut self,
         b: &mut Builder<'m>,
-        locals: &mut std::collections::HashMap<String, ValueId>,
+        locals: &mut HashMap<String, ValueId>,
         e: &Expr,
     ) -> LResult<ValueId> {
         // For demo, booleans are stored as Type::Bool from comparisons, logical ops.
@@ -971,7 +1250,7 @@ impl<'m> Lowerer<'m> {
     fn lower_expr(
         &mut self,
         b: &mut Builder<'m>,
-        locals: &mut std::collections::HashMap<String, ValueId>,
+        locals: &mut HashMap<String, ValueId>,
         e: &Expr,
     ) -> LResult<ValueId> {
         use BinOp::*;
@@ -1044,35 +1323,47 @@ impl<'m> Lowerer<'m> {
                         );
                         Ok(res[0])
                     }
-                    And | Or => {
+                    BinOp::And | BinOp::Or => {
                         let then_b = b.block();
                         let else_b = b.block();
-                        let cont = b.block();
+                        let cont   = b.block();
 
-                        if *op == And { b.branch(va, then_b, else_b); }
-                        else { b.branch(va, else_b, then_b); }
+                        // Declare the result param on `cont` BEFORE creating predecessors.
+                        let res_param = b.add_block_param(cont, Type::Bool);
 
+                        if *op == BinOp::And {
+                            b.branch(va, then_b, else_b);
+                        } else {
+                            b.branch(va, else_b, then_b);
+                        }
+
+                        // THEN
                         b.position_at(then_b);
-                        let tval = if *op == And {
+                        let tval = if *op == BinOp::And {
+                            // Evaluate RHS for &&
                             self.lower_expr(b, locals, bb)?
                         } else {
+                            // true  for ||
                             let (_nid, res) = b.push_node(Inst::Const(Constant::Bool(true)), Some(Type::Bool), 1, false);
                             res[0]
                         };
                         b.jump(cont, &[tval]);
 
+                        // ELSE
                         b.position_at(else_b);
-                        let eval_else = if *op == And {
+                        let fval = if *op == BinOp::And {
+                            // false for &&
                             let (_nid, res) = b.push_node(Inst::Const(Constant::Bool(false)), Some(Type::Bool), 1, false);
                             res[0]
                         } else {
+                            // Evaluate RHS for ||
                             self.lower_expr(b, locals, bb)?
                         };
-                        b.jump(cont, &[eval_else]);
+                        b.jump(cont, &[fval]);
 
+                        // CONT
                         b.position_at(cont);
-                        let resv = b.add_block_param(cont, Type::Bool);
-                        Ok(resv)
+                        Ok(res_param)
                     }
                 }
             }
@@ -1156,6 +1447,25 @@ impl<'m> Lowerer<'m> {
                         return Ok(res[0]);
                     }
                 }
+
+                if let Expr::FnLit { params, body } = &**callee {
+                    // Stage #1: no captures -> the body may only use its params.
+                    // We'll detect any capture by failing to resolve a name -> UnknownVar.
+                    let fid = self.lower_inline_fn_to_function(params, body)?;
+
+                    // Lower the call args
+                    let mut argv = Vec::with_capacity(args.len());
+                    for a in args { argv.push(self.lower_expr(b, locals, a)?); }
+
+                    let (_nid, res) = b.push_node(
+                        Inst::CallDirect { conv: crate::wir::CallConv::Fast, callee: fid, args: argv },
+                        Some(Type::Int32),
+                        1,
+                        true,
+                    );
+                    return Ok(res[0]);
+                }
+
                 Err(LowerError::NotLowerable("dynamic calls not yet implemented"))
             }
 
@@ -1178,6 +1488,16 @@ impl<'m> Lowerer<'m> {
                 let (_nid, res) = b.push_node(Inst::LoadElem { arr, idx }, Some(Type::Int32), 1, false);
                 Ok(res[0])
             }
+
+            Expr::FnLit { .. } => {
+                // Stage #1: lambdas must be called immediately.
+                Err(LowerError::NotLowerable("function literal must be called immediately (Stage #1)"))
+            }
+
+            _ => {
+                // Other expressions not yet implemented
+                Err(LowerError::NotLowerable("expression not yet implemented"))
+            }
         }
     }
 
@@ -1194,11 +1514,11 @@ impl<'m> Lowerer<'m> {
 
 fn lower_block_free<'m>(
     b: &mut Builder<'m>,
-    locals: &mut std::collections::HashMap<String, ValueId>,
-    fields: &mut std::collections::HashMap<String, FieldId>,
+    locals: &mut HashMap<String, ValueId>,
+    fields: &mut HashMap<String, FieldId>,
     next_field: &mut u32,
     blk: &Block,
-    funcs: &std::collections::HashMap<String, FuncId>,
+    funcs: &HashMap<String, FuncId>,
 ) -> LResult<()> {
     for s in &blk.stmts {
         lower_stmt_free(b, locals, fields, next_field, s, funcs)?;
@@ -1208,11 +1528,11 @@ fn lower_block_free<'m>(
 
 fn lower_stmt_free<'m>(
     b: &mut Builder<'m>,
-    locals: &mut std::collections::HashMap<String, ValueId>,
-    fields: &mut std::collections::HashMap<String, FieldId>,
+    locals: &mut HashMap<String, ValueId>,
+    fields: &mut HashMap<String, FieldId>,
     next_field: &mut u32,
     s: &Stmt,
-    funcs: &std::collections::HashMap<String, FuncId>,
+    funcs: &HashMap<String, FuncId>,
 ) -> LResult<()> {
     match s {
         Stmt::Var { name, init } => {
@@ -1354,7 +1674,7 @@ fn lower_stmt_free<'m>(
             let exit   = b.block();
 
             // 2) Loop-carried locals: mutated in body or step & already exist
-            use std::collections::BTreeSet;
+            use BTreeSet;
             let mut mutated_set: BTreeSet<String> = BTreeSet::new();
             for st in &body.stmts { collect_mut_locals_in_stmt(st, &mut mutated_set); }
             if let Some(step_e) = step { collect_mut_locals_in_expr(step_e, &mut mutated_set); }
@@ -1489,11 +1809,11 @@ fn collect_mut_locals_in_block(b: &Block) -> Vec<String> {
 
 fn lower_expr_free<'m>(
     b: &mut Builder<'m>,
-    locals: &mut std::collections::HashMap<String, ValueId>,
-    fields: &mut std::collections::HashMap<String, FieldId>,
+    locals: &mut HashMap<String, ValueId>,
+    fields: &mut HashMap<String, FieldId>,
     next_field: &mut u32,
     e: &Expr,
-    funcs: &std::collections::HashMap<String, FuncId>,
+    funcs: &HashMap<String, FuncId>,
 ) -> LResult<ValueId> {
     use BinOp::*;
     use Inst::*;
@@ -1569,16 +1889,23 @@ fn lower_expr_free<'m>(
                     Ok(res[0])
                 }
 
-                And | Or => {
+                BinOp::And | BinOp::Or => {
                     let then_b = b.block();
                     let else_b = b.block();
-                    let cont = b.block();
+                    let cont   = b.block();
 
-                    if *op == And { b.branch(va, then_b, else_b); }
-                    else { b.branch(va, else_b, then_b); }
+                    // Declare the result param first.
+                    let res_param = b.add_block_param(cont, Type::Bool);
 
+                    if *op == BinOp::And {
+                        b.branch(va, then_b, else_b);
+                    } else {
+                        b.branch(va, else_b, then_b);
+                    }
+
+                    // THEN
                     b.position_at(then_b);
-                    let tval = if *op == And {
+                    let tval = if *op == BinOp::And {
                         lower_expr_free(b, locals, fields, next_field, bb, funcs)?
                     } else {
                         let (_nid, res) = b.push_node(Inst::Const(Constant::Bool(true)), Some(Type::Bool), 1, false);
@@ -1586,18 +1913,19 @@ fn lower_expr_free<'m>(
                     };
                     b.jump(cont, &[tval]);
 
+                    // ELSE
                     b.position_at(else_b);
-                    let eval_else = if *op == And {
+                    let fval = if *op == BinOp::And {
                         let (_nid, res) = b.push_node(Inst::Const(Constant::Bool(false)), Some(Type::Bool), 1, false);
                         res[0]
                     } else {
                         lower_expr_free(b, locals, fields, next_field, bb, funcs)?
                     };
-                    b.jump(cont, &[eval_else]);
+                    b.jump(cont, &[fval]);
 
+                    // CONT
                     b.position_at(cont);
-                    let resv = b.add_block_param(cont, Type::Bool);
-                    Ok(resv)
+                    Ok(res_param)
                 }
             }
         }
@@ -1685,6 +2013,14 @@ fn lower_expr_free<'m>(
                     return Ok(res[0]);
                 }
             }
+
+            // If the callee is a function literal here, the hoister failed; free lowerer can't build functions.
+            if matches!(&**callee, Expr::FnLit { .. }) {
+                return Err(LowerError::NotLowerable(
+                    "internal: callee FnLit should have been hoisted before free lowering"
+                ));
+            }
+
             Err(LowerError::NotLowerable("dynamic calls not yet implemented"))
         }
 
@@ -1707,11 +2043,16 @@ fn lower_expr_free<'m>(
             let (_nid, res) = b.push_node(Inst::LoadElem { arr, idx }, Some(Type::Int32), 1, false);
             Ok(res[0])
         }
+
+        _ => {
+            // Other expressions not yet implemented
+            Err(LowerError::NotLowerable("expression not yet implemented"))
+        }
     }
 }
 
 fn intern_field_local(
-    fields: &mut std::collections::HashMap<String, FieldId>,
+    fields: &mut HashMap<String, FieldId>,
     next_field: &mut u32,
     name: &str,
 ) -> FieldId {
