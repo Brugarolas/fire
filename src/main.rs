@@ -1,4 +1,5 @@
 // src/main.rs
+mod value;
 mod wir;
 mod front;
 // mod optimizer; // not used yet, but keep for future pipeline
