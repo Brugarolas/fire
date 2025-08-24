@@ -322,6 +322,9 @@ pub enum Inst {
     LoadEnv { clos: ValueId, index: u32 },
     StoreEnv { clos: ValueId, index: u32, val: ValueId },
 
+    MakeClosure { callee: FuncId, env: ValueId },
+    CallClosure { conv: CallConv, fun: ValueId, args: Vec<ValueId> },
+
     // ---- Natives / intrinsics ----
     CallNative {
         name: String,
@@ -363,6 +366,7 @@ impl Inst {
                 | StrToNumber(_)
                 | CallDirect { .. }
                 | CallIC { .. }
+                | CallClosure { .. }
                 | AllocClosure { .. }
                 | StoreEnv { .. }
                 | CallNative { .. }
@@ -375,6 +379,7 @@ impl Inst {
         self.needs_effect_in()
     }
 }
+
 
 /// One IR node (instruction) with type/effect annotations.
 #[derive(Clone, Debug)]
@@ -721,6 +726,7 @@ impl EffectKind {
 
             crate::wir::Inst::CallDirect { .. }
             | crate::wir::Inst::CallIC { .. }
+            | crate::wir::Inst::CallClosure { .. }
             | crate::wir::Inst::CallNative { .. }
             | crate::wir::Inst::AllocClosure { .. }
             | crate::wir::Inst::StoreEnv { .. } => EffectKind::Call,
@@ -728,10 +734,8 @@ impl EffectKind {
             crate::wir::Inst::PostWriteBarrier { .. }
             | crate::wir::Inst::ReadBarrier { .. } => EffectKind::Barrier,
 
-            // May call into runtime:
             crate::wir::Inst::StrToNumber(_) => EffectKind::Call,
 
-            // Default tag for pure ops:
             _ => EffectKind::Entry,
         }
     }
@@ -761,6 +765,27 @@ impl fmt::Display for Function {
             }
         }
         Ok(())
+    }
+}
+
+impl<'m> Builder<'m> {
+    pub fn make_closure(&mut self, callee: FuncId, env: ValueId) -> ValueId {
+        let (_nid, res) = self.push_node(
+            Inst::MakeClosure { callee, env },
+            Some(Type::Closure(None)),   // <-- fix
+            1,
+            false,
+        );
+        res[0]
+    }
+    pub fn call_closure(&mut self, fun: ValueId, args: Vec<ValueId>) -> ValueId {
+        let (_nid, res) = self.push_node(
+            Inst::CallClosure { conv: CallConv::Fast, fun, args },
+            Some(Type::Int32),
+            1,
+            true,
+        );
+        res[0]
     }
 }
 

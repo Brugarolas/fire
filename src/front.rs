@@ -204,7 +204,9 @@ pub enum Expr {
     Index { recv: Box<Expr>, index: Box<Expr> },
     Group(Box<Expr>),
     FnLit { params: Vec<String>, body: Block },
+    FnRef { name: String },
 }
+
 
 #[derive(Debug, Clone)]
 pub enum LValue {
@@ -770,13 +772,15 @@ impl<'src> Parser<'src> {
     }
 }
 
-fn hoist_fn_lits_program(prog: &Program) -> Program {
+fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String>>) {
     use BTreeSet;
 
-    let mut used: BTreeSet<String> =
-        prog.functions.iter().map(|f| f.name.clone()).collect();
-    let mut counter: u32 = 0;
+    // name -> sorted capture list (stable order)
+    let mut lam_captures: HashMap<String, Vec<String>> = HashMap::new();
 
+    // Generate unique lam names avoiding collisions with existing functions.
+    let mut used: BTreeSet<String> = prog.functions.iter().map(|f| f.name.clone()).collect();
+    let mut counter: u32 = 0;
     fn fresh(used: &mut BTreeSet<String>, counter: &mut u32) -> String {
         loop {
             let name = format!("__lam_{}", *counter);
@@ -785,135 +789,209 @@ fn hoist_fn_lits_program(prog: &Program) -> Program {
         }
     }
 
-    // Rewriters that accumulate *per-function* hoists in `new_funcs_out`
+    // Collect {defs, uses} inside a block
+    fn collect_defs_uses_block(b: &Block, defs: &mut BTreeSet<String>, uses: &mut BTreeSet<String>) {
+        for s in &b.stmts { collect_defs_uses_stmt(s, defs, uses); }
+    }
+    fn collect_defs_uses_stmt(s: &Stmt, defs: &mut BTreeSet<String>, uses: &mut BTreeSet<String>) {
+        match s {
+            Stmt::Var { name, init } => {
+                defs.insert(name.clone());
+                if let Some(e) = init { collect_uses_expr(e, uses); }
+            }
+            Stmt::If { cond, then_b, else_b } => {
+                collect_uses_expr(cond, uses);
+                collect_defs_uses_block(then_b, defs, uses);
+                if let Some(b) = else_b { collect_defs_uses_block(b, defs, uses); }
+            }
+            Stmt::While { cond, body } => {
+                collect_uses_expr(cond, uses);
+                collect_defs_uses_block(body, defs, uses);
+            }
+            Stmt::For { init, cond, step, body } => {
+                if let Some(i) = init.as_deref() { collect_defs_uses_stmt(i, defs, uses); }
+                if let Some(c) = cond { collect_uses_expr(c, uses); }
+                if let Some(st) = step { collect_uses_expr(st, uses); }
+                collect_defs_uses_block(body, defs, uses);
+            }
+            Stmt::Return(e) => { if let Some(e) = e { collect_uses_expr(e, uses); } }
+            Stmt::Expr(e) => collect_uses_expr(e, uses),
+        }
+    }
+    fn collect_uses_expr(e: &Expr, uses: &mut BTreeSet<String>) {
+        match e {
+            Expr::Ident(s) => { uses.insert(s.clone()); }
+            Expr::Assign(lv, rhs) => {
+                match &**lv {
+                    LValue::Ident(s) => { uses.insert(s.clone()); }
+                    LValue::GetProp { recv, .. } => collect_uses_expr(recv, uses),
+                    LValue::Index { recv, index } => { collect_uses_expr(recv, uses); collect_uses_expr(index, uses); }
+                }
+                collect_uses_expr(rhs, uses);
+            }
+            Expr::Binary { a, b, .. } => { collect_uses_expr(a, uses); collect_uses_expr(b, uses); }
+            Expr::Unary  { e, .. }    => { collect_uses_expr(e, uses); }
+            Expr::Call   { callee, args } => {
+                collect_uses_expr(callee, uses);
+                for a in args { collect_uses_expr(a, uses); }
+            }
+            Expr::GetProp { recv, .. } => collect_uses_expr(recv, uses),
+            Expr::Index { recv, index } => { collect_uses_expr(recv, uses); collect_uses_expr(index, uses); }
+            Expr::Group(g) => collect_uses_expr(g, uses),
+            Expr::FnLit { .. } | Expr::FnRef { .. } => { /* handled at outer level */ }
+            Expr::LitInt(_) | Expr::LitF64(_) | Expr::LitBool(_) | Expr::LitNull | Expr::Str(_) => {}
+        }
+    }
+
+    // Rewrite helpers
     fn rw_block(
         b: &Block,
         used: &mut BTreeSet<String>,
         counter: &mut u32,
-        new_funcs_out: &mut Vec<FuncDecl>,
+        enclosing_locals: &BTreeSet<String>,
+        out_funcs: &mut Vec<FuncDecl>,
+        lam_caps_out: &mut HashMap<String, Vec<String>>,
     ) -> Block {
         Block {
             stmts: b.stmts.iter()
-                .map(|s| rw_stmt(s, used, counter, new_funcs_out))
+                .map(|s| rw_stmt(s, used, counter, enclosing_locals, out_funcs, lam_caps_out))
                 .collect()
         }
     }
-
     fn rw_stmt(
         s: &Stmt,
         used: &mut BTreeSet<String>,
         counter: &mut u32,
-        new_funcs_out: &mut Vec<FuncDecl>,
+        enclosing_locals: &BTreeSet<String>,
+        out_funcs: &mut Vec<FuncDecl>,
+        lam_caps_out: &mut HashMap<String, Vec<String>>,
     ) -> Stmt {
         match s {
             Stmt::Var { name, init } => Stmt::Var {
                 name: name.clone(),
-                init: init.as_ref().map(|e| rw_expr(e, used, counter, new_funcs_out)),
+                init: init.as_ref().map(|e| rw_expr(e, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
             },
             Stmt::If { cond, then_b, else_b } => Stmt::If {
-                cond: rw_expr(cond, used, counter, new_funcs_out),
-                then_b: rw_block(then_b, used, counter, new_funcs_out),
-                else_b: else_b.as_ref().map(|b| rw_block(b, used, counter, new_funcs_out)),
+                cond: rw_expr(cond, used, counter, enclosing_locals, out_funcs, lam_caps_out),
+                then_b: rw_block(then_b, used, counter, enclosing_locals, out_funcs, lam_caps_out),
+                else_b: else_b.as_ref().map(|b| rw_block(b, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
             },
             Stmt::While { cond, body } => Stmt::While {
-                cond: rw_expr(cond, used, counter, new_funcs_out),
-                body: rw_block(body, used, counter, new_funcs_out),
+                cond: rw_expr(cond, used, counter, enclosing_locals, out_funcs, lam_caps_out),
+                body: rw_block(body, used, counter, enclosing_locals, out_funcs, lam_caps_out),
             },
             Stmt::For { init, cond, step, body } => Stmt::For {
-                init: init.as_deref().map(|i| Box::new(rw_stmt(i, used, counter, new_funcs_out))),
-                cond: cond.as_ref().map(|e| rw_expr(e, used, counter, new_funcs_out)),
-                step: step.as_ref().map(|e| rw_expr(e, used, counter, new_funcs_out)),
-                body: rw_block(body, used, counter, new_funcs_out),
+                init: init.as_deref().map(|i| Box::new(rw_stmt(i, used, counter, enclosing_locals, out_funcs, lam_caps_out))),
+                cond: cond.as_ref().map(|e| rw_expr(e, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                step: step.as_ref().map(|e| rw_expr(e, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                body: rw_block(body, used, counter, enclosing_locals, out_funcs, lam_caps_out),
             },
             Stmt::Return(e) =>
-                Stmt::Return(e.as_ref().map(|x| rw_expr(x, used, counter, new_funcs_out))),
-            Stmt::Expr(e) => Stmt::Expr(rw_expr(e, used, counter, new_funcs_out)),
+                Stmt::Return(e.as_ref().map(|x| rw_expr(x, used, counter, enclosing_locals, out_funcs, lam_caps_out))),
+            Stmt::Expr(e) => Stmt::Expr(rw_expr(e, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
         }
     }
-
     fn rw_lvalue(
         lv: &LValue,
         used: &mut BTreeSet<String>,
         counter: &mut u32,
-        new_funcs_out: &mut Vec<FuncDecl>,
+        enclosing_locals: &BTreeSet<String>,
+        out_funcs: &mut Vec<FuncDecl>,
+        lam_caps_out: &mut HashMap<String, Vec<String>>,
     ) -> LValue {
         match lv {
             LValue::Ident(s) => LValue::Ident(s.clone()),
             LValue::GetProp { recv, name } =>
-                LValue::GetProp { recv: rw_expr(recv, used, counter, new_funcs_out), name: name.clone() },
+                LValue::GetProp { recv: rw_expr(recv, used, counter, enclosing_locals, out_funcs, lam_caps_out), name: name.clone() },
             LValue::Index { recv, index } =>
-                LValue::Index { recv: rw_expr(recv, used, counter, new_funcs_out), index: rw_expr(index, used, counter, new_funcs_out) },
+                LValue::Index { recv: rw_expr(recv, used, counter, enclosing_locals, out_funcs, lam_caps_out),
+                                index: rw_expr(index, used, counter, enclosing_locals, out_funcs, lam_caps_out) },
         }
     }
-
     fn rw_expr(
         e: &Expr,
         used: &mut BTreeSet<String>,
         counter: &mut u32,
-        new_funcs: &mut Vec<FuncDecl>
+        enclosing_locals: &BTreeSet<String>,
+        out_funcs: &mut Vec<FuncDecl>,
+        lam_caps_out: &mut HashMap<String, Vec<String>>,
     ) -> Expr {
         match e {
-            Expr::Assign(lv, rhs) =>
-                Expr::Assign(Box::new(rw_lvalue(lv, used, counter, new_funcs)),
-                            Box::new(rw_expr(rhs, used, counter, new_funcs))),
-            Expr::Binary { op, a, b } =>
-                Expr::Binary { op: *op,
-                            a: Box::new(rw_expr(a, used, counter, new_funcs)),
-                            b: Box::new(rw_expr(b, used, counter, new_funcs)) },
-            Expr::Unary { op, e } =>
-                Expr::Unary { op: *op, e: Box::new(rw_expr(e, used, counter, new_funcs)) },
+            Expr::Assign(lv, rhs) => Expr::Assign(
+                Box::new(rw_lvalue(lv, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                Box::new(rw_expr(rhs, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+            ),
+            Expr::Binary { op, a, b } => Expr::Binary {
+                op: *op,
+                a: Box::new(rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                b: Box::new(rw_expr(b, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+            },
+            Expr::Unary { op, e } => Expr::Unary { op: *op, e: Box::new(rw_expr(e, used, counter, enclosing_locals, out_funcs, lam_caps_out)) },
+            Expr::Call { callee, args } => Expr::Call {
+                callee: Box::new(rw_expr(callee, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                args: args.iter().map(|a| rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out)).collect(),
+            },
+            Expr::GetProp { recv, name } =>
+                Expr::GetProp { recv: Box::new(rw_expr(recv, used, counter, enclosing_locals, out_funcs, lam_caps_out)), name: name.clone() },
+            Expr::Index { recv, index } =>
+                Expr::Index { recv: Box::new(rw_expr(recv, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                              index: Box::new(rw_expr(index, used, counter, enclosing_locals, out_funcs, lam_caps_out)) },
+            Expr::Group(g) => Expr::Group(Box::new(rw_expr(g, used, counter, enclosing_locals, out_funcs, lam_caps_out))),
 
-            // Hoist even when not in call position
+            // CORE: hoist to a top-level function with extra hidden `__env` param; replace with FnRef
             Expr::FnLit { params, body } => {
-                let name = fresh(used, counter);
-                new_funcs.push(FuncDecl {
-                    name: name.clone(),
-                    params: params.clone(),
-                    body: body.clone()
-                });
-                Expr::Ident(name)
+                // names defined inside the lambda
+                let mut inner_defs: BTreeSet<String> = params.iter().cloned().collect();
+                let mut uses: BTreeSet<String> = BTreeSet::new();
+                collect_defs_uses_block(body, &mut inner_defs, &mut uses);
+
+                // captures = (uses ∩ enclosing_locals) \ params
+                let mut caps = Vec::<String>::new();
+                for u in uses {
+                    if enclosing_locals.contains(&u) && !params.contains(&u) {
+                        caps.push(u);
+                    }
+                }
+                caps.sort();
+
+                // Fresh name
+                let lam_name = fresh(used, counter);
+
+                // Record capture list
+                lam_caps_out.insert(lam_name.clone(), caps.clone());
+
+                // Create the hoisted function: first param is "__env", then user's params
+                let mut lam_params = Vec::<String>::with_capacity(params.len() + 1);
+                lam_params.push("__env".to_string());
+                lam_params.extend(params.iter().cloned());
+
+                out_funcs.push(FuncDecl { name: lam_name.clone(), params: lam_params, body: body.clone() });
+
+                // Replace literal with a named lam reference
+                Expr::FnRef { name: lam_name }
             }
 
-            Expr::Call { callee, args } => Expr::Call {
-                callee: Box::new(rw_expr(callee, used, counter, new_funcs)),
-                args: args.iter().map(|a| rw_expr(a, used, counter, new_funcs)).collect(),
-            },
-
-            Expr::GetProp { recv, name } =>
-                Expr::GetProp { recv: Box::new(rw_expr(recv, used, counter, new_funcs)), name: name.clone() },
-            Expr::Index { recv, index } =>
-                Expr::Index { recv: Box::new(rw_expr(recv, used, counter, new_funcs)),
-                            index: Box::new(rw_expr(index, used, counter, new_funcs)) },
-            Expr::Group(g) => Expr::Group(Box::new(rw_expr(g, used, counter, new_funcs))),
+            // Already a reference (created earlier)
+            Expr::FnRef { name } => Expr::FnRef { name: name.clone() },
 
             // terminals
-            Expr::LitInt(_) | Expr::LitF64(_) | Expr::LitBool(_) | Expr::LitNull | Expr::Str(_)
-            | Expr::Ident(_) => e.clone(),
+            Expr::LitInt(_) | Expr::LitF64(_) | Expr::LitBool(_) | Expr::LitNull | Expr::Str(_) | Expr::Ident(_) => e.clone(),
         }
     }
 
-    // Build the final function list, inserting each function’s hoists
-    // *before* that function.
-    let mut out_funcs = Vec::new();
+    // Walk functions, threading the set of enclosing locals (toplevel has none).
+    let mut out_funcs: Vec<FuncDecl> = Vec::new();
     for f in &prog.functions {
-        let mut hoisted_for_f = Vec::<FuncDecl>::new();
-        let body = rw_block(&f.body, &mut used, &mut counter, &mut hoisted_for_f);
-
-        // Insert the hoisted lambdas first (so they get lower FuncIds),
-        // then the function that uses them.
-        out_funcs.extend(hoisted_for_f.into_iter());
-        out_funcs.push(FuncDecl {
-            name: f.name.clone(),
-            params: f.params.clone(),
-            body,
-        });
+        // at top-level of a function, enclosing locals = its params (can be captured by nested lambdas)
+        let enclosing: BTreeSet<String> = f.params.iter().cloned().collect();
+        let rew_body = rw_block(&f.body, &mut used, &mut counter, &enclosing, &mut out_funcs, &mut lam_captures);
+        out_funcs.push(FuncDecl { name: f.name.clone(), params: f.params.clone(), body: rew_body });
     }
 
-    Program { functions: out_funcs }
+    (Program { functions: out_funcs }, lam_captures)
 }
 
-
-/// -------------------------
+// -------------------------
 /// LOWERING (AST → WIR)
 /// -------------------------
 
@@ -928,73 +1006,97 @@ type LResult<T> = Result<T, LowerError>;
 
 pub struct Lowerer<'m> {
     module: &'m mut Module,
-    // function registry (very simple)
     funcs: HashMap<String, FuncId>,
+    lam_captures: HashMap<String, Vec<String>>,
 }
 
 impl<'m> Lowerer<'m> {
     pub fn new(module: &'m mut Module) -> Self {
-        Self { module, funcs: Default::default() }
+        Self {
+            module,
+            funcs: Default::default(),
+            lam_captures: Default::default(),
+        }
     }
 
     pub fn lower_program(&mut self, prog: &Program) -> LResult<Vec<FuncId>> {
-        let prog = hoist_fn_lits_program(prog);
+        // Stage 3 hoist: produce lam functions with __env + capture table, and FnRef at sites
+        let (prog, lam_caps) = hoist_fn_lits_program(prog);
+        self.lam_captures = lam_caps;
 
+        // Predeclare all functions, including hoisted lambdas (so direct calls resolve)
         self.funcs.clear();
         for (i, f) in prog.functions.iter().enumerate() {
             self.funcs.insert(f.name.clone(), FuncId(i as u32));
         }
 
+        // Lower each function
         let mut out = Vec::new();
-
-        // 1) real functions + hoisted lambdas
-        for f in prog.functions.iter().filter(|f| f.name != "__toplevel__") {
-            out.push(self.lower_fn(f)?);
+        for f in &prog.functions {
+            let id = self.lower_fn(f)?;
+            out.push(id);
         }
-        // 2) toplevel(s) last (so all callees exist)
-        for f in prog.functions.iter().filter(|f| f.name == "__toplevel__") {
-            out.push(self.lower_fn(f)?);
-        }
-
         Ok(out)
     }
 
     fn lower_fn(&mut self, fdecl: &FuncDecl) -> LResult<FuncId> {
+        // Params: i32 for demo; return: i32
         let param_tys = fdecl.params.iter().map(|_| Type::Int32).collect::<Vec<_>>();
         let ret_tys   = vec![Type::Int32];
 
-        // Snapshot the function table for free lowerers
+        // Snapshot function table for free helpers (no &mut self borrow during build)
         let funcs_snapshot = self.funcs.clone();
 
-        // Build the function while the builder holds &mut Module, but never borrow `self` again until `finish()`.
-        let mut func = {
-            let mut b = Builder::new(self.module, &fdecl.name, param_tys, ret_tys);
+        let func_name = fdecl.name.clone();
+        let lam_caps_for_this = self.lam_captures.get(&func_name).cloned().unwrap_or_default();
 
-            // Locals = params
+        // Build function
+        let mut func = {
+            let mut b = Builder::new(self.module, &func_name, param_tys, ret_tys);
+
+            // Bind params as locals
             let mut locals: HashMap<String, ValueId> = Default::default();
             for (i, name) in fdecl.params.iter().enumerate() {
                 locals.insert(name.clone(), b.param(i));
             }
 
-            // Per-function field table for lowering
+            // If this is a hoisted lambda, param 0 is __env (array). Load each capture from env.
+            if !lam_caps_for_this.is_empty() {
+                let env_arr = *locals.get("__env").expect("__env param present");
+                for (i, cap) in lam_caps_for_this.iter().enumerate() {
+                    let idx = b.const_i32(i as i32);
+                    let (_nid, loaded) = b.push_node(
+                        Inst::LoadElem { arr: env_arr, idx },
+                        Some(Type::Int32),
+                        1,
+                        false,
+                    );
+                    locals.insert(cap.clone(), loaded[0]);
+                }
+            }
+
+            // Per-function field table for object props during lowering (unchanged)
             let mut fields: HashMap<String, FieldId> = Default::default();
             let mut next_field: u32 = 0;
 
-            let mut fnvals: HashMap<String, FuncId> = HashMap::new();
-
-            // FREE lowerer (no &mut self borrow)
             lower_block_free(
-                &mut b, &mut locals, &mut fields, &mut next_field, &fdecl.body, &funcs_snapshot, &mut fnvals
+                &mut b,
+                &mut locals,
+                &mut fields,
+                &mut next_field,
+                &fdecl.body,
+                &funcs_snapshot,
+                &self.lam_captures,
             )?;
 
-            // Default fallthrough return
+            // Fallthrough return 0
             let zero = b.const_i32(0);
             b.ret(&[zero]);
 
             b.finish()
         };
 
-        // Now the builder is dropped; we can touch `self.module` again.
+        // publish
         let fid = FuncId(self.module.funcs.len() as u32);
         func.id = fid;
         self.module.funcs.push(func);
@@ -1014,37 +1116,30 @@ impl<'m> Lowerer<'m> {
     }
 
     fn lower_inline_fn_to_function(
-        &mut self,
-        params: &[String],
-        body: &Block,
+    &mut self,
+    params: &[String],
+    body: &Block,
     ) -> LResult<FuncId> {
-        // All params are i32 for now; one i32 return (demo)
         let param_tys = params.iter().map(|_| Type::Int32).collect::<Vec<_>>();
         let ret_tys   = vec![Type::Int32];
 
-        // Synthetic unique-ish name
         let name = format!("__lam_{}", self.module.funcs.len());
-
-        // Snapshot the function table for free-lowering
         let funcs_snapshot = self.funcs.clone();
 
-        // --- Build while holding &mut Module, but don't borrow &mut self inside
         let mut func = {
             let mut b = Builder::new(self.module, &name, param_tys, ret_tys);
 
-            // locals = params
             let mut locals = HashMap::<String, ValueId>::new();
             for (i, p) in params.iter().enumerate() {
                 locals.insert(p.clone(), b.param(i));
             }
 
-            // per-function field table for free-lowering
             let mut fields: HashMap<String, FieldId> = Default::default();
             let mut next_field: u32 = 0;
 
-            let mut fnvals: HashMap<String, FuncId> = HashMap::new();
+            // Stage 3 helpers expect lam_caps; use an empty map here.
+            let empty_caps: HashMap<String, Vec<String>> = HashMap::new();
 
-            // Lower body using FREE helpers (no &mut self while Builder holds &mut Module)
             lower_block_free(
                 &mut b,
                 &mut locals,
@@ -1052,21 +1147,18 @@ impl<'m> Lowerer<'m> {
                 &mut next_field,
                 body,
                 &funcs_snapshot,
-                &mut fnvals,
+                &empty_caps,
             )?;
 
-            // default fallthrough return 0
             let zero = b.const_i32(0);
             b.ret(&[zero]);
 
             b.finish()
-        }; // <- Builder dropped here; &mut Module borrow ends
+        };
 
-        // --- Now safe to mutate self.module again
         let fid = FuncId(self.module.funcs.len() as u32);
         func.id = fid;
         self.module.funcs.push(func);
-        // optional: register the symbol so direct calls by name work later
         self.funcs.insert(name, fid);
 
         Ok(fid)
@@ -1504,10 +1596,10 @@ fn lower_block_free<'m>(
     next_field: &mut u32,
     blk: &Block,
     funcs: &HashMap<String, FuncId>,
-    fnvals: &mut HashMap<String, FuncId>,
+    lam_caps: &HashMap<String, Vec<String>>,
 ) -> LResult<()> {
     for s in &blk.stmts {
-        lower_stmt_free(b, locals, fields, next_field, s, funcs, fnvals)?;
+        lower_stmt_free(b, locals, fields, next_field, s, funcs, lam_caps)?; // <-- pass through
     }
     Ok(())
 }
@@ -1519,32 +1611,19 @@ fn lower_stmt_free<'m>(
     next_field: &mut u32,
     s: &Stmt,
     funcs: &HashMap<String, FuncId>,
-    fnvals: &mut HashMap<String, FuncId>,
+    lam_caps: &HashMap<String, Vec<String>>,   // <-- new
 ) -> LResult<()> {
     match s {
         Stmt::Var { name, init } => {
-            if let Some(e) = init {
-                if let Some(fid) = resolve_fn_ref(e, funcs, fnvals) {
-                    // bind as function value (small i32 handle)
-                    fnvals.insert(name.clone(), fid);
-                    let handle = b.const_i32(fid.0 as i32);
-                    locals.insert(name.clone(), handle);
-                } else {
-                    fnvals.remove(name);
-                    let val = lower_expr_free(b, locals, fields, next_field, e, funcs, fnvals)?;
-                    locals.insert(name.clone(), val);
-                }
+            let val = if let Some(e) = init {
+                lower_expr_free(b, locals, fields, next_field, e, funcs, lam_caps)? // <-- pass
             } else {
-                fnvals.remove(name);
-                locals.insert(name.clone(), b.const_i32(0));
-            }
+                b.const_i32(0)
+            };
+            locals.insert(name.clone(), val);
         }
-
         Stmt::If { cond, then_b, else_b } => {
-            // Evaluate condition with current knowledge
-            let c = lower_expr_free(b, locals, fields, next_field, cond, funcs, fnvals)?;
-
-            // Blocks
+            let c = lower_expr_free(b, locals, fields, next_field, cond, funcs, lam_caps)?; // <-- pass
             let then_id  = b.block();
             let else_id  = b.block();
             let then_end = b.block();
@@ -1553,204 +1632,128 @@ fn lower_stmt_free<'m>(
 
             b.branch(c, then_id, else_id);
 
-            // Snapshot incoming locals/fnvals
-            let incoming_locals = locals.clone();
-            let incoming_fnvals = fnvals.clone();
+            let incoming = locals.clone();
 
-            // THEN arm
             b.position_at(then_id);
-            let mut locals_then = incoming_locals.clone();
-            let mut fnvals_then = incoming_fnvals.clone();
-            lower_block_free(b, &mut locals_then, fields, next_field, then_b, funcs, &mut fnvals_then)?;
-            if !b.current_block_terminated() {
-                b.jump(then_end, &[]);
-            }
+            let mut locals_then = incoming.clone();
+            lower_block_free(b, &mut locals_then, fields, next_field, then_b, funcs, lam_caps)?; // <-- pass
+            if !b.current_block_terminated() { b.jump(then_end, &[]); }
             b.position_at(then_end);
 
-            // ELSE arm
             b.position_at(else_id);
-            let mut locals_else = incoming_locals.clone();
-            let mut fnvals_else = incoming_fnvals.clone();
+            let mut locals_else = incoming.clone();
             if let Some(eb) = else_b {
-                lower_block_free(b, &mut locals_else, fields, next_field, eb, funcs, &mut fnvals_else)?;
+                lower_block_free(b, &mut locals_else, fields, next_field, eb, funcs, lam_caps)?; // <-- pass
             }
-            if !b.current_block_terminated() {
-                b.jump(else_end, &[]);
-            }
+            if !b.current_block_terminated() { b.jump(else_end, &[]); }
             b.position_at(else_end);
 
-            // Compute phi set (locals that changed)
             let mut phi_vars: Vec<String> = Vec::new();
-            for (name, &vin) in incoming_locals.iter() {
+            for (name, &vin) in incoming.iter() {
                 let vt = *locals_then.get(name).unwrap_or(&vin);
                 let ve = *locals_else.get(name).unwrap_or(&vin);
-                if vt != ve {
-                    phi_vars.push(name.clone());
-                }
+                if vt != ve { phi_vars.push(name.clone()); }
             }
             phi_vars.sort();
 
-            // Add block params on cont
             let mut phi_params = Vec::with_capacity(phi_vars.len());
-            for _ in &phi_vars {
-                phi_params.push(b.add_block_param(cont_id, crate::wir::Type::Int32));
-            }
+            for _ in &phi_vars { phi_params.push(b.add_block_param(cont_id, Type::Int32)); }
 
-            // Build arg tuples
             let mut args_then = Vec::with_capacity(phi_vars.len());
             let mut args_else = Vec::with_capacity(phi_vars.len());
             for name in &phi_vars {
-                let vin = *incoming_locals.get(name).unwrap();
+                let vin = *incoming.get(name).unwrap();
                 args_then.push(*locals_then.get(name).unwrap_or(&vin));
                 args_else.push(*locals_else.get(name).unwrap_or(&vin));
             }
 
-            // Landings → cont
-            b.position_at(then_end);
-            b.jump(cont_id, &args_then);
-            b.position_at(else_end);
-            b.jump(cont_id, &args_else);
+            b.position_at(then_end); b.jump(cont_id, &args_then);
+            b.position_at(else_end); b.jump(cont_id, &args_else);
 
-            // Merge at cont
             b.position_at(cont_id);
             for (i, name) in phi_vars.iter().enumerate() {
                 locals.insert(name.clone(), phi_params[i]);
             }
-
-            // Merge fnvals: keep entry only if both arms agree on same FuncId
-            for name in &phi_vars {
-                match (fnvals_then.get(name), fnvals_else.get(name)) {
-                    (Some(&a), Some(&b)) if a == b => { fnvals.insert(name.clone(), a); }
-                    _ => { fnvals.remove(name); }
-                }
-            }
         }
-
         Stmt::While { cond, body } => {
             let head = b.block();
             let body_b = b.block();
             let exit = b.block();
 
-            // Loop-carried locals (mutated inside body)
             let mut_names = collect_mut_locals_in_block(body)
                 .into_iter()
-                .filter(|name| locals.contains_key(name))
+                .filter(|n| locals.contains_key(n))
                 .collect::<Vec<_>>();
 
-            // Snapshot initial tuple
-            let init_args: Vec<ValueId> = mut_names.iter()
-                .map(|n| *locals.get(n).expect("known local"))
-                .collect();
-
-            // Header phis
-            let phi_vals: Vec<ValueId> = mut_names.iter()
-                .map(|_| b.add_block_param(head, Type::Int32))
-                .collect();
+            let init_args: Vec<ValueId> = mut_names.iter().map(|n| *locals.get(n).unwrap()).collect();
+            let phi_vals: Vec<ValueId> = mut_names.iter().map(|_| b.add_block_param(head, Type::Int32)).collect();
 
             b.jump(head, &init_args);
 
-            // Header
             b.position_at(head);
-            for (name, p) in mut_names.iter().zip(phi_vals.iter()) {
-                locals.insert(name.clone(), *p);
+            for (nm, p) in mut_names.iter().zip(phi_vals.iter()) {
+                locals.insert(nm.clone(), *p);
             }
-            let c = lower_expr_free(b, locals, fields, next_field, cond, funcs, fnvals)?;
+            let c = lower_expr_free(b, locals, fields, next_field, cond, funcs, lam_caps)?; // <-- pass
             b.branch(c, body_b, exit);
 
-            // Body
             b.position_at(body_b);
-            lower_block_free(b, locals, fields, next_field, body, funcs, fnvals)?;
-            let back_args: Vec<ValueId> = mut_names.iter()
-                .map(|n| *locals.get(n).expect("local after body"))
-                .collect();
+            lower_block_free(b, locals, fields, next_field, body, funcs, lam_caps)?; // <-- pass
+            let back_args: Vec<ValueId> = mut_names.iter().map(|n| *locals.get(n).unwrap()).collect();
             b.jump(head, &back_args);
 
-            // Exit
             b.position_at(exit);
-            for (name, p) in mut_names.iter().cloned().zip(phi_vals.into_iter()) {
-                locals.insert(name, p);
+            for (nm, p) in mut_names.into_iter().zip(phi_vals.into_iter()) {
+                locals.insert(nm, p);
             }
-            // Conservatively drop fn bindings for loop-carried names
-            for name in mut_names { fnvals.remove(&name); }
         }
-
         Stmt::For { init, cond, step, body } => {
-            // init
-            if let Some(init_s) = init {
-                lower_stmt_free(b, locals, fields, next_field, init_s, funcs, fnvals)?;
-            }
+            if let Some(i) = init { lower_stmt_free(b, locals, fields, next_field, i, funcs, lam_caps)?; } // <-- pass
 
-            // Blocks
-            let head   = b.block();
+            let head = b.block();
             let body_b = b.block();
-            let exit   = b.block();
+            let exit = b.block();
 
-            // Loop-carried locals (mutated in body or step)
             use BTreeSet;
             let mut mutated_set: BTreeSet<String> = BTreeSet::new();
             for st in &body.stmts { collect_mut_locals_in_stmt(st, &mut mutated_set); }
-            if let Some(step_e) = step { collect_mut_locals_in_expr(step_e, &mut mutated_set); }
-            let mut_names: Vec<String> = mutated_set.into_iter()
-                .filter(|n| locals.contains_key(n))
-                .collect();
+            if let Some(se) = step { collect_mut_locals_in_expr(se, &mut mutated_set); }
+            let mut_names: Vec<String> = mutated_set.into_iter().filter(|n| locals.contains_key(n)).collect();
 
-            // Initial tuple + header phis
-            let init_args: Vec<ValueId> = mut_names.iter()
-                .map(|n| *locals.get(n).unwrap())
-                .collect();
-            let phi_vals: Vec<ValueId> = mut_names.iter()
-                .map(|_| b.add_block_param(head, Type::Int32))
-                .collect();
+            let init_args: Vec<ValueId> = mut_names.iter().map(|n| *locals.get(n).unwrap()).collect();
+            let phi_vals: Vec<ValueId> = mut_names.iter().map(|_| b.add_block_param(head, Type::Int32)).collect();
 
-            // Enter header
             b.jump(head, &init_args);
 
-            // Header
             b.position_at(head);
-            for (name, p) in mut_names.iter().zip(phi_vals.iter()) {
-                locals.insert(name.clone(), *p);
-            }
+            for (nm, p) in mut_names.iter().zip(phi_vals.iter()) { locals.insert(nm.clone(), *p); }
             let c = if let Some(e) = cond {
-                lower_expr_free(b, locals, fields, next_field, e, funcs, fnvals)?
+                lower_expr_free(b, locals, fields, next_field, e, funcs, lam_caps)? // <-- pass
             } else {
                 let (_nid, res) = b.push_node(Inst::Const(Constant::Bool(true)), Some(Type::Bool), 1, false);
                 res[0]
             };
             b.branch(c, body_b, exit);
 
-            // Body + step + backedge
             b.position_at(body_b);
-            lower_block_free(b, locals, fields, next_field, body, funcs, fnvals)?;
-            if let Some(step_e) = step {
-                let _ = lower_expr_free(b, locals, fields, next_field, step_e, funcs, fnvals)?;
-            }
-            let back_args: Vec<ValueId> = mut_names.iter()
-                .map(|n| *locals.get(n).unwrap())
-                .collect();
+            lower_block_free(b, locals, fields, next_field, body, funcs, lam_caps)?; // <-- pass
+            if let Some(se) = step { let _ = lower_expr_free(b, locals, fields, next_field, se, funcs, lam_caps)?; } // <-- pass
+            let back_args: Vec<ValueId> = mut_names.iter().map(|n| *locals.get(n).unwrap()).collect();
             b.jump(head, &back_args);
 
-            // Exit
             b.position_at(exit);
-            for (name, p) in mut_names.iter().cloned().zip(phi_vals.into_iter()) {
-                locals.insert(name, p);
-            }
-            // Drop fn bindings for loop-carried names
-            for name in mut_names { fnvals.remove(&name); }
+            for (nm, p) in mut_names.into_iter().zip(phi_vals.into_iter()) { locals.insert(nm, p); }
         }
-
         Stmt::Return(e) => {
-            if let Some(expr) = e {
-                let v = lower_expr_free(b, locals, fields, next_field, expr, funcs, fnvals)?;
+            if let Some(e) = e {
+                let v = lower_expr_free(b, locals, fields, next_field, e, funcs, lam_caps)?; // <-- pass
                 b.ret(&[v]);
             } else {
                 let z = b.const_i32(0);
                 b.ret(&[z]);
             }
         }
-
-        Stmt::Expr(e) => {
-            let _ = lower_expr_free(b, locals, fields, next_field, e, funcs, fnvals)?;
-        }
+        Stmt::Expr(e) => { let _ = lower_expr_free(b, locals, fields, next_field, e, funcs, lam_caps)?; } // <-- pass
     }
     Ok(())
 }
@@ -1853,47 +1856,51 @@ fn lower_expr_free<'m>(
     next_field: &mut u32,
     e: &Expr,
     funcs: &HashMap<String, FuncId>,
-    fnvals: &mut HashMap<String, FuncId>,
+    lam_caps: &HashMap<String, Vec<String>>,   // <-- new
 ) -> LResult<ValueId> {
     use BinOp::*;
     use Inst::*;
 
     match e {
-        Expr::LitInt(i)   => Ok(b.const_i32(*i)),
-        Expr::LitF64(f)   => Ok(b.const_f64(*f)),
-        Expr::LitBool(v)  => {
+        Expr::LitInt(i) => Ok(b.const_i32(*i)),
+        Expr::LitF64(f) => Ok(b.const_f64(*f)),
+        Expr::LitBool(v) => {
             let (_nid, res) = b.push_node(Inst::Const(Constant::Bool(*v)), Some(Type::Bool), 1, false);
             Ok(res[0])
         }
-        Expr::LitNull     => {
+        Expr::LitNull => {
             let (_nid, res) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
             Ok(res[0])
         }
-        Expr::Str(s)      => {
+        Expr::Str(s) => {
             let (_nid, res) = b.push_node(Inst::Const(Constant::Str(s.clone())), Some(Type::Str), 1, false);
             Ok(res[0])
         }
 
-        // Stage 2: value position can see global functions as handles (i32) if not a local.
+        // locals first, else known function -> a closure with null env
         Expr::Ident(name) => {
             if let Some(&v) = locals.get(name) {
                 Ok(v)
             } else if let Some(&fid) = funcs.get(name) {
-                Ok(b.const_i32(fid.0 as i32))
+                let (_nid, env_null) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
+                let (_nid, clos) = b.push_node(
+                    Inst::MakeClosure { callee: fid, env: env_null[0] },
+                    Some(Type::Closure(None)),   // <-- fix
+                    1,
+                    false,
+                );
+                Ok(clos[0])
             } else {
                 Err(LowerError::UnknownVar(name.clone()))
             }
         }
 
-        Expr::Group(inner) => lower_expr_free(b, locals, fields, next_field, inner, funcs, fnvals),
+        Expr::Group(inner) => lower_expr_free(b, locals, fields, next_field, inner, funcs, lam_caps),
 
         Expr::Unary { op, e } => {
-            let v = lower_expr_free(b, locals, fields, next_field, e, funcs, fnvals)?;
+            let v = lower_expr_free(b, locals, fields, next_field, e, funcs, lam_caps)?;
             match op {
-                UnOp::Neg => {
-                    let zero = b.const_i32(0);
-                    Ok(b.int_bin(IntBinOp::Sub, zero, v))
-                }
+                UnOp::Neg => { let zero = b.const_i32(0); Ok(b.int_bin(IntBinOp::Sub, zero, v)) }
                 UnOp::Pos => Ok(v),
                 UnOp::Not => {
                     let (_nid, falsev) = b.push_node(Inst::Const(Constant::Bool(false)), Some(Type::Bool), 1, false);
@@ -1909,15 +1916,14 @@ fn lower_expr_free<'m>(
         }
 
         Expr::Binary { op, a, b: bb } => {
-            let va = lower_expr_free(b, locals, fields, next_field, a,  funcs, fnvals)?;
-            let vb = lower_expr_free(b, locals, fields, next_field, bb, funcs, fnvals)?;
+            let va = lower_expr_free(b, locals, fields, next_field, a, funcs, lam_caps)?;
+            let vb = lower_expr_free(b, locals, fields, next_field, bb, funcs, lam_caps)?;
             match op {
                 Add => Ok(b.int_bin(IntBinOp::Add, va, vb)),
                 Sub => Ok(b.int_bin(IntBinOp::Sub, va, vb)),
                 Mul => Ok(b.int_bin(IntBinOp::Mul, va, vb)),
                 Div => Ok(b.int_bin(IntBinOp::DivS, va, vb)),
                 Rem => Ok(b.int_bin(IntBinOp::RemS, va, vb)),
-
                 Eq | Ne | Lt | Le | Gt | Ge => {
                     let kind = match *op {
                         BinOp::Eq => crate::wir::CmpKind::Eq,
@@ -1928,47 +1934,35 @@ fn lower_expr_free<'m>(
                         BinOp::Ge => crate::wir::CmpKind::Ge,
                         _ => unreachable!(),
                     };
-                    let (_nid, res) = b.push_node(
-                        Inst::CmpInt { kind, a: va, b: vb },
-                        Some(Type::Bool),
-                        1,
-                        false,
-                    );
+                    let (_nid, res) = b.push_node(Inst::CmpInt { kind, a: va, b: vb }, Some(Type::Bool), 1, false);
                     Ok(res[0])
                 }
-
                 And | Or => {
                     let then_b = b.block();
                     let else_b = b.block();
                     let cont   = b.block();
-
-                    // Declare the result param first.
                     let res_param = b.add_block_param(cont, Type::Bool);
 
-                    if *op == And { b.branch(va, then_b, else_b); }
-                    else          { b.branch(va, else_b, then_b); }
+                    if *op == And { b.branch(va, then_b, else_b); } else { b.branch(va, else_b, then_b); }
 
-                    // THEN
                     b.position_at(then_b);
                     let tval = if *op == And {
-                        lower_expr_free(b, locals, fields, next_field, bb, funcs, fnvals)?
+                        lower_expr_free(b, locals, fields, next_field, bb, funcs, lam_caps)?
                     } else {
                         let (_nid, res) = b.push_node(Inst::Const(Constant::Bool(true)), Some(Type::Bool), 1, false);
                         res[0]
                     };
                     b.jump(cont, &[tval]);
 
-                    // ELSE
                     b.position_at(else_b);
                     let fval = if *op == And {
                         let (_nid, res) = b.push_node(Inst::Const(Constant::Bool(false)), Some(Type::Bool), 1, false);
                         res[0]
                     } else {
-                        lower_expr_free(b, locals, fields, next_field, bb, funcs, fnvals)?
+                        lower_expr_free(b, locals, fields, next_field, bb, funcs, lam_caps)?
                     };
                     b.jump(cont, &[fval]);
 
-                    // CONT
                     b.position_at(cont);
                     Ok(res_param)
                 }
@@ -1976,56 +1970,33 @@ fn lower_expr_free<'m>(
         }
 
         Expr::Assign(lv, rhs) => {
+            let rv = lower_expr_free(b, locals, fields, next_field, rhs, funcs, lam_caps)?;
             match &**lv {
-                LValue::Ident(name) => {
-                    if let Some(fid) = resolve_fn_ref(rhs, funcs, fnvals) {
-                        fnvals.insert(name.clone(), fid);
-                        let handle = b.const_i32(fid.0 as i32);
-                        locals.insert(name.clone(), handle);
-                        Ok(handle)
-                    } else {
-                        let rv = lower_expr_free(b, locals, fields, next_field, rhs, funcs, fnvals)?;
-                        fnvals.remove(name);
-                        locals.insert(name.clone(), rv);
-                        Ok(rv)
-                    }
-                }
+                LValue::Ident(name) => { locals.insert(name.clone(), rv); Ok(rv) }
                 LValue::GetProp { recv, name } => {
-                    let obj = lower_expr_free(b, locals, fields, next_field, recv, funcs, fnvals)?;
-                    let rv  = lower_expr_free(b, locals, fields, next_field, rhs,  funcs, fnvals)?;
+                    let obj = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
                     let field = intern_field_local(fields, next_field, name);
-                    let (_nid, _res) = b.push_node(
-                        Inst::StoreField { obj, field, val: rv, expected: None },
-                        Some(Type::Top),
-                        1,
-                        true,
-                    );
+                    let _ = b.push_node(Inst::StoreField { obj, field, val: rv, expected: None }, Some(Type::Top), 1, true);
                     Ok(rv)
                 }
                 LValue::Index { recv, index } => {
-                    let arr = lower_expr_free(b, locals, fields, next_field, recv, funcs, fnvals)?;
-                    let idx = lower_expr_free(b, locals, fields, next_field, index, funcs, fnvals)?;
-                    let len = {
-                        let (_nid, res) = b.push_node(Inst::ArrayLen(arr), Some(Type::Int32), 1, false);
-                        res[0]
-                    };
+                    let arr = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
+                    let idx = lower_expr_free(b, locals, fields, next_field, index, funcs, lam_caps)?;
+                    let len = { let (_nid, res) = b.push_node(Inst::ArrayLen(arr), Some(Type::Int32), 1, false); res[0] };
                     let deopt = b.deopt_point("store_idx_oob");
                     let _ = b.push_node(Inst::GuardBounds { idx, len, deopt }, Some(Type::Top), 1, true);
-                    let rv = lower_expr_free(b, locals, fields, next_field, rhs, funcs, fnvals)?;
-                    let (_nid, _res) = b.push_node(Inst::StoreElem { arr, idx, val: rv }, Some(Type::Top), 1, true);
+                    let _ = b.push_node(Inst::StoreElem { arr, idx, val: rv }, Some(Type::Top), 1, true);
                     Ok(rv)
                 }
             }
         }
 
+        // Calls / builtins
         Expr::Call { callee, args } => {
-            // Builtins when syntactically an Ident
             if let Expr::Ident(name) = &**callee {
                 if name == "list" {
-                    if args.len() != 1 {
-                        return Err(LowerError::NotLowerable("list() expects 1 arg"));
-                    }
-                    let len = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, fnvals)?;
+                    if args.len() != 1 { return Err(LowerError::NotLowerable("list() expects 1 arg")); }
+                    let len = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
                     let (_nid, res) = b.push_node(
                         Inst::AllocArray { elem_hint: Some(Type::Int32), len },
                         Some(Type::Array(Box::new(Some(Type::Int32)))),
@@ -2035,11 +2006,9 @@ fn lower_expr_free<'m>(
                     return Ok(res[0]);
                 }
                 if name == "print" {
-                    if args.len() != 1 {
-                        return Err(LowerError::NotLowerable("print() expects 1 arg"));
-                    }
+                    if args.len() != 1 { return Err(LowerError::NotLowerable("print() expects 1 arg")); }
                     let is_str_lit = matches!(args[0], Expr::Str(_));
-                    let v = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, fnvals)?;
+                    let v = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
                     let (_nid, res) = b.push_node(
                         Inst::CallNative {
                             name: if is_str_lit { "wir_print_str".into() } else { "wir_print_i64".into() },
@@ -2053,51 +2022,81 @@ fn lower_expr_free<'m>(
                     );
                     return Ok(res[0]);
                 }
-            }
-
-            // Resolve any callee that denotes a known function (ident or (ident))
-            if let Some(fid) = resolve_fn_ref(callee, funcs, fnvals) {
-                let mut argv = Vec::with_capacity(args.len());
-                for a in args {
-                    argv.push(lower_expr_free(b, locals, fields, next_field, a, funcs, fnvals)?);
+                if let Some(&fid) = funcs.get(name) {
+                    let mut argv = Vec::with_capacity(args.len());
+                    for a in args { argv.push(lower_expr_free(b, locals, fields, next_field, a, funcs, lam_caps)?); }
+                    let (_nid, res) = b.push_node(
+                        Inst::CallDirect { conv: crate::wir::CallConv::Fast, callee: fid, args: argv },
+                        Some(Type::Int32),
+                        1,
+                        true,
+                    );
+                    return Ok(res[0]);
                 }
-                let (_nid, res) = b.push_node(
-                    Inst::CallDirect { conv: crate::wir::CallConv::Fast, callee: fid, args: argv },
-                    Some(Type::Int32),
-                    1,
-                    true,
-                );
-                return Ok(res[0]);
             }
 
-            Err(LowerError::NotLowerable(
-                "dynamic calls not yet implemented (Stage 2 allows only known functions via names/locals)",
-            ))
+            // generic: fun value + CallClosure
+            let funv = lower_expr_free(b, locals, fields, next_field, callee, funcs, lam_caps)?;
+            let mut argv = Vec::with_capacity(args.len());
+            for a in args { argv.push(lower_expr_free(b, locals, fields, next_field, a, funcs, lam_caps)?); }
+            let (_nid, res) = b.push_node(
+                Inst::CallClosure { conv: crate::wir::CallConv::Fast, fun: funv, args: argv },
+                Some(Type::Int32),
+                1,
+                true,
+            );
+            Ok(res[0])
         }
 
+        // Property / Index
         Expr::GetProp { recv, name } => {
-            let obj = lower_expr_free(b, locals, fields, next_field, recv, funcs, fnvals)?;
+            let obj = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
             let field = intern_field_local(fields, next_field, name);
             let (_nid, res) = b.push_node(Inst::LoadField { obj, field, expected: None }, None, 1, false);
             Ok(res[0])
         }
-
         Expr::Index { recv, index } => {
-            let arr = lower_expr_free(b, locals, fields, next_field, recv, funcs, fnvals)?;
-            let idx = lower_expr_free(b, locals, fields, next_field, index, funcs, fnvals)?;
-            let len = {
-                let (_nid, res) = b.push_node(Inst::ArrayLen(arr), Some(Type::Int32), 1, false);
-                res[0]
-            };
+            let arr = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
+            let idx = lower_expr_free(b, locals, fields, next_field, index, funcs, lam_caps)?;
+            let len = { let (_nid, res) = b.push_node(Inst::ArrayLen(arr), Some(Type::Int32), 1, false); res[0] };
             let deopt = b.deopt_point("load_idx_oob");
             let _ = b.push_node(Inst::GuardBounds { idx, len, deopt }, Some(Type::Top), 1, true);
             let (_nid, res) = b.push_node(Inst::LoadElem { arr, idx }, Some(Type::Int32), 1, false);
             Ok(res[0])
         }
 
-        _ => {
-            Err(LowerError::NotLowerable("expression not yet implemented (Stage 2)"))
+        // Closure creation from hoisted lambda
+        Expr::FnRef { name } => {
+            let fid = *funcs.get(name).ok_or_else(|| LowerError::UnknownFunc(name.clone()))?;
+            let caps = lam_caps.get(name).cloned().unwrap_or_default();
+
+            // build env array [cap0, cap1, ...] in the exact hoist order
+            let len = b.const_i32(caps.len() as i32);
+            let (_nid, env_res) = b.push_node(
+                Inst::AllocArray { elem_hint: Some(Type::Int32), len },
+                Some(Type::Array(Box::new(Some(Type::Int32)))),
+                1,
+                true,
+            );
+            let env = env_res[0];
+
+            for (i, cap_name) in caps.iter().enumerate() {
+                let cap_val = *locals.get(cap_name)
+                    .ok_or_else(|| LowerError::UnknownVar(format!("capture `{}` not in scope", cap_name)))?;
+                let idx = b.const_i32(i as i32);
+                let _ = b.push_node(Inst::StoreElem { arr: env, idx, val: cap_val }, Some(Type::Top), 1, true);
+            }
+
+            let (_nid, clos) = b.push_node(
+                Inst::MakeClosure { callee: fid, env },
+                Some(Type::Closure(None)),
+                1,
+                false,
+            );
+            Ok(clos[0])
         }
+
+        _ => Err(LowerError::NotLowerable("expression not yet implemented")),
     }
 }
 

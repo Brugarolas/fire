@@ -10,7 +10,7 @@ use cranelift_module::{Linkage, Module as _};
 use cranelift::codegen::ir::instructions::BlockArg;
 
 use crate::wir::{
-    Constant, Function as WirFunction, Inst, IntBinOp, Value as WirValue, ValueDef, ValueId,
+    Constant, Function as WirFunction, Inst, IntBinOp, Value as WirValue, ValueDef, ValueId, FuncId,
 };
 
 /// ABI: `unsafe extern "C" fn(argv: *const i64, argc: usize) -> i64`
@@ -51,12 +51,30 @@ impl Default for JIT {
     }
 }
 
+// Add this helper near the top of jit.rs (or as a small inner fn in compile)
+fn find_make_closure(fun: &WirFunction, v: ValueId) -> Option<(crate::wir::FuncId, ValueId)> {
+    use crate::wir::{Inst, ValueDef};
+    let mut cur = v;
+    loop {
+        match &fun.values[cur.0 as usize].def {
+            ValueDef::InstResult(inst, 0) => {
+                match &fun.nodes[inst.0 as usize].kind {
+                    Inst::MakeClosure { callee, env } => return Some((*callee, *env)),
+                    Inst::Mov(src) => { cur = *src; }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+}
+
 impl JIT {
     pub fn compile(&mut self, fun: &WirFunction) -> Result<JitFnPtr, String> {
         use cranelift::prelude::*;
         use cranelift::prelude::{AbiParam, FunctionBuilder, FunctionBuilderContext};
         use cranelift::prelude::types;
-        use cranelift::codegen::ir::{StackSlotData, StackSlotKind};
+        use cranelift::codegen::ir::{StackSlot, StackSlotData, StackSlotKind};
         use cranelift_module::{Linkage, Module};
 
         // ---- build cranelift context/signature: (argv_ptr, argc) -> i64
@@ -66,7 +84,6 @@ impl JIT {
         ctx.func.signature.params.push(AbiParam::new(types::I64));
         ctx.func.signature.returns.push(AbiParam::new(types::I64));
 
-        // Dump a quick header about the function we’re compiling
         eprintln!(
             "[JIT] compile wir_f_{}: {} nodes, {} values, {} params",
             fun.id.0,
@@ -90,42 +107,54 @@ impl JIT {
         let mut terminated = false;
         let mut saw_any_return = false;
 
-        // Bind WIR params for this function to loads from argv[i].
+        // Track stack-allocated "arrays" so we can answer ArrayLen at JIT time.
+        // Keyed by the WIR value produced by AllocArray.
+        let mut array_info: HashMap<ValueId, (cranelift::codegen::ir::StackSlot, i64)> = HashMap::new();
+
+        // Track closures we build: closure_value -> (callee FuncId, env ValueId)
+        let mut closure_info: HashMap<ValueId, (crate::wir::FuncId, ValueId)> = HashMap::new();
+
+        // For small const-sized arrays/envs we back them by stack slots.
+        let mut arr_slots: HashMap<ValueId, StackSlot> = HashMap::new();
+        let mut arr_sizes: HashMap<ValueId, i32> = HashMap::new();
+
+        // Bind WIR params: load argv[i] as i64s.
         let param_count = fun.sig.params.len();
         for i in 0..param_count {
             let off = (i as i64) * 8;
             let addr = fb.ins().iadd_imm(args_base, off);
             let loaded = fb.ins().load(types::I64, MemFlags::trusted(), addr, 0);
             vmap.bind(ValueId(i as u32), loaded);
-
             eprintln!("[JIT] prebind param {} -> ValueId#{:?}", i, i);
         }
 
-        // Helpers
+        // helpers
         let mut emit_const = |fb: &mut FunctionBuilder, c: &Constant| -> Value {
             match c {
                 Constant::Int32(x) => fb.ins().iconst(types::I64, *x as i64),
                 Constant::F64(f)   => fb.ins().iconst(types::I64, (*f).to_bits() as i64),
                 Constant::Bool(b)  => fb.ins().iconst(types::I64, if *b { 1 } else { 0 }),
                 Constant::Null     => fb.ins().iconst(types::I64, 0),
-
-                // NEW: turn WIR string constant into a stable C string pointer
                 Constant::Str(s)   => {
                     let cstr = std::ffi::CString::new(s.as_str()).unwrap();
                     let ptr = cstr.as_ptr() as i64;
-                    // Keep the CString alive for as long as the JIT instance lives
                     self.keep_alive.push(cstr);
                     fb.ins().iconst(types::I64, ptr)
                 }
             }
         };
+        let const_i32_of = |id: ValueId| -> Option<i32> {
+            match &fun.values[id.0 as usize].def {
+                ValueDef::Const(Constant::Int32(x)) => Some(*x),
+                _ => None,
+            }
+        };
 
-        // --- Precreate one CLIF block per WIR block ---
+        // Precreate one CLIF block per WIR block.
         let mut clif_of = Vec::with_capacity(fun.blocks.len());
         for blk in &fun.blocks {
             let ebb = if blk.id == fun.entry { entry } else { fb.create_block() };
             clif_of.push(ebb);
-
             if blk.id != fun.entry {
                 for &vid in &blk.params {
                     let p = fb.append_block_param(ebb, types::I64);
@@ -134,7 +163,7 @@ impl JIT {
             }
         }
 
-        // ---- naïve linear pass over all blocks in order
+        // ---- linear pass
         for (bid, block) in fun.blocks.iter().enumerate() {
             eprintln!("  [block] visiting block #{bid} with {} insts", block.insts.len());
 
@@ -149,10 +178,8 @@ impl JIT {
                 if block_terminated || terminated { break; }
 
                 eprintln!("  [nodes] processing nid={:?}", nid);
-
                 let node = &fun.nodes[nid.0 as usize];
                 let res_count = node.results.len();
-
                 eprintln!(
                     "  [nodes] processing nid={:?} kind={:?} results={:?}",
                     nid, node.kind, node.results
@@ -160,40 +187,16 @@ impl JIT {
 
                 match &node.kind {
                     Inst::Const(c) => {
-                        eprintln!("[JIT] Const {:?}", c);
-
                         let v = emit_const(&mut fb, c);
                         if res_count == 1 { vmap.bind(node.results[0], v); }
                     }
 
                     Inst::Mov(src) => {
-                        eprintln!("[JIT] Mov from {:?}", src);
-                        eprintln!(
-                            "  [nodes] Mov -> dst={:?} <- src={:?}",
-                            node.results.get(0).cloned().unwrap_or(ValueId(u32::MAX)),
-                            src
-                        );
                         let v = vmap.get_or_emit(*src, &mut fb, args_base, fun);
-                        if res_count == 1 {
-                            vmap.bind(node.results[0], v);
-                            eprintln!("           bind {:?} (Mov)", node.results[0]);
-                        } else {
-                            eprintln!("           (Mov) no results to bind (res_count={})", res_count);
-                        }
+                        if res_count == 1 { vmap.bind(node.results[0], v); }
                     }
 
                     Inst::IntBin { op, a, b } => {
-                        eprintln!(
-                            "[JIT] IntBin {:?} a={:?}({:?}) b={:?}({:?})",
-                            op, a, dump_value_kind(&fun.values, *a),
-                                b, dump_value_kind(&fun.values, *b)
-                        );
-                        eprintln!(
-                            "           operands: a={:?}({:?}) b={:?}({:?})",
-                            a, dump_value_kind(&fun.values, *a),
-                            b, dump_value_kind(&fun.values, *b)
-                        );
-
                         let a = vmap.get_or_emit(*a, &mut fb, args_base, fun);
                         let b = vmap.get_or_emit(*b, &mut fb, args_base, fun);
                         let v = match op {
@@ -213,17 +216,6 @@ impl JIT {
                     }
 
                     Inst::CmpInt { kind, a, b } => {
-                        eprintln!(
-                            "[JIT] CmpInt {:?} a={:?}({:?}) b={:?}({:?})",
-                            kind, a, dump_value_kind(&fun.values, *a),
-                                b, dump_value_kind(&fun.values, *b)
-                        );
-                        eprintln!(
-                            "           operands: a={:?}({:?}) b={:?}({:?})",
-                            a, dump_value_kind(&fun.values, *a),
-                            b, dump_value_kind(&fun.values, *b)
-                        );
-
                         let a = vmap.get_or_emit(*a, &mut fb, args_base, fun);
                         let b = vmap.get_or_emit(*b, &mut fb, args_base, fun);
                         let cc = match kind {
@@ -241,20 +233,145 @@ impl JIT {
                         if res_count == 1 { vmap.bind(node.results[0], v); }
                     }
 
-                    Inst::CallDirect { callee, args, .. } => {
-                        eprintln!("[JIT] CallDirect wir_f_{} argc={}", callee.0, args.len());
-                        eprintln!(
-                            "  [nodes] CallDirect callee=wir_f_{} argc={}  results={:?}",
-                            callee.0, args.len(), node.results
-                        );
+                    // -------- Arrays (const-size, stack-backed) --------
+                    Inst::AllocArray { elem_hint: _ /* ignored for JIT */, len } => {
+                        // We only need this for closure envs (small, constant lengths).
+                        // Try to get a constant length; if not, fall back to a minimal slot.
+                        let len_v = vmap.get_or_emit(*len, &mut fb, args_base, fun);
+                        // Best-effort constant fold (works for Int32/Bool/Null consts).
+                        let len_const = match &fun.values[len.0 as usize].def {
+                            ValueDef::Const(Constant::Int32(x)) => *x as i64,
+                            ValueDef::Const(Constant::Bool(b))  => if *b { 1 } else { 0 },
+                            ValueDef::Const(Constant::Null)     => 0,
+                            _ => 0, // non-const: treat as 0; we still make a small slot
+                        }.max(0);
 
-                        // Callee ABI: (argv_ptr, argc) -> i64
+                        // Allocate a sized stack slot. Use at least 8 bytes so address is valid.
+                        let bytes: u32 = ((len_const as u32).saturating_mul(8)).max(8);
+                        let slot = fb.create_sized_stack_slot(StackSlotData::new(
+                            StackSlotKind::ExplicitSlot,
+                            bytes,
+                            3, // 8-byte alignment
+                        ));
+                        let addr = fb.ins().stack_addr(ptr_ty, slot, 0);
+                        if res_count == 1 {
+                            vmap.bind(node.results[0], addr);
+                            array_info.insert(node.results[0], (slot, len_const));
+                        }
+                    }
+                    Inst::LoadElem { arr, idx } => {
+                        // addr = arr + idx * 8
+                        let base = vmap.get_or_emit(*arr, &mut fb, args_base, fun);
+                        let i    = vmap.get_or_emit(*idx, &mut fb, args_base, fun);
+                        let eight = fb.ins().iconst(types::I64, 8);
+                        let off   = fb.ins().imul(i, eight);
+                        let addr  = fb.ins().iadd(base, off);
+                        let v     = fb.ins().load(types::I64, MemFlags::trusted(), addr, 0);
+                        if res_count == 1 {
+                            vmap.bind(node.results[0], v);
+                        }
+                    }
+
+                    Inst::StoreElem { arr, idx, val } => {
+                        // addr = arr + idx * 8 ; store val
+                        let base = vmap.get_or_emit(*arr, &mut fb, args_base, fun);
+                        let i    = vmap.get_or_emit(*idx, &mut fb, args_base, fun);
+                        let v    = vmap.get_or_emit(*val, &mut fb, args_base, fun);
+                        let eight = fb.ins().iconst(types::I64, 8);
+                        let off   = fb.ins().imul(i, eight);
+                        let addr  = fb.ins().iadd(base, off);
+                        fb.ins().store(MemFlags::trusted(), v, addr, 0);
+                        // no SSA result to bind (res_count is usually 1 due to effect token in WIR; we already bind that elsewhere)
+                    }
+
+                    Inst::ArrayLen(arr) => {
+                        // If we created this array in this function, return the known constant length.
+                        let len_const = array_info.get(arr).map(|&(_, n)| n).unwrap_or(0);
+                        let v = fb.ins().iconst(types::I64, len_const);
+                        if res_count == 1 {
+                            vmap.bind(node.results[0], v);
+                        }
+                    }
+
+                    // -------- Closures --------
+                    Inst::MakeClosure { callee, env } => {
+                        // Record which callee/env this closure carries so CallClosure can recover it.
+                        if res_count == 1 {
+                            // Bind a harmless placeholder value (0) as the "closure object".
+                            let zero = fb.ins().iconst(types::I64, 0);
+                            vmap.bind(node.results[0], zero);
+
+                            // Remember the logical payload of the closure.
+                            closure_info.insert(node.results[0], (*callee, *env));
+                        }
+                    }
+
+                    Inst::CallClosure { conv: _, fun: clos, args } => {
+                        let clos_id = *clos;
+
+                        // Recover (callee, env) for this closure; trap if we never saw its MakeClosure.
+                        let (callee_fid, env_vid) = match closure_info.get(&clos_id) {
+                            Some(&(fid, env_v)) => (fid, env_v),
+                            None => {
+                                let code = TrapCode::unwrap_user(0xE2);
+                                fb.ins().trap(code);
+                                // Dummy (unreached) values to satisfy the type checker
+                                (crate::wir::FuncId(0), ValueId(u32::MAX))
+                            }
+                        };
+
+                        // Build the imported callee signature: (argv_ptr, argc) -> i64  (same as CallDirect)
                         let mut sig = self.module.make_signature();
                         sig.params.push(AbiParam::new(ptr_ty));
                         sig.params.push(AbiParam::new(types::I64));
                         sig.returns.push(AbiParam::new(types::I64));
 
-                        // Stable symbol per FuncId so we can import it here
+                        let sym = format!("wir_f_{}", callee_fid.0);
+                        let func_id = self
+                            .module
+                            .declare_function(&sym, Linkage::Import, &sig)
+                            .map_err(|e| e.to_string())?;
+                        let callee_ref = self.module.declare_func_in_func(func_id, &mut fb.func);
+
+                        // Pack argv = [env, args…]
+                        let n = 1 + args.len();
+                        let size_bytes: u32 = (n as u32) * 8;
+                        let slot = fb.create_sized_stack_slot(StackSlotData::new(
+                            StackSlotKind::ExplicitSlot, size_bytes, 3,
+                        ));
+
+                        // env first
+                        let env_val = if env_vid.0 != u32::MAX {
+                            vmap.get_or_emit(env_vid, &mut fb, args_base, fun) // <-- this `fun` is &WirFunction
+                        } else {
+                            fb.ins().iconst(types::I64, 0)
+                        };
+                        fb.ins().stack_store(env_val, slot, 0);
+
+                        // positional args follow
+                        for (i, a) in args.iter().enumerate() {
+                            let v = vmap.get_or_emit(*a, &mut fb, args_base, fun);
+                            fb.ins().stack_store(v, slot, ((i as i32) + 1) * 8);
+                        }
+
+                        // Call
+                        let argv_ptr = fb.ins().stack_addr(ptr_ty, slot, 0);
+                        let argc     = fb.ins().iconst(types::I64, n as i64);
+                        let call     = fb.ins().call(callee_ref, &[argv_ptr, argc]);
+
+                        if res_count >= 1 {
+                            let r = fb.inst_results(call)[0];
+                            vmap.bind(node.results[0], r);
+                        }
+                    }
+
+                    // -------- Calls --------
+                    Inst::CallDirect { callee, args, .. } => {
+                        let mut sig = self.module.make_signature();
+                        sig.params.push(AbiParam::new(ptr_ty));
+                        sig.params.push(AbiParam::new(types::I64));
+                        sig.returns.push(AbiParam::new(types::I64));
+
                         let sym = format!("wir_f_{}", callee.0);
                         let func_id = self
                             .module
@@ -262,41 +379,27 @@ impl JIT {
                             .map_err(|e| e.to_string())?;
                         let callee_ref = self.module.declare_func_in_func(func_id, &mut fb.func);
 
-                        // Pack args into a stack array of i64s
                         let n = args.len();
                         let size_bytes: u32 = (n as u32) * 8;
                         let slot = fb.create_sized_stack_slot(StackSlotData::new(
                             StackSlotKind::ExplicitSlot,
                             size_bytes,
-                            3, // 2^3 = 8-byte alignment
+                            3,
                         ));
                         for (i, a) in args.iter().enumerate() {
                             let v = vmap.get_or_emit(*a, &mut fb, args_base, fun);
                             fb.ins().stack_store(v, slot, (i as i32) * 8);
-                            eprintln!("           arg[{}] <- {:?}", i, a);
                         }
                         let argv_ptr = fb.ins().stack_addr(ptr_ty, slot, 0);
                         let argc = fb.ins().iconst(types::I64, n as i64);
-
                         let call = fb.ins().call(callee_ref, &[argv_ptr, argc]);
-
-                        // IMPORTANT: Bind the produced result if WIR says there is one.
                         if res_count >= 1 {
                             let r = fb.inst_results(call)[0];
                             vmap.bind(node.results[0], r);
-                            eprintln!("           bind result {:?} from CallDirect", node.results[0]);
-                        } else {
-                            // If this ever triggers, the lowerer created a call without a result
-                            // but later WIR tries to use it (like your ValueId#5). This log will prove it.
-                            eprintln!("           WARNING: CallDirect had res_count=0; no value bound");
                         }
                     }
 
-                    // Native call already supported elsewhere in your JIT:
                     Inst::CallNative { name, args, .. } => {
-                        eprintln!("[JIT] CallNative {} argc={}", name, args.len());
-                        eprintln!("           native: {}  args: {:?}", name, args);
-
                         let mut sig = self.module.make_signature();
                         for _ in 0..args.len() {
                             sig.params.push(AbiParam::new(types::I64));
@@ -309,14 +412,7 @@ impl JIT {
                         let callee = self.module.declare_func_in_func(func_id, &mut fb.func);
 
                         let mut argv = Vec::with_capacity(args.len());
-                        let mut index = 0;
                         for a in args {
-                            eprintln!(
-                                "             arg[{}] = {:?} kind={} const={:?}",
-                                index, a, dump_value_kind(&fun.values, *a), dump_const(&fun.values, *a)
-                            );
-                            index += 1;
-
                             argv.push(vmap.get_or_emit(*a, &mut fb, args_base, fun));
                         }
                         let call = fb.ins().call(callee, &argv);
@@ -326,24 +422,25 @@ impl JIT {
                         }
                     }
 
+                    // -------- Control flow (BlockArg!) --------
                     Inst::Jump(to, args) => {
                         let dst = clif_of[to.0 as usize];
-                        // Build BlockArgs (BlockArg::from(Value))
                         let mut bargs: Vec<BlockArg> = Vec::with_capacity(args.len());
                         for &a in args {
                             let v = vmap.get_or_emit(a, &mut fb, args_base, fun);
                             bargs.push(BlockArg::from(v));
                         }
-                        fb.ins().jump(dst, &bargs[..]); // expects &BlockArg, not &Value
+                        fb.ins().jump(dst, &bargs[..]); // &BlockArg slice
                         block_terminated = true;
                     }
 
                     Inst::Branch { cond, then_b, else_b } => {
                         let c = vmap.get_or_emit(*cond, &mut fb, args_base, fun);
-                        // Our booleans are 0/1; brif treats non-zero as true.
-                        fb.ins().brif(c,
+                        fb.ins().brif(
+                            c,
                             clif_of[then_b.0 as usize], &[] as &[BlockArg],
-                            clif_of[else_b.0 as usize], &[] as &[BlockArg]);
+                            clif_of[else_b.0 as usize], &[] as &[BlockArg],
+                        );
                         block_terminated = true;
                     }
 
@@ -355,20 +452,50 @@ impl JIT {
                         };
                         fb.ins().return_(&[ret]);
                         block_terminated = true;
-                        saw_any_return = true;     // <-- add this
+                        saw_any_return = true;
                     }
 
-                    // benign markers
+                    // -------- Effects / markers --------
                     Inst::EffectEntry => {
-                        // Create a dummy effect token value
                         let token = fb.ins().iconst(ptr_ty, 0);
+                        if res_count == 1 { vmap.bind(node.results[0], token); }
+                    }
+
+                    Inst::Safepoint => { /* ignore for now */ }
+
+                    Inst::GuardBounds { idx, len, .. } => {
+                        // idx and len are i64 values in our JIT
+                        let i = vmap.get_or_emit(*idx, &mut fb, args_base, fun);
+                        let n = vmap.get_or_emit(*len, &mut fb, args_base, fun);
+
+                        // Build constants separately to avoid multiple mutable borrows of `fb`.
+                        let zero = fb.ins().iconst(types::I64, 0);
+
+                        // idx >= 0 && idx < len
+                        let ge0 = fb.ins().icmp(IntCC::SignedGreaterThanOrEqual, i, zero);
+                        let lt  = fb.ins().icmp(IntCC::SignedLessThan, i, n);
+                        let ok  = fb.ins().band(ge0, lt);
+
+                        // If not ok → trap (user code OOB)
+                        let cont = fb.create_block();
+                        let bad  = fb.create_block();
+                        fb.ins().brif(
+                            ok,
+                            cont, &[] as &[BlockArg],
+                            bad,  &[] as &[BlockArg],
+                        );
+
+                        fb.switch_to_block(bad);
+                        fb.ins().trap(TrapCode::unwrap_user(0xE1));
+
+                        fb.switch_to_block(cont);
+
+                        // Bind a dummy token result (so downstream users don’t crash)
                         if res_count == 1 {
-                            vmap.bind(node.results[0], token);
-                            eprintln!("           bind {:?} (EffectEntry)", node.results[0]);
+                            let tok = fb.ins().iconst(self.module.target_config().pointer_type(), 0);
+                            vmap.bind(node.results[0], tok);
                         }
                     }
-
-                    Inst::Safepoint => {}
 
                     _ => {
                         trap_unsupported(&mut fb, "unsupported");
@@ -376,16 +503,13 @@ impl JIT {
                     }
                 }
 
-                // Safety net: if an instruction declares results but we didn’t bind them,
-                // bind zeros so later users don’t crash.
-                for &rid in &node.results {
-                    if vmap.get(rid).is_none() {
-                        eprintln!(
-                            "[JIT][warn] result {:?} of kind {:?} not bound; zeroing",
-                            rid, node.kind
-                        );
-                        let z = fb.ins().iconst(types::I64, 0);
-                        vmap.bind(rid, z);
+                // Safety net: only bind zeros if block still open.
+                if !(block_terminated || terminated) {
+                    for &rid in &node.results {
+                        if vmap.get(rid).is_none() {
+                            let z = fb.ins().iconst(types::I64, 0);
+                            vmap.bind(rid, z);
+                        }
                     }
                 }
             }
@@ -402,7 +526,7 @@ impl JIT {
         fb.seal_all_blocks();
         fb.finalize();
 
-        // ---- declare/define current function with stable symbol (wir_f_<id>)
+        // ---- define current function with stable symbol (wir_f_<id>)
         let sym = format!("wir_f_{}", fun.id.0);
         let func_id = self
             .module
