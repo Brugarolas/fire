@@ -9,6 +9,11 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module as _};
 use cranelift::codegen::ir::instructions::BlockArg;
 
+use crate::value::{
+    self, BoxedF64, ObjHeader, TAG_BOXED_F64, TAG_ARRAY,
+    ARRAY_LEN_OFFSET, ARRAY_DATA_OFFSET,
+    NULL, is_imm, smi_to_i64
+};
 use crate::wir::{
     Constant, Function as WirFunction, Inst, IntBinOp, Value as WirValue, ValueDef, ValueId, FuncId,
 };
@@ -34,28 +39,37 @@ impl Default for JIT {
             fn wir_make_closure(code_ptr: *const u8, env: i64) -> i64;
             fn wir_call_closure(clo_ptr: i64, argv: *const i64, argc: i64) -> i64;
             fn wir_alloc_words(n: i64) -> *mut i64;
+            fn wir_alloc_array(n: i64) -> i64;
+
+            fn wir_add_slow(a: i64, b: i64) -> i64;
+            fn wir_sub_slow(a: i64, b: i64) -> i64;
+            fn wir_mul_slow(a: i64, b: i64) -> i64;
+
+            fn wir_cmp_eq_slow(a: i64, b: i64) -> i64;
+            fn wir_cmp_ne_slow(a: i64, b: i64) -> i64;
+            fn wir_cmp_lt_slow(a: i64, b: i64) -> i64;
+            fn wir_cmp_le_slow(a: i64, b: i64) -> i64;
+            fn wir_cmp_gt_slow(a: i64, b: i64) -> i64;
+            fn wir_cmp_ge_slow(a: i64, b: i64) -> i64;
         }
         unsafe {
-            jb.symbol(
-                "wir_print_i64",
-                wir_print_i64 as *const extern "C" fn(i64) -> i64 as *const u8,
-            );
-            jb.symbol(
-                "wir_print_str",
-                wir_print_str as *const extern "C" fn(*const std::os::raw::c_char) -> i64 as *const u8,
-            );
-            jb.symbol(
-                "wir_make_closure",
-                wir_make_closure as *const extern "C" fn(*const u8, i64) -> i64 as *const u8,
-            );
-            jb.symbol(
-                "wir_call_closure",
-                wir_call_closure as *const extern "C" fn(i64, *const i64, i64) -> i64 as *const u8,
-            );
-            jb.symbol(
-                "wir_alloc_words",
-                wir_alloc_words as *const extern "C" fn(i64) -> *mut i64 as *const u8
-            );
+            jb.symbol("wir_print_i64", wir_print_i64 as *const extern "C" fn(i64) -> i64 as *const u8);
+            jb.symbol("wir_print_str", wir_print_str as *const extern "C" fn(*const std::os::raw::c_char) -> i64 as *const u8);
+            jb.symbol("wir_make_closure", wir_make_closure as *const extern "C" fn(*const u8, i64) -> i64 as *const u8);
+            jb.symbol("wir_call_closure", wir_call_closure as *const extern "C" fn(i64, *const i64, i64) -> i64 as *const u8);
+            jb.symbol("wir_alloc_words", wir_alloc_words as *const extern "C" fn(i64) -> *mut i64 as *const u8);
+            jb.symbol("wir_alloc_array", wir_alloc_array as *const extern "C" fn(i64) -> i64 as *const u8);
+
+            jb.symbol("wir_add_slow", wir_add_slow as *const extern "C" fn(i64,i64)->i64 as *const u8);
+            jb.symbol("wir_sub_slow", wir_sub_slow as *const extern "C" fn(i64,i64)->i64 as *const u8);
+            jb.symbol("wir_mul_slow", wir_mul_slow as *const extern "C" fn(i64,i64)->i64 as *const u8);
+
+            jb.symbol("wir_cmp_eq_slow", wir_cmp_eq_slow as *const extern "C" fn(i64,i64)->i64 as *const u8);
+            jb.symbol("wir_cmp_ne_slow", wir_cmp_ne_slow as *const extern "C" fn(i64,i64)->i64 as *const u8);
+            jb.symbol("wir_cmp_lt_slow", wir_cmp_lt_slow as *const extern "C" fn(i64,i64)->i64 as *const u8);
+            jb.symbol("wir_cmp_le_slow", wir_cmp_le_slow as *const extern "C" fn(i64,i64)->i64 as *const u8);
+            jb.symbol("wir_cmp_gt_slow", wir_cmp_gt_slow as *const extern "C" fn(i64,i64)->i64 as *const u8);
+            jb.symbol("wir_cmp_ge_slow", wir_cmp_ge_slow as *const extern "C" fn(i64,i64)->i64 as *const u8);
         }
 
         let module = cranelift_jit::JITModule::new(jb);
@@ -75,6 +89,8 @@ impl JIT {
         use cranelift::prelude::types;
         use cranelift::codegen::ir::{StackSlotData, StackSlotKind};
         use cranelift_module::{Linkage, Module};
+
+        let fun_ir: &WirFunction = fun;
 
         // Small helpers for SMI encode/decode (do NOT capture &mut self)
         let mut dec_smi = |fb: &mut FunctionBuilder, v: Value| -> Value {
@@ -186,12 +202,15 @@ impl JIT {
 
                         // ---------------- Int ops (on SMIs) ----------------
                         Inst::IntBin { op, a, b } => {
-                            let a = vmap.get_or_emit(*a, &mut fb, args_base, fun);
-                            let b = vmap.get_or_emit(*b, &mut fb, args_base, fun);
-                            let ra = dec_smi(&mut fb, a);
-                            let rb = dec_smi(&mut fb, b);
+                            let a = vmap.get_or_emit(*a, &mut fb, args_base, fun_ir);
+                            let b = vmap.get_or_emit(*b, &mut fb, args_base, fun_ir);
 
-                            let raw_res = match op {
+                            // decode SMIs -> raw i64
+                            let ra = fb.ins().sshr_imm(a, 1);
+                            let rb = fb.ins().sshr_imm(b, 1);
+
+                            // arithmetic/bitwise on raw
+                            let raw = match op {
                                 IntBinOp::Add => fb.ins().iadd(ra, rb),
                                 IntBinOp::Sub => fb.ins().isub(ra, rb),
                                 IntBinOp::Mul => fb.ins().imul(ra, rb),
@@ -205,16 +224,22 @@ impl JIT {
                                 IntBinOp::Sar  => fb.ins().sshr(ra, rb),
                             };
 
-                            let v = enc_smi(&mut fb, raw_res);
-                            if res_count == 1 { vmap.bind(node.results[0], v); }
+                            // re-encode to SMI: (raw << 1) | 1
+                            let sh  = fb.ins().ishl_imm(raw, 1);
+                            let smi = fb.ins().iadd_imm(sh, 1);
+
+                            if res_count == 1 { vmap.bind(node.results[0], smi); }
                         }
 
                         Inst::CmpInt { kind, a, b } => {
-                            let a = vmap.get_or_emit(*a, &mut fb, args_base, fun);
-                            let b = vmap.get_or_emit(*b, &mut fb, args_base, fun);
-                            let ra = dec_smi(&mut fb, a);
-                            let rb = dec_smi(&mut fb, b);
+                            let a = vmap.get_or_emit(*a, &mut fb, args_base, fun_ir);
+                            let b = vmap.get_or_emit(*b, &mut fb, args_base, fun_ir);
 
+                            // decode SMIs
+                            let ra = fb.ins().sshr_imm(a, 1);
+                            let rb = fb.ins().sshr_imm(b, 1);
+
+                            // raw compare → 0/1 (NOT SMI)
                             let cc = match kind {
                                 crate::wir::CmpKind::Eq => IntCC::Equal,
                                 crate::wir::CmpKind::Ne => IntCC::NotEqual,
@@ -224,15 +249,24 @@ impl JIT {
                                 crate::wir::CmpKind::Ge => IntCC::SignedGreaterThanOrEqual,
                             };
                             let cond = fb.ins().icmp(cc, ra, rb);
-
                             let one  = fb.ins().iconst(types::I64, 1);
                             let zero = fb.ins().iconst(types::I64, 0);
-                            let v    = fb.ins().select(cond, one, zero);
-                            if res_count == 1 { vmap.bind(node.results[0], v); }
+                            let fast_res = fb.ins().select(cond, one, zero);
+
+                            if res_count == 1 { vmap.bind(node.results[0], fast_res); }
                         }
 
                         // ---------------- Arrays (heap words via wir_alloc_words) ----------------
                         Inst::AllocArray { elem_hint: _, len } => {
+                            // Decode SMI length -> raw i64
+                            let len_smi = vmap.get_or_emit(*len, &mut fb, args_base, fun_ir);
+                            let len_raw = fb.ins().sshr_imm(len_smi, 1);
+
+                            // total_words = 1 (header) + len_raw
+                            let one      = fb.ins().iconst(types::I64, 1);
+                            let total    = fb.ins().iadd(len_raw, one);
+
+                            // call: wir_alloc_words(total: i64) -> *mut i64
                             let mut sig = self.module.make_signature();
                             sig.params.push(AbiParam::new(types::I64));
                             sig.returns.push(AbiParam::new(ptr_ty));
@@ -241,21 +275,28 @@ impl JIT {
                                 .map_err(|e| e.to_string())?;
                             let callee = self.module.declare_func_in_func(fid, &mut fb.func);
 
-                            let len_v = vmap.get_or_emit(*len, &mut fb, args_base, fun);
-                            let call  = fb.ins().call(callee, &[len_v]);
-                            let ptr   = fb.inst_results(call)[0];
+                            let call  = fb.ins().call(callee, &[total]);
+                            let base  = fb.inst_results(call)[0]; // ptr to header
 
-                            if res_count == 1 { vmap.bind(node.results[0], ptr); }
+                            // header[0] = raw length
+                            fb.ins().store(MemFlags::trusted(), len_raw, base, 0);
+
+                            if res_count == 1 { vmap.bind(node.results[0], base); }
                         }
 
                         Inst::StoreElem { arr, idx, val } => {
-                            let arr_v = vmap.get_or_emit(*arr, &mut fb, args_base, fun);
-                            let idx_v = vmap.get_or_emit(*idx, &mut fb, args_base, fun);
-                            let val_v = vmap.get_or_emit(*val, &mut fb, args_base, fun);
+                            let base   = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
+                            let idx_s  = vmap.get_or_emit(*idx, &mut fb, args_base, fun_ir);
+                            let val_v  = vmap.get_or_emit(*val, &mut fb, args_base, fun_ir);
 
-                            let sh   = fb.ins().iconst(types::I64, 3);
-                            let off  = fb.ins().ishl(idx_v, sh);
-                            let addr = fb.ins().iadd(arr_v, off);
+                            // idx_raw = idx_smi >> 1
+                            let idx_r  = fb.ins().sshr_imm(idx_s, 1);
+                            // (1 + idx_raw) * 8
+                            let one    = fb.ins().iconst(types::I64, 1);
+                            let idx1   = fb.ins().iadd(idx_r, one);
+                            let off    = fb.ins().ishl_imm(idx1, 3);    // *8
+                            let addr   = fb.ins().iadd(base, off);
+
                             fb.ins().store(MemFlags::trusted(), val_v, addr, 0);
 
                             if res_count == 1 {
@@ -265,19 +306,26 @@ impl JIT {
                         }
 
                         Inst::LoadElem { arr, idx } => {
-                            let arr_v = vmap.get_or_emit(*arr, &mut fb, args_base, fun);
-                            let idx_v = vmap.get_or_emit(*idx, &mut fb, args_base, fun);
-                            let sh    = fb.ins().iconst(types::I64, 3);
-                            let off   = fb.ins().ishl(idx_v, sh);
-                            let addr  = fb.ins().iadd(arr_v, off);
-                            let v     = fb.ins().load(types::I64, MemFlags::trusted(), addr, 0);
+                            let base  = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
+                            let idx_s = vmap.get_or_emit(*idx, &mut fb, args_base, fun_ir);
+
+                            let idx_r = fb.ins().sshr_imm(idx_s, 1);
+                            let one   = fb.ins().iconst(types::I64, 1);
+                            let idx1  = fb.ins().iadd(idx_r, one);
+                            let off   = fb.ins().ishl_imm(idx1, 3);
+                            let addr  = fb.ins().iadd(base, off);
+
+                            let v = fb.ins().load(types::I64, MemFlags::trusted(), addr, 0);
                             if res_count == 1 { vmap.bind(node.results[0], v); }
                         }
 
                         Inst::ArrayLen(arr) => {
-                            let len_const = array_info.get(arr).map(|&(_, n)| n).unwrap_or(0);
-                            let v = fb.ins().iconst(types::I64, len_const);
-                            if res_count == 1 { vmap.bind(node.results[0], v); }
+                            let base     = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
+                            let len_raw  = fb.ins().load(types::I64, MemFlags::trusted(), base, 0);
+                            // Re-encode to SMI: (raw<<1)|1
+                            let sh       = fb.ins().ishl_imm(len_raw, 1);
+                            let len_smi  = fb.ins().iadd_imm(sh, 1);
+                            if res_count == 1 { vmap.bind(node.results[0], len_smi); }
                         }
 
                         // ---------------- Closures ----------------
@@ -378,24 +426,32 @@ impl JIT {
 
                         // ---------------- Native calls ----------------
                         Inst::CallNative { name, args, .. } => {
+                            let import_name: &str = if name == "wir_print_str" {
+                                "wir_print_i64"   // treat string prints as generic value prints
+                            } else {
+                                name
+                            };
+
                             let mut sig = self.module.make_signature();
                             for _ in 0..args.len() {
                                 sig.params.push(AbiParam::new(types::I64));
                             }
                             sig.returns.push(AbiParam::new(types::I64));
+
                             let func_id = self
                                 .module
-                                .declare_function(name, Linkage::Import, &sig)
+                                .declare_function(import_name, Linkage::Import, &sig)
                                 .map_err(|e| e.to_string())?;
                             let callee = self.module.declare_func_in_func(func_id, &mut fb.func);
 
                             let mut argv = Vec::with_capacity(args.len());
                             for a in args {
-                                argv.push(vmap.get_or_emit(*a, &mut fb, args_base, fun));
+                                argv.push(vmap.get_or_emit(*a, &mut fb, args_base, fun_ir));
                             }
                             let call = fb.ins().call(callee, &argv);
                             if res_count == 1 {
-                                vmap.bind(node.results[0], fb.inst_results(call)[0]);
+                                let res = fb.inst_results(call)[0];
+                                vmap.bind(node.results[0], res);
                             }
                         }
 
@@ -442,23 +498,20 @@ impl JIT {
                         Inst::Safepoint => { /* ignore for now */ }
 
                         Inst::GuardBounds { idx, len, .. } => {
-                            let i = vmap.get_or_emit(*idx, &mut fb, args_base, fun);
-                            let n = vmap.get_or_emit(*len, &mut fb, args_base, fun);
+                            let i_smi = vmap.get_or_emit(*idx, &mut fb, args_base, fun_ir);
+                            let n_smi = vmap.get_or_emit(*len, &mut fb, args_base, fun_ir);
+
+                            let i = fb.ins().sshr_imm(i_smi, 1); // raw idx
+                            let n = fb.ins().sshr_imm(n_smi, 1); // raw len
+
                             let zero = fb.ins().iconst(types::I64, 0);
+                            let ge0  = fb.ins().icmp(IntCC::SignedGreaterThanOrEqual, i, zero);
+                            let lt   = fb.ins().icmp(IntCC::SignedLessThan, i, n);
+                            let ok   = fb.ins().band(ge0, lt);
 
-                            // idx >= 0 && idx < len
-                            let ge0 = fb.ins().icmp(IntCC::SignedGreaterThanOrEqual, i, zero);
-                            let lt  = fb.ins().icmp(IntCC::SignedLessThan, i, n);
-                            let ok  = fb.ins().band(ge0, lt);
-
-                            // If not ok → trap
                             let cont = fb.create_block();
                             let bad  = fb.create_block();
-                            fb.ins().brif(
-                                ok,
-                                cont, &[] as &[cranelift::codegen::ir::instructions::BlockArg],
-                                bad,  &[] as &[cranelift::codegen::ir::instructions::BlockArg],
-                            );
+                            fb.ins().brif(ok, cont, &[] as &[BlockArg], bad, &[] as &[BlockArg]);
 
                             fb.switch_to_block(bad);
                             fb.ins().trap(TrapCode::unwrap_user(0xE1));
@@ -538,10 +591,8 @@ impl JIT {
 
             // strings -> stable C string pointer kept alive
             Constant::Str(s)   => {
-                let cstr = std::ffi::CString::new(s.as_str()).unwrap();
-                let ptr = cstr.as_ptr() as i64;
-                self.keep_alive.push(cstr);
-                fb.ins().iconst(types::I64, ptr)
+                let p = self.alloc_boxed_str(s);
+                fb.ins().iconst(types::I64, p)
             }
 
             // f64 -> heap-allocated BoxedF64
@@ -558,6 +609,31 @@ impl JIT {
         let ptr = Box::into_raw(obj) as *mut u8;
         self.heap_keep_alive.push(ptr);       // leak (intentionally) until GC
         ptr as i64                             // even pointer => tagged “pointer”
+    }
+
+    fn alloc_boxed_str(&mut self, s: &str) -> i64 {
+        use crate::value::{BoxedStr, ObjHeader, TAG_STRING};
+
+        // Keep UTF-8 bytes alive using CString (or you can keep raw Vec<u8>).
+        let c = std::ffi::CString::new(s).unwrap();
+        let data = c.as_ptr() as *const u8;
+        let len  = s.as_bytes().len();
+
+        // Store the CString so its memory isn't freed.
+        self.keep_alive.push(c);
+
+        // Box the string object itself
+        let obj = Box::new(BoxedStr {
+            hdr: ObjHeader { tag: TAG_STRING, aux: 0 },
+            len,
+            data,
+        });
+        let ptr = Box::into_raw(obj) as *mut u8;
+
+        // Keep the object alive (until GC arrives)
+        self.heap_keep_alive.push(ptr);
+
+        ptr as i64  // even pointer => “heap object”
     }
 }
 /// Value binder: maps WIR ValueIds to CLIF Values, and lazily loads argv[idx] only for params.
@@ -661,17 +737,35 @@ struct WirClosure {
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_print_i64(v: i64) -> i64 {
     use crate::value::*;
+    use std::slice;
+    use std::str;
+
     if is_imm(v) {
-        // Treat all odd values as SMI for now.
-        // (When we switch booleans to singletons, we can special-case them here.)
-        println!("{}", smi_to_i64(v));
-    } else {
-        // 0 = null, other even = pointer (address for now)
-        if v == NULL {
-            println!("null");
-        } else {
-            // TODO: inspect header + pretty-print object
-            println!("{:#x}", v as u64);
+        println!("{}", smi_to_i64(v));   // SMI
+        return 0;
+    }
+
+    if v == NULL {
+        println!("null");
+        return 0;
+    }
+
+    unsafe {
+        let hdr = &*(v as *const ObjHeader);
+        match hdr.tag {
+            TAG_BOXED_F64 => {
+                let b = &*(v as *const BoxedF64);
+                println!("{}", b.val);
+            }
+            TAG_STRING => {
+                let s = &*(v as *const BoxedStr);
+                let bytes = slice::from_raw_parts(s.data, s.len);
+                println!("{}", String::from_utf8_lossy(bytes));
+            }
+            _ => {
+                // Unknown object type for now
+                println!("{:#x}", v as u64);
+            }
         }
     }
     0
@@ -723,6 +817,138 @@ pub extern "C" fn wir_alloc_words(n: i64) -> *mut i64 {
     std::mem::forget(v); // leak: fine for JIT demo
     p
 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_alloc_array(n: i64) -> i64 {
+    use std::ptr::{write_unaligned};
+    use crate::value::{ObjHeader, TAG_ARRAY, ARRAY_LEN_OFFSET, ARRAY_DATA_OFFSET};
+
+    if n <= 0 {
+        return 0; // null for degenerate
+    }
+
+    let total = (ARRAY_DATA_OFFSET as usize) + (n as usize) * 8;
+    // Zero-initialized backing memory; we’ll leak it (fine until GC arrives).
+    let mut buf = vec![0u8; total];
+    let p = buf.as_mut_ptr();
+    std::mem::forget(buf);
+
+    unsafe {
+        // header
+        let hdr_ptr = p as *mut ObjHeader;
+        (*hdr_ptr).tag = TAG_ARRAY;
+        (*hdr_ptr).aux = 0;
+
+        // len
+        let len_ptr = p.add(ARRAY_LEN_OFFSET as usize) as *mut i64;
+        write_unaligned(len_ptr, n);
+
+        // data is already zeroed
+    }
+
+    p as i64 // even pointer => “heap object”
+}
+
+#[inline]
+fn smi_encode(x: i64) -> i64 { (x << 1) | 1 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_box_f64_runtime(bits: u64) -> i64 {
+    use crate::value::{BoxedF64, ObjHeader, TAG_BOXED_F64};
+    let x = f64::from_bits(bits);
+    let obj = Box::new(BoxedF64 { hdr: ObjHeader { tag: TAG_BOXED_F64, aux: 0 }, val: x });
+    Box::into_raw(obj) as i64
+}
+
+#[inline]
+fn val_to_f64(v: i64) -> Result<f64, &'static str> {
+    use crate::value::*;
+    if is_imm(v) {
+        Ok(smi_to_i64(v) as f64)
+    } else {
+        if v == NULL { return Err("null is not a number"); }
+        unsafe {
+            let hdr = &*(v as *const ObjHeader);
+            if hdr.tag == TAG_BOXED_F64 {
+                let bf = &*(v as *const BoxedF64);
+                Ok(bf.val)
+            } else {
+                Err("not a number")
+            }
+        }
+    }
+}
+
+#[inline]
+fn f64_to_val(x: f64) -> i64 {
+    let xi = x as i64;
+    if (xi as f64) == x {
+        smi_encode(xi)
+    } else {
+        wir_box_f64_runtime(x.to_bits())
+    }
+}
+
+// ----- arithmetic slow paths -----
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_add_slow(a: i64, b: i64) -> i64 {
+    let af = val_to_f64(a).expect("TypeError: add lhs not a number");
+    let bf = val_to_f64(b).expect("TypeError: add rhs not a number");
+    f64_to_val(af + bf)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_sub_slow(a: i64, b: i64) -> i64 {
+    let af = val_to_f64(a).expect("TypeError: sub lhs not a number");
+    let bf = val_to_f64(b).expect("TypeError: sub rhs not a number");
+    f64_to_val(af - bf)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_mul_slow(a: i64, b: i64) -> i64 {
+    let af = val_to_f64(a).expect("TypeError: mul lhs not a number");
+    let bf = val_to_f64(b).expect("TypeError: mul rhs not a number");
+    f64_to_val(af * bf)
+}
+
+// ----- comparison slow paths (return raw 0/1) -----
+#[inline] fn b2i(b: bool) -> i64 { if b { 1 } else { 0 } }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_cmp_eq_slow(a: i64, b: i64) -> i64 {
+    let af = val_to_f64(a).expect("TypeError: == lhs");
+    let bf = val_to_f64(b).expect("TypeError: == rhs");
+    b2i(af == bf)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_cmp_ne_slow(a: i64, b: i64) -> i64 {
+    let af = val_to_f64(a).expect("TypeError: != lhs");
+    let bf = val_to_f64(b).expect("TypeError: != rhs");
+    b2i(af != bf)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_cmp_lt_slow(a: i64, b: i64) -> i64 {
+    let af = val_to_f64(a).expect("TypeError: < lhs");
+    let bf = val_to_f64(b).expect("TypeError: < rhs");
+    b2i(af < bf)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_cmp_le_slow(a: i64, b: i64) -> i64 {
+    let af = val_to_f64(a).expect("TypeError: <= lhs");
+    let bf = val_to_f64(b).expect("TypeError: <= rhs");
+    b2i(af <= bf)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_cmp_gt_slow(a: i64, b: i64) -> i64 {
+    let af = val_to_f64(a).expect("TypeError: > lhs");
+    let bf = val_to_f64(b).expect("TypeError: > rhs");
+    b2i(af > bf)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_cmp_ge_slow(a: i64, b: i64) -> i64 {
+    let af = val_to_f64(a).expect("TypeError: >= lhs");
+    let bf = val_to_f64(b).expect("TypeError: >= rhs");
+    b2i(af >= bf)
+}
+
 
 // --- DEBUG HELPERS (fixed) ---------------------------------------------------
 fn dump_value_kind(values: &Vec<WirValue>, id: ValueId) -> &'static str {

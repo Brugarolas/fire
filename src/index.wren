@@ -1,5 +1,8 @@
 // src/index.napalm
 
+print("===== Hello World =====");
+print("Hello, World!"); // expect Hello, World!
+
 print("===== Simple function =====");
 fn add2(a, b) {
     return a + b;
