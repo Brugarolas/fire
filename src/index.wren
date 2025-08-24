@@ -45,3 +45,12 @@ print("===== Lambda functions =====");
 print((fn (a, b) { return a + b; })(2, 3));      // 5
 print((|x| x + 1)(41));                  // 42
 print((|a, b| { return a*b; })(6, 7));   // 42
+
+print("===== Closures =====");
+fn make_adder(x) {
+    return |y| x + y;
+}
+
+var add42 = make_adder(42);
+print(add42(0));  // expect 42
+print(add42(100)); // expect 142
