@@ -1849,6 +1849,114 @@ fn collect_mut_locals_in_block(b: &Block) -> Vec<String> {
     set.into_iter().collect() // stable order
 }
 
+fn lower_array_method_call<'m>(
+    b: &mut Builder<'m>,
+    locals: &mut HashMap<String, ValueId>,
+    fields: &mut HashMap<String, FieldId>,
+    next_field: &mut u32,
+    recv: &Expr,
+    name: &str,
+    args: &[Expr],
+    funcs: &HashMap<String, FuncId>,
+    lam_caps: &HashMap<String, Vec<String>>,
+) -> LResult<Option<ValueId>> {
+    use crate::wir::{Inst, Type};
+
+    let arr = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
+
+    macro_rules! cn {
+        ($fname:expr, [$($argv:expr),*], $ty:expr) => {{
+            let (_nid, res) = b.push_node(
+                Inst::CallNative {
+                    name: $fname.into(),
+                    args: vec![$($argv),*],
+                    pure: false,
+                    can_throw: false,
+                },
+                $ty,
+                1,
+                true,
+            );
+            Ok(Some(res[0]))
+        }};
+    }
+
+    match name {
+        // --- length as a method for symmetry: a.setLength(n) ---
+        "setLength" => {
+            if args.len() != 1 { return Err(LowerError::NotLowerable("setLength expects 1 arg")); }
+            let n = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+            return cn!("wir_array_set_len", [arr, n], Some(Type::Int32));
+        }
+
+        // --- basic mutators ---
+        "push" => {
+            if args.len() != 1 { return Err(LowerError::NotLowerable("push expects 1 arg")); }
+            let v = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+            return cn!("wir_array_push", [arr, v], Some(Type::Int32)); // new length
+        }
+        "pop" => {
+            if !args.is_empty() { return Err(LowerError::NotLowerable("pop expects 0 args")); }
+            return cn!("wir_array_pop", [arr], None); // element or null
+        }
+        "shift" => {
+            if !args.is_empty() { return Err(LowerError::NotLowerable("shift expects 0 args")); }
+            return cn!("wir_array_shift", [arr], None); // element or null
+        }
+        "unshift" => {
+            if args.len() != 1 { return Err(LowerError::NotLowerable("unshift expects 1 arg")); }
+            let v = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+            return cn!("wir_array_unshift", [arr, v], Some(Type::Int32)); // new length
+        }
+
+        // --- higher-order ---
+        "map" => {
+            if args.len() != 1 { return Err(LowerError::NotLowerable("map expects 1 arg")); }
+            let fun = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+            return cn!("wir_array_map", [arr, fun], Some(Type::Array(Box::new(None))));
+        }
+        "forEach" => {
+            if args.len() != 1 { return Err(LowerError::NotLowerable("forEach expects 1 arg")); }
+            let fun = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+            return cn!("wir_array_for_each", [arr, fun], Some(Type::Null));
+        }
+        "find" => {
+            if args.len() != 1 { return Err(LowerError::NotLowerable("find expects 1 arg")); }
+            let fun = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+            return cn!("wir_array_find", [arr, fun], None); // element or null
+        }
+        "findIndex" => {
+            if args.len() != 1 { return Err(LowerError::NotLowerable("findIndex expects 1 arg")); }
+            let fun = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+            return cn!("wir_array_find_index", [arr, fun], Some(Type::Int32));
+        }
+        "filter" => {
+            if args.len() != 1 { return Err(LowerError::NotLowerable("filter expects 1 arg")); }
+            let fun = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+            return cn!("wir_array_filter", [arr, fun], Some(Type::Array(Box::new(None))));
+        }
+        "reduce" => {
+            if !(args.len() == 1 || args.len() == 2) {
+                return Err(LowerError::NotLowerable("reduce expects (fn) or (fn, init)"));
+            }
+            let fun = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+            let (init, has_init) = if args.len() == 2 {
+                let i  = lower_expr_free(b, locals, fields, next_field, &args[1], funcs, lam_caps)?;
+                let hi = b.const_i32(1);
+                (i, hi)
+            } else {
+                let i  = b.const_i32(0);
+                let hi = b.const_i32(0);
+                (i, hi)
+            };
+            return cn!("wir_array_reduce", [arr, fun, init, has_init], None);
+        }
+
+        _ => {}
+    }
+    Ok(None)
+}
+
 fn lower_expr_free<'m>(
     b: &mut Builder<'m>,
     locals: &mut HashMap<String, ValueId>,
@@ -1972,9 +2080,23 @@ fn lower_expr_free<'m>(
         Expr::Assign(lv, rhs) => {
             let rv = lower_expr_free(b, locals, fields, next_field, rhs, funcs, lam_caps)?;
             match &**lv {
-                LValue::Ident(name) => { locals.insert(name.clone(), rv); Ok(rv) }
                 LValue::GetProp { recv, name } => {
                     let obj = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
+                    if name == "length" {
+                        // arr.length = n  → wir_array_set_len(arr, n)
+                        let (_nid, _r) = b.push_node(
+                            Inst::CallNative {
+                                name: "wir_array_set_len".into(),
+                                args: vec![obj, rv],
+                                pure: false,
+                                can_throw: false,
+                            },
+                            Some(Type::Int32),
+                            1,
+                            true,
+                        );
+                        return Ok(rv);
+                    }
                     let field = intern_field_local(fields, next_field, name);
                     let _ = b.push_node(Inst::StoreField { obj, field, val: rv, expected: None }, Some(Type::Top), 1, true);
                     Ok(rv)
@@ -1982,24 +2104,55 @@ fn lower_expr_free<'m>(
                 LValue::Index { recv, index } => {
                     let arr = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
                     let idx = lower_expr_free(b, locals, fields, next_field, index, funcs, lam_caps)?;
-                    let len = { let (_nid, res) = b.push_node(Inst::ArrayLen(arr), Some(Type::Int32), 1, false); res[0] };
-                    let deopt = b.deopt_point("store_idx_oob");
-                    let _ = b.push_node(Inst::GuardBounds { idx, len, deopt }, Some(Type::Top), 1, true);
-                    let _ = b.push_node(Inst::StoreElem { arr, idx, val: rv }, Some(Type::Top), 1, true);
+                    let (_nid, _res) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_array_set".into(),
+                            args: vec![arr, idx, rv],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::Int32), // native may return new length or status; we ignore it here
+                        1,
+                        true,
+                    );
                     Ok(rv)
+                }
+
+                LValue::Ident(name) => {
+                    if locals.contains_key(name) {
+                        locals.insert(name.clone(), rv);
+                        Ok(rv)
+                    } else {
+                        Err(LowerError::UnknownVar(name.clone()))
+                    }
                 }
             }
         }
 
         // Calls / builtins
         Expr::Call { callee, args } => {
+            // 1) Array methods: a.push(x), a.map(f), ...
+            if let Expr::GetProp { recv, name } = &**callee {
+                if let Some(v) = lower_array_method_call(
+                    b, locals, fields, next_field, recv, name, args, funcs, lam_caps
+                )? {
+                    return Ok(v);
+                }
+            }
+
+            // 2) Builtin functions: list(n), print(x)
             if let Expr::Ident(name) = &**callee {
                 if name == "list" {
                     if args.len() != 1 { return Err(LowerError::NotLowerable("list() expects 1 arg")); }
                     let len = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
                     let (_nid, res) = b.push_node(
-                        Inst::AllocArray { elem_hint: Some(Type::Int32), len },
-                        Some(Type::Array(Box::new(Some(Type::Int32)))),
+                        Inst::CallNative {
+                            name: "wir_array_new".into(),
+                            args: vec![len],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::Array(Box::new(None))),
                         1,
                         true,
                     );
@@ -2050,18 +2203,42 @@ fn lower_expr_free<'m>(
 
         // Property / Index
         Expr::GetProp { recv, name } => {
+            if name == "length" {
+                let arr = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
+                let (_nid, res) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_array_len".into(),
+                        args: vec![arr],
+                        pure: false,
+                        can_throw: false,
+                    },
+                    Some(Type::Int32),
+                    1,
+                    true,
+                );
+                return Ok(res[0]);
+            }
+            // fallback: object field
             let obj = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
             let field = intern_field_local(fields, next_field, name);
             let (_nid, res) = b.push_node(Inst::LoadField { obj, field, expected: None }, None, 1, false);
             Ok(res[0])
         }
+
         Expr::Index { recv, index } => {
             let arr = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
             let idx = lower_expr_free(b, locals, fields, next_field, index, funcs, lam_caps)?;
-            let len = { let (_nid, res) = b.push_node(Inst::ArrayLen(arr), Some(Type::Int32), 1, false); res[0] };
-            let deopt = b.deopt_point("load_idx_oob");
-            let _ = b.push_node(Inst::GuardBounds { idx, len, deopt }, Some(Type::Top), 1, true);
-            let (_nid, res) = b.push_node(Inst::LoadElem { arr, idx }, Some(Type::Int32), 1, false);
+            let (_nid, res) = b.push_node(
+                Inst::CallNative {
+                    name: "wir_array_get".into(),
+                    args: vec![arr, idx],
+                    pure: false,
+                    can_throw: false,
+                },
+                None,
+                1,
+                true,
+            );
             Ok(res[0])
         }
 

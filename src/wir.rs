@@ -263,16 +263,29 @@ pub enum Inst {
 
     // ---- Arrays ----
     AllocArray { elem_hint: Option<Type>, len: ValueId },
-    ArrayLen(ValueId),
+    ArrayLen (ValueId),
+    ArraySetLen { arr: ValueId, new_len: ValueId },
     LoadElem { arr: ValueId, idx: ValueId },
     StoreElem { arr: ValueId, idx: ValueId, val: ValueId },
     ArraySlice { arr: ValueId, start: ValueId, end: ValueId },
+
+    // Array methods
+    ArrayPush { arr: ValueId, val: ValueId }, // returns new length
+    ArrayPop  (ValueId),                    // returns popped value or Null
+    ArrayShift  (ValueId),                  // returns shifted value or Null
+    ArrayUnshift { arr: ValueId, val: ValueId }, // returns new length
 
     // High-level array intrinsics (vectorizable lowering)
     ArrayMap { func: FuncId, arr: ValueId },
     ArrayReduce { func: FuncId, init: ValueId, arr: ValueId },
     ArrayFill { arr: ValueId, val: ValueId },
     ArrayCopy { dst: ValueId, src: ValueId, len: ValueId },
+
+    // Extra high-level methods
+    ArrayForEach   { func: FuncId, arr: ValueId }, // returns Null
+    ArrayFind      { func: FuncId, arr: ValueId }, // returns element or Null
+    ArrayFindIndex { func: FuncId, arr: ValueId }, // returns i32 (-1 if not found)
+    ArrayFilter    { func: FuncId, arr: ValueId }, // returns Array<?>
 
     // ---- Strings ----
     StrLen(ValueId),
@@ -363,6 +376,19 @@ impl Inst {
                 | StoreElem { .. }
                 | ArrayFill { .. }
                 | ArrayCopy { .. }
+                // NEW: mutating array ops
+                | ArrayPush { .. }
+                | ArrayPop ( .. )
+                | ArrayShift ( .. )
+                | ArrayUnshift { .. }
+                // NEW: higher-order ops (call user code / runtime)
+                | ArrayMap { .. }
+                | ArrayReduce { .. }
+                | ArrayForEach { .. }
+                | ArrayFind { .. }
+                | ArrayFindIndex { .. }
+                | ArrayFilter { .. }
+                | ArrayReduce { .. }
                 | StrToNumber(_)
                 | CallDirect { .. }
                 | CallIC { .. }
@@ -374,6 +400,7 @@ impl Inst {
                 | ReadBarrier { .. }
         )
     }
+
     /// Whether the instruction *produces* a new effect token.
     pub fn produces_effect_out(&self) -> bool {
         self.needs_effect_in()
@@ -722,19 +749,31 @@ impl EffectKind {
 
             crate::wir::Inst::StoreField { .. }
             | crate::wir::Inst::StoreElem { .. }
-            | crate::wir::Inst::TransitionShape { .. } => EffectKind::Store,
+            | crate::wir::Inst::TransitionShape { .. }
+            | crate::wir::Inst::ArrayPush { .. }
+            | crate::wir::Inst::ArrayPop ( .. )
+            | crate::wir::Inst::ArrayShift ( .. )
+            | crate::wir::Inst::ArrayUnshift { .. }
+            | crate::wir::Inst::ArrayFill { .. }
+            | crate::wir::Inst::ArrayCopy { .. } => EffectKind::Store,
 
+            // Calls (user closures / runtime loops)
             crate::wir::Inst::CallDirect { .. }
             | crate::wir::Inst::CallIC { .. }
             | crate::wir::Inst::CallClosure { .. }
             | crate::wir::Inst::CallNative { .. }
             | crate::wir::Inst::AllocClosure { .. }
-            | crate::wir::Inst::StoreEnv { .. } => EffectKind::Call,
+            | crate::wir::Inst::StoreEnv { .. }
+            | crate::wir::Inst::ArrayMap { .. }
+            | crate::wir::Inst::ArrayReduce { .. }
+            | crate::wir::Inst::ArrayForEach { .. }
+            | crate::wir::Inst::ArrayFind { .. }
+            | crate::wir::Inst::ArrayFindIndex { .. }
+            | crate::wir::Inst::ArrayFilter { .. }
+            | crate::wir::Inst::StrToNumber(_) => EffectKind::Call,
 
             crate::wir::Inst::PostWriteBarrier { .. }
             | crate::wir::Inst::ReadBarrier { .. } => EffectKind::Barrier,
-
-            crate::wir::Inst::StrToNumber(_) => EffectKind::Call,
 
             _ => EffectKind::Entry,
         }
@@ -788,6 +827,55 @@ impl<'m> Builder<'m> {
         res[0]
     }
 }
+
+impl<'m> Builder<'m> {
+    pub fn array_push(&mut self, arr: ValueId, val: ValueId) -> ValueId {
+        let (_nid, res) = self.push_node(Inst::ArrayPush { arr, val }, Some(Type::Int32), 1, true);
+        res[0]
+    }
+    pub fn array_pop(&mut self, arr: ValueId) -> ValueId {
+        let (_nid, res) = self.push_node(Inst::ArrayPop(arr), None, 1, true);
+        res[0]
+    }
+    pub fn array_shift(&mut self, arr: ValueId) -> ValueId {
+        let (_nid, res) = self.push_node(Inst::ArrayShift(arr), None, 1, true);
+        res[0]
+    }
+    pub fn array_unshift(&mut self, arr: ValueId, val: ValueId) -> ValueId {
+        let (_nid, res) = self.push_node(Inst::ArrayUnshift { arr, val }, Some(Type::Int32), 1, true);
+        res[0]
+    }
+
+    pub fn array_map(&mut self, func: FuncId, arr: ValueId) -> ValueId {
+        let (_nid, res) = self.push_node(Inst::ArrayMap { func, arr }, Some(Type::Array(Box::new(None))), 1, true);
+        res[0]
+    }
+    pub fn array_for_each(&mut self, func: FuncId, arr: ValueId) {
+        let _ = self.push_node(Inst::ArrayForEach { func, arr }, Some(Type::Null), 0, true);
+    }
+    pub fn array_find(&mut self, func: FuncId, arr: ValueId) -> ValueId {
+        let (_nid, res) = self.push_node(Inst::ArrayFind { func, arr }, None, 1, true);
+        res[0]
+    }
+    pub fn array_find_index(&mut self, func: FuncId, arr: ValueId) -> ValueId {
+        let (_nid, res) = self.push_node(Inst::ArrayFindIndex { func, arr }, Some(Type::Int32), 1, true);
+        res[0]
+    }
+    pub fn array_filter(&mut self, func: FuncId, arr: ValueId) -> ValueId {
+        let (_nid, res) = self.push_node(Inst::ArrayFilter { func, arr }, Some(Type::Array(Box::new(None))), 1, true);
+        res[0]
+    }
+    pub fn array_reduce(&mut self, func: FuncId, init: ValueId, arr: ValueId) -> ValueId {
+        let (_nid, res) = self.push_node(
+            Inst::ArrayReduce { func, init, arr },
+            Some(Type::Int32),
+            1,
+            true,
+        );
+        res[0]
+    }
+}
+
 
 /// -------- Tiny smoke test (optional) --------
 /// Run with `cargo test` to validate the builder compiles and IR prints.
