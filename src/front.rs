@@ -85,8 +85,8 @@ pub enum Tok {
     #[token("false")] False,
     #[token("null")] Null,
 
-    // Simple builtins (for demo lowering)
-    #[token("list")] ListBuiltin,
+    // Simple builtins
+    #[token("Array")] ListBuiltin,
 
     // Identifiers & literals
     #[regex(r"[A-Za-z_][A-Za-z0-9_]*", |lex| lex.slice().to_string())]
@@ -205,6 +205,7 @@ pub enum Expr {
     Group(Box<Expr>),
     FnLit { params: Vec<String>, body: Block },
     FnRef { name: String },
+    ArrayLit(Vec<Expr>),
 }
 
 
@@ -728,11 +729,25 @@ impl<'src> Parser<'src> {
             Tok::Null => Ok(Expr::LitNull),
             Tok::Str(s) => Ok(Expr::Str(s)),
             Tok::Ident(s) => Ok(Expr::Ident(s)),
-            Tok::ListBuiltin => Ok(Expr::Ident("list".into())), // treated as function
+            Tok::ListBuiltin => Ok(Expr::Ident("Array".into())), // treated as function
             Tok::LParen => {
                 let e = self.expr()?;
                 self.expect(Tok::RParen, "expected ')'")?;
                 Ok(Expr::Group(Box::new(e)))
+            }
+            Tok::LBracket => {
+                let mut elems = Vec::new();
+                if !self.matches(&Tok::RBracket) {
+                    loop {
+                        elems.push(self.expr()?);
+                        // ] ends the literal
+                        if self.matches(&Tok::RBracket) { break; }
+                        // expect comma; allow trailing comma
+                        self.expect(Tok::Comma, "expected ',' in array literal")?;
+                        if self.matches(&Tok::RBracket) { break; }
+                    }
+                }
+                Ok(Expr::ArrayLit(elems))
             }
             Tok::Fn => {
                 // Stage #1: only the anonymous form inside expressions.
@@ -840,6 +855,12 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
             Expr::Group(g) => collect_uses_expr(g, uses),
             Expr::FnLit { .. } | Expr::FnRef { .. } => { /* handled at outer level */ }
             Expr::LitInt(_) | Expr::LitF64(_) | Expr::LitBool(_) | Expr::LitNull | Expr::Str(_) => {}
+
+            Expr::ArrayLit(elems) => {
+                for el in elems {
+                    collect_uses_expr(el, uses);
+                }
+            }
         }
     }
 
@@ -852,12 +873,57 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
         out_funcs: &mut Vec<FuncDecl>,
         lam_caps_out: &mut HashMap<String, Vec<String>>,
     ) -> Block {
-        Block {
-            stmts: b.stmts.iter()
-                .map(|s| rw_stmt(s, used, counter, enclosing_locals, out_funcs, lam_caps_out))
-                .collect()
+        // Start with the incoming scope, then extend as we see new `var`s.
+        let mut scope = enclosing_locals.clone();
+        let mut out_stmts = Vec::with_capacity(b.stmts.len());
+
+        for s in &b.stmts {
+            match s {
+                // `var` introduces a name *after* its initializer; rewrite init with current scope,
+                // then add the binding to the scope for following statements.
+                Stmt::Var { name, init } => {
+                    let init_rw = init.as_ref()
+                        .map(|e| rw_expr(e, used, counter, &scope, out_funcs, lam_caps_out));
+                    out_stmts.push(Stmt::Var { name: name.clone(), init: init_rw });
+                    scope.insert(name.clone());
+                }
+
+                // `for` init can introduce a name that is visible to cond/step/body.
+                Stmt::For { init, cond, step, body } => {
+                    // The `for` sub-scope starts from the scope *before* the loop,
+                    // then (if init is a `var`) it gains that binding.
+                    let mut for_scope = scope.clone();
+
+                    let init_rw = if let Some(i0) = init.as_deref() {
+                        // Rewrite the init using the current for_scope.
+                        let rewritten = Box::new(rw_stmt(i0, used, counter, &for_scope, out_funcs, lam_caps_out));
+                        // If the init is `var id = ...;`, extend for_scope for the rest.
+                        if let Stmt::Var { name, .. } = i0 {
+                            for_scope.insert(name.clone());
+                        }
+                        Some(rewritten)
+                    } else {
+                        None
+                    };
+
+                    let cond_rw = cond.as_ref().map(|e| rw_expr(e, used, counter, &for_scope, out_funcs, lam_caps_out));
+                    let step_rw = step.as_ref().map(|e| rw_expr(e, used, counter, &for_scope, out_funcs, lam_caps_out));
+                    let body_rw = rw_block(body, used, counter, &for_scope, out_funcs, lam_caps_out);
+
+                    out_stmts.push(Stmt::For { init: init_rw, cond: cond_rw, step: step_rw, body: body_rw });
+                }
+
+                // Everything else: rewrite with the current scope.
+                _ => {
+                    let srw = rw_stmt(s, used, counter, &scope, out_funcs, lam_caps_out);
+                    out_stmts.push(srw);
+                }
+            }
         }
+
+        Block { stmts: out_stmts }
     }
+
     fn rw_stmt(
         s: &Stmt,
         used: &mut BTreeSet<String>,
@@ -976,6 +1042,14 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
 
             // terminals
             Expr::LitInt(_) | Expr::LitF64(_) | Expr::LitBool(_) | Expr::LitNull | Expr::Str(_) | Expr::Ident(_) => e.clone(),
+
+            Expr::ArrayLit(elems) => {
+                Expr::ArrayLit(
+                    elems.iter()
+                        .map(|el| rw_expr(el, used, counter, enclosing_locals, out_funcs, lam_caps_out))
+                        .collect()
+                )
+            }
         }
     }
 
@@ -1451,6 +1525,17 @@ impl<'m> Lowerer<'m> {
                     LValue::Ident(name) => { locals.insert(name.clone(), rv); Ok(rv) }
                     LValue::GetProp { recv, name } => {
                         let obj = self.lower_expr(b, locals, recv)?;
+                        if name == "length" {
+                            let (_nid, _r) = b.push_node(
+                                Inst::CallNative { name: "wir_array_set_len".into(), args: vec![obj, rv], pure: false, can_throw: false },
+                                Some(Type::Int32),
+                                1,
+                                true,
+                            );
+                            return Ok(rv);
+                        }
+
+                        let obj = self.lower_expr(b, locals, recv)?;
                         let field = self.intern_field(name);
                         let (_nid, _res) = b.push_node(
                             Inst::StoreField { obj, field, val: rv, expected: None },
@@ -1478,7 +1563,7 @@ impl<'m> Lowerer<'m> {
             Expr::Call { callee, args } => {
                 if let Expr::Ident(name) = &**callee {
                     // Builtin: list(n)
-                    if name == "list" {
+                    if name == "Array" {
                         if args.len() != 1 { return Err(LowerError::NotLowerable("list() expects 1 arg")); }
                         let len = self.lower_expr(b, locals, &args[0])?;
                         let (_nid, res) = b.push_node(
@@ -1547,6 +1632,16 @@ impl<'m> Lowerer<'m> {
             }
 
             Expr::GetProp { recv, name } => {
+                    if name == "length" {
+                    let arr = self.lower_expr(b, locals, recv)?;
+                    let (_nid, res) = b.push_node(
+                        Inst::CallNative { name: "wir_array_len".into(), args: vec![arr], pure: false, can_throw: false },
+                        Some(Type::Int32),
+                        1,
+                        true,
+                    );
+                    return Ok(res[0]);
+                }
                 let obj = self.lower_expr(b, locals, recv)?;
                 let field = self.intern_field(name);
                 let (_nid, res) = b.push_node(Inst::LoadField { obj, field, expected: None }, None, 1, false);
@@ -1564,6 +1659,34 @@ impl<'m> Lowerer<'m> {
                 let _ = b.push_node(Inst::GuardBounds { idx, len, deopt }, Some(Type::Top), 1, true);
                 let (_nid, res) = b.push_node(Inst::LoadElem { arr, idx }, Some(Type::Int32), 1, false);
                 Ok(res[0])
+            }
+
+            Expr::ArrayLit(elems) => {
+                // length
+                let len_v = b.const_i32(elems.len() as i32);
+
+                // allocate (element hint: i32 for now; adjust later if you add type inference)
+                let (_nid, arr_res) = b.push_node(
+                    Inst::AllocArray { elem_hint: Some(Type::Int32), len: len_v },
+                    Some(Type::Array(Box::new(Some(Type::Int32)))),
+                    1,
+                    true,
+                );
+                let arr = arr_res[0];
+
+                // initialize elements
+                for (i, el) in elems.iter().enumerate() {
+                    let v   = self.lower_expr(b, locals, el)?;
+                    let idx = b.const_i32(i as i32);
+                    let _ = b.push_node(
+                        Inst::StoreElem { arr, idx, val: v },
+                        Some(Type::Top),
+                        1,
+                        true,
+                    );
+                }
+
+                Ok(arr)
             }
 
             Expr::FnLit { .. } => {
@@ -1852,8 +1975,8 @@ fn collect_mut_locals_in_block(b: &Block) -> Vec<String> {
 fn lower_array_method_call<'m>(
     b: &mut Builder<'m>,
     locals: &mut HashMap<String, ValueId>,
-    fields: &mut HashMap<String, FieldId>,
-    next_field: &mut u32,
+    _fields: &mut HashMap<String, FieldId>,
+    _next_field: &mut u32,
     recv: &Expr,
     name: &str,
     args: &[Expr],
@@ -1862,8 +1985,9 @@ fn lower_array_method_call<'m>(
 ) -> LResult<Option<ValueId>> {
     use crate::wir::{Inst, Type};
 
-    let arr = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
+    let arr = lower_expr_free(b, locals, _fields, _next_field, recv, funcs, lam_caps)?;
 
+    // Small helper to call a simple native
     macro_rules! cn {
         ($fname:expr, [$($argv:expr),*], $ty:expr) => {{
             let (_nid, res) = b.push_node(
@@ -1882,78 +2006,403 @@ fn lower_array_method_call<'m>(
     }
 
     match name {
-        // --- length as a method for symmetry: a.setLength(n) ---
-        "setLength" => {
-            if args.len() != 1 { return Err(LowerError::NotLowerable("setLength expects 1 arg")); }
-            let n = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
-            return cn!("wir_array_set_len", [arr, n], Some(Type::Int32));
+        // ---- property-like method kept for back-compat
+        "length" => {
+            if !args.is_empty() { return Err(LowerError::NotLowerable("length() expects 0 args")); }
+            return cn!("wir_array_len", [arr], Some(Type::Int32));
         }
 
-        // --- basic mutators ---
+        // ---- basic mutators that already worked via natives
+        "setLength" => {
+            if args.len() != 1 { return Err(LowerError::NotLowerable("setLength expects 1 arg")); }
+            let n = lower_expr_free(b, locals, _fields, _next_field, &args[0], funcs, lam_caps)?;
+            return cn!("wir_array_set_len", [arr, n], Some(Type::Int32));
+        }
         "push" => {
             if args.len() != 1 { return Err(LowerError::NotLowerable("push expects 1 arg")); }
-            let v = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
-            return cn!("wir_array_push", [arr, v], Some(Type::Int32)); // new length
+            let v = lower_expr_free(b, locals, _fields, _next_field, &args[0], funcs, lam_caps)?;
+            return cn!("wir_array_push", [arr, v], Some(Type::Int32));
         }
         "pop" => {
             if !args.is_empty() { return Err(LowerError::NotLowerable("pop expects 0 args")); }
-            return cn!("wir_array_pop", [arr], None); // element or null
+            return cn!("wir_array_pop", [arr], Some(Type::Int32));
         }
         "shift" => {
             if !args.is_empty() { return Err(LowerError::NotLowerable("shift expects 0 args")); }
-            return cn!("wir_array_shift", [arr], None); // element or null
+            return cn!("wir_array_shift", [arr], Some(Type::Int32));
         }
         "unshift" => {
             if args.len() != 1 { return Err(LowerError::NotLowerable("unshift expects 1 arg")); }
-            let v = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
-            return cn!("wir_array_unshift", [arr, v], Some(Type::Int32)); // new length
+            let v = lower_expr_free(b, locals, _fields, _next_field, &args[0], funcs, lam_caps)?;
+            return cn!("wir_array_unshift", [arr, v], Some(Type::Int32));
         }
 
-        // --- higher-order ---
+        // ---- map: build loop in WIR, call the closure for each element
         "map" => {
             if args.len() != 1 { return Err(LowerError::NotLowerable("map expects 1 arg")); }
-            let fun = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
-            return cn!("wir_array_map", [arr, fun], Some(Type::Array(Box::new(None))));
+            let fun = lower_expr_free(b, locals, _fields, _next_field, &args[0], funcs, lam_caps)?;
+
+            // len
+            let (_nid, len_res) = b.push_node(
+                Inst::CallNative { name: "wir_array_len".into(), args: vec![arr], pure: false, can_throw: false },
+                Some(Type::Int32), 1, true);
+            let len = len_res[0];
+
+            // out = new array len
+            let (_nid, out_res) = b.push_node(
+                Inst::CallNative { name: "wir_array_new".into(), args: vec![len], pure: false, can_throw: false },
+                Some(Type::Array(Box::new(None))), 1, true);
+            let out = out_res[0];
+
+            let zero = b.const_i32(0);
+            let one  = b.const_i32(1);
+
+            let head = b.block();
+            let body = b.block();
+            let exit = b.block();
+
+            // loop var phi
+            let i_phi = b.add_block_param(head, Type::Int32);
+
+            b.jump(head, &[zero]);
+            b.position_at(head);
+
+            let (_nid, cnd) = b.push_node(
+                Inst::CmpInt { kind: crate::wir::CmpKind::Lt, a: i_phi, b: len },
+                Some(Type::Bool), 1, false);
+            b.branch(cnd[0], body, exit);
+
+            b.position_at(body);
+            let (_nid, elr) = b.push_node(
+                Inst::CallNative { name: "wir_array_get".into(), args: vec![arr, i_phi], pure: false, can_throw: false },
+                None, 1, true);
+            let el = elr[0];
+
+            let (_nid, mapped) = b.push_node(
+                Inst::CallClosure { conv: crate::wir::CallConv::Fast, fun, args: vec![el] },
+                Some(Type::Int32), 1, true);
+
+            let (_nid, _s) = b.push_node(
+                Inst::CallNative { name: "wir_array_set".into(), args: vec![out, i_phi, mapped[0]], pure: false, can_throw: false },
+                Some(Type::Int32), 1, true);
+
+            let next = b.int_bin(crate::wir::IntBinOp::Add, i_phi, one);
+            b.jump(head, &[next]);
+
+            b.position_at(exit);
+            return Ok(Some(out));
         }
-        "forEach" => {
-            if args.len() != 1 { return Err(LowerError::NotLowerable("forEach expects 1 arg")); }
-            let fun = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
-            return cn!("wir_array_for_each", [arr, fun], Some(Type::Null));
-        }
-        "find" => {
-            if args.len() != 1 { return Err(LowerError::NotLowerable("find expects 1 arg")); }
-            let fun = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
-            return cn!("wir_array_find", [arr, fun], None); // element or null
-        }
-        "findIndex" => {
-            if args.len() != 1 { return Err(LowerError::NotLowerable("findIndex expects 1 arg")); }
-            let fun = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
-            return cn!("wir_array_find_index", [arr, fun], Some(Type::Int32));
-        }
+
+        // ---- filter: out = []; if pred(el) push(out, el)
         "filter" => {
             if args.len() != 1 { return Err(LowerError::NotLowerable("filter expects 1 arg")); }
-            let fun = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
-            return cn!("wir_array_filter", [arr, fun], Some(Type::Array(Box::new(None))));
+            let fun = lower_expr_free(b, locals, _fields, _next_field, &args[0], funcs, lam_caps)?;
+
+            let (_nid, len_res) = b.push_node(
+                Inst::CallNative { name: "wir_array_len".into(), args: vec![arr], pure: false, can_throw: false },
+                Some(Type::Int32), 1, true);
+            let len = len_res[0];
+
+            let zero = b.const_i32(0);
+            let one  = b.const_i32(1);
+
+            // out = list(0)
+            let (_nid, out_res) = b.push_node(
+                Inst::CallNative { name: "wir_array_new".into(), args: vec![zero], pure: false, can_throw: false },
+                Some(Type::Array(Box::new(None))), 1, true);
+            let out = out_res[0];
+
+            let head = b.block();
+            let body = b.block();
+            let exit = b.block();
+
+            let i_phi = b.add_block_param(head, Type::Int32);
+            b.jump(head, &[zero]);
+            b.position_at(head);
+            let (_nid, cnd) = b.push_node(
+                Inst::CmpInt { kind: crate::wir::CmpKind::Lt, a: i_phi, b: len },
+                Some(Type::Bool), 1, false);
+            b.branch(cnd[0], body, exit);
+
+            b.position_at(body);
+            let (_nid, elr) = b.push_node(
+                Inst::CallNative { name: "wir_array_get".into(), args: vec![arr, i_phi], pure: false, can_throw: false },
+                None, 1, true);
+            let el = elr[0];
+
+            let (_nid, pred) = b.push_node(
+                Inst::CallClosure { conv: crate::wir::CallConv::Fast, fun, args: vec![el] },
+                Some(Type::Bool), 1, true);
+
+            let then_b = b.block();
+            let cont_b = b.block();
+            b.branch(pred[0], then_b, cont_b);
+
+            b.position_at(then_b);
+            let (_nid, _pushed) = b.push_node(
+                Inst::CallNative { name: "wir_array_push".into(), args: vec![out, el], pure: false, can_throw: false },
+                Some(Type::Int32), 1, true);
+            b.jump(cont_b, &[]);
+
+            b.position_at(cont_b);
+            let next = b.int_bin(crate::wir::IntBinOp::Add, i_phi, one);
+            b.jump(head, &[next]);
+
+            b.position_at(exit);
+            return Ok(Some(out));
         }
+
+        // ---- forEach: just invoke, return 0
+        "forEach" => {
+            if args.len() != 1 { return Err(LowerError::NotLowerable("forEach expects 1 arg")); }
+            let fun = lower_expr_free(b, locals, _fields, _next_field, &args[0], funcs, lam_caps)?;
+
+            let (_nid, len_res) = b.push_node(
+                Inst::CallNative { name: "wir_array_len".into(), args: vec![arr], pure: false, can_throw: false },
+                Some(Type::Int32), 1, true);
+            let len = len_res[0];
+
+            let zero = b.const_i32(0);
+            let one  = b.const_i32(1);
+
+            let head = b.block();
+            let body = b.block();
+            let exit = b.block();
+
+            let i_phi = b.add_block_param(head, Type::Int32);
+            b.jump(head, &[zero]);
+            b.position_at(head);
+            let (_nid, cnd) = b.push_node(
+                Inst::CmpInt { kind: crate::wir::CmpKind::Lt, a: i_phi, b: len },
+                Some(Type::Bool), 1, false);
+            b.branch(cnd[0], body, exit);
+
+            b.position_at(body);
+            let (_nid, elr) = b.push_node(
+                Inst::CallNative { name: "wir_array_get".into(), args: vec![arr, i_phi], pure: false, can_throw: false },
+                None, 1, true);
+            let el = elr[0];
+
+            let (_nid, _ignored) = b.push_node(
+                Inst::CallClosure { conv: crate::wir::CallConv::Fast, fun, args: vec![el] },
+                Some(Type::Int32), 1, true);
+
+            let next = b.int_bin(crate::wir::IntBinOp::Add, i_phi, one);
+            b.jump(head, &[next]);
+
+            b.position_at(exit);
+            let z = b.const_i32(0);
+            return Ok(Some(z));
+        }
+
+        // ---- reduce: closure(acc, el)
         "reduce" => {
+            use crate::wir::{CallConv, CmpKind, IntBinOp, Inst, Type};
+
             if !(args.len() == 1 || args.len() == 2) {
                 return Err(LowerError::NotLowerable("reduce expects (fn) or (fn, init)"));
             }
-            let fun = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
-            let (init, has_init) = if args.len() == 2 {
-                let i  = lower_expr_free(b, locals, fields, next_field, &args[1], funcs, lam_caps)?;
-                let hi = b.const_i32(1);
-                (i, hi)
+
+            let fun = lower_expr_free(b, locals, _fields, _next_field, &args[0], funcs, lam_caps)?;
+
+            // len(arr)
+            let (_nid, len_res) = b.push_node(
+                Inst::CallNative { name: "wir_array_len".into(), args: vec![arr], pure: false, can_throw: false },
+                Some(Type::Int32), 1, true,
+            );
+            let len = len_res[0];
+
+            let zero = b.const_i32(0);
+            let one  = b.const_i32(1);
+
+            // --- Seed (i0, acc0)
+            // Use init if provided, else: if len==0 -> (0,0), else -> (1, arr[0])
+            let seed_join = b.block();
+            let seed_i    = b.add_block_param(seed_join, Type::Int32);
+            let seed_acc  = b.add_block_param(seed_join, Type::Int32);
+
+            if args.len() == 2 {
+                let init = lower_expr_free(b, locals, _fields, _next_field, &args[1], funcs, lam_caps)?;
+                b.jump(seed_join, &[zero, init]);
             } else {
-                let i  = b.const_i32(0);
-                let hi = b.const_i32(0);
-                (i, hi)
-            };
-            return cn!("wir_array_reduce", [arr, fun, init, has_init], None);
+                let empty_b    = b.block();
+                let nonempty_b = b.block();
+
+                let (_nid, is_empty) = b.push_node(
+                    Inst::CmpInt { kind: CmpKind::Eq, a: len, b: zero },
+                    Some(Type::Bool), 1, false,
+                );
+                b.branch(is_empty[0], empty_b, nonempty_b);
+
+                b.position_at(empty_b);
+                b.jump(seed_join, &[zero, zero]);
+
+                b.position_at(nonempty_b);
+                let (_nid, first_r) = b.push_node(
+                    Inst::CallNative { name: "wir_array_get".into(), args: vec![arr, zero], pure: false, can_throw: false },
+                    None, 1, true,
+                );
+                b.jump(seed_join, &[one, first_r[0]]);
+            }
+
+            // --- Main loop: phis (i, acc)
+            b.position_at(seed_join);
+
+            let head = b.block();
+            let body = b.block();
+            let exit = b.block();
+            let cont = b.block();
+            let res  = b.add_block_param(cont, Type::Int32);
+
+            let i_phi   = b.add_block_param(head, Type::Int32);
+            let acc_phi = b.add_block_param(head, Type::Int32);
+            b.jump(head, &[seed_i, seed_acc]);
+
+            b.position_at(head);
+            let (_nid, cnd) = b.push_node(
+                Inst::CmpInt { kind: CmpKind::Lt, a: i_phi, b: len },
+                Some(Type::Bool), 1, false,
+            );
+            b.branch(cnd[0], body, exit); // <-- no direct branch to cont
+
+            b.position_at(body);
+            let (_nid, el_r) = b.push_node(
+                Inst::CallNative { name: "wir_array_get".into(), args: vec![arr, i_phi], pure: false, can_throw: false },
+                None, 1, true,
+            );
+            let el = el_r[0];
+
+            let (_nid, acc2) = b.push_node(
+                Inst::CallClosure { conv: CallConv::Fast, fun, args: vec![acc_phi, el] },
+                Some(Type::Int32), 1, true,
+            );
+
+            let next_i = b.int_bin(IntBinOp::Add, i_phi, one);
+            b.jump(head, &[next_i, acc2[0]]);
+
+            b.position_at(exit);
+            b.jump(cont, &[acc_phi]);     // <-- pass the phi into cont
+
+            b.position_at(cont);
+            return Ok(Some(res));
+        }
+
+        // ---- find: return first matching element, else 0
+        "find" => {
+            if args.len() != 1 { return Err(LowerError::NotLowerable("find expects 1 arg")); }
+            let fun = lower_expr_free(b, locals, _fields, _next_field, &args[0], funcs, lam_caps)?;
+
+            let (_nid, len_res) = b.push_node(
+                Inst::CallNative { name: "wir_array_len".into(), args: vec![arr], pure: false, can_throw: false },
+                Some(Type::Int32), 1, true);
+            let len = len_res[0];
+
+            let zero = b.const_i32(0);
+            let one  = b.const_i32(1);
+
+            let head = b.block();
+            let body = b.block();
+            let exit = b.block();
+            let cont = b.block();
+            let resp = b.add_block_param(cont, Type::Int32);
+
+            let i_phi = b.add_block_param(head, Type::Int32);
+            b.jump(head, &[zero]);
+
+            b.position_at(head);
+            let (_nid, cnd) = b.push_node(
+                Inst::CmpInt { kind: crate::wir::CmpKind::Lt, a: i_phi, b: len },
+                Some(Type::Bool), 1, false);
+            b.branch(cnd[0], body, exit);
+
+            b.position_at(body);
+            let (_nid, elr) = b.push_node(
+                Inst::CallNative { name: "wir_array_get".into(), args: vec![arr, i_phi], pure: false, can_throw: false },
+                None, 1, true);
+            let el = elr[0];
+
+            let (_nid, hit) = b.push_node(
+                Inst::CallClosure { conv: crate::wir::CallConv::Fast, fun, args: vec![el] },
+                Some(Type::Bool), 1, true);
+
+            let then_b = b.block();
+            let cont_b = b.block();
+            b.branch(hit[0], then_b, cont_b);
+
+            b.position_at(then_b);
+            b.jump(cont, &[el]);
+
+            b.position_at(cont_b);
+            let next = b.int_bin(crate::wir::IntBinOp::Add, i_phi, one);
+            b.jump(head, &[next]);
+
+            b.position_at(exit);
+            b.jump(cont, &[zero]);
+
+            b.position_at(cont);
+            return Ok(Some(resp));
+        }
+
+        // ---- findIndex: return index or -1
+        "findIndex" => {
+            if args.len() != 1 { return Err(LowerError::NotLowerable("findIndex expects 1 arg")); }
+            let fun = lower_expr_free(b, locals, _fields, _next_field, &args[0], funcs, lam_caps)?;
+
+            let (_nid, len_res) = b.push_node(
+                Inst::CallNative { name: "wir_array_len".into(), args: vec![arr], pure: false, can_throw: false },
+                Some(Type::Int32), 1, true);
+            let len = len_res[0];
+
+            let zero = b.const_i32(0);
+            let one  = b.const_i32(1);
+            let neg1 = b.const_i32(-1);
+
+            let head = b.block();
+            let body = b.block();
+            let exit = b.block();
+            let cont = b.block();
+            let resp = b.add_block_param(cont, Type::Int32);
+
+            let i_phi = b.add_block_param(head, Type::Int32);
+            b.jump(head, &[zero]);
+
+            b.position_at(head);
+            let (_nid, cnd) = b.push_node(
+                Inst::CmpInt { kind: crate::wir::CmpKind::Lt, a: i_phi, b: len },
+                Some(Type::Bool), 1, false);
+            b.branch(cnd[0], body, exit);
+
+            b.position_at(body);
+            let (_nid, elr) = b.push_node(
+                Inst::CallNative { name: "wir_array_get".into(), args: vec![arr, i_phi], pure: false, can_throw: false },
+                None, 1, true);
+            let el = elr[0];
+
+            let (_nid, hit) = b.push_node(
+                Inst::CallClosure { conv: crate::wir::CallConv::Fast, fun, args: vec![el] },
+                Some(Type::Bool), 1, true);
+
+            let then_b = b.block();
+            let cont_b = b.block();
+            b.branch(hit[0], then_b, cont_b);
+
+            b.position_at(then_b);
+            b.jump(cont, &[i_phi]);
+
+            b.position_at(cont_b);
+            let next = b.int_bin(crate::wir::IntBinOp::Add, i_phi, one);
+            b.jump(head, &[next]);
+
+            b.position_at(exit);
+            b.jump(cont, &[neg1]);
+
+            b.position_at(cont);
+            return Ok(Some(resp));
         }
 
         _ => {}
     }
+
     Ok(None)
 }
 
@@ -2142,7 +2591,7 @@ fn lower_expr_free<'m>(
 
             // 2) Builtin functions: list(n), print(x)
             if let Expr::Ident(name) = &**callee {
-                if name == "list" {
+                if name == "Array" {
                     if args.len() != 1 { return Err(LowerError::NotLowerable("list() expects 1 arg")); }
                     let len = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
                     let (_nid, res) = b.push_node(
@@ -2240,6 +2689,29 @@ fn lower_expr_free<'m>(
                 true,
             );
             Ok(res[0])
+        }
+
+        Expr::ArrayLit(elems) => {
+            let len_v = b.const_i32(elems.len() as i32);
+            let (_nid, arr_res) = b.push_node(
+                Inst::AllocArray { elem_hint: Some(Type::Int32), len: len_v },
+                Some(Type::Array(Box::new(Some(Type::Int32)))),
+                1,
+                true,
+            );
+            let arr = arr_res[0];
+
+            for (i, el) in elems.iter().enumerate() {
+                let v   = lower_expr_free(b, locals, fields, next_field, el, funcs, lam_caps)?;
+                let idx = b.const_i32(i as i32);
+                let _ = b.push_node(
+                    Inst::StoreElem { arr, idx, val: v },
+                    Some(Type::Top),
+                    1,
+                    true,
+                );
+            }
+            Ok(arr)
         }
 
         // Closure creation from hoisted lambda

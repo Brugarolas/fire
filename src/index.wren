@@ -57,3 +57,81 @@ fn make_adder(x) {
 var add42 = make_adder(42);
 print(add42(0));  // expect 42
 print(add42(100)); // expect 142
+
+// ===========================
+// Arrays
+// ===========================
+
+print("===== Arrays: create & index =====");
+var array = [10, 20, 30];
+print(array[0] + array[1] + array[2]); // expect 60
+print(array);
+
+var a = Array(3);        // [0,0,0]
+a[0] = 10;
+a[1] = 20;
+a[2] = 30;
+print(a[0] + a[1] + a[2]); // expect 60
+
+print("===== Arrays: length & setLength =====");
+print(a.length());      // expect 3
+a.setLength(5);         // grow to 5
+a[3] = 40;
+a[4] = 50;
+print(a.length());      // expect 5
+print(a[3] + a[4]);     // expect 90
+
+print("===== Arrays: length property =====");
+var arr = [1, 2, 3, 4, 5, 6, 7, 8];
+print(arr.length);      // expect 8
+arr.length = 5;
+print(arr.length);      // expect 5
+arr.setLength(2);       // legacy method still works
+print(arr.length);      // expect 2
+print(arr.length());    // method form still works → expect 2
+
+print("===== Arrays: push/pop/shift/unshift =====");
+var b = Array(0);        // start empty-length array (implementation may allow 0)
+b.setLength(0);
+b.push(1);
+b.push(2);
+b.push(3);              // b = [1,2,3]
+print(b.length());      // expect 3
+print(b.pop());         // expect 3, b = [1,2]
+print(b.shift());       // expect 1, b = [2]
+b.unshift(9);           // b = [9,2]
+print(b.length());      // expect 2
+print(b[0] + b[1]);     // expect 11
+
+print("===== Arrays: map/filter/forEach/reduce/find/findIndex =====");
+var n = 6;
+var c = Array(n);
+var i = 0;
+while (i < n) {
+    c[i] = i;   // c = [0,1,2,3,4,5]
+    i += 1;
+}
+
+// map: x -> x*2  => [0,2,4,6,8,10]
+var d = c.map(|x| x * 2);
+print(d[0] + d[1] + d[2]);       // expect 6
+
+// filter: keep >= 4  => [4,5]
+var e = c.filter(|x| x >= 4);
+print(e.length());               // expect 2
+print(e[0] + e[1]);              // expect 9
+
+// forEach: accumulate into outer var
+var acc = 0;
+c.forEach(|x| { acc = acc + x; });
+print(acc);                      // expect 15  (0+1+2+3+4+5)
+
+// reduce: sum with init 100 -> 115
+var sum = c.reduce(|s, x| s + x, 100);
+print(sum);                      // expect 115
+
+// find: first even >= 4 -> 4
+print(c.find(|x| (x % 2) == 0 && x >= 4));   // expect 4
+
+// findIndex: index of 4 -> 4
+print(c.findIndex(|x| x == 4));              // expect 4

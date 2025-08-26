@@ -10,6 +10,7 @@ use cranelift_module::{Linkage, Module as _};
 use cranelift::codegen::ir::instructions::BlockArg;
 use crate::value::*;
 use std::mem;
+use cranelift::prelude::{types, AbiParam, InstBuilder, IntCC};
 
 use crate::value::{
     self, BoxedF64, ObjHeader, TAG_BOXED_F64, TAG_ARRAY,
@@ -55,23 +56,27 @@ impl Default for JIT {
             fn wir_cmp_ge_slow(a: i64, b: i64) -> i64;
 
             // arrays
-            fn wir_array_new(init_len_val: i64) -> i64;
-            fn wir_array_len(arr_val: i64) -> i64;
-            fn wir_array_get(arr_val: i64, idx_val: i64) -> i64;
-            fn wir_array_set(arr_val: i64, idx_val: i64, value: i64) -> i64;
-            fn wir_array_set_len(arr_val: i64, new_len_val: i64) -> i64;
+            fn wir_array_new(len: i64) -> i64;
+            fn wir_array_len(arr: i64) -> i64;
+            fn wir_array_get(arr: i64, idx: i64) -> i64;
+            fn wir_array_set(arr: i64, idx: i64, val: i64) -> i64;
+            fn wir_array_set_len(arr: i64, new_len: i64) -> i64;
 
-            fn wir_array_push(arr_val: i64, value: i64) -> i64;
-            fn wir_array_pop(arr_val: i64) -> i64;
-            fn wir_array_shift(arr_val: i64) -> i64;
-            fn wir_array_unshift(arr_val: i64, value: i64) -> i64;
+            fn wir_array_push(arr: i64, val: i64) -> i64;
+            fn wir_array_pop(arr: i64) -> i64;
+            fn wir_array_shift(arr: i64) -> i64;
+            fn wir_array_unshift(arr: i64, val: i64) -> i64;
 
-            fn wir_array_map(arr_val: i64, closure: i64) -> i64;
-            fn wir_array_for_each(arr_val: i64, closure: i64) -> i64;
-            fn wir_array_find(arr_val: i64, closure: i64) -> i64;
-            fn wir_array_find_index(arr_val: i64, closure: i64) -> i64;
-            fn wir_array_filter(arr_val: i64, closure: i64) -> i64;
-            fn wir_array_reduce(arr_val: i64, closure: i64, init: i64, has_init_raw_bool: i64) -> i64;
+            fn wir_array_slice(arr: i64, start: i64, end: i64) -> i64;
+            fn wir_array_map(arr: i64, fun_ptr: i64) -> i64;
+            fn wir_array_for_each(arr: i64, fun_ptr: i64) -> i64;
+            fn wir_array_find(arr: i64, fun_ptr: i64) -> i64;
+            fn wir_array_find_index(arr: i64, fun_ptr: i64) -> i64;
+            fn wir_array_filter(arr: i64, fun_ptr: i64) -> i64;
+            fn wir_array_reduce(arr: i64, fun_ptr: i64, has_init: i64, init: i64) -> i64;
+
+            fn wir_array_fill(arr: i64, val: i64) -> i64;
+            fn wir_array_copy(dst: i64, src: i64, len: i64) -> i64;
         }
         unsafe {
             jb.symbol("wir_print_i64", wir_print_i64 as *const extern "C" fn(i64) -> i64 as *const u8);
@@ -92,23 +97,27 @@ impl Default for JIT {
             jb.symbol("wir_cmp_gt_slow", wir_cmp_gt_slow as *const extern "C" fn(i64,i64)->i64 as *const u8);
             jb.symbol("wir_cmp_ge_slow", wir_cmp_ge_slow as *const extern "C" fn(i64,i64)->i64 as *const u8);
 
-            jb.symbol("wir_array_new",        wir_array_new        as *const u8);
-            jb.symbol("wir_array_len",        wir_array_len        as *const u8);
-            jb.symbol("wir_array_get",        wir_array_get        as *const u8);
-            jb.symbol("wir_array_set",        wir_array_set        as *const u8);
-            jb.symbol("wir_array_set_len",    wir_array_set_len    as *const u8);
+            jb.symbol("wir_array_new",       wir_array_new as *const extern "C" fn(i64) -> i64 as *const u8);
+            jb.symbol("wir_array_len",       wir_array_len as *const extern "C" fn(i64) -> i64 as *const u8);
+            jb.symbol("wir_array_get",       wir_array_get as *const extern "C" fn(i64, i64) -> i64 as *const u8);
+            jb.symbol("wir_array_set",       wir_array_set as *const extern "C" fn(i64, i64, i64) -> i64 as *const u8);
+            jb.symbol("wir_array_set_len",   wir_array_set_len as *const extern "C" fn(i64, i64) -> i64 as *const u8);
 
-            jb.symbol("wir_array_push",       wir_array_push       as *const u8);
-            jb.symbol("wir_array_pop",        wir_array_pop        as *const u8);
-            jb.symbol("wir_array_shift",      wir_array_shift      as *const u8);
-            jb.symbol("wir_array_unshift",    wir_array_unshift    as *const u8);
+            jb.symbol("wir_array_push",      wir_array_push as *const extern "C" fn(i64, i64) -> i64 as *const u8);
+            jb.symbol("wir_array_pop",       wir_array_pop as *const extern "C" fn(i64) -> i64 as *const u8);
+            jb.symbol("wir_array_shift",     wir_array_shift as *const extern "C" fn(i64) -> i64 as *const u8);
+            jb.symbol("wir_array_unshift",   wir_array_unshift as *const extern "C" fn(i64, i64) -> i64 as *const u8);
 
-            jb.symbol("wir_array_map",        wir_array_map        as *const u8);
-            jb.symbol("wir_array_for_each",   wir_array_for_each   as *const u8);
-            jb.symbol("wir_array_find",       wir_array_find       as *const u8);
-            jb.symbol("wir_array_find_index", wir_array_find_index as *const u8);
-            jb.symbol("wir_array_filter",     wir_array_filter     as *const u8);
-            jb.symbol("wir_array_reduce",     wir_array_reduce     as *const u8);
+            jb.symbol("wir_array_slice",     wir_array_slice as *const extern "C" fn(i64, i64, i64) -> i64 as *const u8);
+            jb.symbol("wir_array_map",       wir_array_map as *const extern "C" fn(i64, i64) -> i64 as *const u8);
+            jb.symbol("wir_array_for_each",  wir_array_for_each as *const extern "C" fn(i64, i64) -> i64 as *const u8);
+            jb.symbol("wir_array_find",      wir_array_find as *const extern "C" fn(i64, i64) -> i64 as *const u8);
+            jb.symbol("wir_array_find_index",wir_array_find_index as *const extern "C" fn(i64, i64) -> i64 as *const u8);
+            jb.symbol("wir_array_filter",    wir_array_filter as *const extern "C" fn(i64, i64) -> i64 as *const u8);
+            jb.symbol("wir_array_reduce",    wir_array_reduce as *const extern "C" fn(i64, i64, i64, i64) -> i64 as *const u8);
+
+            jb.symbol("wir_array_fill",      wir_array_fill as *const extern "C" fn(i64, i64) -> i64 as *const u8);
+            jb.symbol("wir_array_copy",      wir_array_copy as *const extern "C" fn(i64, i64, i64) -> i64 as *const u8);
         }
 
         let module = cranelift_jit::JITModule::new(jb);
@@ -118,6 +127,103 @@ impl Default for JIT {
             keep_alive: Vec::new(),
             heap_keep_alive: Vec::new(),
         }
+    }
+}
+
+impl JIT {
+    /// Get an i64-typed code pointer for a compiled WIR function (`wir_f_<id>`).
+    fn funptr_i64(&mut self, fb: &mut FunctionBuilder, fid: FuncId) -> cranelift::prelude::Value {
+        use cranelift::prelude::*;
+
+        let ptr_ty = self.module.target_config().pointer_type();
+
+        // JIT-internal callee signature: (argv_ptr, argc) -> i64
+        let mut sig = self.module.make_signature();
+        sig.call_conv = self.module.isa().default_call_conv(); // IMPORTANT: native ABI
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+
+        let sym = format!("wir_f_{}", fid.0);
+        let func_id = self
+            .module
+            .declare_function(&sym, Linkage::Import, &sig)
+            .expect("declare wir_f_*");
+        let func_ref = self.module.declare_func_in_func(func_id, &mut fb.func);
+
+        let addr = fb.ins().func_addr(ptr_ty, func_ref);
+
+        // Normalize to i64 for our FFI.
+        match ptr_ty {
+            types::I64 => addr,
+            types::I32 => fb.ins().uextend(types::I64, addr),
+            _ => fb.ins().uextend(types::I64, addr),
+        }
+    }
+}
+
+impl JIT {
+    #[inline]
+    fn ptr_ty(&self) -> types::Type {
+        self.module.target_config().pointer_type()
+    }
+
+/// Indirect call to a JITed function by emitting `func_addr` and then `call_indirect`.
+    pub fn call_funcref<'a>(
+        &mut self,
+        fb: &mut FunctionBuilder<'a>,
+        func_id: cranelift_module::FuncId,
+        set_sig: impl FnOnce(&mut Signature),
+        args: &[Value],
+    ) -> Result<Vec<Value>, String> {
+        let ptr_ty = self.ptr_ty();
+
+        // Get a FuncRef and materialize its absolute address at runtime.
+        let func_ref = self.module.declare_func_in_func(func_id, &mut fb.func);
+        let fnptr = fb.ins().func_addr(ptr_ty, func_ref);
+
+        // Signature MUST match how wir_f_* were defined: native/default CC.
+        let mut sig = self.module.make_signature();
+        sig.call_conv = self.module.isa().default_call_conv();
+        set_sig(&mut sig);
+        let sigref = fb.import_signature(sig);
+
+        let call = fb.ins().call_indirect(sigref, fnptr, args);
+        Ok(fb.inst_results(call).to_vec())
+    }
+}
+
+impl JIT {
+    /// Call a host/imported function via an *indirect* call.
+    fn call_import<'a>(
+        &mut self,
+        fb: &mut cranelift_frontend::FunctionBuilder<'a>,
+        name: &str,
+        build_sig: impl FnOnce(&mut cranelift::prelude::Signature),
+        args: &[cranelift::prelude::Value],
+    ) -> Result<cranelift::prelude::Value, String> {
+        use cranelift::prelude::*;
+        use cranelift_module::Linkage;
+
+        let ptr_ty = self.module.target_config().pointer_type();
+
+        // Build the callee signature and import it into the current function.
+        let mut sig = self.module.make_signature();
+        sig.call_conv = self.module.isa().default_call_conv(); // IMPORTANT
+        build_sig(&mut sig);
+        let sigref = fb.import_signature(sig.clone());
+
+        // Declare the external symbol, get a FuncRef for this function body.
+        let func_id = self
+            .module
+            .declare_function(name, Linkage::Import, &sig)
+            .map_err(|e| e.to_string())?;
+        let func_ref = self.module.declare_func_in_func(func_id, &mut fb.func);
+
+        // Get a pointer to the callee, then *indirect* call through that pointer.
+        let fptr = fb.ins().func_addr(ptr_ty, func_ref);
+        let call = fb.ins().call_indirect(sigref, fptr, args);
+        Ok(fb.inst_results(call)[0])
     }
 }
 
@@ -148,6 +254,8 @@ impl JIT {
         ctx.func.signature.params.push(AbiParam::new(ptr_ty));
         ctx.func.signature.params.push(AbiParam::new(types::I64));
         ctx.func.signature.returns.push(AbiParam::new(types::I64));
+
+        ctx.func.signature.call_conv = self.module.isa().default_call_conv();
 
         eprintln!(
             "[JIT] compile wir_f_{}: {} nodes, {} values, {} params",
@@ -295,210 +403,467 @@ impl JIT {
                             if res_count == 1 { vmap.bind(node.results[0], fast_res); }
                         }
 
-                        // ---------------- Arrays (heap words via wir_alloc_words) ----------------
-                        // AllocArray: -> wir_array_new(len)
+                        // ---------------- Arrays (host runtime) ----------------
                         Inst::AllocArray { elem_hint: _, len } => {
-                            let mut sig = self.module.make_signature();
-                            sig.params.push(AbiParam::new(types::I64));   // len (SMI)
-                            sig.returns.push(AbiParam::new(types::I64));  // array object
-                            let fid   = self.module.declare_function("wir_array_new", Linkage::Import, &sig).map_err(|e| e.to_string())?;
-                            let fref  = self.module.declare_func_in_func(fid, &mut fb.func);
-                            let llen  = vmap.get_or_emit(*len, &mut fb, args_base, fun_ir);
-                            let call  = fb.ins().call(fref, &[llen]);
-                            let arr   = fb.inst_results(call)[0];
-                            if res_count == 1 { vmap.bind(node.results[0], arr); }
-                        }
-
-                        Inst::ArrayLen(arr) => {
-                            let mut sig = self.module.make_signature();
-                            sig.params.push(AbiParam::new(types::I64));   // arr
-                            sig.returns.push(AbiParam::new(types::I64));  // len (SMI)
-                            let fid  = self.module.declare_function("wir_array_len", Linkage::Import, &sig).map_err(|e| e.to_string())?;
-                            let fref = self.module.declare_func_in_func(fid, &mut fb.func);
-                            let a    = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
-                            let call = fb.ins().call(fref, &[a]);
-                            let lenv = fb.inst_results(call)[0];
-                            if res_count == 1 { vmap.bind(node.results[0], lenv); }
-                        }
-
-                        Inst::LoadElem { arr, idx } => {
-                            let mut sig = self.module.make_signature();
-                            sig.params.push(AbiParam::new(types::I64));   // arr
-                            sig.params.push(AbiParam::new(types::I64));   // idx (SMI)
-                            sig.returns.push(AbiParam::new(types::I64));  // value
-                            let fid  = self.module.declare_function("wir_array_get", Linkage::Import, &sig).map_err(|e| e.to_string())?;
-                            let fref = self.module.declare_func_in_func(fid, &mut fb.func);
-                            let a    = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
-                            let i    = vmap.get_or_emit(*idx, &mut fb, args_base, fun_ir);
-                            let call = fb.ins().call(fref, &[a, i]);
-                            let v    = fb.inst_results(call)[0];
-                            if res_count == 1 { vmap.bind(node.results[0], v); }
-                        }
-
-                        Inst::StoreElem { arr, idx, val } => {
-                            let mut sig = self.module.make_signature();
-                            sig.params.push(AbiParam::new(types::I64));   // arr
-                            sig.params.push(AbiParam::new(types::I64));   // idx (SMI)
-                            sig.params.push(AbiParam::new(types::I64));   // val
-                            sig.returns.push(AbiParam::new(types::I64));  // token (0)
-                            let fid  = self.module.declare_function("wir_array_set", Linkage::Import, &sig).map_err(|e| e.to_string())?;
-                            let fref = self.module.declare_func_in_func(fid, &mut fb.func);
-                            let a    = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
-                            let i    = vmap.get_or_emit(*idx, &mut fb, args_base, fun_ir);
-                            let vv   = vmap.get_or_emit(*val, &mut fb, args_base, fun_ir);
-                            let call = fb.ins().call(fref, &[a, i, vv]);
-                            let tok  = fb.inst_results(call)[0];
-                            if res_count == 1 { vmap.bind(node.results[0], tok); }
-                        }
-
-                        // (NEW) if you add a WIR op:
-                        Inst::ArraySetLen { arr, new_len } => {
-                            let mut sig = self.module.make_signature();
-                            sig.params.push(AbiParam::new(types::I64));   // arr
-                            sig.params.push(AbiParam::new(types::I64));   // new_len (SMI)
-                            sig.returns.push(AbiParam::new(types::I64));  // new len (SMI)
-                            let fid  = self.module.declare_function("wir_array_set_len", Linkage::Import, &sig).map_err(|e| e.to_string())?;
-                            let fref = self.module.declare_func_in_func(fid, &mut fb.func);
-                            let a    = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
-                            let nl   = vmap.get_or_emit(*new_len, &mut fb, args_base, fun_ir);
-                            let call = fb.ins().call(fref, &[a, nl]);
-                            let out  = fb.inst_results(call)[0];
+                            use cranelift::prelude::{AbiParam, types};
+                            let len_v = vmap.get_or_emit(*len, &mut fb, args_base, fun_ir);
+                            let out   = self.call_import(
+                                &mut fb,
+                                "wir_array_new",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64)); // len
+                                    s.returns.push(AbiParam::new(types::I64));
+                                },
+                                &[len_v],
+                            )?;
                             if res_count == 1 { vmap.bind(node.results[0], out); }
                         }
 
                         Inst::ArrayLen(arr) => {
-                            let base     = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
-                            let len_raw  = fb.ins().load(types::I64, MemFlags::trusted(), base, 0);
-                            // Re-encode to SMI: (raw<<1)|1
-                            let sh       = fb.ins().ishl_imm(len_raw, 1);
-                            let len_smi  = fb.ins().iadd_imm(sh, 1);
-                            if res_count == 1 { vmap.bind(node.results[0], len_smi); }
+                            use cranelift::prelude::{AbiParam, types};
+                            let a   = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
+                            let out = self.call_import(
+                                &mut fb,
+                                "wir_array_len",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64)); // arr
+                                    s.returns.push(AbiParam::new(types::I64)); // len (SMI)
+                                },
+                                &[a],
+                            )?;
+                            if res_count == 1 { vmap.bind(node.results[0], out); }
                         }
 
-                        // ---------------- Closures ----------------
+                        Inst::LoadElem { arr, idx } => {
+                            use cranelift::prelude::{AbiParam, types};
+                            let a   = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
+                            let i   = vmap.get_or_emit(*idx, &mut fb, args_base, fun_ir);
+                            let out = self.call_import(
+                                &mut fb,
+                                "wir_array_get",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64)); // arr
+                                    s.params.push(AbiParam::new(types::I64)); // idx (SMI)
+                                    s.returns.push(AbiParam::new(types::I64)); // value
+                                },
+                                &[a, i],
+                            )?;
+                            if res_count == 1 { vmap.bind(node.results[0], out); }
+                        }
+
+                        Inst::StoreElem { arr, idx, val } => {
+                            use cranelift::prelude::{AbiParam, types};
+                            let a   = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
+                            let i   = vmap.get_or_emit(*idx, &mut fb, args_base, fun_ir);
+                            let vv  = vmap.get_or_emit(*val, &mut fb, args_base, fun_ir);
+                            let out = self.call_import(
+                                &mut fb,
+                                "wir_array_set",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64)); // arr
+                                    s.params.push(AbiParam::new(types::I64)); // idx
+                                    s.params.push(AbiParam::new(types::I64)); // val
+                                    s.returns.push(AbiParam::new(types::I64)); // status / 0
+                                },
+                                &[a, i, vv],
+                            )?;
+                            if res_count == 1 { vmap.bind(node.results[0], out); }
+                        }
+
+                        Inst::ArraySetLen { arr, new_len } => {
+                            use cranelift::prelude::{AbiParam, types};
+                            let a   = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
+                            let nl  = vmap.get_or_emit(*new_len, &mut fb, args_base, fun_ir);
+                            let out = self.call_import(
+                                &mut fb,
+                                "wir_array_set_len",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64)); // arr
+                                    s.params.push(AbiParam::new(types::I64)); // new_len (SMI)
+                                    s.returns.push(AbiParam::new(types::I64)); // 0
+                                },
+                                &[a, nl],
+                            )?;
+                            if res_count == 1 { vmap.bind(node.results[0], out); }
+                        }
+
+                        Inst::ArraySlice { arr, start, end } => {
+                            use cranelift::prelude::{AbiParam, types};
+                            let a = vmap.get_or_emit(*arr,   &mut fb, args_base, fun_ir);
+                            let s = vmap.get_or_emit(*start, &mut fb, args_base, fun_ir);
+                            let e = vmap.get_or_emit(*end,   &mut fb, args_base, fun_ir);
+                            let out = self.call_import(
+                                &mut fb,
+                                "wir_array_slice",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64)); // arr
+                                    s.params.push(AbiParam::new(types::I64)); // start (SMI)
+                                    s.params.push(AbiParam::new(types::I64)); // end (SMI)
+                                    s.returns.push(AbiParam::new(types::I64)); // new arr
+                                },
+                                &[a, s, e],
+                            )?;
+                            if res_count == 1 { vmap.bind(node.results[0], out); }
+                        }
+
+                        Inst::ArrayPush { arr, val } => {
+                            use cranelift::prelude::{AbiParam, types};
+                            let a = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
+                            let v = vmap.get_or_emit(*val, &mut fb, args_base, fun_ir);
+                            let out = self.call_import(
+                                &mut fb,
+                                "wir_array_push",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64));
+                                    s.params.push(AbiParam::new(types::I64));
+                                    s.returns.push(AbiParam::new(types::I64)); // new len (SMI)
+                                },
+                                &[a, v],
+                            )?;
+                            if res_count == 1 { vmap.bind(node.results[0], out); }
+                        }
+
+                        Inst::ArrayPop(arr) => {
+                            use cranelift::prelude::{AbiParam, types};
+                            let a = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
+                            let out = self.call_import(
+                                &mut fb,
+                                "wir_array_pop",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64));
+                                    s.returns.push(AbiParam::new(types::I64)); // popped value or 0
+                                },
+                                &[a],
+                            )?;
+                            if res_count == 1 { vmap.bind(node.results[0], out); }
+                        }
+
+                        Inst::ArrayShift(arr) => {
+                            use cranelift::prelude::{AbiParam, types};
+                            let a = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
+                            let out = self.call_import(
+                                &mut fb,
+                                "wir_array_shift",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64));
+                                    s.returns.push(AbiParam::new(types::I64)); // shifted value or 0
+                                },
+                                &[a],
+                            )?;
+                            if res_count == 1 { vmap.bind(node.results[0], out); }
+                        }
+
+                        Inst::ArrayUnshift { arr, val } => {
+                            use cranelift::prelude::{AbiParam, types};
+                            let a = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
+                            let v = vmap.get_or_emit(*val, &mut fb, args_base, fun_ir);
+                            let out = self.call_import(
+                                &mut fb,
+                                "wir_array_unshift",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64));
+                                    s.params.push(AbiParam::new(types::I64));
+                                    s.returns.push(AbiParam::new(types::I64)); // new len (SMI)
+                                },
+                                &[a, v],
+                            )?;
+                            if res_count == 1 { vmap.bind(node.results[0], out); }
+                        }
+
+                        Inst::ArrayMap { func, arr } => {
+                            use cranelift::prelude::{AbiParam, types};
+                            // JIT→JIT code pointer (still fine as direct func_ref->addr)
+                            let fun_ptr = self.funptr_i64(&mut fb, *func);
+                            let a = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
+                            let out = self.call_import(
+                                &mut fb,
+                                "wir_array_map",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64)); // arr
+                                    s.params.push(AbiParam::new(types::I64)); // fun_ptr (i64)
+                                    s.returns.push(AbiParam::new(types::I64)); // new arr
+                                },
+                                &[a, fun_ptr],
+                            )?;
+                            if res_count == 1 { vmap.bind(node.results[0], out); }
+                        }
+
+                        Inst::ArrayForEach { func, arr } => {
+                            use cranelift::prelude::{AbiParam, types};
+                            let fun_ptr = self.funptr_i64(&mut fb, *func);
+                            let a = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
+                            let out = self.call_import(
+                                &mut fb,
+                                "wir_array_for_each",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64));
+                                    s.params.push(AbiParam::new(types::I64));
+                                    s.returns.push(AbiParam::new(types::I64)); // 0
+                                },
+                                &[a, fun_ptr],
+                            )?;
+                            if res_count == 1 { vmap.bind(node.results[0], out); }
+                        }
+
+                        Inst::ArrayFind { func, arr } => {
+                            use cranelift::prelude::{AbiParam, types};
+                            let fun_ptr = self.funptr_i64(&mut fb, *func);
+                            let a = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
+                            let out = self.call_import(
+                                &mut fb,
+                                "wir_array_find",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64));
+                                    s.params.push(AbiParam::new(types::I64));
+                                    s.returns.push(AbiParam::new(types::I64)); // value or 0
+                                },
+                                &[a, fun_ptr],
+                            )?;
+                            if res_count == 1 { vmap.bind(node.results[0], out); }
+                        }
+
+                        Inst::ArrayFindIndex { func, arr } => {
+                            use cranelift::prelude::{AbiParam, types};
+                            let fun_ptr = self.funptr_i64(&mut fb, *func);
+                            let a = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
+                            let out = self.call_import(
+                                &mut fb,
+                                "wir_array_find_index",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64));
+                                    s.params.push(AbiParam::new(types::I64));
+                                    s.returns.push(AbiParam::new(types::I64)); // SMI or smi(-1)
+                                },
+                                &[a, fun_ptr],
+                            )?;
+                            if res_count == 1 { vmap.bind(node.results[0], out); }
+                        }
+
+                        Inst::ArrayFilter { func, arr } => {
+                            use cranelift::prelude::{AbiParam, types};
+                            let fun_ptr = self.funptr_i64(&mut fb, *func);
+                            let a = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
+                            let out = self.call_import(
+                                &mut fb,
+                                "wir_array_filter",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64));
+                                    s.params.push(AbiParam::new(types::I64));
+                                    s.returns.push(AbiParam::new(types::I64)); // new arr
+                                },
+                                &[a, fun_ptr],
+                            )?;
+                            if res_count == 1 { vmap.bind(node.results[0], out); }
+                        }
+
+                        Inst::ArrayReduce { func, init, arr } => {
+                            use cranelift::prelude::{AbiParam, types, IntCC};
+
+                            // Prepare args (and compute has_init).
+                            let fun_ptr  = self.funptr_i64(&mut fb, *func);
+                            let init_v   = vmap.get_or_emit(*init, &mut fb, args_base, fun_ir);
+                            let zero     = fb.ins().iconst(types::I64, 0);
+                            let has_cond = fb.ins().icmp(IntCC::NotEqual, init_v, zero);
+                            let one      = fb.ins().iconst(types::I64, 1);
+                            let has_init = fb.ins().select(has_cond, one, zero);
+                            let a        = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
+
+                            let out = self.call_import(
+                                &mut fb,
+                                "wir_array_reduce",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64)); // arr
+                                    s.params.push(AbiParam::new(types::I64)); // fun_ptr
+                                    s.params.push(AbiParam::new(types::I64)); // has_init
+                                    s.params.push(AbiParam::new(types::I64)); // init
+                                    s.returns.push(AbiParam::new(types::I64)); // result
+                                },
+                                &[a, fun_ptr, has_init, init_v],
+                            )?;
+                            if res_count == 1 { vmap.bind(node.results[0], out); }
+                        }
+
+                        Inst::ArrayFill { arr, val } => {
+                            use cranelift::prelude::{AbiParam, types};
+                            let a = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
+                            let v = vmap.get_or_emit(*val, &mut fb, args_base, fun_ir);
+                            let out = self.call_import(
+                                &mut fb,
+                                "wir_array_fill",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64)); // arr
+                                    s.params.push(AbiParam::new(types::I64)); // val
+                                    s.returns.push(AbiParam::new(types::I64)); // 0
+                                },
+                                &[a, v],
+                            )?;
+                            if res_count == 1 { vmap.bind(node.results[0], out); }
+                        }
+
+                        Inst::ArrayCopy { dst, src, len } => {
+                            use cranelift::prelude::{AbiParam, types};
+                            let d = vmap.get_or_emit(*dst, &mut fb, args_base, fun_ir);
+                            let s = vmap.get_or_emit(*src, &mut fb, args_base, fun_ir);
+                            let n = vmap.get_or_emit(*len, &mut fb, args_base, fun_ir);
+                            let out = self.call_import(
+                                &mut fb,
+                                "wir_array_copy",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64)); // dst
+                                    s.params.push(AbiParam::new(types::I64)); // src
+                                    s.params.push(AbiParam::new(types::I64)); // len (SMI)
+                                    s.returns.push(AbiParam::new(types::I64)); // 0
+                                },
+                                &[d, s, n],
+                            )?;
+                            if res_count == 1 { vmap.bind(node.results[0], out); }
+                        }
+
+                        // ---------------- Closures (host trampoline calls) ----------------
                         Inst::MakeClosure { callee, env } => {
-                            // Code pointer for wir_f_<id>
-                            let mut sig = self.module.make_signature();
-                            sig.params.push(AbiParam::new(ptr_ty));      // argv*
-                            sig.params.push(AbiParam::new(types::I64));  // argc
-                            sig.returns.push(AbiParam::new(types::I64)); // i64 result
+                            use cranelift::prelude::{AbiParam, types};
 
+                            // JIT function code ptr for wir_f_<id> (direct within code heap).
+                            let ptr_ty   = self.module.target_config().pointer_type();
+                            let mut jsig = self.module.make_signature();
+                            jsig.params.push(AbiParam::new(ptr_ty));
+                            jsig.params.push(AbiParam::new(types::I64));
+                            jsig.returns.push(AbiParam::new(types::I64));
                             let sym      = format!("wir_f_{}", callee.0);
-                            let func_id  = self.module.declare_function(&sym, Linkage::Import, &sig)
+                            let fid      = self.module.declare_function(&sym, cranelift_module::Linkage::Import, &jsig)
                                 .map_err(|e| e.to_string())?;
-                            let func_ref = self.module.declare_func_in_func(func_id, &mut fb.func);
-                            let code_ptr = fb.ins().func_addr(ptr_ty, func_ref);
+                            let fref     = self.module.declare_func_in_func(fid, &mut fb.func);
+                            let code_ptr = fb.ins().func_addr(ptr_ty, fref);
 
-                            let env_v = vmap.get_or_emit(*env, &mut fb, args_base, fun);
+                            // env value
+                            let env_v = vmap.get_or_emit(*env, &mut fb, args_base, fun_ir);
 
-                            // wir_make_closure(code_ptr, env)
-                            let mut csig = self.module.make_signature();
-                            csig.params.push(AbiParam::new(ptr_ty));
-                            csig.params.push(AbiParam::new(types::I64));
-                            csig.returns.push(AbiParam::new(types::I64));
-                            let make_id  = self.module
-                                .declare_function("wir_make_closure", Linkage::Import, &csig)
-                                .map_err(|e| e.to_string())?;
-                            let make_ref = self.module.declare_func_in_func(make_id, &mut fb.func);
-                            let call     = fb.ins().call(make_ref, &[code_ptr, env_v]);
-
-                            if res_count == 1 {
-                                vmap.bind(node.results[0], fb.inst_results(call)[0]);
-                            }
+                            // wir_make_closure(code_ptr, env) — call by address
+                            let out = self.call_import(
+                                &mut fb,
+                                "wir_make_closure",
+                                |s| {
+                                    s.params.push(AbiParam::new(ptr_ty));     // code_ptr
+                                    s.params.push(AbiParam::new(types::I64)); // env
+                                    s.returns.push(AbiParam::new(types::I64)); // closure ptr
+                                },
+                                &[code_ptr, env_v],
+                            )?;
+                            if res_count == 1 { vmap.bind(node.results[0], out); }
                         }
 
                         Inst::CallClosure { fun: fun_val, args, .. } => {
-                            // Pack user args (env is prepended by trampoline)
-                            let n = args.len();
-                            let size_bytes: u32 = (n as u32) * 8;
+                            use cranelift::prelude::{AbiParam, types};
+                            use cranelift::codegen::ir::{StackSlotData, StackSlotKind};
+
+                            // Pack args on stack (8-byte slots).
+                            let n: u32 = args.len() as u32;
                             let slot = fb.create_sized_stack_slot(StackSlotData::new(
-                                StackSlotKind::ExplicitSlot, size_bytes, 3,
+                                StackSlotKind::ExplicitSlot,
+                                n * 8,
+                                3,
                             ));
                             for (i, a) in args.iter().enumerate() {
-                                let v = vmap.get_or_emit(*a, &mut fb, args_base, fun);
+                                let v = vmap.get_or_emit(*a, &mut fb, args_base, fun_ir);
                                 fb.ins().stack_store(v, slot, (i as i32) * 8);
                             }
-                            let argv_ptr = fb.ins().stack_addr(ptr_ty, slot, 0);
-                            let argc     = fb.ins().iconst(types::I64, n as i64);
+                            let ptr_ty  = self.module.target_config().pointer_type();
+                            let argv    = fb.ins().stack_addr(ptr_ty, slot, 0);
+                            let argc    = fb.ins().iconst(types::I64, n as i64);
+                            let clo_ptr = vmap.get_or_emit(*fun_val, &mut fb, args_base, fun_ir);
 
-                            let clo_v = vmap.get_or_emit(*fun_val, &mut fb, args_base, fun);
+                            // wir_call_closure(clo, argv, argc) — indirect
+                            let out = self.call_import(
+                                &mut fb,
+                                "wir_call_closure",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64)); // closure
+                                    s.params.push(AbiParam::new(ptr_ty));     // argv*
+                                    s.params.push(AbiParam::new(types::I64)); // argc
+                                    s.returns.push(AbiParam::new(types::I64)); // result
+                                },
+                                &[clo_ptr, argv, argc],
+                            )?;
+                            if res_count >= 1 { vmap.bind(node.results[0], out); }
+                        }
 
-                            // wir_call_closure(clo_ptr, argv, argc)
-                            let mut csig = self.module.make_signature();
-                            csig.params.push(AbiParam::new(types::I64)); // closure (i64)
-                            csig.params.push(AbiParam::new(ptr_ty));     // argv*
-                            csig.params.push(AbiParam::new(types::I64)); // argc
-                            csig.returns.push(AbiParam::new(types::I64));
-                            let call_id  = self.module
-                                .declare_function("wir_call_closure", Linkage::Import, &csig)
-                                .map_err(|e| e.to_string())?;
-                            let call_ref = self.module.declare_func_in_func(call_id, &mut fb.func);
-                            let call     = fb.ins().call(call_ref, &[clo_v, argv_ptr, argc]);
+                        // ---------------- Native calls (host) ----------------
+                        Inst::CallNative { name, args, .. } => {
+                            use cranelift::prelude::{AbiParam, types};
 
-                            if res_count >= 1 {
-                                vmap.bind(node.results[0], fb.inst_results(call)[0]);
+                            // We route "wir_print_str" via wir_print_i64 (keeps all args i64).
+                            let import_name: &str = if name == "wir_print_str" {
+                                "wir_print_i64"
+                            } else {
+                                name
+                            };
+
+                            // Gather argv values first.
+                            let mut argv = Vec::with_capacity(args.len());
+                            for a in args {
+                                argv.push(vmap.get_or_emit(*a, &mut fb, args_base, fun_ir));
                             }
+
+                            // Build signature: (i64, i64, ...) -> i64
+                            let out = self.call_import(
+                                &mut fb,
+                                import_name,
+                                |s| {
+                                    for _ in 0..argv.len() { s.params.push(AbiParam::new(types::I64)); }
+                                    s.returns.push(AbiParam::new(types::I64));
+                                },
+                                &argv,
+                            )?;
+                            if res_count == 1 { vmap.bind(node.results[0], out); }
                         }
 
                         // ---------------- Direct calls ----------------
                         Inst::CallDirect { callee, args, .. } => {
+                            use cranelift::prelude::{AbiParam, types};
+                            use cranelift::codegen::ir::{StackSlotData, StackSlotKind};
+
+                            // Signature for wir_f_* must match how we define them (argv*, argc) -> i64
                             let mut sig = self.module.make_signature();
-                            sig.params.push(AbiParam::new(ptr_ty));      // argv*
-                            sig.params.push(AbiParam::new(types::I64));  // argc
-                            sig.returns.push(AbiParam::new(types::I64)); // ret
+                            sig.call_conv = self.module.isa().default_call_conv();
+                            sig.params.push(AbiParam::new(ptr_ty));     // argv*
+                            sig.params.push(AbiParam::new(types::I64)); // argc
+                            sig.returns.push(AbiParam::new(types::I64));
 
                             let sym = format!("wir_f_{}", callee.0);
                             let func_id = self
                                 .module
                                 .declare_function(&sym, Linkage::Import, &sig)
                                 .map_err(|e| e.to_string())?;
-                            let callee_ref = self.module.declare_func_in_func(func_id, &mut fb.func);
 
+                            // Marshal args into a stack argv buffer
                             let n = args.len();
                             let size_bytes: u32 = (n as u32) * 8;
                             let slot = fb.create_sized_stack_slot(StackSlotData::new(
-                                StackSlotKind::ExplicitSlot, size_bytes, 3,
+                                StackSlotKind::ExplicitSlot, size_bytes, 0,
                             ));
                             for (i, a) in args.iter().enumerate() {
-                                let v = vmap.get_or_emit(*a, &mut fb, args_base, fun);
+                                let v = vmap.get_or_emit(*a, &mut fb, args_base, fun_ir);
                                 fb.ins().stack_store(v, slot, (i as i32) * 8);
                             }
                             let argv_ptr = fb.ins().stack_addr(ptr_ty, slot, 0);
-                            let argc = fb.ins().iconst(types::I64, n as i64);
-                            let call = fb.ins().call(callee_ref, &[argv_ptr, argc]);
+                            let argc     = fb.ins().iconst(types::I64, n as i64);
+
+                            // Indirect call through absolute address (avoids 26-bit range issue)
+                            let outs = self.call_funcref(
+                                &mut fb,
+                                func_id,
+                                |s| {
+                                    // IMPORTANT: do not touch `self` here.
+                                    // call_funcref itself already sets `s.call_conv = default_call_conv()`.
+                                    s.params.push(AbiParam::new(ptr_ty));     // argv*
+                                    s.params.push(AbiParam::new(types::I64)); // argc
+                                    s.returns.push(AbiParam::new(types::I64));
+                                },
+                                &[argv_ptr, argc],
+                            )?;
+
                             if res_count >= 1 {
-                                vmap.bind(node.results[0], fb.inst_results(call)[0]);
-                            }
-                        }
-
-                        // ---------------- Native calls ----------------
-                        Inst::CallNative { name, args, .. } => {
-                            let import_name: &str = if name == "wir_print_str" {
-                                "wir_print_i64"   // treat string prints as generic value prints
-                            } else {
-                                name
-                            };
-
-                            let mut sig = self.module.make_signature();
-                            for _ in 0..args.len() {
-                                sig.params.push(AbiParam::new(types::I64));
-                            }
-                            sig.returns.push(AbiParam::new(types::I64));
-
-                            let func_id = self
-                                .module
-                                .declare_function(import_name, Linkage::Import, &sig)
-                                .map_err(|e| e.to_string())?;
-                            let callee = self.module.declare_func_in_func(func_id, &mut fb.func);
-
-                            let mut argv = Vec::with_capacity(args.len());
-                            for a in args {
-                                argv.push(vmap.get_or_emit(*a, &mut fb, args_base, fun_ir));
-                            }
-                            let call = fb.ins().call(callee, &argv);
-                            if res_count == 1 {
-                                let res = fb.inst_results(call)[0];
-                                vmap.bind(node.results[0], res);
+                                vmap.bind(node.results[0], outs[0]);
                             }
                         }
 
@@ -896,220 +1261,7 @@ pub extern "C" fn wir_alloc_array(n: i64) -> i64 {
     p as i64 // even pointer => “heap object”
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn wir_array_new(init_len_val: i64) -> i64 {
-    let init_len = if is_imm(init_len_val) { smi_to_i64(init_len_val).max(0) as usize } else { 0 };
-    let mut buf = Vec::<i64>::with_capacity(init_len);
-    buf.resize(init_len, NULL); // fill with nulls
-    let arr = Box::new(BoxedArray { hdr: ObjHeader { tag: TAG_ARRAY, aux: 0 }, buf });
-    Box::into_raw(arr) as i64
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn wir_array_len(arr_val: i64) -> i64 {
-    if arr_val == NULL { return make_smi(0); }
-    unsafe {
-        let arr = &*(arr_val as *const BoxedArray);
-        make_smi(arr.len() as i64)
-    }
-}
-
-// Safe get: out-of-bounds => null
-#[unsafe(no_mangle)]
-pub extern "C" fn wir_array_get(arr_val: i64, idx_val: i64) -> i64 {
-    if arr_val == NULL { return NULL; }
-    let idx = if is_imm(idx_val) { smi_to_i64(idx_val) } else { 0 };
-    if idx < 0 { return NULL; }
-    unsafe {
-        let arr = &*(arr_val as *const BoxedArray);
-        let i = idx as usize;
-        if i < arr.buf.len() { arr.buf[i] } else { NULL }
-    }
-}
-
-// Set with auto-extend: fill holes with null
-#[unsafe(no_mangle)]
-pub extern "C" fn wir_array_set(arr_val: i64, idx_val: i64, v: i64) -> i64 {
-    if arr_val == NULL { return NULL; }
-    let idx = if is_imm(idx_val) { smi_to_i64(idx_val) } else { 0 };
-    if idx < 0 { return NULL; }
-    unsafe {
-        let arr = &mut *(arr_val as *mut BoxedArray);
-        let i = idx as usize;
-        if i >= arr.buf.len() {
-            arr.buf.resize(i + 1, NULL);
-        }
-        arr.buf[i] = v;
-    }
-    NULL // store returns a token; change to `v` if you want to return the value
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn wir_array_set_len(arr_val: i64, new_len_val: i64) -> i64 {
-    if arr_val == NULL { return make_smi(0); }
-    let new_len = if is_imm(new_len_val) { smi_to_i64(new_len_val).max(0) as usize } else { 0 };
-    unsafe {
-        let arr = &mut *(arr_val as *mut BoxedArray);
-        if new_len > arr.buf.len() {
-            arr.buf.resize(new_len, NULL);
-        } else {
-            arr.buf.truncate(new_len);
-        }
-        make_smi(arr.buf.len() as i64)
-    }
-}
-
-// ---- basic methods ----
-
-#[unsafe(no_mangle)]
-pub extern "C" fn wir_array_push(arr_val: i64, v: i64) -> i64 {
-    if arr_val == NULL { return make_smi(0); }
-    unsafe {
-        let arr = &mut *(arr_val as *mut BoxedArray);
-        arr.buf.push(v);
-        make_smi(arr.buf.len() as i64)
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn wir_array_pop(arr_val: i64) -> i64 {
-    if arr_val == NULL { return NULL; }
-    unsafe {
-        let arr = &mut *(arr_val as *mut BoxedArray);
-        arr.buf.pop().unwrap_or(NULL)
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn wir_array_shift(arr_val: i64) -> i64 {
-    if arr_val == NULL { return NULL; }
-    unsafe {
-        let arr = &mut *(arr_val as *mut BoxedArray);
-        if arr.buf.is_empty() { return NULL; }
-        arr.buf.remove(0)
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn wir_array_unshift(arr_val: i64, v: i64) -> i64 {
-    if arr_val == NULL { return make_smi(0); }
-    unsafe {
-        let arr = &mut *(arr_val as *mut BoxedArray);
-        arr.buf.insert(0, v);
-        make_smi(arr.buf.len() as i64)
-    }
-}
-
-// ---- advanced methods (closure-driven) ----
-// Note: we reuse your existing wir_call_closure(clo_ptr, argv, argc).
-
-#[inline]
-unsafe fn call3(clo: i64, a: i64, b: i64, c: i64) -> i64 {
-    let args = [a, b, c];
-    wir_call_closure(clo, args.as_ptr(), 3)
-}
-#[inline]
-unsafe fn call2(clo: i64, a: i64, b: i64) -> i64 {
-    let args = [a, b];
-    wir_call_closure(clo, args.as_ptr(), 2)
-}
-#[inline]
-unsafe fn call1(clo: i64, a: i64) -> i64 {
-    let args = [a];
-    wir_call_closure(clo, args.as_ptr(), 1)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn wir_array_map(arr_val: i64, clo: i64) -> i64 {
-    if arr_val == NULL { return wir_array_new(make_smi(0)); }
-    unsafe {
-        let arr = &*(arr_val as *const BoxedArray);
-        let n = arr.buf.len();
-        let mut out = Vec::<i64>::with_capacity(n);
-        out.resize(n, NULL);
-        for i in 0..n {
-            out[i] = call3(clo, arr.buf[i], make_smi(i as i64), arr_val);
-        }
-        let r = Box::new(BoxedArray { hdr: ObjHeader { tag: TAG_ARRAY, aux: 0 }, buf: out });
-        Box::into_raw(r) as i64
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn wir_array_for_each(arr_val: i64, clo: i64) -> i64 {
-    if arr_val == NULL { return NULL; }
-    unsafe {
-        let arr = &*(arr_val as *const BoxedArray);
-        for i in 0..arr.buf.len() {
-            let _ = call3(clo, arr.buf[i], make_smi(i as i64), arr_val);
-        }
-    }
-    NULL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn wir_array_find(arr_val: i64, clo: i64) -> i64 {
-    if arr_val == NULL { return NULL; }
-    unsafe {
-        let arr = &*(arr_val as *const BoxedArray);
-        for i in 0..arr.buf.len() {
-            let pred = call3(clo, arr.buf[i], make_smi(i as i64), arr_val);
-            if pred != 0 { return arr.buf[i]; } // truthy if != 0
-        }
-    }
-    NULL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn wir_array_find_index(arr_val: i64, clo: i64) -> i64 {
-    if arr_val == NULL { return make_smi(-1); }
-    unsafe {
-        let arr = &*(arr_val as *const BoxedArray);
-        for i in 0..arr.buf.len() {
-            let pred = call3(clo, arr.buf[i], make_smi(i as i64), arr_val);
-            if pred != 0 { return make_smi(i as i64); }
-        }
-    }
-    make_smi(-1)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn wir_array_filter(arr_val: i64, clo: i64) -> i64 {
-    if arr_val == NULL { return wir_array_new(make_smi(0)); }
-    unsafe {
-        let arr = &*(arr_val as *const BoxedArray);
-        let mut out = Vec::<i64>::new();
-        for i in 0..arr.buf.len() {
-            let pred = call3(clo, arr.buf[i], make_smi(i as i64), arr_val);
-            if pred != 0 { out.push(arr.buf[i]); }
-        }
-        let r = Box::new(BoxedArray { hdr: ObjHeader { tag: TAG_ARRAY, aux: 0 }, buf: out });
-        Box::into_raw(r) as i64
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn wir_array_reduce(arr_val: i64, clo: i64, init: i64, has_init_raw_bool: i64) -> i64 {
-    if arr_val == NULL { return init; }
-    unsafe {
-        let arr = &*(arr_val as *const BoxedArray);
-        let mut i = 0usize;
-        let mut acc = if has_init_raw_bool != 0 {
-            init
-        } else {
-            if arr.buf.is_empty() { return NULL; }
-            let v = arr.buf[0];
-            i = 1;
-            v
-        };
-        while i < arr.buf.len() {
-            acc = call2(clo, acc, arr.buf[i]);
-            i += 1;
-        }
-        acc
-    }
-}
-
+// ----- SMI and boxed f64 handling -----
 
 #[inline]
 fn smi_encode(x: i64) -> i64 { (x << 1) | 1 }
@@ -1211,22 +1363,214 @@ pub extern "C" fn wir_cmp_ge_slow(a: i64, b: i64) -> i64 {
     b2i(af >= bf)
 }
 
+// ---------------------
+// Naive Array Runtime
+// ---------------------
 
-// --- DEBUG HELPERS (fixed) ---------------------------------------------------
-fn dump_value_kind(values: &Vec<WirValue>, id: ValueId) -> &'static str {
-    match &values[id.0 as usize].def {
-        crate::wir::ValueDef::Const(_) => "Const",
-        _ => "Other",
-    }
+#[repr(C)]
+struct WirArray {
+    buf: Vec<i64>,
 }
 
-fn dump_const(values: &Vec<WirValue>, id: ValueId) -> Option<i64> {
-    use crate::wir::Constant::*;
-    match &values[id.0 as usize].def {
-        crate::wir::ValueDef::Const(Int32(x)) => Some(*x as i64),
-        crate::wir::ValueDef::Const(Bool(b))  => Some(if *b { 1 } else { 0 }),
-        crate::wir::ValueDef::Const(F64(f))   => Some((*f).to_bits() as i64),
-        crate::wir::ValueDef::Const(Null)     => Some(0),
-        _ => None,
+fn smi(v: i64) -> i64 { (v << 1) | 1 }
+fn smi_to_i64_wrapped(v: i64) -> i64 { v >> 1 } // arithmetic shift; matches earlier SMI scheme
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_array_new(len: i64) -> i64 {
+    let n = smi_to_i64_wrapped(len).max(0) as usize;
+    let arr = Box::new(WirArray { buf: vec![0; n] });
+    Box::into_raw(arr) as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_array_len(arr: i64) -> i64 {
+    if arr == 0 { return smi(0); }
+    let a = unsafe { &*(arr as *const WirArray) };
+    smi(a.buf.len() as i64)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_array_get(arr: i64, idx: i64) -> i64 {
+    if arr == 0 { return 0; }
+    let i = smi_to_i64_wrapped(idx);
+    if i < 0 { return 0; }
+    let a = unsafe { &*(arr as *const WirArray) };
+    a.buf.get(i as usize).copied().unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_array_set(arr: i64, idx: i64, val: i64) -> i64 {
+    if arr == 0 { return 0; }
+    let i = smi_to_i64_wrapped(idx);
+    if i < 0 { return 0; }
+    let a = unsafe { &mut *(arr as *mut WirArray) };
+    let iu = i as usize;
+    if iu >= a.buf.len() {
+        a.buf.resize(iu + 1, 0);
     }
+    a.buf[iu] = val;
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_array_set_len(arr: i64, new_len: i64) -> i64 {
+    if arr == 0 { return 0; }
+    let n = smi_to_i64_wrapped(new_len).max(0) as usize;
+    let a = unsafe { &mut *(arr as *mut WirArray) };
+    a.buf.resize(n, 0);
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_array_push(arr: i64, val: i64) -> i64 {
+    if arr == 0 { return smi(0); }
+    let a = unsafe { &mut *(arr as *mut WirArray) };
+    a.buf.push(val);
+    smi(a.buf.len() as i64)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_array_pop(arr: i64) -> i64 {
+    if arr == 0 { return 0; }
+    let a = unsafe { &mut *(arr as *mut WirArray) };
+    a.buf.pop().unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_array_shift(arr: i64) -> i64 {
+    if arr == 0 { return 0; }
+    let a = unsafe { &mut *(arr as *mut WirArray) };
+    if a.buf.is_empty() { return 0; }
+    let v = a.buf.remove(0);
+    v
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_array_unshift(arr: i64, val: i64) -> i64 {
+    if arr == 0 { return smi(0); }
+    let a = unsafe { &mut *(arr as *mut WirArray) };
+    a.buf.insert(0, val);
+    smi(a.buf.len() as i64)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_array_slice(arr: i64, start: i64, end: i64) -> i64 {
+    if arr == 0 { return 0; }
+    let a = unsafe { &*(arr as *const WirArray) };
+    let n = a.buf.len() as i64;
+    let s = smi_to_i64_wrapped(start).clamp(0, n) as usize;
+    let e = smi_to_i64_wrapped(end).clamp(s as i64, n) as usize;
+    let mut out = Vec::with_capacity(e - s);
+    out.extend_from_slice(&a.buf[s..e]);
+    let b = Box::new(WirArray { buf: out });
+    Box::into_raw(b) as i64
+}
+
+type HostCb = unsafe extern "C" fn(*const i64, usize) -> i64;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_array_map(arr: i64, fun_ptr: i64) -> i64 {
+    if arr == 0 { return 0; }
+    let a = unsafe { &*(arr as *const WirArray) };
+    let f: HostCb = unsafe { std::mem::transmute::<i64, HostCb>(fun_ptr) };
+
+    let mut out = Vec::with_capacity(a.buf.len());
+    for &x in &a.buf {
+        let args = [x];
+        let y = unsafe { f(args.as_ptr(), 1) };
+        out.push(y);
+    }
+    let b = Box::new(WirArray { buf: out });
+    Box::into_raw(b) as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_array_for_each(arr: i64, fun_ptr: i64) -> i64 {
+    if arr == 0 { return 0; }
+    let a = unsafe { &*(arr as *const WirArray) };
+    let f: HostCb = unsafe { std::mem::transmute::<i64, HostCb>(fun_ptr) };
+    for &x in &a.buf {
+        let args = [x];
+        let _ = unsafe { f(args.as_ptr(), 1) };
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_array_find(arr: i64, fun_ptr: i64) -> i64 {
+    if arr == 0 { return 0; }
+    let a = unsafe { &*(arr as *const WirArray) };
+    let f: HostCb = unsafe { std::mem::transmute::<i64, HostCb>(fun_ptr) };
+    for &x in &a.buf {
+        let args = [x];
+        let ok = unsafe { f(args.as_ptr(), 1) };
+        if ok != 0 { return x; }
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_array_find_index(arr: i64, fun_ptr: i64) -> i64 {
+    if arr == 0 { return smi(-1); }
+    let a = unsafe { &*(arr as *const WirArray) };
+    let f: HostCb = unsafe { std::mem::transmute::<i64, HostCb>(fun_ptr) };
+    for (i, &x) in a.buf.iter().enumerate() {
+        let args = [x];
+        let ok = unsafe { f(args.as_ptr(), 1) };
+        if ok != 0 { return smi(i as i64); }
+    }
+    smi(-1)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_array_filter(arr: i64, fun_ptr: i64) -> i64 {
+    if arr == 0 { return 0; }
+    let a = unsafe { &*(arr as *const WirArray) };
+    let f: HostCb = unsafe { std::mem::transmute::<i64, HostCb>(fun_ptr) };
+    let mut out = Vec::new();
+    for &x in &a.buf {
+        let args = [x];
+        let ok = unsafe { f(args.as_ptr(), 1) };
+        if ok != 0 { out.push(x); }
+    }
+    let b = Box::new(WirArray { buf: out });
+    Box::into_raw(b) as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_array_reduce(arr: i64, fun_ptr: i64, has_init: i64, init: i64) -> i64 {
+    if arr == 0 { return 0; }
+    let a = unsafe { &*(arr as *const WirArray) };
+    let f: HostCb = unsafe { std::mem::transmute::<i64, HostCb>(fun_ptr) };
+    if a.buf.is_empty() {
+        return if has_init != 0 { init } else { 0 };
+    }
+    let mut it = a.buf.iter().copied();
+    let mut acc = if has_init != 0 { init } else { it.next().unwrap() };
+    for x in it {
+        let args = [acc, x];
+        acc = unsafe { f(args.as_ptr(), 2) };
+    }
+    acc
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_array_fill(arr: i64, val: i64) -> i64 {
+    if arr == 0 { return 0; }
+    let a = unsafe { &mut *(arr as *mut WirArray) };
+    for v in &mut a.buf { *v = val; }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_array_copy(dst: i64, src: i64, len: i64) -> i64 {
+    if dst == 0 || src == 0 { return 0; }
+    let d = unsafe { &mut *(dst as *mut WirArray) };
+    let s = unsafe { &*(src as *const WirArray) };
+    let n = smi_to_i64_wrapped(len).max(0) as usize;
+    if d.buf.len() < n { d.buf.resize(n, 0); }
+    let nn = n.min(s.buf.len());
+    d.buf[..nn].copy_from_slice(&s.buf[..nn]);
+    if nn < n { for i in nn..n { d.buf[i] = 0; } }
+    0
 }

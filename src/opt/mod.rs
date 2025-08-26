@@ -195,30 +195,31 @@ impl WirEditQueue {
             let mut offset: isize = 0;
             for (_k, e) in &expanded[start..end] {
                 match e {
-                    WirEdit::InsertBefore{ at, insts: add } => {
+                    WirEdit::InsertBefore{ at, insts: add, .. } => {
                         let pos = map_with_offset(*at, offset, insts.len());
                         insts.splice(pos..pos, add.clone());
                         offset += add.len() as isize;
                     }
-                    WirEdit::InsertAfter{ at, insts: add } => {
+                    WirEdit::InsertAfter{ at, insts: add, .. } => {
                         let pos = map_with_offset(*at, offset, insts.len()) + 1;
                         insts.splice(pos..pos, add.clone());
                         offset += add.len() as isize;
                     }
-                    WirEdit::ReplaceKind{ id, new_kind } => {
-                        f.nodes[id.0 as usize].kind = new_kind.clone();
-                    }
-                    WirEdit::Erase{ at } => {
+                    WirEdit::Erase{ at, .. } => {
                         let pos = map_with_offset(*at, offset, insts.len());
                         insts.remove(pos);
                         offset -= 1;
                     }
-                    WirEdit::SpliceRange{ start, end, insts: add } => {
+                    WirEdit::SpliceRange{ start, end, insts: add, .. } => {
                         let s = map_with_offset(*start, offset, insts.len());
                         let e = map_with_offset(*end,   offset, insts.len());
                         let removed = e - s;
                         insts.splice(s..e, add.clone());
                         offset += add.len() as isize - removed as isize;
+                    }
+                    WirEdit::ReplaceKind{ .. } => {
+                        // Already handled in the anchorless phase above.
+                        // Intentionally no-op here to avoid borrow conflicts with `insts`.
                     }
                 }
             }
@@ -242,8 +243,8 @@ impl WirEditQueue {
 ///  - `true`  => stop running further optimizations for this node (advance)
 ///  - `false` => keep trying the remaining optimizations on this same node
 pub trait OptimizationWIR {
-    fn set_metadata_any(&mut self, _data: Box<dyn Any>) {}
-    fn set_metadata<M: Any>(&mut self, data: M) { self.set_metadata_any(Box::new(data)); }
+    fn set_metadata_any(&mut self, _data: &dyn Any) {}
+
     fn optimize_node(&mut self, cur: &mut InstCursor, q: &mut WirEditQueue) -> bool;
 }
 
@@ -257,10 +258,13 @@ impl OptimizationPass {
         Self { optimizations, pass_meta: None }
     }
 
-    pub fn initialize<M: Any + Clone>(&mut self, meta: M) {
-        self.pass_meta = Some(Box::new(meta.clone()));
+    /// Broadcast pass-level metadata to every optimization.
+    /// `meta` is stored so that the reference we hand out stays valid.
+    pub fn initialize(&mut self, meta: impl Any) {
+        self.pass_meta = Some(Box::new(meta));
+        let meta_ref: &dyn Any = self.pass_meta.as_deref().unwrap();
         for o in &mut self.optimizations {
-            o.set_metadata(meta.clone());
+            o.set_metadata_any(meta_ref);
         }
     }
 

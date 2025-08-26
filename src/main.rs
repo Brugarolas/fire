@@ -2,6 +2,7 @@
 mod value;
 mod wir;
 mod front;
+mod opt;
 // mod optimizer; // not used yet, but keep for future pipeline
 mod jit;
 
