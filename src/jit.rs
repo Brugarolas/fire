@@ -570,116 +570,134 @@ impl JIT {
                             if res_count == 1 { vmap.bind(node.results[0], out); }
                         }
 
+                        // ---------------- Arrays (host runtime; FuncId → closure with env=0) ----------------
                         Inst::ArrayMap { func, arr } => {
                             use cranelift::prelude::{AbiParam, types};
-                            // JIT→JIT code pointer (still fine as direct func_ref->addr)
-                            let fun_ptr = self.funptr_i64(&mut fb, *func);
-                            let a = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
-                            let out = self.call_import(
-                                &mut fb,
-                                "wir_array_map",
-                                |s| {
-                                    s.params.push(AbiParam::new(types::I64)); // arr
-                                    s.params.push(AbiParam::new(types::I64)); // fun_ptr (i64)
-                                    s.returns.push(AbiParam::new(types::I64)); // new arr
-                                },
-                                &[a, fun_ptr],
-                            )?;
+                            let ptr_ty   = self.ptr_ty();
+                            let code_ptr = self.funptr_i64(&mut fb, *func);      // wir_f_<id> address (i64)
+                            let zero     = fb.ins().iconst(types::I64, 0);       // empty env
+                            let clo      = self.call_import(&mut fb, "wir_make_closure", |s| {
+                                s.params.push(AbiParam::new(ptr_ty));            // code_ptr
+                                s.params.push(AbiParam::new(types::I64));        // env
+                                s.returns.push(AbiParam::new(types::I64));       // closure*
+                            }, &[code_ptr, zero])?;
+
+                            let a   = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
+                            let out = self.call_import(&mut fb, "wir_array_map", |s| {
+                                s.params.push(AbiParam::new(types::I64));        // arr
+                                s.params.push(AbiParam::new(types::I64));        // clo
+                                s.returns.push(AbiParam::new(types::I64));       // new arr
+                            }, &[a, clo])?;
                             if res_count == 1 { vmap.bind(node.results[0], out); }
                         }
 
                         Inst::ArrayForEach { func, arr } => {
                             use cranelift::prelude::{AbiParam, types};
-                            let fun_ptr = self.funptr_i64(&mut fb, *func);
-                            let a = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
-                            let out = self.call_import(
-                                &mut fb,
-                                "wir_array_for_each",
-                                |s| {
-                                    s.params.push(AbiParam::new(types::I64));
-                                    s.params.push(AbiParam::new(types::I64));
-                                    s.returns.push(AbiParam::new(types::I64)); // 0
-                                },
-                                &[a, fun_ptr],
-                            )?;
+                            let ptr_ty   = self.ptr_ty();
+                            let code_ptr = self.funptr_i64(&mut fb, *func);
+                            let zero     = fb.ins().iconst(types::I64, 0);
+                            let clo      = self.call_import(&mut fb, "wir_make_closure", |s| {
+                                s.params.push(AbiParam::new(ptr_ty));
+                                s.params.push(AbiParam::new(types::I64));
+                                s.returns.push(AbiParam::new(types::I64));
+                            }, &[code_ptr, zero])?;
+
+                            let a   = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
+                            let out = self.call_import(&mut fb, "wir_array_for_each", |s| {
+                                s.params.push(AbiParam::new(types::I64));
+                                s.params.push(AbiParam::new(types::I64));
+                                s.returns.push(AbiParam::new(types::I64));       // 0
+                            }, &[a, clo])?;
                             if res_count == 1 { vmap.bind(node.results[0], out); }
                         }
 
                         Inst::ArrayFind { func, arr } => {
                             use cranelift::prelude::{AbiParam, types};
-                            let fun_ptr = self.funptr_i64(&mut fb, *func);
-                            let a = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
-                            let out = self.call_import(
-                                &mut fb,
-                                "wir_array_find",
-                                |s| {
-                                    s.params.push(AbiParam::new(types::I64));
-                                    s.params.push(AbiParam::new(types::I64));
-                                    s.returns.push(AbiParam::new(types::I64)); // value or 0
-                                },
-                                &[a, fun_ptr],
-                            )?;
+                            let ptr_ty   = self.ptr_ty();
+                            let code_ptr = self.funptr_i64(&mut fb, *func);
+                            let zero     = fb.ins().iconst(types::I64, 0);
+                            let clo      = self.call_import(&mut fb, "wir_make_closure", |s| {
+                                s.params.push(AbiParam::new(ptr_ty));
+                                s.params.push(AbiParam::new(types::I64));
+                                s.returns.push(AbiParam::new(types::I64));
+                            }, &[code_ptr, zero])?;
+
+                            let a   = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
+                            let out = self.call_import(&mut fb, "wir_array_find", |s| {
+                                s.params.push(AbiParam::new(types::I64));
+                                s.params.push(AbiParam::new(types::I64));
+                                s.returns.push(AbiParam::new(types::I64));       // value or 0
+                            }, &[a, clo])?;
                             if res_count == 1 { vmap.bind(node.results[0], out); }
                         }
 
                         Inst::ArrayFindIndex { func, arr } => {
                             use cranelift::prelude::{AbiParam, types};
-                            let fun_ptr = self.funptr_i64(&mut fb, *func);
-                            let a = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
-                            let out = self.call_import(
-                                &mut fb,
-                                "wir_array_find_index",
-                                |s| {
-                                    s.params.push(AbiParam::new(types::I64));
-                                    s.params.push(AbiParam::new(types::I64));
-                                    s.returns.push(AbiParam::new(types::I64)); // SMI or smi(-1)
-                                },
-                                &[a, fun_ptr],
-                            )?;
+                            let ptr_ty   = self.ptr_ty();
+                            let code_ptr = self.funptr_i64(&mut fb, *func);
+                            let zero     = fb.ins().iconst(types::I64, 0);
+                            let clo      = self.call_import(&mut fb, "wir_make_closure", |s| {
+                                s.params.push(AbiParam::new(ptr_ty));
+                                s.params.push(AbiParam::new(types::I64));
+                                s.returns.push(AbiParam::new(types::I64));
+                            }, &[code_ptr, zero])?;
+
+                            let a   = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
+                            let out = self.call_import(&mut fb, "wir_array_find_index", |s| {
+                                s.params.push(AbiParam::new(types::I64));
+                                s.params.push(AbiParam::new(types::I64));
+                                s.returns.push(AbiParam::new(types::I64));       // SMI index or smi(-1)
+                            }, &[a, clo])?;
                             if res_count == 1 { vmap.bind(node.results[0], out); }
                         }
 
                         Inst::ArrayFilter { func, arr } => {
                             use cranelift::prelude::{AbiParam, types};
-                            let fun_ptr = self.funptr_i64(&mut fb, *func);
-                            let a = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
-                            let out = self.call_import(
-                                &mut fb,
-                                "wir_array_filter",
-                                |s| {
-                                    s.params.push(AbiParam::new(types::I64));
-                                    s.params.push(AbiParam::new(types::I64));
-                                    s.returns.push(AbiParam::new(types::I64)); // new arr
-                                },
-                                &[a, fun_ptr],
-                            )?;
+                            let ptr_ty   = self.ptr_ty();
+                            let code_ptr = self.funptr_i64(&mut fb, *func);
+                            let zero     = fb.ins().iconst(types::I64, 0);
+                            let clo      = self.call_import(&mut fb, "wir_make_closure", |s| {
+                                s.params.push(AbiParam::new(ptr_ty));
+                                s.params.push(AbiParam::new(types::I64));
+                                s.returns.push(AbiParam::new(types::I64));
+                            }, &[code_ptr, zero])?;
+
+                            let a   = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
+                            let out = self.call_import(&mut fb, "wir_array_filter", |s| {
+                                s.params.push(AbiParam::new(types::I64));
+                                s.params.push(AbiParam::new(types::I64));
+                                s.returns.push(AbiParam::new(types::I64));       // new arr
+                            }, &[a, clo])?;
                             if res_count == 1 { vmap.bind(node.results[0], out); }
                         }
 
                         Inst::ArrayReduce { func, init, arr } => {
                             use cranelift::prelude::{AbiParam, types, IntCC};
-
-                            // Prepare args (and compute has_init).
-                            let fun_ptr  = self.funptr_i64(&mut fb, *func);
-                            let init_v   = vmap.get_or_emit(*init, &mut fb, args_base, fun_ir);
+                            let ptr_ty   = self.ptr_ty();
+                            let code_ptr = self.funptr_i64(&mut fb, *func);
                             let zero     = fb.ins().iconst(types::I64, 0);
-                            let has_cond = fb.ins().icmp(IntCC::NotEqual, init_v, zero);
-                            let one      = fb.ins().iconst(types::I64, 1);
-                            let has_init = fb.ins().select(has_cond, one, zero);
-                            let a        = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
+                            let clo      = self.call_import(&mut fb, "wir_make_closure", |s| {
+                                s.params.push(AbiParam::new(ptr_ty));
+                                s.params.push(AbiParam::new(types::I64));
+                                s.returns.push(AbiParam::new(types::I64));
+                            }, &[code_ptr, zero])?;
 
-                            let out = self.call_import(
-                                &mut fb,
-                                "wir_array_reduce",
-                                |s| {
-                                    s.params.push(AbiParam::new(types::I64)); // arr
-                                    s.params.push(AbiParam::new(types::I64)); // fun_ptr
-                                    s.params.push(AbiParam::new(types::I64)); // has_init
-                                    s.params.push(AbiParam::new(types::I64)); // init
-                                    s.returns.push(AbiParam::new(types::I64)); // result
-                                },
-                                &[a, fun_ptr, has_init, init_v],
-                            )?;
+                            let a       = vmap.get_or_emit(*arr, &mut fb, args_base, fun_ir);
+                            let init_v  = vmap.get_or_emit(*init, &mut fb, args_base, fun_ir);
+                            let one     = fb.ins().iconst(types::I64, 1);
+                            let z64     = fb.ins().iconst(types::I64, 0);
+                            let has_init= {
+                                let c = fb.ins().icmp(IntCC::NotEqual, init_v, z64);
+                                fb.ins().select(c, one, z64)
+                            };
+
+                            let out = self.call_import(&mut fb, "wir_array_reduce", |s| {
+                                s.params.push(AbiParam::new(types::I64));        // arr
+                                s.params.push(AbiParam::new(types::I64));        // clo
+                                s.params.push(AbiParam::new(types::I64));        // has_init
+                                s.params.push(AbiParam::new(types::I64));        // init
+                                s.returns.push(AbiParam::new(types::I64));       // result
+                            }, &[a, clo, has_init, init_v])?;
                             if res_count == 1 { vmap.bind(node.results[0], out); }
                         }
 
@@ -1467,17 +1485,14 @@ pub extern "C" fn wir_array_slice(arr: i64, start: i64, end: i64) -> i64 {
 }
 
 type HostCb = unsafe extern "C" fn(*const i64, usize) -> i64;
-
 #[unsafe(no_mangle)]
-pub extern "C" fn wir_array_map(arr: i64, fun_ptr: i64) -> i64 {
+pub extern "C" fn wir_array_map(arr: i64, clo_ptr: i64) -> i64 {
     if arr == 0 { return 0; }
     let a = unsafe { &*(arr as *const WirArray) };
-    let f: HostCb = unsafe { std::mem::transmute::<i64, HostCb>(fun_ptr) };
-
     let mut out = Vec::with_capacity(a.buf.len());
     for &x in &a.buf {
         let args = [x];
-        let y = unsafe { f(args.as_ptr(), 1) };
+        let y = unsafe { wir_call_closure(clo_ptr, args.as_ptr(), 1) };
         out.push(y);
     }
     let b = Box::new(WirArray { buf: out });
@@ -1485,52 +1500,48 @@ pub extern "C" fn wir_array_map(arr: i64, fun_ptr: i64) -> i64 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn wir_array_for_each(arr: i64, fun_ptr: i64) -> i64 {
+pub extern "C" fn wir_array_for_each(arr: i64, clo_ptr: i64) -> i64 {
     if arr == 0 { return 0; }
     let a = unsafe { &*(arr as *const WirArray) };
-    let f: HostCb = unsafe { std::mem::transmute::<i64, HostCb>(fun_ptr) };
     for &x in &a.buf {
         let args = [x];
-        let _ = unsafe { f(args.as_ptr(), 1) };
+        let _ = unsafe { wir_call_closure(clo_ptr, args.as_ptr(), 1) };
     }
     0
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn wir_array_find(arr: i64, fun_ptr: i64) -> i64 {
+pub extern "C" fn wir_array_find(arr: i64, clo_ptr: i64) -> i64 {
     if arr == 0 { return 0; }
     let a = unsafe { &*(arr as *const WirArray) };
-    let f: HostCb = unsafe { std::mem::transmute::<i64, HostCb>(fun_ptr) };
     for &x in &a.buf {
         let args = [x];
-        let ok = unsafe { f(args.as_ptr(), 1) };
+        let ok = unsafe { wir_call_closure(clo_ptr, args.as_ptr(), 1) };
         if ok != 0 { return x; }
     }
     0
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn wir_array_find_index(arr: i64, fun_ptr: i64) -> i64 {
+pub extern "C" fn wir_array_find_index(arr: i64, clo_ptr: i64) -> i64 {
     if arr == 0 { return smi(-1); }
     let a = unsafe { &*(arr as *const WirArray) };
-    let f: HostCb = unsafe { std::mem::transmute::<i64, HostCb>(fun_ptr) };
     for (i, &x) in a.buf.iter().enumerate() {
         let args = [x];
-        let ok = unsafe { f(args.as_ptr(), 1) };
+        let ok = unsafe { wir_call_closure(clo_ptr, args.as_ptr(), 1) };
         if ok != 0 { return smi(i as i64); }
     }
     smi(-1)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn wir_array_filter(arr: i64, fun_ptr: i64) -> i64 {
+pub extern "C" fn wir_array_filter(arr: i64, clo_ptr: i64) -> i64 {
     if arr == 0 { return 0; }
     let a = unsafe { &*(arr as *const WirArray) };
-    let f: HostCb = unsafe { std::mem::transmute::<i64, HostCb>(fun_ptr) };
     let mut out = Vec::new();
     for &x in &a.buf {
         let args = [x];
-        let ok = unsafe { f(args.as_ptr(), 1) };
+        let ok = unsafe { wir_call_closure(clo_ptr, args.as_ptr(), 1) };
         if ok != 0 { out.push(x); }
     }
     let b = Box::new(WirArray { buf: out });
@@ -1538,10 +1549,9 @@ pub extern "C" fn wir_array_filter(arr: i64, fun_ptr: i64) -> i64 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn wir_array_reduce(arr: i64, fun_ptr: i64, has_init: i64, init: i64) -> i64 {
+pub extern "C" fn wir_array_reduce(arr: i64, clo_ptr: i64, has_init: i64, init: i64) -> i64 {
     if arr == 0 { return 0; }
     let a = unsafe { &*(arr as *const WirArray) };
-    let f: HostCb = unsafe { std::mem::transmute::<i64, HostCb>(fun_ptr) };
     if a.buf.is_empty() {
         return if has_init != 0 { init } else { 0 };
     }
@@ -1549,7 +1559,7 @@ pub extern "C" fn wir_array_reduce(arr: i64, fun_ptr: i64, has_init: i64, init: 
     let mut acc = if has_init != 0 { init } else { it.next().unwrap() };
     for x in it {
         let args = [acc, x];
-        acc = unsafe { f(args.as_ptr(), 2) };
+        acc = unsafe { wir_call_closure(clo_ptr, args.as_ptr(), 2) };
     }
     acc
 }

@@ -134,4 +134,5 @@ print(sum);                      // expect 115
 print(c.find(|x| (x % 2) == 0 && x >= 4));   // expect 4
 
 // findIndex: index of 4 -> 4
+var find_index = 4;
 print(c.findIndex(|x| x == 4));              // expect 4

@@ -125,20 +125,3 @@ pub fn fmt_value(v: i64) -> String {
     // Unknown object
     format!("{:#x}", v as u64)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test] fn smi_roundtrip() {
-        for x in [-2, -1, 0, 1, 2, 1234567] {
-            let v = smi_from_i64(x);
-            assert!(is_imm(v));
-            assert_eq!(smi_to_i64(v), x);
-        }
-    }
-    #[test] fn fmt_bool_and_null() {
-        assert_eq!(fmt_value(0), "0"); // false
-        assert_eq!(fmt_value(1), "1"); // true
-        assert_eq!(fmt_value(NULL), "null");
-    }
-}

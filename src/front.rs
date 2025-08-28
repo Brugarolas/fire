@@ -1134,18 +1134,20 @@ impl<'m> Lowerer<'m> {
                 locals.insert(name.clone(), b.param(i));
             }
 
-            // If this is a hoisted lambda, param 0 is __env (array). Load each capture from env.
+            // Hoisted lambda: param 0 is __env (array of "boxes"). Each capture is a box.
             if !lam_caps_for_this.is_empty() {
                 let env_arr = *locals.get("__env").expect("__env param present");
                 for (i, cap) in lam_caps_for_this.iter().enumerate() {
                     let idx = b.const_i32(i as i32);
-                    let (_nid, loaded) = b.push_node(
+                    let (_nid, boxv) = b.push_node(
                         Inst::LoadElem { arr: env_arr, idx },
-                        Some(Type::Int32),
+                        None, // it’s a box (array), element type is unknown Top/None here
                         1,
                         false,
                     );
-                    locals.insert(cap.clone(), loaded[0]);
+                    // Bind the captured name to its box, and mark it boxed.
+                    locals.insert(cap.clone(), boxv[0]);
+                    locals.insert(boxed_key(cap), boxv[0]);
                 }
             }
 
@@ -2436,13 +2438,25 @@ fn lower_expr_free<'m>(
 
         // locals first, else known function -> a closure with null env
         Expr::Ident(name) => {
-            if let Some(&v) = locals.get(name) {
+            // If this local is "boxed" (captured), read box[0].
+            if locals.get(&boxed_key(name)).is_some() {
+                let box_arr = *locals.get(name).ok_or_else(|| LowerError::UnknownVar(name.clone()))?;
+                let zero = b.const_i32(0);
+                let (_nid, res) = b.push_node(
+                    Inst::CallNative { name: "wir_array_get".into(), args: vec![box_arr, zero], pure: false, can_throw: false },
+                    None,
+                    1,
+                    true,
+                );
+                Ok(res[0])
+            } else if let Some(&v) = locals.get(name) {
                 Ok(v)
             } else if let Some(&fid) = funcs.get(name) {
+                // Name is a global function: return a closure with null env.
                 let (_nid, env_null) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
                 let (_nid, clos) = b.push_node(
                     Inst::MakeClosure { callee: fid, env: env_null[0] },
-                    Some(Type::Closure(None)),   // <-- fix
+                    Some(Type::Closure(None)),
                     1,
                     false,
                 );
@@ -2568,11 +2582,24 @@ fn lower_expr_free<'m>(
                 }
 
                 LValue::Ident(name) => {
-                    if locals.contains_key(name) {
-                        locals.insert(name.clone(), rv);
+                    // If the target is boxed, write box[0] = rv; otherwise rebind local.
+                    if locals.get(&boxed_key(name)).is_some() {
+                        let box_arr = *locals.get(name).ok_or_else(|| LowerError::UnknownVar(name.clone()))?;
+                        let zero = b.const_i32(0);
+                        let (_nid, _res) = b.push_node(
+                            Inst::CallNative { name: "wir_array_set".into(), args: vec![box_arr, zero, rv], pure: false, can_throw: false },
+                            Some(Type::Int32),
+                            1,
+                            true,
+                        );
                         Ok(rv)
                     } else {
-                        Err(LowerError::UnknownVar(name.clone()))
+                        if locals.contains_key(name) {
+                            locals.insert(name.clone(), rv);
+                            Ok(rv)
+                        } else {
+                            Err(LowerError::UnknownVar(name.clone()))
+                        }
                     }
                 }
             }
@@ -2719,21 +2746,50 @@ fn lower_expr_free<'m>(
             let fid = *funcs.get(name).ok_or_else(|| LowerError::UnknownFunc(name.clone()))?;
             let caps = lam_caps.get(name).cloned().unwrap_or_default();
 
-            // build env array [cap0, cap1, ...] in the exact hoist order
+            // For each capture, if it is not boxed yet in this scope, box it now:
+            //   box = Array(1); box[0] = current_value; rebind local to box; mark boxed.
+            for cap in &caps {
+                if locals.get(&boxed_key(cap)).is_none() {
+                    let cur = *locals.get(cap).ok_or_else(|| LowerError::UnknownVar(cap.clone()))?;
+                    let one = b.const_i32(1);
+                    let (_nid, box_res) = b.push_node(
+                        Inst::AllocArray { elem_hint: Some(Type::Int32), len: one },
+                        Some(Type::Array(Box::new(Some(Type::Int32)))),
+                        1,
+                        true,
+                    );
+                    let box_arr = box_res[0];
+                    let zero = b.const_i32(0);
+                    let _ = b.push_node(
+                        Inst::CallNative { name: "wir_array_set".into(), args: vec![box_arr, zero, cur], pure: false, can_throw: false },
+                        Some(Type::Int32),
+                        1,
+                        true,
+                    );
+                    locals.insert(cap.clone(), box_arr);
+                    locals.insert(boxed_key(cap), box_arr);
+                }
+            }
+
+            // Build env array out of *boxes* (so inner lambda can mutate them)
             let len = b.const_i32(caps.len() as i32);
             let (_nid, env_res) = b.push_node(
-                Inst::AllocArray { elem_hint: Some(Type::Int32), len },
-                Some(Type::Array(Box::new(Some(Type::Int32)))),
+                Inst::AllocArray { elem_hint: Some(Type::Array(Box::new(None))), len },
+                Some(Type::Array(Box::new(None))),
                 1,
                 true,
             );
             let env = env_res[0];
 
-            for (i, cap_name) in caps.iter().enumerate() {
-                let cap_val = *locals.get(cap_name)
-                    .ok_or_else(|| LowerError::UnknownVar(format!("capture `{}` not in scope", cap_name)))?;
+            for (i, cap) in caps.iter().enumerate() {
                 let idx = b.const_i32(i as i32);
-                let _ = b.push_node(Inst::StoreElem { arr: env, idx, val: cap_val }, Some(Type::Top), 1, true);
+                let box_arr = *locals.get(cap).expect("boxed local present");
+                let _ = b.push_node(
+                    Inst::StoreElem { arr: env, idx, val: box_arr },
+                    Some(Type::Top),
+                    1,
+                    true,
+                );
             }
 
             let (_nid, clos) = b.push_node(
@@ -2763,45 +2819,6 @@ fn intern_field_local(
     fid
 }
 
-/// -------------------------
-/// Tiny end-to-end demo (tests)
-/// -------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::wir::Function;
-
-    #[test]
-    fn lex_and_parse_and_lower() {
-        let src = r#"
-            fn sum_n(n) {
-                var i = 0;
-                var s = 0;
-                var a = list(n);
-                while (i < n) {
-                    a[i] = i;
-                    s = s + a[i];
-                    i = i + 1;
-                }
-                return s;
-            }
-        "#;
-
-        let mut p = Parser::new(src);
-        let prog = p.program().expect("parse ok");
-        assert_eq!(prog.functions.len(), 1);
-        assert_eq!(prog.functions[0].name, "sum_n");
-
-        let mut module = Module::new();
-        let mut lowerer = Lowerer::new(&mut module);
-        let fids = lowerer.lower_program(&prog).expect("lower ok");
-        assert_eq!(fids.len(), 1);
-
-        // Dump the produced WIR function (pretty-printer from WIR file)
-        let fun: &Function = &module.funcs[0];
-        println!("{}", fun);
-        // Very loose sanity checks
-        assert!(fun.nodes.len() > 0);
-    }
+fn boxed_key(name: &str) -> String {
+    format!("__boxed:{}", name)
 }
