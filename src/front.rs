@@ -1859,7 +1859,6 @@ fn lower_expr_free<'m>(
     lam_caps: &HashMap<String, Vec<String>>,   // <-- new
 ) -> LResult<ValueId> {
     use BinOp::*;
-    use Inst::*;
 
     match e {
         Expr::LitInt(i) => Ok(b.const_i32(*i)),

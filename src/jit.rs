@@ -5,18 +5,11 @@ use hashbrown::HashMap;
 
 use cranelift::prelude::*;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_jit::{JITBuilder, JITModule};
+use cranelift_jit::{JITModule};
 use cranelift_module::{Linkage, Module as _};
 use cranelift::codegen::ir::instructions::BlockArg;
-use crate::value::*;
-use std::mem;
-use cranelift::prelude::{types, AbiParam, InstBuilder, IntCC};
+use cranelift::prelude::{types, InstBuilder};
 
-use crate::value::{
-    self, BoxedF64, ObjHeader, TAG_BOXED_F64, TAG_ARRAY,
-    ARRAY_LEN_OFFSET, ARRAY_DATA_OFFSET,
-    NULL, is_imm, smi_to_i64
-};
 use crate::wir::{
     Constant, Function as WirFunction, Inst, IntBinOp, Value as WirValue, ValueDef, ValueId, FuncId,
 };
@@ -232,7 +225,6 @@ impl JIT {
         use cranelift::prelude::*;
         use cranelift::prelude::{AbiParam, FunctionBuilder};
         use cranelift::prelude::types;
-        use cranelift::codegen::ir::{StackSlotData, StackSlotKind};
         use cranelift_module::{Linkage, Module};
 
         let fun_ir: &WirFunction = fun;
@@ -286,9 +278,6 @@ impl JIT {
             let mut vmap = ValueMap::new();
             let mut terminated = false;
             let mut saw_any_return = false;
-
-            // (Optional) future: track array sizes created in this function
-            let mut array_info: HashMap<ValueId, (cranelift::codegen::ir::StackSlot, i64)> = HashMap::new();
 
             // Precreate one CLIF block per WIR block.
             let mut clif_of = Vec::with_capacity(fun.blocks.len());
@@ -1484,7 +1473,6 @@ pub extern "C" fn wir_array_slice(arr: i64, start: i64, end: i64) -> i64 {
     Box::into_raw(b) as i64
 }
 
-type HostCb = unsafe extern "C" fn(*const i64, usize) -> i64;
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_array_map(arr: i64, clo_ptr: i64) -> i64 {
     if arr == 0 { return 0; }
@@ -1492,7 +1480,7 @@ pub extern "C" fn wir_array_map(arr: i64, clo_ptr: i64) -> i64 {
     let mut out = Vec::with_capacity(a.buf.len());
     for &x in &a.buf {
         let args = [x];
-        let y = unsafe { wir_call_closure(clo_ptr, args.as_ptr(), 1) };
+        let y = wir_call_closure(clo_ptr, args.as_ptr(), 1);
         out.push(y);
     }
     let b = Box::new(WirArray { buf: out });
@@ -1505,7 +1493,7 @@ pub extern "C" fn wir_array_for_each(arr: i64, clo_ptr: i64) -> i64 {
     let a = unsafe { &*(arr as *const WirArray) };
     for &x in &a.buf {
         let args = [x];
-        let _ = unsafe { wir_call_closure(clo_ptr, args.as_ptr(), 1) };
+        let _ = wir_call_closure(clo_ptr, args.as_ptr(), 1);
     }
     0
 }
@@ -1516,7 +1504,7 @@ pub extern "C" fn wir_array_find(arr: i64, clo_ptr: i64) -> i64 {
     let a = unsafe { &*(arr as *const WirArray) };
     for &x in &a.buf {
         let args = [x];
-        let ok = unsafe { wir_call_closure(clo_ptr, args.as_ptr(), 1) };
+        let ok = wir_call_closure(clo_ptr, args.as_ptr(), 1);
         if ok != 0 { return x; }
     }
     0
@@ -1528,7 +1516,7 @@ pub extern "C" fn wir_array_find_index(arr: i64, clo_ptr: i64) -> i64 {
     let a = unsafe { &*(arr as *const WirArray) };
     for (i, &x) in a.buf.iter().enumerate() {
         let args = [x];
-        let ok = unsafe { wir_call_closure(clo_ptr, args.as_ptr(), 1) };
+        let ok = wir_call_closure(clo_ptr, args.as_ptr(), 1);
         if ok != 0 { return smi(i as i64); }
     }
     smi(-1)
@@ -1541,7 +1529,7 @@ pub extern "C" fn wir_array_filter(arr: i64, clo_ptr: i64) -> i64 {
     let mut out = Vec::new();
     for &x in &a.buf {
         let args = [x];
-        let ok = unsafe { wir_call_closure(clo_ptr, args.as_ptr(), 1) };
+        let ok = wir_call_closure(clo_ptr, args.as_ptr(), 1);
         if ok != 0 { out.push(x); }
     }
     let b = Box::new(WirArray { buf: out });
@@ -1559,7 +1547,7 @@ pub extern "C" fn wir_array_reduce(arr: i64, clo_ptr: i64, has_init: i64, init: 
     let mut acc = if has_init != 0 { init } else { it.next().unwrap() };
     for x in it {
         let args = [acc, x];
-        acc = unsafe { wir_call_closure(clo_ptr, args.as_ptr(), 2) };
+        acc = wir_call_closure(clo_ptr, args.as_ptr(), 2);
     }
     acc
 }
