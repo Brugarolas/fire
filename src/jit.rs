@@ -1,7 +1,7 @@
 // src/jit.rs
 //! jit.rs — Cranelift JIT for WIR (Cranelift 0.121.x compatible)
 
-use hashbrown::HashMap;
+use ahash::AHashMap as HashMap;
 
 use cranelift::prelude::*;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -13,7 +13,11 @@ use cranelift::prelude::{types, InstBuilder};
 use crate::wir::{
     Constant, Function as WirFunction, Inst, IntBinOp, Value as WirValue, ValueDef, ValueId, FuncId,
 };
-
+use crate::runtime::{
+    wir_obj_new,
+    wir_obj_get_field, wir_obj_set_field, wir_obj_has_field, wir_obj_del_field,
+    wir_obj_get_str, wir_obj_set_str, wir_obj_has_str, wir_obj_del_str
+};
 /// ABI: `unsafe extern "C" fn(argv: *const i64, argc: usize) -> i64`
 pub type JitFnPtr = unsafe extern "C" fn(*const i64, usize) -> i64;
 
@@ -71,6 +75,22 @@ impl Default for JIT {
             fn wir_array_fill(arr: i64, val: i64) -> i64;
             fn wir_array_copy(dst: i64, src: i64, len: i64) -> i64;
         }
+
+        // --- declare the object natives so we can take typed fn pointers ---
+        unsafe extern "C" {
+            fn wir_obj_new() -> i64;
+
+            fn wir_obj_get_field(obj: i64, field_id: i64) -> i64;
+            fn wir_obj_set_field(obj: i64, field_id: i64, val: i64) -> i64;
+            fn wir_obj_has_field(obj: i64, field_id: i64) -> i64;
+            fn wir_obj_del_field(obj: i64, field_id: i64) -> i64;
+
+            fn wir_obj_get_str(obj: i64, key: i64) -> i64;
+            fn wir_obj_set_str(obj: i64, key: i64, val: i64) -> i64;
+            fn wir_obj_has_str(obj: i64, key: i64) -> i64;
+            fn wir_obj_del_str(obj: i64, key: i64) -> i64;
+        }
+
         unsafe {
             jb.symbol("wir_print_i64", wir_print_i64 as *const extern "C" fn(i64) -> i64 as *const u8);
             jb.symbol("wir_print_str", wir_print_str as *const extern "C" fn(*const std::os::raw::c_char) -> i64 as *const u8);
@@ -111,6 +131,46 @@ impl Default for JIT {
 
             jb.symbol("wir_array_fill",      wir_array_fill as *const extern "C" fn(i64, i64) -> i64 as *const u8);
             jb.symbol("wir_array_copy",      wir_array_copy as *const extern "C" fn(i64, i64, i64) -> i64 as *const u8);
+
+            // ---- object natives: bind symbol names used by CallNative to real addresses ----
+            jb.symbol(
+                "wir_obj_new",
+                wir_obj_new as *const extern "C" fn() -> i64 as *const u8,
+            );
+
+            jb.symbol(
+                "wir_obj_get_field",
+                wir_obj_get_field as *const extern "C" fn(i64, i64) -> i64 as *const u8,
+            );
+            jb.symbol(
+                "wir_obj_set_field",
+                wir_obj_set_field as *const extern "C" fn(i64, i64, i64) -> i64 as *const u8,
+            );
+            jb.symbol(
+                "wir_obj_has_field",
+                wir_obj_has_field as *const extern "C" fn(i64, i64) -> i64 as *const u8,
+            );
+            jb.symbol(
+                "wir_obj_del_field",
+                wir_obj_del_field as *const extern "C" fn(i64, i64) -> i64 as *const u8,
+            );
+
+            jb.symbol(
+                "wir_obj_get_str",
+                wir_obj_get_str as *const extern "C" fn(i64, i64) -> i64 as *const u8,
+            );
+            jb.symbol(
+                "wir_obj_set_str",
+                wir_obj_set_str as *const extern "C" fn(i64, i64, i64) -> i64 as *const u8,
+            );
+            jb.symbol(
+                "wir_obj_has_str",
+                wir_obj_has_str as *const extern "C" fn(i64, i64) -> i64 as *const u8,
+            );
+            jb.symbol(
+                "wir_obj_del_str",
+                wir_obj_del_str as *const extern "C" fn(i64, i64) -> i64 as *const u8,
+            );
         }
 
         let module = cranelift_jit::JITModule::new(jb);
@@ -908,6 +968,54 @@ impl JIT {
                             saw_any_return = true;
                         }
 
+                        Inst::LoadField { obj, field, .. } => {
+                            use cranelift::prelude::{AbiParam, types};
+
+                            let o = vmap.get_or_emit(*obj, &mut fb, args_base, fun_ir);
+
+                            // field id -> SMI
+                            let raw  = fb.ins().iconst(types::I64, field.0 as i64);
+                            let sh   = fb.ins().ishl_imm(raw, 1);
+                            let fid  = fb.ins().iadd_imm(sh, 1);
+
+                            let out = self.call_import(
+                                &mut fb,
+                                "wir_obj_get_field",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64)); // obj
+                                    s.params.push(AbiParam::new(types::I64)); // field_id (SMI)
+                                    s.returns.push(AbiParam::new(types::I64)); // value or 0
+                                },
+                                &[o, fid],
+                            )?;
+                            if res_count == 1 { vmap.bind(node.results[0], out); }
+                        }
+
+                        Inst::StoreField { obj, field, val, .. } => {
+                            use cranelift::prelude::{AbiParam, types};
+
+                            let o = vmap.get_or_emit(*obj,  &mut fb, args_base, fun_ir);
+                            let v = vmap.get_or_emit(*val,  &mut fb, args_base, fun_ir);
+
+                            // field id -> SMI
+                            let raw  = fb.ins().iconst(types::I64, field.0 as i64);
+                            let sh   = fb.ins().ishl_imm(raw, 1);
+                            let fid  = fb.ins().iadd_imm(sh, 1);
+
+                            let out = self.call_import(
+                                &mut fb,
+                                "wir_obj_set_field",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64)); // obj
+                                    s.params.push(AbiParam::new(types::I64)); // field_id (SMI)
+                                    s.params.push(AbiParam::new(types::I64)); // val
+                                    s.returns.push(AbiParam::new(types::I64)); // status / 0 (ignored)
+                                },
+                                &[o, fid, v],
+                            )?;
+                            if res_count == 1 { vmap.bind(node.results[0], out); }
+                        }
+
                         // ---------------- Effects / markers ----------------
                         Inst::EffectEntry => {
                             let token = fb.ins().iconst(ptr_ty, 0);
@@ -1157,7 +1265,6 @@ struct WirClosure {
 pub extern "C" fn wir_print_i64(v: i64) -> i64 {
     use crate::value::*;
     use std::slice;
-    use std::str;
 
     if is_imm(v) {
         println!("{}", smi_to_i64(v));   // SMI

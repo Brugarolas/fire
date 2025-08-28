@@ -2,9 +2,11 @@
 mod value;
 mod wir;
 mod front;
-mod opt;
-// mod optimizer; // not used yet, but keep for future pipeline
+//mod opt;
+mod runtime;
 mod jit;
+
+//pub use crate::opt::optimization::early_pipeline;
 
 fn default_script() -> &'static str {
     r#"
@@ -47,6 +49,9 @@ fn main() {
         eprintln!("Lowering error: {:?}", e);
         return;
     }
+
+    //let optimizer = early_pipeline();
+    //optimizer.optimize_module(&mut module);
 
     // 4) JIT compile ALL functions
     let mut jit = jit::JIT::default();

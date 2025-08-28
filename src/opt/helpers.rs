@@ -186,3 +186,17 @@ pub fn replace_uses_in_inst(inst: &mut Inst, from: ValueId, to: ValueId) -> usiz
     n
 }
 
+pub fn is_pure(inst: &Inst) -> bool {
+    use Inst::*;
+    match inst {
+        // Control or effectful explicitly not pure
+        Phi(_) | Jump(_, _) | Branch { .. } | Switch { .. } | Return(_) | Throw(_) => false,
+        EffectEntry | Safepoint => false,
+        // Guards are effectful (ordering) — skip
+        GuardType { .. } | GuardShape { .. } | GuardBounds { .. } | GuardNotNull { .. } | GuardIsInt { .. } | GuardIsF64 { .. } | Bailout { .. } => false,
+        // Stores/allocs/calls/barriers are effectful — skip
+        AllocObj { .. } | StoreField { .. } | TransitionShape { .. } | AllocArray { .. } | StoreElem { .. } | ArraySetLen { .. } | ArrayPush { .. } | ArrayPop(_) | ArrayShift(_) | ArrayUnshift { .. } | ArrayFill { .. } | ArrayCopy { .. } | ArrayMap { .. } | ArrayReduce { .. } | ArrayForEach { .. } | ArrayFind { .. } | ArrayFindIndex { .. } | ArrayFilter { .. } | CallDirect { .. } | CallIC { .. } | CallClosure { .. } | CallNative { .. } | AllocClosure { .. } | StoreEnv { .. } | PostWriteBarrier { .. } | ReadBarrier { .. } | StrToNumber(_) | OSRPoint => false,
+        // Everything else is pure.
+        _ => true,
+    }
+}

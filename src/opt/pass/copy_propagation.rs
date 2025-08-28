@@ -16,15 +16,11 @@ use crate::opt::{InstCursor, OptimizationWIR, WirEditQueue};
 use crate::opt::helpers::replace_uses_in_inst;
 use crate::wir::{Function, Inst, InstId, ValueDef, ValueId};
 
-pub struct CopyPropagation {
-    /// Maximum number of Mov links to chase when collapsing Mov(Mov(..)).
-    chase_limit: usize,
-}
-impl CopyPropagation {
-    pub fn new() -> Self {
-        Self { chase_limit: 8 }
-    }
+pub const CHASE_LIMIT: usize = 8;
 
+pub struct CopyPropagation;
+
+impl CopyPropagation {
     /// Follow Mov chains up to `chase_limit`, returning the first non-Mov source.
     fn chase_mov_chain(func: &Function, mut v: ValueId, limit: usize) -> ValueId {
         let mut steps = 0usize;
@@ -66,7 +62,7 @@ impl OptimizationWIR for CopyPropagation {
         let Some(res) = res_v else { return false; };
 
         // 1) Collapse Mov chains: Mov(Mov(x)) -> Mov(x_final)
-        let final_src = cur.with_func(|f| Self::chase_mov_chain(f, src0, self.chase_limit));
+        let final_src = cur.with_func(|f| Self::chase_mov_chain(f, src0, CHASE_LIMIT));
         if final_src != src0 {
             // Replace the Mov's operand in-place, keep results/effects the same.
             q.replace_kind(this_id, Inst::Mov(final_src));

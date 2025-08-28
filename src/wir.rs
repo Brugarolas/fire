@@ -23,7 +23,8 @@
 #![allow(clippy::large_enum_variant)]
 #![allow(clippy::too_many_arguments)]
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
+use ahash::AHashMap as HashMap;
 use std::fmt;
 
 /// -------- Newtyped IDs for stable handles (indices into Vecs) --------

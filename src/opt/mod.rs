@@ -14,7 +14,8 @@
 #![allow(clippy::needless_return)]
 
 pub mod helpers;
-pub mod peephole_simplify;
+pub mod pass;
+pub mod optimization;
 
 use std::any::Any;
 use std::cmp::Ordering;

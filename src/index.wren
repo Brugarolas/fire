@@ -136,3 +136,12 @@ print(c.find(|x| (x % 2) == 0 && x >= 4));   // expect 4
 // findIndex: index of 4 -> 4
 var find_index = 4;
 print(c.findIndex(|x| x == 4));              // expect 4
+
+print("===== Objects =====");
+var o = { a: 10, "b": 20 };
+print(o.a);          // 10
+o.a = o.a + 1;
+print(o["b"]);       // 20
+print("a" in o);     // 1
+delete o.a;
+print("a" in o);     // 0

@@ -1,55 +1,7 @@
 // front.rs
-//! frontend.rs — Logos-based tokenizer + hand-rolled parser → WIR lowerer
-//!
-//! This is a real, compiling Rust module that provides:
-//!   1) A `logos` lexer for a small, Wren-ish language subset
-//!   2) A hand-rolled Pratt parser (expressions) + RD parser (statements/functions)
-//!   3) A lowering pass from the parsed AST into the previously defined WIR
-//!
-//! Drop this next to the WIR file you already have (the one I gave earlier).
-//! Then in `Cargo.toml`, add:
-//!     [dependencies]
-//!     logos = "0.14"
-//!
-//! Example supported grammar (subset, Wren-ish / C-ish blend):
-//!   program     := { fn_def | class_def? }*
-//!   fn_def      := "fn" IDENT "(" param_list? ")" block
-//!   param_list  := IDENT ("," IDENT)*
-//!   block       := "{" stmt* "}"
-//!   stmt        := var_decl | if_stmt | while_stmt | for_stmt | return_stmt | expr_stmt
-//!   var_decl    := "var" IDENT ("=" expr)? ";"
-//!   if_stmt     := "if" "(" expr ")" block ("else" block)?
-//!   while_stmt  := "while" "(" expr ")" block
-//!   for_stmt    := "for" "(" (var_decl | expr_stmt | ";") expr? ";" expr? ")" block
-//!   return_stmt := "return" expr? ";"
-//!   expr_stmt   := expr ";"
-//!   expr        := assignment
-//!   assignment  := (primary "." IDENT | IDENT | index) "=" assignment | logic_or
-//!   logic_or    := logic_and ("||" logic_and)*
-//!   logic_and   := equality ("&&" equality)*
-//!   equality    := comparison (("==" | "!=") comparison)*
-//!   comparison  := term (("<" | "<=" | ">" | ">=") term)*
-//!   term        := factor (("+" | "-") factor)*
-//!   factor      := unary (("*" | "/" | "%") unary)*
-//!   unary       := ("!" | "-" | "+") unary | call
-//!   call        := primary ( "(" arg_list? ")" | "." IDENT | "[" expr "]" )*
-//!   primary     := NUMBER | STRING | "true" | "false" | "null" | IDENT | "(" expr ")"
-//!
-//! Types: we keep them dynamic in the surface, but the lowerer prefers i32/f64/bool and Array<i32>
-//! to keep the WIR example tight. You can expand as needed.
-//!
-//! Lowering strategy (initial):
-//!  - locals are SSA-ish by rewriting to builder temps (this is *not* full SSA; good enough to
-//!    generate WIR for tests). A future pass can do proper SSA construction & phi placement.
-//!  - arithmetic → Int32 by default unless literals are f64 (*very* simple typing).
-//!  - arrays: `list(n)` intrinsic -> AllocArray; `a[i]` -> GuardBounds + LoadElem.
-//!  - calls to known `fn` (parsed in same module) → CallDirect; otherwise CallIC on receiver.
-//!
-//! Note: this is deliberately small to keep it readable, but fully functional.
-
 use logos::Logos;
 use std::collections::{BTreeSet};
-use hashbrown::HashMap;
+use ahash::AHashMap as HashMap;
 
 // Bring in the WIR types from your other file/module.
 use crate::wir::{
@@ -82,6 +34,8 @@ pub enum Tok {
     #[token("true")] True,
     #[token("false")] False,
     #[token("null")] Null,
+    #[token("in")] In,
+    #[token("delete")] Delete,
 
     // Simple builtins
     #[token("Array")] ListBuiltin,
@@ -127,6 +81,7 @@ pub enum Tok {
     #[token("}")] RBrace,
     #[token("[")] LBracket,
     #[token("]")] RBracket,
+    #[token(":")] Colon,
 }
 
 fn unescape_string(raw: &str) -> String {
@@ -187,6 +142,12 @@ pub enum Stmt {
 }
 
 #[derive(Debug, Clone)]
+pub enum PropKey {
+    Ident(String),  // identifier property name (interned later)
+    Str(String),    // string-literal property name
+}
+
+#[derive(Debug, Clone)]
 pub enum Expr {
     LitInt(i32),
     LitF64(f64),
@@ -204,6 +165,21 @@ pub enum Expr {
     FnLit { params: Vec<String>, body: Block },
     FnRef { name: String },
     ArrayLit(Vec<Expr>),
+
+    // { a: 1, "b": 2, c: x+y }
+    ObjLit(Vec<(PropKey, Expr)>),
+
+    // obj.x   or   obj["x"]
+    GetPropObj { obj: Box<Expr>, key: PropKey },
+
+    // obj.x = value   or   obj["x"] = value
+    SetPropObj { obj: Box<Expr>, key: PropKey, value: Box<Expr> },
+
+    // "<key>" in obj   — key is a general Expr; at lowering we'll coerce to string/symbol
+    In { key: Box<Expr>, obj: Box<Expr> },
+
+    // delete obj.x / delete obj["x"]
+    DeleteProp { obj: Box<Expr>, key: PropKey },
 }
 
 
@@ -641,7 +617,13 @@ impl<'src> Parser<'src> {
             } else if self.matches(&Tok::GtEq) {
                 let rhs = self.parse_term()?;
                 e = Expr::Binary { op: BinOp::Ge, a: Box::new(e), b: Box::new(rhs) };
-            } else { break; }
+            } else if self.matches(&Tok::In) {
+                let rhs = self.parse_term()?;
+                // left "in" right → Expr::In { key: left, obj: right }
+                e = Expr::In { key: Box::new(e), obj: Box::new(rhs) };
+            } else {
+                break;
+            }
         }
         Ok(e)
     }
@@ -780,9 +762,93 @@ impl<'src> Parser<'src> {
                     Ok(Expr::FnLit { params, body })
                 }
             }
+            Tok::LBrace => self.parse_object_literal(),
+            Tok::Delete => self.parse_delete(),
             _ => Err(ParseError { msg: "unexpected token".into(), span: t.span }),
         }
     }
+
+    // Parse an object literal: { a: 1, "b": 2, c: x+y }
+    fn parse_object_literal(&mut self) -> PResult<Expr> {
+        // self.expect(Tok::LBrace, "expected '{'")?; // already consumed
+        let mut props = Vec::new();
+
+        if !self.check(&Tok::RBrace) {
+            loop {
+                // key: Ident | Str
+                let key = match &self.peek().tok {
+                    Tok::Ident(s) => {
+                        let s = if let Tok::Ident(s) = self.next().tok { s } else { unreachable!() };
+                        PropKey::Ident(s)
+                    }
+                    Tok::Str(_) => {
+                        let s = if let Tok::Str(s) = self.next().tok { s } else { unreachable!() };
+                        PropKey::Str(s)
+                    }
+                    _ => return Err(self.err_here("expected property name (identifier or string)")),
+                };
+
+                self.expect(Tok::Colon, "expected ':' after property name")?;
+                let value = self.expr()?;
+                props.push((key, value));
+
+                if self.matches(&Tok::Comma) {
+                    if self.matches(&Tok::RBrace) { break; } // trailing comma
+                    continue;
+                }
+                break;
+            }
+        }
+
+        self.expect(Tok::RBrace, "expected '}' to close object literal")?;
+        Ok(Expr::ObjLit(props))
+    }
+
+    // delete obj.x   |   delete obj["x"]
+    fn parse_delete(&mut self) -> PResult<Expr> {
+        // self.expect(Tok::Delete, "expected 'delete'")?; // already consumed
+        // Parse a member expression after delete. We reuse your existing call/postfix chain.
+        // Start from a primary and then allow . / [ ] as your parse_call() does.
+        // Easiest minimum-change approach: parse like parse_call() but only accept a GetProp/Index.
+
+        // Parse receiver first
+        let mut recv = self.parse_primary()?;
+        // Then allow just one layer of .name or [expr] (that mirrors how 'delete' is used)
+        let key = if self.matches(&Tok::Dot) {
+            // delete obj.ident
+            let name = match self.next().tok {
+                Tok::Ident(s) => s,
+                _ => return Err(self.err_here("expected identifier after '.' in delete")),
+            };
+            return Ok(Expr::DeleteProp { obj: Box::new(recv), key: PropKey::Ident(name) });
+        } else if self.matches(&Tok::LBracket) {
+            // delete obj["x"]  or delete obj[expr]
+            // For MVP, support string and identifier statically; fall back to Index for general expr.
+            match &self.peek().tok {
+                Tok::Str(_) => {
+                    let s = if let Tok::Str(s) = self.next().tok { s } else { unreachable!() };
+                    self.expect(Tok::RBracket, "expected ']'")?;
+                    return Ok(Expr::DeleteProp { obj: Box::new(recv), key: PropKey::Str(s) });
+                }
+                Tok::Ident(_) => {
+                    let name = if let Tok::Ident(s) = self.next().tok { s } else { unreachable!() };
+                    self.expect(Tok::RBracket, "expected ']'")?;
+                    return Ok(Expr::DeleteProp { obj: Box::new(recv), key: PropKey::Ident(name) });
+                }
+                _ => {
+                    // general index: delete obj[expr]
+                    let idx = self.expr()?;
+                    self.expect(Tok::RBracket, "expected ']'")?;
+                    // Keep an Index-flavored delete as "delete index". If you prefer a distinct node,
+                    // add Expr::DeleteIndex and return that instead.
+                    return Ok(Expr::Unary { op: UnOp::Pos, e: Box::new(Expr::Index { recv: Box::new(recv), index: Box::new(idx) }) });
+                }
+            }
+        } else {
+            return Err(self.err_here("delete expects a property access (obj.x or obj[...])"));
+        };
+    }
+
 }
 
 fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String>>) {
@@ -831,6 +897,7 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
             Stmt::Expr(e) => collect_uses_expr(e, uses),
         }
     }
+
     fn collect_uses_expr(e: &Expr, uses: &mut BTreeSet<String>) {
         match e {
             Expr::Ident(s) => { uses.insert(s.clone()); }
@@ -858,6 +925,30 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
                 for el in elems {
                     collect_uses_expr(el, uses);
                 }
+            }
+
+            Expr::ObjLit(props) => {
+                for (_, v) in props {
+                    collect_uses_expr(v, uses);
+                }
+            }
+
+            Expr::GetPropObj { obj, .. } => {
+                collect_uses_expr(obj, uses);
+            }
+
+            Expr::SetPropObj { obj, value, .. } => {
+                collect_uses_expr(obj, uses);
+                collect_uses_expr(value, uses);
+            }
+
+            Expr::In { key, obj } => {
+                collect_uses_expr(key, uses);
+                collect_uses_expr(obj, uses);
+            }
+
+            Expr::DeleteProp { obj, .. } => {
+                collect_uses_expr(obj, uses);
             }
         }
     }
@@ -955,6 +1046,7 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
             Stmt::Expr(e) => Stmt::Expr(rw_expr(e, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
         }
     }
+
     fn rw_lvalue(
         lv: &LValue,
         used: &mut BTreeSet<String>,
@@ -972,6 +1064,7 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
                                 index: rw_expr(index, used, counter, enclosing_locals, out_funcs, lam_caps_out) },
         }
     }
+
     fn rw_expr(
         e: &Expr,
         used: &mut BTreeSet<String>,
@@ -1047,6 +1140,44 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
                         .map(|el| rw_expr(el, used, counter, enclosing_locals, out_funcs, lam_caps_out))
                         .collect()
                 )
+            }
+
+            Expr::ObjLit(props) => {
+                Expr::ObjLit(
+                    props.iter()
+                        .map(|(k, v)| (k.clone(),
+                            rw_expr(v, used, counter, enclosing_locals, out_funcs, lam_caps_out)))
+                        .collect()
+                )
+            }
+
+            Expr::GetPropObj { obj, key } => {
+                Expr::GetPropObj {
+                    obj: Box::new(rw_expr(obj, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                    key: key.clone(),
+                }
+            }
+
+            Expr::SetPropObj { obj, key, value } => {
+                Expr::SetPropObj {
+                    obj: Box::new(rw_expr(obj, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                    key: key.clone(),
+                    value: Box::new(rw_expr(value, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                }
+            }
+
+            Expr::In { key, obj } => {
+                Expr::In {
+                    key: Box::new(rw_expr(key, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                    obj: Box::new(rw_expr(obj, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                }
+            }
+
+            Expr::DeleteProp { obj, key } => {
+                Expr::DeleteProp {
+                    obj: Box::new(rw_expr(obj, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                    key: key.clone(),
+                }
             }
         }
     }
@@ -2005,20 +2136,44 @@ fn lower_expr_free<'m>(
                     Ok(rv)
                 }
                 LValue::Index { recv, index } => {
-                    let arr = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
-                    let idx = lower_expr_free(b, locals, fields, next_field, index, funcs, lam_caps)?;
-                    let (_nid, _res) = b.push_node(
-                        Inst::CallNative {
-                            name: "wir_array_set".into(),
-                            args: vec![arr, idx, rv],
-                            pure: false,
-                            can_throw: false,
-                        },
-                        Some(Type::Int32), // native may return new length or status; we ignore it here
-                        1,
-                        true,
-                    );
-                    Ok(rv)
+                    // If the index is a string literal, treat as object property write
+                    if let Expr::Str(s) = index {
+                        let obj = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
+                        let (_nid, ks) = b.push_node(
+                            Inst::Const(Constant::Str(s.clone())),
+                            Some(Type::Str),
+                            1,
+                            false,
+                        );
+                        let (_nid, _res) = b.push_node(
+                            Inst::CallNative {
+                                name: "wir_obj_set_str".into(),
+                                args: vec![obj, ks[0], rv],
+                                pure: false,
+                                can_throw: false,
+                            },
+                            Some(Type::Int32), // ignored
+                            1,
+                            true,
+                        );
+                        Ok(rv)
+                    } else {
+                        // regular array write
+                        let arr = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
+                        let idx = lower_expr_free(b, locals, fields, next_field, index, funcs, lam_caps)?;
+                        let (_nid, _res) = b.push_node(
+                            Inst::CallNative {
+                                name: "wir_array_set".into(),
+                                args: vec![arr, idx, rv],
+                                pure: false,
+                                can_throw: false,
+                            },
+                            Some(Type::Int32),
+                            1,
+                            true,
+                        );
+                        Ok(rv)
+                    }
                 }
 
                 LValue::Ident(name) => {
@@ -2076,12 +2231,72 @@ fn lower_expr_free<'m>(
                 }
                 if name == "print" {
                     if args.len() != 1 { return Err(LowerError::NotLowerable("print() expects 1 arg")); }
-                    let is_str_lit = matches!(args[0], Expr::Str(_));
-                    let v = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+
+                    // 1) If it’s a string literal, use the string printer directly.
+                    if matches!(args[0], Expr::Str(_)) {
+                        let v = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+                        let (_nid, res) = b.push_node(
+                            Inst::CallNative {
+                                name: "wir_print_str".into(),
+                                args: vec![v],
+                                pure: false,
+                                can_throw: false,
+                            },
+                            Some(Type::Int32),
+                            1,
+                            true,
+                        );
+                        return Ok(res[0]);
+                    }
+
+                    // 2) If it’s “bool-ish”, coerce Bool → i32 {false:0, true:1} then print as i64.
+                    let is_boolish = matches!(
+                        args[0],
+                        // comparisons / equality
+                        Expr::Binary { op: BinOp::Eq  , .. }
+                        | Expr::Binary { op: BinOp::Ne , .. }
+                        | Expr::Binary { op: BinOp::Lt , .. }
+                        | Expr::Binary { op: BinOp::Le , .. }
+                        | Expr::Binary { op: BinOp::Gt , .. }
+                        | Expr::Binary { op: BinOp::Ge , .. }
+                        // logical operators (already return Bool)
+                        | Expr::Binary { op: BinOp::And, .. }
+                        | Expr::Binary { op: BinOp::Or , .. }
+                        // unary not
+                        | Expr::Unary  { op: UnOp::Not, .. }
+                        // the `in` operator
+                        | Expr::In { .. }
+                    );
+
+                    let v0 = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+
+                    // If bool-ish, branch to synthesize 0/1; else, pass the value directly.
+                    let v_to_print = if is_boolish {
+                        let then_b = b.block();
+                        let else_b = b.block();
+                        let cont   = b.block();
+                        let out_i  = b.add_block_param(cont, Type::Int32);
+
+                        b.branch(v0, then_b, else_b);
+
+                        b.position_at(then_b);
+                        let one = b.const_i32(1);
+                        b.jump(cont, &[one]);
+
+                        b.position_at(else_b);
+                        let zero = b.const_i32(0);
+                        b.jump(cont, &[zero]);
+
+                        b.position_at(cont);
+                        out_i
+                    } else {
+                        v0
+                    };
+
                     let (_nid, res) = b.push_node(
                         Inst::CallNative {
-                            name: if is_str_lit { "wir_print_str".into() } else { "wir_print_i64".into() },
-                            args: vec![v],
+                            name: "wir_print_i64".into(),
+                            args: vec![v_to_print],
                             pure: false,
                             can_throw: false,
                         },
@@ -2142,20 +2357,44 @@ fn lower_expr_free<'m>(
         }
 
         Expr::Index { recv, index } => {
-            let arr = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
-            let idx = lower_expr_free(b, locals, fields, next_field, index, funcs, lam_caps)?;
-            let (_nid, res) = b.push_node(
-                Inst::CallNative {
-                    name: "wir_array_get".into(),
-                    args: vec![arr, idx],
-                    pure: false,
-                    can_throw: false,
-                },
-                None,
-                1,
-                true,
-            );
-            Ok(res[0])
+            // If the index is a string literal, treat as object property read
+            if let Expr::Str(s) = &**index {
+                let obj = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
+                let (_nid, ks) = b.push_node(
+                    Inst::Const(Constant::Str(s.clone())),
+                    Some(Type::Str),
+                    1,
+                    false,
+                );
+                let (_nid, res) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_obj_get_str".into(),
+                        args: vec![obj, ks[0]],
+                        pure: false,
+                        can_throw: false,
+                    },
+                    None,
+                    1,
+                    true,
+                );
+                Ok(res[0])
+            } else {
+                // regular array indexing
+                let arr = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
+                let idx = lower_expr_free(b, locals, fields, next_field, index, funcs, lam_caps)?;
+                let (_nid, res) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_array_get".into(),
+                        args: vec![arr, idx],
+                        pure: false,
+                        can_throw: false,
+                    },
+                    None,
+                    1,
+                    true,
+                );
+                Ok(res[0])
+            }
         }
 
         Expr::ArrayLit(elems) => {
@@ -2241,7 +2480,191 @@ fn lower_expr_free<'m>(
             Ok(clos[0])
         }
 
-        _ => Err(LowerError::NotLowerable("expression not yet implemented")),
+        Expr::ObjLit(props) => {
+            // obj = wir_obj_new()
+            let (_nid, obj_res) = b.push_node(
+                Inst::CallNative {
+                    name: "wir_obj_new".into(),
+                    args: vec![],
+                    pure: false,
+                    can_throw: false,
+                },
+                None, // dynamic object
+                1,
+                true,
+            );
+            let obj = obj_res[0];
+
+            for (key, val_e) in props {
+                let v = lower_expr_free(b, locals, fields, next_field, val_e, funcs, lam_caps)?;
+                match key {
+                    PropKey::Ident(name) => {
+                        // Use your fast slot path (stable, same as obj.x)
+                        let field = intern_field_local(fields, next_field, name);
+                        let _ = b.push_node(
+                            Inst::StoreField { obj, field, val: v, expected: None },
+                            Some(Type::Top),
+                            1,
+                            true,
+                        );
+                    }
+                    PropKey::Str(s) => {
+                        // General string key → native set(obj, "k", v)
+                        let (_nid, ks) = b.push_node(Inst::Const(Constant::Str(s.clone())), Some(Type::Str), 1, false);
+                        let _ = b.push_node(
+                            Inst::CallNative {
+                                name: "wir_obj_set_str".into(),
+                                args: vec![obj, ks[0], v],
+                                pure: false,
+                                can_throw: false,
+                            },
+                            Some(Type::Int32), // ignore result
+                            1,
+                            true,
+                        );
+                    }
+                }
+            }
+
+            Ok(obj)
+        }
+
+        Expr::DeleteProp { obj, key } => {
+            let o = lower_expr_free(b, locals, fields, next_field, obj, funcs, lam_caps)?;
+            match key {
+                PropKey::Ident(name) => {
+                let field   = intern_field_local(fields, next_field, name);
+                let fid_smi = b.const_i32(field.0 as i32);
+
+                let (_nid, res) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_obj_del_field".into(),
+                        args: vec![o, fid_smi],
+                        pure: false,
+                        can_throw: false,
+                    },
+                    Some(crate::wir::Type::Bool),
+                    1,
+                    true,
+                );
+                Ok(res[0])
+            }
+                PropKey::Str(s) => {
+                    let (_nid, ks) = b.push_node(
+                        Inst::Const(Constant::Str(s.clone())),
+                        Some(Type::Str),
+                        1,
+                        false,
+                    );
+                    let (_nid, res) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_obj_del_str".into(),
+                            args: vec![o, ks[0]],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::Bool),
+                        1,
+                        true,
+                    );
+                    Ok(res[0])
+                }
+            }
+        }
+
+        Expr::In { key, obj } => {
+            let o = lower_expr_free(b, locals, fields, next_field, obj, funcs, lam_caps)?;
+
+            match &**key {
+                // identifier key:  a in o
+                Expr::Ident(name) => {
+                    // fast slot check (SMI-encode the field id)
+                    let field   = intern_field_local(fields, next_field, name);
+                    // field id, already SMI as a Const::Int32
+                    let fid_smi = b.const_i32(field.0 as i32);
+
+                    let (_nid_f, hf) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_obj_has_field".into(),
+                            args: vec![o, fid_smi],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::Bool),
+                        1,
+                        true,
+                    );
+
+                    // string table check
+                    let (_nid_sconst, ks) = b.push_node(
+                        Inst::Const(Constant::Str(name.clone())),
+                        Some(Type::Str),
+                        1,
+                        false,
+                    );
+                    let (_nid_s, hs) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_obj_has_str".into(),
+                            args: vec![o, ks[0]],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::Bool),
+                        1,
+                        true,
+                    );
+
+                    Ok(build_bool_or(b, hf[0], hs[0]))
+                }
+
+                // string-literal key:  "a" in o
+                Expr::Str(s) => {
+                    // fast slot check (SMI-encode the field id)
+                    let field   = intern_field_local(fields, next_field, s);
+                    // already SMI
+                    let fid_smi = b.const_i32(field.0 as i32);
+
+                    let (_nid_f, hf) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_obj_has_field".into(),
+                            args: vec![o, fid_smi],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::Bool),
+                        1,
+                        true,
+                    );
+
+                    // string table check
+                    let (_nid_sconst, ks) = b.push_node(
+                        Inst::Const(Constant::Str(s.clone())),
+                        Some(Type::Str),
+                        1,
+                        false,
+                    );
+                    let (_nid_s, hs) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_obj_has_str".into(),
+                            args: vec![o, ks[0]],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::Bool),
+                        1,
+                        true,
+                    );
+
+                    Ok(build_bool_or(b, hf[0], hs[0]))
+                }
+
+                _ => {
+                    unreachable!()
+                }
+            }
+        }
+
+        _ => Err(LowerError::NotLowerable("expression type not supported"))
     }
 }
 
@@ -2257,6 +2680,27 @@ fn intern_field_local(
     *next_field += 1;
     fields.insert(name.to_string(), fid);
     fid
+}
+
+// Put this at module scope in front.rs (or wherever your other IR helpers live)
+fn build_bool_or(b: &mut Builder, lhs: ValueId, rhs: ValueId) -> ValueId {
+    // if lhs then true else rhs
+    let then_b = b.block();
+    let else_b = b.block();
+    let cont   = b.block();
+    let out    = b.add_block_param(cont, Type::Bool);
+
+    b.branch(lhs, then_b, else_b);
+
+    b.position_at(then_b);
+    let (_nid_t, t) = b.push_node(Inst::Const(Constant::Bool(true)), Some(Type::Bool), 1, false);
+    b.jump(cont, &[t[0]]);
+
+    b.position_at(else_b);
+    b.jump(cont, &[rhs]);
+
+    b.position_at(cont);
+    out
 }
 
 fn boxed_key(name: &str) -> String {
