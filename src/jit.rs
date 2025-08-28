@@ -14,7 +14,7 @@ use crate::wir::{
     Constant, Function as WirFunction, Inst, IntBinOp, Value as WirValue, ValueDef, ValueId, FuncId,
 };
 use crate::runtime::{
-    wir_obj_new,
+    wir_obj_new, wir_is_str,
     wir_obj_get_field, wir_obj_set_field, wir_obj_has_field, wir_obj_del_field,
     wir_obj_get_str, wir_obj_set_str, wir_obj_has_str, wir_obj_del_str
 };
@@ -79,6 +79,7 @@ impl Default for JIT {
         // --- declare the object natives so we can take typed fn pointers ---
         unsafe extern "C" {
             fn wir_obj_new() -> i64;
+            fn wir_is_str(v: i64) -> i64;
 
             fn wir_obj_get_field(obj: i64, field_id: i64) -> i64;
             fn wir_obj_set_field(obj: i64, field_id: i64, val: i64) -> i64;
@@ -137,6 +138,7 @@ impl Default for JIT {
                 "wir_obj_new",
                 wir_obj_new as *const extern "C" fn() -> i64 as *const u8,
             );
+            jb.symbol("wir_is_str", wir_is_str as *const u8);
 
             jb.symbol(
                 "wir_obj_get_field",

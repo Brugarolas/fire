@@ -26,6 +26,19 @@ pub extern "C" fn wir_obj_new() -> i64 {
     Box::into_raw(o) as i64
 }
 
+#[unsafe(no_mangle)] // or #[unsafe(no_mangle)] if you're using that everywhere else
+pub extern "C" fn wir_is_str(v: i64) -> i64 {
+    // Immediates (SMIs) and null are not strings
+    if v == 0 || (v & 1) == 1 {
+        return 0;
+    }
+    // v is an even (pointer) ValueRepr. Read its header tag.
+    unsafe {
+        let hdr = &*(v as *const ObjHeader);
+        if hdr.tag == TAG_STRING { 1 } else { 0 }
+    }
+}
+
 // -------- fast-slot path (field id is a SMI) --------
 
 #[unsafe(no_mangle)]

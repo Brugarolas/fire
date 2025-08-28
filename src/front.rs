@@ -2114,10 +2114,12 @@ fn lower_expr_free<'m>(
         Expr::Assign(lv, rhs) => {
             let rv = lower_expr_free(b, locals, fields, next_field, rhs, funcs, lam_caps)?;
             match &**lv {
+                // o.a = rv      (dot write)
                 LValue::GetProp { recv, name } => {
                     let obj = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
+
+                    // Special-case: arr.length = n
                     if name == "length" {
-                        // arr.length = n  → wir_array_set_len(arr, n)
                         let (_nid, _r) = b.push_node(
                             Inst::CallNative {
                                 name: "wir_array_set_len".into(),
@@ -2131,58 +2133,113 @@ fn lower_expr_free<'m>(
                         );
                         return Ok(rv);
                     }
+
+                    // 1) Store fast field
                     let field = intern_field_local(fields, next_field, name);
-                    let _ = b.push_node(Inst::StoreField { obj, field, val: rv, expected: None }, Some(Type::Top), 1, true);
+                    let _ = b.push_node(
+                        Inst::StoreField { obj, field, val: rv, expected: None },
+                        Some(Type::Top),
+                        1,
+                        true,
+                    );
+
+                    // 2) Mirror into string table
+                    let (_nid_sconst, ks) =
+                        b.push_node(Inst::Const(Constant::Str(name.clone())), Some(Type::Str), 1, false);
+                    let _ = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_obj_set_str".into(),
+                            args: vec![obj, ks[0], rv],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::Int32),
+                        1,
+                        true,
+                    );
+
                     Ok(rv)
                 }
-                LValue::Index { recv, index } => {
-                    // If the index is a string literal, treat as object property write
-                    if let Expr::Str(s) = index {
-                        let obj = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
-                        let (_nid, ks) = b.push_node(
-                            Inst::Const(Constant::Str(s.clone())),
-                            Some(Type::Str),
-                            1,
-                            false,
-                        );
-                        let (_nid, _res) = b.push_node(
-                            Inst::CallNative {
-                                name: "wir_obj_set_str".into(),
-                                args: vec![obj, ks[0], rv],
-                                pure: false,
-                                can_throw: false,
-                            },
-                            Some(Type::Int32), // ignored
-                            1,
-                            true,
-                        );
-                        Ok(rv)
-                    } else {
-                        // regular array write
-                        let arr = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
-                        let idx = lower_expr_free(b, locals, fields, next_field, index, funcs, lam_caps)?;
-                        let (_nid, _res) = b.push_node(
-                            Inst::CallNative {
-                                name: "wir_array_set".into(),
-                                args: vec![arr, idx, rv],
-                                pure: false,
-                                can_throw: false,
-                            },
-                            Some(Type::Int32),
-                            1,
-                            true,
-                        );
-                        Ok(rv)
-                    }
+
+                // o["a"] = rv     (bracket write with string)
+                LValue::Index { recv, index } if matches!(index, Expr::Str(_)) => {
+                    let obj = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
+                    let s = if let Expr::Str(s) = index { s } else { unreachable!() };
+
+                    // 1) Store fast field
+                    let field = intern_field_local(fields, next_field, s);
+                    let _ = b.push_node(
+                        Inst::StoreField { obj, field, val: rv, expected: None },
+                        Some(Type::Top),
+                        1,
+                        true,
+                    );
+
+                    // 2) Mirror into string table
+                    let (_nid, ks) = b.push_node(Inst::Const(Constant::Str(s.clone())), Some(Type::Str), 1, false);
+                    let _ = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_obj_set_str".into(),
+                            args: vec![obj, ks[0], rv],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::Int32),
+                        1,
+                        true,
+                    );
+
+                    Ok(rv)
                 }
 
+                // --- inside Expr::Assign(lv, rhs) match ---
+                LValue::Index { recv, index } if !matches!(index, Expr::Str(_)) => {
+                    let obj  = lower_expr_free(b, locals, fields, next_field, recv,  funcs, lam_caps)?;
+                    let idxv = lower_expr_free(b, locals, fields, next_field, index, funcs, lam_caps)?;
+
+                    let (_nid_is, is_str) = b.push_node(
+                        Inst::CallNative { name: "wir_is_str".into(), args: vec![idxv], pure: false, can_throw: false },
+                        Some(Type::Bool), 1, true,
+                    );
+
+                    let str_b = b.block();
+                    let arr_b = b.block();
+                    let cont  = b.block();
+
+                    b.branch(is_str[0], str_b, arr_b);
+
+                    // object["key"] = rv  (also mirror into fast field if you want symmetry)
+                    b.position_at(str_b);
+                    let (_nid_set_s, _r_s) = b.push_node(
+                        Inst::CallNative { name: "wir_obj_set_str".into(), args: vec![obj, idxv, rv], pure: false, can_throw: false },
+                        Some(Type::Int32), 1, true,
+                    );
+                    b.jump(cont, &[]);
+
+                    // array[index] = rv
+                    b.position_at(arr_b);
+                    let (_nid_set_a, _r_a) = b.push_node(
+                        Inst::CallNative { name: "wir_array_set".into(), args: vec![obj, idxv, rv], pure: false, can_throw: false },
+                        Some(Type::Int32), 1, true,
+                    );
+                    b.jump(cont, &[]);
+
+                    b.position_at(cont);
+                    Ok(rv)
+                }
+
+                // x = rv          (local write, with capture boxing support)
                 LValue::Ident(name) => {
-                    // If the target is boxed, write box[0] = rv; otherwise rebind local.
                     if locals.get(&boxed_key(name)).is_some() {
                         let box_arr = *locals.get(name).ok_or_else(|| LowerError::UnknownVar(name.clone()))?;
                         let zero = b.const_i32(0);
                         let (_nid, _res) = b.push_node(
-                            Inst::CallNative { name: "wir_array_set".into(), args: vec![box_arr, zero, rv], pure: false, can_throw: false },
+                            Inst::CallNative {
+                                name: "wir_array_set".into(),
+                                args: vec![box_arr, zero, rv],
+                                pure: false,
+                                can_throw: false,
+                            },
                             Some(Type::Int32),
                             1,
                             true,
@@ -2197,6 +2254,8 @@ fn lower_expr_free<'m>(
                         }
                     }
                 }
+
+                _ => Err(LowerError::NotLowerable("invalid lvalue"))
             }
         }
 
@@ -2334,6 +2393,7 @@ fn lower_expr_free<'m>(
 
         // Property / Index
         Expr::GetProp { recv, name } => {
+            // Special-case: arr.length
             if name == "length" {
                 let arr = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
                 let (_nid, res) = b.push_node(
@@ -2349,52 +2409,134 @@ fn lower_expr_free<'m>(
                 );
                 return Ok(res[0]);
             }
-            // fallback: object field
-            let obj = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
-            let field = intern_field_local(fields, next_field, name);
-            let (_nid, res) = b.push_node(Inst::LoadField { obj, field, expected: None }, None, 1, false);
-            Ok(res[0])
+
+            // Unify: prefer fast field if present, else string table
+            let obj     = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
+            let field   = intern_field_local(fields, next_field, name);
+            let fid_smi = b.const_i32(field.0 as i32);
+
+            let (_nid_h, hasf) = b.push_node(
+                Inst::CallNative {
+                    name: "wir_obj_has_field".into(),
+                    args: vec![obj, fid_smi],
+                    pure: false,
+                    can_throw: false,
+                },
+                Some(Type::Bool),
+                1,
+                true,
+            );
+
+            let then_b = b.block();
+            let else_b = b.block();
+            let cont   = b.block();
+            let out    = b.add_block_param(cont, Type::Int32);
+
+            b.branch(hasf[0], then_b, else_b);
+
+            b.position_at(then_b);
+            let (_nid_f, fv) = b.push_node(
+                Inst::LoadField { obj, field, expected: None },
+                None,
+                1,
+                false,
+            );
+            b.jump(cont, &[fv[0]]);
+
+            b.position_at(else_b);
+            let (_nid_sc, ks) = b.push_node(
+                Inst::Const(Constant::Str(name.clone())),
+                Some(Type::Str),
+                1,
+                false,
+            );
+            let (_nid_s, sv) = b.push_node(
+                Inst::CallNative {
+                    name: "wir_obj_get_str".into(),
+                    args: vec![obj, ks[0]],
+                    pure: false,
+                    can_throw: false,
+                },
+                None,
+                1,
+                true,
+            );
+            b.jump(cont, &[sv[0]]);
+
+            b.position_at(cont);
+            Ok(out)
         }
 
         Expr::Index { recv, index } => {
-            // If the index is a string literal, treat as object property read
+            // Fast path: string literal → unify with field access (fast-field if present, else string table)
             if let Expr::Str(s) = &**index {
-                let obj = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
-                let (_nid, ks) = b.push_node(
-                    Inst::Const(Constant::Str(s.clone())),
-                    Some(Type::Str),
-                    1,
-                    false,
+                let obj     = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
+                let field   = intern_field_local(fields, next_field, s);
+                let fid_smi = b.const_i32(field.0 as i32);
+
+                let (_nid_h, hasf) = b.push_node(
+                    Inst::CallNative { name: "wir_obj_has_field".into(), args: vec![obj, fid_smi], pure: false, can_throw: false },
+                    Some(Type::Bool), 1, true,
                 );
-                let (_nid, res) = b.push_node(
-                    Inst::CallNative {
-                        name: "wir_obj_get_str".into(),
-                        args: vec![obj, ks[0]],
-                        pure: false,
-                        can_throw: false,
-                    },
-                    None,
-                    1,
-                    true,
+
+                let then_b = b.block();
+                let else_b = b.block();
+                let cont   = b.block();
+                let out    = b.add_block_param(cont, Type::Int32);
+
+                b.branch(hasf[0], then_b, else_b);
+
+                b.position_at(then_b);
+                let (_nid_f, fv) = b.push_node(Inst::LoadField { obj, field, expected: None }, None, 1, false);
+                b.jump(cont, &[fv[0]]);
+
+                b.position_at(else_b);
+                let (_nid_sc, ks) = b.push_node(Inst::Const(Constant::Str(s.clone())), Some(Type::Str), 1, false);
+                let (_nid_s, sv)  = b.push_node(
+                    Inst::CallNative { name: "wir_obj_get_str".into(), args: vec![obj, ks[0]], pure: false, can_throw: false },
+                    None, 1, true,
                 );
-                Ok(res[0])
-            } else {
-                // regular array indexing
-                let arr = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
-                let idx = lower_expr_free(b, locals, fields, next_field, index, funcs, lam_caps)?;
-                let (_nid, res) = b.push_node(
-                    Inst::CallNative {
-                        name: "wir_array_get".into(),
-                        args: vec![arr, idx],
-                        pure: false,
-                        can_throw: false,
-                    },
-                    None,
-                    1,
-                    true,
-                );
-                Ok(res[0])
+                b.jump(cont, &[sv[0]]);
+
+                b.position_at(cont);
+                return Ok(out);
             }
+
+            // Generic path: decide at runtime. If index is a string → object["key"]; else → array[index].
+            let obj  = lower_expr_free(b, locals, fields, next_field, recv,  funcs, lam_caps)?;
+            let idxv = lower_expr_free(b, locals, fields, next_field, index, funcs, lam_caps)?;
+
+            // Requires a tiny native: bool wir_is_str(value)
+            let (_nid_is, is_str) = b.push_node(
+                Inst::CallNative { name: "wir_is_str".into(), args: vec![idxv], pure: false, can_throw: false },
+                Some(Type::Bool), 1, true,
+            );
+
+            let str_b = b.block();
+            let arr_b = b.block();
+            let cont  = b.block();
+            let out   = b.add_block_param(cont, Type::Int32);
+
+            b.branch(is_str[0], str_b, arr_b);
+
+            // object["key"]
+            b.position_at(str_b);
+            let (_nid_s, sv) = b.push_node(
+                Inst::CallNative { name: "wir_obj_get_str".into(), args: vec![obj, idxv], pure: false, can_throw: false },
+                None, 1, true,
+            );
+            b.jump(cont, &[sv[0]]);
+
+            // array[index]
+            b.position_at(arr_b);
+            let (_nid_a, av) = b.push_node(
+                Inst::CallNative { name: "wir_array_get".into(), args: vec![obj, idxv], pure: false, can_throw: false },
+                None, 1, true,
+            );
+            b.jump(cont, &[av[0]]);
+
+            b.position_at(cont);
+            Ok(out)
         }
 
         Expr::ArrayLit(elems) => {
@@ -2531,32 +2673,34 @@ fn lower_expr_free<'m>(
 
         Expr::DeleteProp { obj, key } => {
             let o = lower_expr_free(b, locals, fields, next_field, obj, funcs, lam_caps)?;
-            match key {
-                PropKey::Ident(name) => {
-                let field   = intern_field_local(fields, next_field, name);
-                let fid_smi = b.const_i32(field.0 as i32);
 
-                let (_nid, res) = b.push_node(
-                    Inst::CallNative {
-                        name: "wir_obj_del_field".into(),
-                        args: vec![o, fid_smi],
-                        pure: false,
-                        can_throw: false,
-                    },
-                    Some(crate::wir::Type::Bool),
-                    1,
-                    true,
-                );
-                Ok(res[0])
-            }
-                PropKey::Str(s) => {
-                    let (_nid, ks) = b.push_node(
-                        Inst::Const(Constant::Str(s.clone())),
+            match key {
+                // delete o.a  — delete both field and string
+                PropKey::Ident(name) => {
+                    let field   = intern_field_local(fields, next_field, name);
+                    let fid_smi = b.const_i32(field.0 as i32);
+
+                    // del fast field
+                    let (_nid_f, _rf) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_obj_del_field".into(),
+                            args: vec![o, fid_smi],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::Bool),
+                        1,
+                        true,
+                    );
+
+                    // del string key (mirror)
+                    let (_nid_sc, ks) = b.push_node(
+                        Inst::Const(Constant::Str(name.clone())),
                         Some(Type::Str),
                         1,
                         false,
                     );
-                    let (_nid, res) = b.push_node(
+                    let (_nid_s, rs) = b.push_node(
                         Inst::CallNative {
                             name: "wir_obj_del_str".into(),
                             args: vec![o, ks[0]],
@@ -2567,7 +2711,47 @@ fn lower_expr_free<'m>(
                         1,
                         true,
                     );
-                    Ok(res[0])
+
+                    Ok(rs[0]) // return last result (truthy if deleted)
+                }
+
+                // delete o["a"] — delete both string and field
+                PropKey::Str(s) => {
+                    // del string key
+                    let (_nid_sc, ks) = b.push_node(
+                        Inst::Const(Constant::Str(s.clone())),
+                        Some(Type::Str),
+                        1,
+                        false,
+                    );
+                    let (_nid_s, rs) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_obj_del_str".into(),
+                            args: vec![o, ks[0]],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::Bool),
+                        1,
+                        true,
+                    );
+
+                    // del fast field mirror (safe even if not an identifier originally)
+                    let field   = intern_field_local(fields, next_field, s);
+                    let fid_smi = b.const_i32(field.0 as i32);
+                    let (_nid_f, _rf) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_obj_del_field".into(),
+                            args: vec![o, fid_smi],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::Bool),
+                        1,
+                        true,
+                    );
+
+                    Ok(rs[0])
                 }
             }
         }
@@ -2578,11 +2762,10 @@ fn lower_expr_free<'m>(
             match &**key {
                 // identifier key:  a in o
                 Expr::Ident(name) => {
-                    // fast slot check (SMI-encode the field id)
                     let field   = intern_field_local(fields, next_field, name);
-                    // field id, already SMI as a Const::Int32
                     let fid_smi = b.const_i32(field.0 as i32);
 
+                    // fast-slot check
                     let (_nid_f, hf) = b.push_node(
                         Inst::CallNative {
                             name: "wir_obj_has_field".into(),
@@ -2595,8 +2778,8 @@ fn lower_expr_free<'m>(
                         true,
                     );
 
-                    // string table check
-                    let (_nid_sconst, ks) = b.push_node(
+                    // string-table check
+                    let (_nid_sc, ks) = b.push_node(
                         Inst::Const(Constant::Str(name.clone())),
                         Some(Type::Str),
                         1,
@@ -2619,9 +2802,7 @@ fn lower_expr_free<'m>(
 
                 // string-literal key:  "a" in o
                 Expr::Str(s) => {
-                    // fast slot check (SMI-encode the field id)
                     let field   = intern_field_local(fields, next_field, s);
-                    // already SMI
                     let fid_smi = b.const_i32(field.0 as i32);
 
                     let (_nid_f, hf) = b.push_node(
@@ -2636,8 +2817,7 @@ fn lower_expr_free<'m>(
                         true,
                     );
 
-                    // string table check
-                    let (_nid_sconst, ks) = b.push_node(
+                    let (_nid_sc, ks) = b.push_node(
                         Inst::Const(Constant::Str(s.clone())),
                         Some(Type::Str),
                         1,
@@ -2658,9 +2838,7 @@ fn lower_expr_free<'m>(
                     Ok(build_bool_or(b, hf[0], hs[0]))
                 }
 
-                _ => {
-                    unreachable!()
-                }
+                _ => unreachable!(),
             }
         }
 

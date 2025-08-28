@@ -141,7 +141,10 @@ print("===== Objects =====");
 var o = { a: 10, "b": 20 };
 print(o.a);          // 10
 o.a = o.a + 1;
+print(o["a"]);       // 11
 print(o["b"]);       // 20
 print("a" in o);     // 1
 delete o.a;
 print("a" in o);     // 0
+var key_b = "b";
+print(o[key_b]);     // 20
