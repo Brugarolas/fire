@@ -30,8 +30,7 @@ pub struct JIT {
 
 impl Default for JIT {
     fn default() -> Self {
-        let mut jb = cranelift_jit::JITBuilder::new(cranelift_module::default_libcall_names())
-            .expect("JITBuilder::new");
+        let mut jb = cranelift_jit::JITBuilder::new(cranelift_module::default_libcall_names()).expect("JITBuilder::new");
 
         unsafe extern "C" {
             fn wir_print_i64(x: i64) -> i64;
@@ -311,13 +310,15 @@ impl JIT {
 
         ctx.func.signature.call_conv = self.module.isa().default_call_conv();
 
-        eprintln!(
-            "[JIT] compile wir_f_{}: {} nodes, {} values, {} params",
-            fun.id.0,
-            fun.nodes.len(),
-            fun.values.len(),
-            fun.sig.params.len()
-        );
+        #[cfg(debug_assertions)] {
+            eprintln!(
+                "[JIT] compile wir_f_{}: {} nodes, {} values, {} params",
+                fun.id.0,
+                fun.nodes.len(),
+                fun.values.len(),
+                fun.sig.params.len()
+            );
+        }
 
         // Take the shared FunctionBuilderContext out of `self` for this compile.
         // This avoids aliasing &mut self (used by emit_const/module calls) with &mut self.fctx held by `fb`.
@@ -361,12 +362,17 @@ impl JIT {
                 let addr = fb.ins().iadd_imm(args_base, off);
                 let loaded = fb.ins().load(types::I64, MemFlags::trusted(), addr, 0);
                 vmap.bind(ValueId(i as u32), loaded);
-                eprintln!("[JIT] prebind param {} -> ValueId#{:?}", i, i);
+
+                #[cfg(debug_assertions)] {
+                    eprintln!("[JIT] prebind param {} -> ValueId#{:?}", i, i);
+                }
             }
 
             // ---- linear pass
             for (bid, block) in fun.blocks.iter().enumerate() {
-                eprintln!("  [block] visiting block #{bid} with {} insts", block.insts.len());
+                #[cfg(debug_assertions)] {
+                    eprintln!("  [block] visiting block #{bid} with {} insts", block.insts.len());
+                }
 
                 let cur_ebb = clif_of[bid];
                 if bid != fun.entry.0 as usize {
@@ -378,13 +384,19 @@ impl JIT {
                 for nid in &block.insts {
                     if block_terminated || terminated { break; }
 
-                    eprintln!("  [nodes] processing nid={:?}", nid);
+                    #[cfg(debug_assertions)] {
+                        eprintln!("  [nodes] processing nid={:?}", nid);
+                    }
+
                     let node = &fun.nodes[nid.0 as usize];
                     let res_count = node.results.len();
-                    eprintln!(
-                        "  [nodes] processing nid={:?} kind={:?} results={:?}",
-                        nid, node.kind, node.results
-                    );
+
+                    #[cfg(debug_assertions)] {
+                        eprintln!(
+                            "  [nodes] processing nid={:?} kind={:?} results={:?}",
+                            nid, node.kind, node.results
+                        );
+                    }
 
                     match &node.kind {
                         // ---------------- Constants ----------------
@@ -1199,10 +1211,13 @@ impl ValueMap {
 
         // Log the *actual* defining site so we know what we missed.
         let vdef = &values[id.0 as usize].def;
-        eprintln!(
-            "[JIT][warn] get_or_load fallback -> 0 for {:?} (def={:?})",
-            id, vdef
-        );
+
+        #[cfg(debug_assertions)] {
+            eprintln!(
+                "[JIT][warn] get_or_load fallback -> 0 for {:?} (def={:?})",
+                id, vdef
+            );
+        }
 
         // Fallback to 0 so we can keep running and see the rest of the trace.
         let zero = fb.ins().iconst(cranelift::prelude::types::I64, 0);
@@ -1220,7 +1235,9 @@ impl ValueMap {
         if let Some(v) = self.get(id) { return v; }
         if let Some(v) = synth_const(&fun.values, id, fb) { self.bind(id, v); return v; }
 
-        eprintln!("[JIT][warn] get_or_emit fallback -> 0 for {:?} (def={:?})", id, fun.values[id.0 as usize].def);
+        #[cfg(debug_assertions)] {
+            eprintln!("[JIT][warn] get_or_emit fallback -> 0 for {:?} (def={:?})", id, fun.values[id.0 as usize].def);
+        }
 
         let zero = fb.ins().iconst(cranelift::prelude::types::I64, 0);
         self.bind(id, zero);
@@ -1269,12 +1286,16 @@ pub extern "C" fn wir_print_i64(v: i64) -> i64 {
     use std::slice;
 
     if is_imm(v) {
-        println!("{}", smi_to_i64(v));   // SMI
+        #[cfg(debug_assertions)] {
+            eprintln!("{}", smi_to_i64(v));
+        }
         return 0;
     }
 
     if v == NULL {
-        println!("null");
+        #[cfg(debug_assertions)] {
+            eprintln!("NULL");
+        }
         return 0;
     }
 

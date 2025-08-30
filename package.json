@@ -5,7 +5,8 @@
     "main": "index.js",
     "type": "module",
     "scripts": {
-        "cargo::run": "cargo run -- src/index.napalm"
+        "cargo::run": "cargo run -- src/index.napalm",
+        "cargo::build": "cargo build --release"
     },
     "author": "Andrés Brugarolas Martínez",
     "license": "MIT"

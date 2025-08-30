@@ -8,6 +8,8 @@ mod runtime;
 mod jit;
 
 use mimalloc::MiMalloc;
+use ahash::AHashMap as HashMap;
+use std::time::Instant;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -16,12 +18,13 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 fn default_script() -> &'static str {
     r#"
-        fn add2(a, b) {
-            return a + b;
+        fn fibonacci(n) {
+            if (n <= 1) {
+                return n;
+            }
+            return fibonacci(n - 1) + fibonacci(n - 2);
         }
-
-        // top-level runs without mandatory main
-        print(add2(2, 3)); // expect 5
+        print(fibonacci(40));
     "#
 }
 
@@ -37,7 +40,7 @@ fn main() {
             }
         }
     } else {
-        println!("(no file provided) Using built-in demo script:\n\n{}", default_script());
+        eprintln!("(No file provided) Using built-in demo script:\n\n{}", default_script());
         default_script().to_string()
     };
 
@@ -61,11 +64,16 @@ fn main() {
 
     // 4) JIT compile ALL functions
     let mut jit = jit::JIT::default();
-    let mut fptrs = std::collections::HashMap::new();
+    let mut fptrs = HashMap::new();
     for f in &module.funcs {
         match jit.compile(f) {
-            Ok(fp) => { fptrs.insert(f.sig.name.clone(), fp); }
-            Err(e) => { eprintln!("JIT compile error in {}: {}", f.sig.name, e); return; }
+            Ok(fp) => {
+                fptrs.insert(f.sig.name.clone(), fp);
+            }
+            Err(e) => {
+                eprintln!("JIT compile error in {}: {}", f.sig.name, e);
+                return;
+            }
         }
     }
 
@@ -82,14 +90,18 @@ fn main() {
     };
 
     let entry_fun = module.funcs.iter().find(|f| f.sig.name == entry_name).unwrap();
-    println!(
-        "Selected function: {} (id={:?}) with {} params",
-        entry_fun.sig.name, entry_fun.id, entry_fun.sig.params.len()
-    );
+    #[cfg(debug_assertions)] {
+        eprintln!("(Debug build) Selected function: {} (id={:?}) with {} params", entry_fun.sig.name, entry_fun.id, entry_fun.sig.params.len());
+    }
+    let t0 = Instant::now(); // Start timing just before running the entry function
 
     // 6) Build argv and run (ABI: (argv_ptr, argc) -> i64)
     let argv: Vec<i64> = vec![0; entry_fun.sig.params.len()];
     let fptr = *fptrs.get(&entry_name).unwrap();
     let ret: i64 = unsafe { fptr(argv.as_ptr(), argv.len()) };
-    println!("Program returned: {} (0x{:x})", ret, ret as u64);
+
+    let t1 = Instant::now(); // End timing just after the function returns
+    let duration = t1.duration_since(t0);
+    let secs = duration.as_secs_f64();
+    eprintln!("(Debug build) Program returned: {} (0x{:x}) and took {:.6} seconds", ret, ret as u64, secs);
 }
