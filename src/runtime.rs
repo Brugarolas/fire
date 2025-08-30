@@ -1,6 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::value::{ValueRepr, make_smi, as_obj_mut, TAG_STRING, BoxedStr, ObjHeader};
+use crate::gc::post_write_barrier;
 
 use ahash::AHashMap as HashMap;
 
@@ -41,6 +42,12 @@ pub extern "C" fn wir_is_str(v: i64) -> i64 {
     }
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn napalm_yieldpoint() -> i64 {
+    crate::gc::safepoint::yieldpoint();
+    0
+}
+
 // -------- fast-slot path (field id is a SMI) --------
 
 #[unsafe(no_mangle)]
@@ -56,7 +63,11 @@ pub extern "C" fn wir_obj_set_field(obj: i64, field_id_smi: i64, val: i64) -> i6
     if obj == 0 { return 0; }
     let id = decode_field_smi(field_id_smi);
     let o = unsafe { &mut *(obj as *mut WirObj) };
-    o.by_id.insert(id, val);
+
+    let cell = o.by_id.entry(id).or_insert(0);
+    let slot: *mut i64 = cell as *mut i64;
+    *cell = val;
+    unsafe { post_write_barrier(obj as *mut u8, slot, val) };
     0
 }
 
@@ -91,7 +102,11 @@ pub extern "C" fn wir_obj_set_str(obj: i64, key_ptr: i64, val: i64) -> i64 {
     if obj == 0 { return 0; }
     let Some(k) = (unsafe { boxedstr_to_string(key_ptr) }) else { return 0; };
     let o = unsafe { &mut *(obj as *mut WirObj) };
-    o.by_str.insert(k, val);
+
+    let cell = o.by_str.entry(k).or_insert(0);
+    let slot: *mut i64 = cell as *mut i64;
+    *cell = val;
+    unsafe { post_write_barrier(obj as *mut u8, slot, val) };
     0
 }
 

@@ -1,6 +1,10 @@
 #![allow(dead_code)]
 #![allow(unsafe_op_in_unsafe_fn)]
 
+#[cfg(feature = "gc_mmtk")]
+use crate::gc::api::{alloc_raw, alloc_slow_path, post_alloc_object};
+use crate::gc::post_write_barrier;
+
 use ahash::AHashMap as HashMap;
 
 // ============================================================================
@@ -55,8 +59,25 @@ pub struct BoxedF64 {
 
 #[inline(always)]
 pub fn box_f64(x: f64) -> ValueRepr {
-    let b = Box::new(BoxedF64 { hdr: ObjHeader { tag: TAG_BOXED_F64, aux: 0 }, val: x });
-    Box::into_raw(b) as ValueRepr
+    #[cfg(not(feature = "gc_mmtk"))]
+    {
+        let b = Box::new(BoxedF64 { hdr: ObjHeader { tag: TAG_BOXED_F64, aux: 0 }, val: x });
+        return Box::into_raw(b) as ValueRepr;
+    }
+    #[cfg(feature = "gc_mmtk")]
+    unsafe {
+        let size = mem::size_of::<BoxedF64>();
+        let align = mem::align_of::<BoxedF64>();
+        let mut p = alloc_raw(size, align);
+        if p.is_null() { p = alloc_slow_path(size, align); }
+        let obj = p as *mut BoxedF64;
+        core::ptr::write(
+            obj,
+            BoxedF64 { hdr: ObjHeader { tag: TAG_BOXED_F64, aux: 0 }, val: x }
+        );
+        post_alloc_object(p, size);
+        p as ValueRepr
+    }
 }
 
 #[inline(always)]
@@ -95,12 +116,34 @@ impl BoxedArray {
     #[inline(always)] pub fn cap(&self) -> usize { self.buf.capacity() }
 }
 
-#[inline(always)]
+#[inline]
 pub fn box_array_with_len(len: usize) -> ValueRepr {
-    let mut buf = Vec::<i64>::with_capacity(len);
-    unsafe { buf.set_len(len); } // initialized to garbage; runtime usually fills in
-    let b = Box::new(BoxedArray { hdr: ObjHeader { tag: TAG_ARRAY, aux: 0 }, buf });
-    Box::into_raw(b) as ValueRepr
+    #[cfg(not(feature = "gc_mmtk"))]
+    {
+        let mut buf = Vec::<i64>::with_capacity(len);
+        unsafe { buf.set_len(len); }
+        let b = Box::new(BoxedArray { hdr: ObjHeader { tag: TAG_ARRAY, aux: 0 }, buf });
+        return Box::into_raw(b) as ValueRepr;
+    }
+    #[cfg(feature = "gc_mmtk")]
+    unsafe {
+        let size  = mem::size_of::<BoxedArray>();
+        let align = mem::align_of::<BoxedArray>();
+        let mut p = alloc_raw(size, align);
+        if p.is_null() { p = alloc_slow_path(size, align); }
+        let obj = p as *mut BoxedArray;
+
+        // Build Vec on the Rust heap (capacity=len, length=len), filled with uninitialized i64.
+        let mut buf = Vec::<i64>::with_capacity(len);
+        buf.set_len(len);
+
+        core::ptr::write(
+            obj,
+            BoxedArray { hdr: ObjHeader { tag: TAG_ARRAY, aux: 0 }, buf }
+        );
+        post_alloc_object(p, size);
+        p as ValueRepr
+    }
 }
 
 #[inline(always)]
@@ -121,12 +164,29 @@ pub struct BoxedStr {
 
 #[inline(always)]
 pub fn box_str_borrowed(bytes: &[u8]) -> ValueRepr {
-    let b = Box::new(BoxedStr {
-        hdr: ObjHeader { tag: TAG_STRING, aux: 0 },
-        len: bytes.len(),
-        data: bytes.as_ptr(), // NOTE: lifetime! use owned if you need to keep beyond scope
-    });
-    Box::into_raw(b) as ValueRepr
+    #[cfg(not(feature = "gc_mmtk"))]
+    {
+        let b = Box::new(BoxedStr {
+            hdr: ObjHeader { tag: TAG_STRING, aux: 0 },
+            len: bytes.len(),
+            data: bytes.as_ptr(),
+        });
+        return Box::into_raw(b) as ValueRepr;
+    }
+    #[cfg(feature = "gc_mmtk")]
+    unsafe {
+        let size  = mem::size_of::<BoxedStr>();
+        let align = mem::align_of::<BoxedStr>();
+        let mut p = alloc_raw(size, align);
+        if p.is_null() { p = alloc_slow_path(size, align); }
+        let obj = p as *mut BoxedStr;
+        core::ptr::write(
+            obj,
+            BoxedStr { hdr: ObjHeader { tag: TAG_STRING, aux: 0 }, len: bytes.len(), data: bytes.as_ptr() }
+        );
+        post_alloc_object(p, size);
+        p as ValueRepr
+    }
 }
 
 // ============================================================================
@@ -142,12 +202,33 @@ pub struct BoxedObj {
 
 #[inline(always)]
 pub fn obj_new() -> ValueRepr {
-    let b = Box::new(BoxedObj {
-        hdr: ObjHeader { tag: TAG_OBJECT, aux: 0 },
-        by_id:  HashMap::new(),
-        by_str: HashMap::new(),
-    });
-    Box::into_raw(b) as ValueRepr
+    #[cfg(not(feature = "gc_mmtk"))]
+    {
+        let b = Box::new(BoxedObj {
+            hdr: ObjHeader { tag: TAG_OBJECT, aux: 0 },
+            by_id:  HashMap::new(),
+            by_str: HashMap::new(),
+        });
+        return Box::into_raw(b) as ValueRepr;
+    }
+    #[cfg(feature = "gc_mmtk")]
+    unsafe {
+        let size  = mem::size_of::<BoxedObj>();
+        let align = mem::align_of::<BoxedObj>();
+        let mut p = alloc_raw(size, align);
+        if p.is_null() { p = alloc_slow_path(size, align); }
+        let obj = p as *mut BoxedObj;
+        core::ptr::write(
+            obj,
+            BoxedObj {
+                hdr: ObjHeader { tag: TAG_OBJECT, aux: 0 },
+                by_id:  HashMap::new(),
+                by_str: HashMap::new(),
+            }
+        );
+        post_alloc_object(p, size);
+        p as ValueRepr
+    }
 }
 
 #[inline(always)]
@@ -165,15 +246,13 @@ pub unsafe fn obj_get_field(obj_v: ValueRepr, fid: u32) -> ValueRepr {
 
 #[inline(always)]
 pub unsafe fn obj_set_field(obj_v: ValueRepr, fid: u32, val: ValueRepr) -> ValueRepr {
-    use crate::gc::barrier::post_write_if_ptr;
-
     let o = &mut *as_obj_mut(obj_v);
-    // get a mutable slot address (so the barrier can see it)
-    let slot = o.by_id.entry(fid).or_insert(NULL);
-    *slot = val;
+    let cell = o.by_id.entry(fid).or_insert(NULL);
+    let slot: *mut ValueRepr = cell as *mut ValueRepr;
+    *cell = val;
 
-    // generational remembered-set barrier (old -> young)
-    post_write_if_ptr(obj_v, slot as *mut i64, val);
+    // Post-write barrier
+    post_write_barrier(obj_v as *mut u8, slot, val);
     val
 }
 
@@ -199,13 +278,12 @@ pub unsafe fn obj_get_str(obj_v: ValueRepr, key: &str) -> ValueRepr {
 
 #[inline(always)]
 pub unsafe fn obj_set_str(obj_v: ValueRepr, key: &str, val: ValueRepr) -> ValueRepr {
-    use crate::gc::barrier::post_write_if_ptr;
-
     let o = &mut *as_obj_mut(obj_v);
-    let slot = o.by_str.entry(key.to_string()).or_insert(NULL);
-    *slot = val;
+    let cell = o.by_str.entry(key.to_string()).or_insert(NULL);
+    let slot: *mut ValueRepr = cell as *mut ValueRepr;
+    *cell = val;
 
-    post_write_if_ptr(obj_v, slot as *mut i64, val);
+    post_write_barrier(obj_v as *mut u8, slot, val);
     val
 }
 

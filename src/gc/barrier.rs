@@ -1,14 +1,24 @@
-/// Post-write barrier hook.
-/// Phase 1: no-op (we’ll call MMTk’s store buffer in Phase 5).
-#[inline(always)]
-pub fn post_write(_obj: i64, _slot_addr: *mut i64, _new_val: i64) {
-    // no-op for now
+#![cfg(feature = "gc_mmtk")]
+
+use mmtk::memory_manager;
+use mmtk::util::{Address, ObjectReference};
+use crate::gc::binding::NapalmVM;
+use crate::value::{ValueRepr, is_ptr, NULL};
+
+#[inline]
+pub unsafe fn post_write_barrier(object_base: *mut u8, slot: *mut ValueRepr, new_val: ValueRepr) {
+    if is_ptr(new_val) && new_val != NULL {
+        let objref = ObjectReference::from_raw_address(Address::from_ptr(object_base));
+        let slot_addr = Address::from_ptr(slot.cast::<u8>());
+        let target = ObjectReference::from_raw_address(Address::from_ptr(new_val as *mut u8));
+        // StickyImmix relies on a remembered-set style post barrier.
+        memory_manager::object_reference_write_post::<NapalmVM>(objref, slot_addr, target);
+    }
 }
 
-/// Convenience: only call the barrier if `val` looks like a heap ref (even, non-zero).
-#[inline(always)]
-pub fn post_write_if_ptr(obj: i64, slot_addr: *mut i64, val: i64) {
-    if (val & 1) == 0 && val != 0 {
-        post_write(obj, slot_addr, val);
-    }
+#[inline]
+pub unsafe fn pre_write_barrier(object_base: *mut u8, slot: *mut ValueRepr) {
+    let objref = ObjectReference::from_raw_address(Address::from_ptr(object_base));
+    let slot_addr = Address::from_ptr(slot.cast::<u8>());
+    memory_manager::object_reference_write_pre::<NapalmVM>(objref, slot_addr);
 }

@@ -1,3 +1,4 @@
+// src/gc/roots.rs
 use std::cell::RefCell;
 
 /// Shadow stack holds slices of GC-visible slots (ValueRepr = i64).

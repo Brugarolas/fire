@@ -36,11 +36,10 @@ rclite = "0.2.7" # Optimized Rc for memory usage
 zallocator = "0.5.1" # Zero-cost allocator for small allocations
 
 # Disable default logging feature – it is large and not needed in Napalm
-mmtk = { git = "https://github.com/mmtk/mmtk-core.git", default-features = false, features = [
-    # "malloc_mimalloc", "malloc_native_mimalloc",
-]} #git = "https://github.com/mmtk/mmtk-core.git", #version = "0.31"
+mmtk = { git = "https://github.com/mmtk/mmtk-core.git", default-features = true } #git = "https://github.com/mmtk/mmtk-core.git", #version = "0.31"
 bumpalo = "3.19.0"
 mimalloc = "0.1.47"
+libc = "0.2.175"
 
 tokio = { version = "1.46.1", features = ["full", "rt-multi-thread", "macros"] }
 
@@ -53,3 +52,7 @@ cranelift-codegen = "0.121.2"
 cranelift-frontend = "0.121.2"
 memmap2 = "0.9.7"
 target-lexicon = "0.13.2"
+
+[features]
+# Off by default; flips the facade from no-op to the “real” path.
+gc_mmtk = ["mmtk"]

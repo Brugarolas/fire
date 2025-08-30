@@ -14,12 +14,14 @@ use crate::wir::{
     Constant, Function as WirFunction, Inst, IntBinOp, Value as WirValue, ValueDef, ValueId, FuncId,
 };
 use crate::runtime::{
-    wir_obj_new, wir_is_str,
+    wir_obj_new, wir_is_str, napalm_yieldpoint,
     wir_obj_get_field, wir_obj_set_field, wir_obj_has_field, wir_obj_del_field,
     wir_obj_get_str, wir_obj_set_str, wir_obj_has_str, wir_obj_del_str
 };
 /// ABI: `unsafe extern "C" fn(argv: *const i64, argc: usize) -> i64`
 pub type JitFnPtr = unsafe extern "C" fn(*const i64, usize) -> i64;
+
+let mut tick: u32 = 0;
 
 pub struct JIT {
     module: JITModule,
@@ -79,6 +81,8 @@ impl Default for JIT {
         unsafe extern "C" {
             fn wir_obj_new() -> i64;
             fn wir_is_str(v: i64) -> i64;
+
+            fn napalm_yieldpoint() -> i64;
 
             fn wir_obj_get_field(obj: i64, field_id: i64) -> i64;
             fn wir_obj_set_field(obj: i64, field_id: i64, val: i64) -> i64;
@@ -171,6 +175,11 @@ impl Default for JIT {
             jb.symbol(
                 "wir_obj_del_str",
                 wir_obj_del_str as *const extern "C" fn(i64, i64) -> i64 as *const u8,
+            );
+
+            jb.symbol(
+                "napalm_yieldpoint",
+                napalm_yieldpoint as *const extern "C" fn() -> i64 as *const u8,
             );
         }
 
@@ -1036,7 +1045,18 @@ impl JIT {
                             if res_count == 1 { vmap.bind(node.results[0], token); }
                         }
 
-                        Inst::Safepoint => { /* ignore for now */ }
+                        Inst::Safepoint => {
+                            use cranelift::prelude::{AbiParam, types};
+                            let _ = self.call_import(
+                                &mut fb,
+                                "napalm_yieldpoint",
+                                |s| {
+                                    // () -> i64 (ignored)
+                                    s.returns.push(AbiParam::new(types::I64));
+                                },
+                                &[],
+                            )?;
+                        }
 
                         Inst::GuardBounds { idx, len, .. } => {
                             let i_smi = vmap.get_or_emit(*idx, &mut fb, args_base, fun_ir);
@@ -1273,6 +1293,18 @@ fn trap_unsupported(fb: &mut FunctionBuilder, _what: &str) {
     let code = TrapCode::unwrap_user(0xE0);
     fb.ins().trap(code);
 }
+
+#[inline(always)]
+fn maybe_safepoint(tick: &mut u32) {
+    *tick = tick.wrapping_add(1);
+    if (*tick & 0xFF) == 0 {
+        #[cfg(feature = "gc_mmtk")]
+        {
+            crate::gc::safepoint();
+        }
+    }
+}
+
 
 #[repr(C)]
 struct WirClosure {
@@ -1545,7 +1577,10 @@ pub extern "C" fn wir_array_set(arr: i64, idx: i64, val: i64) -> i64 {
     if iu >= a.buf.len() {
         a.buf.resize(iu + 1, 0);
     }
+    // slot ptr before write
+    let slot = a.buf.as_mut_ptr().wrapping_add(iu);
     a.buf[iu] = val;
+    unsafe { post_write_barrier(arr as *mut u8, slot, val) };
     0
 }
 
@@ -1563,6 +1598,9 @@ pub extern "C" fn wir_array_push(arr: i64, val: i64) -> i64 {
     if arr == 0 { return smi(0); }
     let a = unsafe { &mut *(arr as *mut WirArray) };
     a.buf.push(val);
+    let last = a.buf.len() - 1;
+    let slot = a.buf.as_mut_ptr().wrapping_add(last);
+    unsafe { post_write_barrier(arr as *mut u8, slot, val) };
     smi(a.buf.len() as i64)
 }
 
@@ -1587,6 +1625,9 @@ pub extern "C" fn wir_array_unshift(arr: i64, val: i64) -> i64 {
     if arr == 0 { return smi(0); }
     let a = unsafe { &mut *(arr as *mut WirArray) };
     a.buf.insert(0, val);
+    // new element lives at index 0
+    let slot = a.buf.as_mut_ptr();
+    unsafe { post_write_barrier(arr as *mut u8, slot, val) };
     smi(a.buf.len() as i64)
 }
 
@@ -1612,6 +1653,7 @@ pub extern "C" fn wir_array_map(arr: i64, clo_ptr: i64) -> i64 {
         let args = [x];
         let y = wir_call_closure(clo_ptr, args.as_ptr(), 1);
         out.push(y);
+        maybe_safepoint(&mut tick);
     }
     let b = Box::new(WirArray { buf: out });
     Box::into_raw(b) as i64
@@ -1624,6 +1666,7 @@ pub extern "C" fn wir_array_for_each(arr: i64, clo_ptr: i64) -> i64 {
     for &x in &a.buf {
         let args = [x];
         let _ = wir_call_closure(clo_ptr, args.as_ptr(), 1);
+        maybe_safepoint(&mut tick);
     }
     0
 }
@@ -1636,6 +1679,7 @@ pub extern "C" fn wir_array_find(arr: i64, clo_ptr: i64) -> i64 {
         let args = [x];
         let ok = wir_call_closure(clo_ptr, args.as_ptr(), 1);
         if ok != 0 { return x; }
+        maybe_safepoint(&mut tick);
     }
     0
 }
@@ -1648,6 +1692,7 @@ pub extern "C" fn wir_array_find_index(arr: i64, clo_ptr: i64) -> i64 {
         let args = [x];
         let ok = wir_call_closure(clo_ptr, args.as_ptr(), 1);
         if ok != 0 { return smi(i as i64); }
+        maybe_safepoint(&mut tick);
     }
     smi(-1)
 }
@@ -1661,6 +1706,7 @@ pub extern "C" fn wir_array_filter(arr: i64, clo_ptr: i64) -> i64 {
         let args = [x];
         let ok = wir_call_closure(clo_ptr, args.as_ptr(), 1);
         if ok != 0 { out.push(x); }
+        maybe_safepoint(&mut tick);
     }
     let b = Box::new(WirArray { buf: out });
     Box::into_raw(b) as i64
@@ -1678,6 +1724,7 @@ pub extern "C" fn wir_array_reduce(arr: i64, clo_ptr: i64, has_init: i64, init: 
     for x in it {
         let args = [acc, x];
         acc = wir_call_closure(clo_ptr, args.as_ptr(), 2);
+        maybe_safepoint(&mut tick);
     }
     acc
 }
@@ -1686,7 +1733,15 @@ pub extern "C" fn wir_array_reduce(arr: i64, clo_ptr: i64, has_init: i64, init: 
 pub extern "C" fn wir_array_fill(arr: i64, val: i64) -> i64 {
     if arr == 0 { return 0; }
     let a = unsafe { &mut *(arr as *mut WirArray) };
-    for v in &mut a.buf { *v = val; }
+    let base = a.buf.as_mut_ptr();
+    for i in 0..a.buf.len() {
+        unsafe {
+            let slot = base.add(i);
+            *slot = val;
+            post_write_barrier(arr as *mut u8, slot, val);
+            maybe_safepoint(&mut tick);
+        }
+    }
     0
 }
 
@@ -1696,9 +1751,25 @@ pub extern "C" fn wir_array_copy(dst: i64, src: i64, len: i64) -> i64 {
     let d = unsafe { &mut *(dst as *mut WirArray) };
     let s = unsafe { &*(src as *const WirArray) };
     let n = smi_to_i64_wrapped(len).max(0) as usize;
+
     if d.buf.len() < n { d.buf.resize(n, 0); }
+
     let nn = n.min(s.buf.len());
-    d.buf[..nn].copy_from_slice(&s.buf[..nn]);
-    if nn < n { for i in nn..n { d.buf[i] = 0; } }
+    let dptr = d.buf.as_mut_ptr();
+    let sptr = s.buf.as_ptr();
+
+    // element-wise so we can fire the barrier per write
+    for i in 0..nn {
+        unsafe {
+            let v = *sptr.add(i);
+            let slot = dptr.add(i);
+            *slot = v;
+            post_write_barrier(dst as *mut u8, slot, v);
+        }
+    }
+    // pad tail with 0s (no barrier needed, but harmless if called)
+    for i in nn..n {
+        unsafe { *dptr.add(i) = 0; }
+    }
     0
 }

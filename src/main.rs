@@ -28,6 +28,13 @@ fn default_script() -> &'static str {
     "#
 }
 
+#[cfg(feature = "gc_mmtk")]
+pub fn napalm_gc_init() {
+    use crate::gc::api as gc;
+    let _gc = crate::gc::api::GcInit::init();
+    gc::attach_current_thread();
+}
+
 fn main() {
     // 1) Load source
     let args: Vec<String> = std::env::args().collect();
@@ -43,6 +50,10 @@ fn main() {
         eprintln!("(No file provided) Using built-in demo script:\n\n{}", default_script());
         default_script().to_string()
     };
+
+    // One-time process init:
+    #[cfg(feature = "gc_mmtk")]
+    napalm_gc_init();
 
     // 2) Parse
     let mut p = front::Parser::new(&src);

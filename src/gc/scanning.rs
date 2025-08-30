@@ -1,15 +1,35 @@
-/// Object scanning entry-points (called from the future MMTk binding).
-/// Phase 1: stubs (so we can compile code that references them later).
+// src/gc/scanning.rs
+use crate::value::*;
+use crate::value::ValueRepr;
 
-#[inline]
-pub fn scan_object_edges(_obj_addr: *mut u8, _cb_edge: &mut impl FnMut(*mut i64)) {
-    // In Phase 4 we’ll:
-    //  - read the ObjHeader to decide the tag
-    //  - iterate BoxedArray.buf, BoxedObj.{by_id,by_str}, and closure env
-    //  - for each &mut i64 slot that may hold a ref, call cb_edge(slot_ptr)
+/// Visit mutable ValueRepr slots contained in `obj_v` and call `f(slot_ptr)` for each.
+/// Safety: `obj_v` must be either NULL, an immediate, or a valid Napalm heap object.
+pub unsafe fn visit_object_value_slots<F: FnMut(*mut ValueRepr)>(obj_v: ValueRepr, mut f: F) {
+    if obj_v == NULL || is_imm(obj_v) { return; }
+
+    let hdr = (obj_v as *mut ObjHeader).as_ref().unwrap();
+    match hdr.tag {
+        TAG_ARRAY => {
+            // We walk the Vec<i64> form (BoxedArray).
+            let a = &mut *(obj_v as *mut BoxedArray);
+            let len = a.buf.len();
+            let base = a.buf.as_mut_ptr();
+            for i in 0..len {
+                let slot = base.add(i);
+                // Hand out the slot regardless of its current content
+                f(slot);
+            }
+        }
+
+        TAG_OBJECT => {
+            let o = &mut *(obj_v as *mut BoxedObj);
+            for v in o.by_id.values_mut()  { f(v as *mut ValueRepr); }
+            for v in o.by_str.values_mut() { f(v as *mut ValueRepr); }
+        }
+
+        TAG_BOXED_F64 => { /* no interior refs */ }
+        TAG_STRING    => { /* no interior refs */ }
+        _ => { /* future tags go here */ }
+    }
 }
 
-#[inline]
-pub fn scan_vm_roots(_cb_edge: &mut impl FnMut(*mut i64)) {
-    // In Phase 4 we’ll enumerate from gc::roots::with_roots(...)
-}
