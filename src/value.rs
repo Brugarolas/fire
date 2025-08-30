@@ -59,12 +59,6 @@ pub struct BoxedF64 {
 
 #[inline(always)]
 pub fn box_f64(x: f64) -> ValueRepr {
-    #[cfg(not(feature = "gc_mmtk"))]
-    {
-        let b = Box::new(BoxedF64 { hdr: ObjHeader { tag: TAG_BOXED_F64, aux: 0 }, val: x });
-        return Box::into_raw(b) as ValueRepr;
-    }
-    #[cfg(feature = "gc_mmtk")]
     unsafe {
         let size = mem::size_of::<BoxedF64>();
         let align = mem::align_of::<BoxedF64>();
@@ -118,14 +112,6 @@ impl BoxedArray {
 
 #[inline]
 pub fn box_array_with_len(len: usize) -> ValueRepr {
-    #[cfg(not(feature = "gc_mmtk"))]
-    {
-        let mut buf = Vec::<i64>::with_capacity(len);
-        unsafe { buf.set_len(len); }
-        let b = Box::new(BoxedArray { hdr: ObjHeader { tag: TAG_ARRAY, aux: 0 }, buf });
-        return Box::into_raw(b) as ValueRepr;
-    }
-    #[cfg(feature = "gc_mmtk")]
     unsafe {
         let size  = mem::size_of::<BoxedArray>();
         let align = mem::align_of::<BoxedArray>();
@@ -164,16 +150,6 @@ pub struct BoxedStr {
 
 #[inline(always)]
 pub fn box_str_borrowed(bytes: &[u8]) -> ValueRepr {
-    #[cfg(not(feature = "gc_mmtk"))]
-    {
-        let b = Box::new(BoxedStr {
-            hdr: ObjHeader { tag: TAG_STRING, aux: 0 },
-            len: bytes.len(),
-            data: bytes.as_ptr(),
-        });
-        return Box::into_raw(b) as ValueRepr;
-    }
-    #[cfg(feature = "gc_mmtk")]
     unsafe {
         let size  = mem::size_of::<BoxedStr>();
         let align = mem::align_of::<BoxedStr>();
@@ -202,16 +178,6 @@ pub struct BoxedObj {
 
 #[inline(always)]
 pub fn obj_new() -> ValueRepr {
-    #[cfg(not(feature = "gc_mmtk"))]
-    {
-        let b = Box::new(BoxedObj {
-            hdr: ObjHeader { tag: TAG_OBJECT, aux: 0 },
-            by_id:  HashMap::new(),
-            by_str: HashMap::new(),
-        });
-        return Box::into_raw(b) as ValueRepr;
-    }
-    #[cfg(feature = "gc_mmtk")]
     unsafe {
         let size  = mem::size_of::<BoxedObj>();
         let align = mem::align_of::<BoxedObj>();

@@ -5,9 +5,9 @@ var fib = function(n) {
 };
 
 var t0 = performance.now();     // 1) start
-var result = fib(40);
+var result = fib(45);
 var t1 = performance.now();     // 2) end
 var dt = t1 - t0;               // 3) difference
 var secs = dt / 1000;           // 4) milliseconds to seconds
-console.log(`Fibonacci(40) = ${result}, time = ${secs.toFixed(6)} s`);  // 5) print
+console.log(`Fibonacci(45) = ${result}, time = ${secs.toFixed(6)} s`);  // 5) print
 // console.log(fib(40)); --- IGNORE ---

@@ -28,7 +28,6 @@ fn default_script() -> &'static str {
     "#
 }
 
-#[cfg(feature = "gc_mmtk")]
 pub fn napalm_gc_init() {
     use crate::gc::api as gc;
     let _gc = crate::gc::api::GcInit::init();
@@ -52,7 +51,6 @@ fn main() {
     };
 
     // One-time process init:
-    #[cfg(feature = "gc_mmtk")]
     napalm_gc_init();
 
     // 2) Parse

@@ -3,6 +3,11 @@ name = "Napalm"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+lto = true
+opt-level = 3
+overflow-checks = false
+
 [dependencies]
 once_cell = "1.21.3"
 hashbrown = "0.15.4"
@@ -53,6 +58,3 @@ cranelift-frontend = "0.121.2"
 memmap2 = "0.9.7"
 target-lexicon = "0.13.2"
 
-[features]
-# Off by default; flips the facade from no-op to the “real” path.
-gc_mmtk = ["mmtk"]

@@ -14,9 +14,9 @@ def fibonacci(num: int) -> int:
     return fibonacci(num - 1) + fibonacci(num - 2)
 
 t0 = time.perf_counter()     # 1) start
-fib = fibonacci(40)
+fib = fibonacci(45)
 t1 = time.perf_counter()     # 2) end
 dt = t1 - t0                 # 3) difference
 secs = dt                    # 4) already seconds
 
-print(f"Fibonacci(40) = {fib}, time = {secs:.6f} s")  # 5) print
+print(f"Fibonacci(45) = {fib}, time = {secs:.6f} s")  # 5) print

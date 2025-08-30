@@ -1,35 +1,42 @@
 // src/gc/scanning.rs
-use crate::value::*;
-use crate::value::ValueRepr;
+use mmtk::vm::scanning::{Scanning, SlotVisitor, RootsWorkFactory};
+use mmtk::vm::VMWorkerThread;
+use mmtk::util::ObjectReference;
 
-/// Visit mutable ValueRepr slots contained in `obj_v` and call `f(slot_ptr)` for each.
-/// Safety: `obj_v` must be either NULL, an immediate, or a valid Napalm heap object.
-pub unsafe fn visit_object_value_slots<F: FnMut(*mut ValueRepr)>(obj_v: ValueRepr, mut f: F) {
-    if obj_v == NULL || is_imm(obj_v) { return; }
+use crate::gc::binding::NapalmVM;
+use crate::gc::api::Slot;
 
-    let hdr = (obj_v as *mut ObjHeader).as_ref().unwrap();
-    match hdr.tag {
-        TAG_ARRAY => {
-            // We walk the Vec<i64> form (BoxedArray).
-            let a = &mut *(obj_v as *mut BoxedArray);
-            let len = a.buf.len();
-            let base = a.buf.as_mut_ptr();
-            for i in 0..len {
-                let slot = base.add(i);
-                // Hand out the slot regardless of its current content
-                f(slot);
-            }
-        }
+pub enum NapalmScanning {}
 
-        TAG_OBJECT => {
-            let o = &mut *(obj_v as *mut BoxedObj);
-            for v in o.by_id.values_mut()  { f(v as *mut ValueRepr); }
-            for v in o.by_str.values_mut() { f(v as *mut ValueRepr); }
-        }
-
-        TAG_BOXED_F64 => { /* no interior refs */ }
-        TAG_STRING    => { /* no interior refs */ }
-        _ => { /* future tags go here */ }
+impl Scanning<NapalmVM> for NapalmScanning {
+    #[inline(always)]
+    fn scan_object<SV: SlotVisitor<Slot>>(
+        _tls: VMWorkerThread,
+        _object: ObjectReference,
+        _slot_visitor: &mut SV,
+    ) {
+        // stub: no interior edges reported yet
     }
-}
 
+    #[inline(always)] fn notify_initial_thread_scan_complete(_partial: bool, _tls: VMWorkerThread) {}
+
+    #[inline(always)]
+    fn scan_roots_in_mutator_thread(
+        _tls: VMWorkerThread,
+        _mutator: &'static mut mmtk::Mutator<NapalmVM>,
+        _factory: impl RootsWorkFactory<Slot>,
+    ) {
+        // stub
+    }
+
+    #[inline(always)]
+    fn scan_vm_specific_roots(
+        _tls: VMWorkerThread,
+        _factory: impl RootsWorkFactory<Slot>,
+    ) {
+        // stub
+    }
+
+    #[inline(always)] fn supports_return_barrier() -> bool { false }
+    #[inline(always)] fn prepare_for_roots_re_scanning() {}
+}

@@ -1,6 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::value::{ValueRepr, make_smi, as_obj_mut, TAG_STRING, BoxedStr, ObjHeader};
+use crate::value::{TAG_STRING, BoxedStr, ObjHeader};
 use crate::gc::post_write_barrier;
 
 use ahash::AHashMap as HashMap;
@@ -44,7 +44,7 @@ pub extern "C" fn wir_is_str(v: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn napalm_yieldpoint() -> i64 {
-    crate::gc::safepoint::yieldpoint();
+    crate::gc::mmtk::yieldpoint();
     0
 }
 
