@@ -1,11 +1,11 @@
 {
-    "name": "wren-lang",
+    "name": "napalm-lang",
     "version": "0.1.0",
-    "description": "Implementation of Wren scripting programming language with Cranelift JIT and MMTk garbage collector.",
+    "description": "Implementation of Napalm scripting programming language with Cranelift JIT and MMTk's StickyImmix garbage collector.",
     "main": "index.js",
     "type": "module",
     "scripts": {
-        "cargo::run": "cargo run -- src/index.wren"
+        "cargo::run": "cargo run -- src/index.napalm"
     },
     "author": "Andrés Brugarolas Martínez",
     "license": "MIT"

@@ -3,8 +3,14 @@ mod value;
 mod wir;
 mod front;
 //mod opt;
+mod gc;
 mod runtime;
 mod jit;
+
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 //pub use crate::opt::optimization::early_pipeline;
 

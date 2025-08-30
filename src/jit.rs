@@ -218,7 +218,7 @@ impl JIT {
 }
 
 impl JIT {
-    #[inline]
+    #[inline(always)]
     fn ptr_ty(&self) -> types::Type {
         self.module.target_config().pointer_type()
     }
@@ -1379,7 +1379,7 @@ pub extern "C" fn wir_alloc_array(n: i64) -> i64 {
 
 // ----- SMI and boxed f64 handling -----
 
-#[inline]
+#[inline(always)]
 fn smi_encode(x: i64) -> i64 { (x << 1) | 1 }
 
 #[unsafe(no_mangle)]
@@ -1390,7 +1390,7 @@ pub extern "C" fn wir_box_f64_runtime(bits: u64) -> i64 {
     Box::into_raw(obj) as i64
 }
 
-#[inline]
+#[inline(always)]
 fn val_to_f64(v: i64) -> Result<f64, &'static str> {
     use crate::value::*;
     if is_imm(v) {
@@ -1409,7 +1409,7 @@ fn val_to_f64(v: i64) -> Result<f64, &'static str> {
     }
 }
 
-#[inline]
+#[inline(always)]
 fn f64_to_val(x: f64) -> i64 {
     let xi = x as i64;
     if (xi as f64) == x {
@@ -1440,7 +1440,7 @@ pub extern "C" fn wir_mul_slow(a: i64, b: i64) -> i64 {
 }
 
 // ----- comparison slow paths (return raw 0/1) -----
-#[inline] fn b2i(b: bool) -> i64 { if b { 1 } else { 0 } }
+#[inline(always)] fn b2i(b: bool) -> i64 { if b { 1 } else { 0 } }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_cmp_eq_slow(a: i64, b: i64) -> i64 {

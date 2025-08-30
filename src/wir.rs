@@ -14,10 +14,7 @@
 //! - Boxing/unboxing explicit; unboxed Int32/F64/Bools preferred.
 //! - Abstract GC barriers (to be lowered to MMTk intrinsics).
 //! - IC/PIC-friendly call forms; deopt snapshots for speculation.
-//!
-//! You’ll likely split this into modules later (types.rs, func.rs, builder.rs, …).
-//!
-//! SPDX-License-Identifier: MIT
+//! - Type lattice with unions, for type inference/speculation.
 
 #![allow(dead_code)]
 #![allow(clippy::large_enum_variant)]

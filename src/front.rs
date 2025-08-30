@@ -248,25 +248,25 @@ impl<'src> Parser<'src> {
         Self { toks, i: 0, _src: src }
     }
 
-    #[inline]
+    #[inline(always)]
     fn peek(&self) -> &SpannedTok {
         // Caller only uses this when self.i < toks.len(); we keep it simple.
         &self.toks[self.i]
     }
 
-    #[inline]
+    #[inline(always)]
     fn next(&mut self) -> SpannedTok {
         let t = self.toks[self.i].clone();
         self.i += 1;
         t
     }
 
-    #[inline]
+    #[inline(always)]
     fn check(&self, t: &Tok) -> bool {
         &self.peek().tok == t
     }
 
-    #[inline]
+    #[inline(always)]
     fn matches(&mut self, t: &Tok) -> bool {
         if self.check(t) {
             self.i += 1;
@@ -276,7 +276,7 @@ impl<'src> Parser<'src> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn expect(&mut self, t: Tok, msg: &str) -> PResult<()> {
         if self.peek().tok == t {
             self.i += 1;
@@ -286,12 +286,12 @@ impl<'src> Parser<'src> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn err_here(&self, msg: &str) -> ParseError {
         ParseError { msg: msg.into(), span: self.peek().span.clone() }
     }
 
-    #[inline]
+    #[inline(always)]
     fn is_eof(&self) -> bool {
         self.i >= self.toks.len()
     }

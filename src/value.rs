@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(unsafe_op_in_unsafe_fn)]
 
 use ahash::AHashMap as HashMap;
 
@@ -9,20 +10,20 @@ use ahash::AHashMap as HashMap;
 pub type ValueRepr = i64;
 
 // ---- Pointer / immediate tests ----
-#[inline] pub fn is_ptr(v: ValueRepr) -> bool { (v & 1) == 0 }
-#[inline] pub fn is_imm(v: ValueRepr) -> bool { (v & 1) == 1 }
+#[inline(always)] pub fn is_ptr(v: ValueRepr) -> bool { (v & 1) == 0 }
+#[inline(always)] pub fn is_imm(v: ValueRepr) -> bool { (v & 1) == 1 }
 
 // ---- Small Int (SMI) encoding ----
-#[inline] pub fn make_smi(n: i64) -> ValueRepr { (n << 1) | 1 }
-#[inline] pub fn smi_to_i64(v: ValueRepr) -> i64 { v >> 1 } // arithmetic shift
+#[inline(always)] pub fn make_smi(n: i64) -> ValueRepr { (n << 1) | 1 }
+#[inline(always)] pub fn smi_to_i64(v: ValueRepr) -> i64 { v >> 1 } // arithmetic shift
 
 // ---- Null (boxed-null) ----
 pub const NULL: ValueRepr = 0;
 
 // ---- Booleans: raw 0/1 (not SMIs) ----
 // (Kept for now to match your lowerer’s behavior)
-#[inline] pub fn is_bool(v: i64) -> bool          { v == 0 || v == 1 }
-#[inline] pub fn to_bool(v: i64) -> bool          { v != 0 }
+#[inline(always)] pub fn is_bool(v: i64) -> bool          { v == 0 || v == 1 }
+#[inline(always)] pub fn to_bool(v: i64) -> bool          { v != 0 }
 
 // ============================================================================
 // Object headers & tags
@@ -52,13 +53,13 @@ pub struct BoxedF64 {
     pub val: f64,
 }
 
-#[inline]
+#[inline(always)]
 pub fn box_f64(x: f64) -> ValueRepr {
     let b = Box::new(BoxedF64 { hdr: ObjHeader { tag: TAG_BOXED_F64, aux: 0 }, val: x });
     Box::into_raw(b) as ValueRepr
 }
 
-#[inline]
+#[inline(always)]
 pub unsafe fn unbox_f64(v: ValueRepr) -> f64 {
     debug_assert!(is_ptr(v));
     let p = v as *const BoxedF64;
@@ -90,11 +91,11 @@ pub struct BoxedArray {
 }
 
 impl BoxedArray {
-    #[inline] pub fn len(&self) -> usize { self.buf.len() }
-    #[inline] pub fn cap(&self) -> usize { self.buf.capacity() }
+    #[inline(always)] pub fn len(&self) -> usize { self.buf.len() }
+    #[inline(always)] pub fn cap(&self) -> usize { self.buf.capacity() }
 }
 
-#[inline]
+#[inline(always)]
 pub fn box_array_with_len(len: usize) -> ValueRepr {
     let mut buf = Vec::<i64>::with_capacity(len);
     unsafe { buf.set_len(len); } // initialized to garbage; runtime usually fills in
@@ -102,7 +103,7 @@ pub fn box_array_with_len(len: usize) -> ValueRepr {
     Box::into_raw(b) as ValueRepr
 }
 
-#[inline]
+#[inline(always)]
 pub unsafe fn as_boxed_array_mut(v: ValueRepr) -> *mut BoxedArray {
     v as *mut BoxedArray
 }
@@ -118,7 +119,7 @@ pub struct BoxedStr {
     pub data: *const u8,  // points to UTF-8 bytes (NUL-terminated OK, not required)
 }
 
-#[inline]
+#[inline(always)]
 pub fn box_str_borrowed(bytes: &[u8]) -> ValueRepr {
     let b = Box::new(BoxedStr {
         hdr: ObjHeader { tag: TAG_STRING, aux: 0 },
@@ -139,7 +140,7 @@ pub struct BoxedObj {
     pub by_str: HashMap<String, ValueRepr> // string-key path
 }
 
-#[inline]
+#[inline(always)]
 pub fn obj_new() -> ValueRepr {
     let b = Box::new(BoxedObj {
         hdr: ObjHeader { tag: TAG_OBJECT, aux: 0 },
@@ -149,33 +150,40 @@ pub fn obj_new() -> ValueRepr {
     Box::into_raw(b) as ValueRepr
 }
 
-#[inline]
+#[inline(always)]
 pub unsafe fn as_obj_mut(v: ValueRepr) -> *mut BoxedObj {
     v as *mut BoxedObj
 }
 
 // ---- FieldId-based (u32) helpers ----
 
-#[inline]
+#[inline(always)]
 pub unsafe fn obj_get_field(obj_v: ValueRepr, fid: u32) -> ValueRepr {
-    let o = &*as_obj_mut(obj_v);
+    let o = &*as_obj_mut(obj_v); // Error
     o.by_id.get(&fid).cloned().unwrap_or(NULL)
 }
 
-#[inline]
+#[inline(always)]
 pub unsafe fn obj_set_field(obj_v: ValueRepr, fid: u32, val: ValueRepr) -> ValueRepr {
+    use crate::gc::barrier::post_write_if_ptr;
+
     let o = &mut *as_obj_mut(obj_v);
-    o.by_id.insert(fid, val);
+    // get a mutable slot address (so the barrier can see it)
+    let slot = o.by_id.entry(fid).or_insert(NULL);
+    *slot = val;
+
+    // generational remembered-set barrier (old -> young)
+    post_write_if_ptr(obj_v, slot as *mut i64, val);
     val
 }
 
-#[inline]
+#[inline(always)]
 pub unsafe fn obj_has_field(obj_v: ValueRepr, fid: u32) -> ValueRepr {
     let o = &*as_obj_mut(obj_v);
     if o.by_id.contains_key(&fid) { 1 } else { 0 }
 }
 
-#[inline]
+#[inline(always)]
 pub unsafe fn obj_del_field(obj_v: ValueRepr, fid: u32) -> ValueRepr {
     let o = &mut *as_obj_mut(obj_v);
     if o.by_id.remove(&fid).is_some() { 1 } else { 0 }
@@ -183,26 +191,31 @@ pub unsafe fn obj_del_field(obj_v: ValueRepr, fid: u32) -> ValueRepr {
 
 // ---- String-key helpers ----
 
-#[inline]
+#[inline(always)]
 pub unsafe fn obj_get_str(obj_v: ValueRepr, key: &str) -> ValueRepr {
     let o = &*as_obj_mut(obj_v);
     o.by_str.get(key).cloned().unwrap_or(NULL)
 }
 
-#[inline]
+#[inline(always)]
 pub unsafe fn obj_set_str(obj_v: ValueRepr, key: &str, val: ValueRepr) -> ValueRepr {
+    use crate::gc::barrier::post_write_if_ptr;
+
     let o = &mut *as_obj_mut(obj_v);
-    o.by_str.insert(key.to_string(), val);
+    let slot = o.by_str.entry(key.to_string()).or_insert(NULL);
+    *slot = val;
+
+    post_write_if_ptr(obj_v, slot as *mut i64, val);
     val
 }
 
-#[inline]
+#[inline(always)]
 pub unsafe fn obj_has_str(obj_v: ValueRepr, key: &str) -> ValueRepr {
     let o = &*as_obj_mut(obj_v);
     if o.by_str.contains_key(key) { 1 } else { 0 }
 }
 
-#[inline]
+#[inline(always)]
 pub unsafe fn obj_del_str(obj_v: ValueRepr, key: &str) -> ValueRepr {
     let o = &mut *as_obj_mut(obj_v);
     if o.by_str.remove(key).is_some() { 1 } else { 0 }

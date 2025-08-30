@@ -1,3 +1,5 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use crate::value::{ValueRepr, make_smi, as_obj_mut, TAG_STRING, BoxedStr, ObjHeader};
 
 use ahash::AHashMap as HashMap;
@@ -9,10 +11,10 @@ struct WirObj {
     by_str: HashMap<String, i64>,
 }
 
-#[inline] fn smi_to_i64(v: i64) -> i64 { v >> 1 }
-#[inline] fn decode_field_smi(v: i64) -> u32 { smi_to_i64(v) as u32 }
+#[inline(always)] fn smi_to_i64(v: i64) -> i64 { v >> 1 }
+#[inline(always)] fn decode_field_smi(v: i64) -> u32 { smi_to_i64(v) as u32 }
 
-#[inline]
+#[inline(always)]
 unsafe fn boxedstr_to_string(p: i64) -> Option<String> {
     if p == 0 { return None; }
     let s = &*(p as *const BoxedStr);
