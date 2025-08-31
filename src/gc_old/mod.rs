@@ -1,7 +1,6 @@
 // src/gc/mod.rs
 pub mod api;
 pub mod binding;
-// pub mod barrier;
 pub mod roots;
 pub mod mmtk;
 pub mod scanning;

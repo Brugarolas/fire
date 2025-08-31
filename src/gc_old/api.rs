@@ -53,9 +53,6 @@ impl SlotTrait for Slot {
         let val: ValueRepr = obj.to_raw_address().to_ptr::<u8>() as i64;
         unsafe { ptr::write(p, val) };
     }
-
-    #[inline(always)]
-    fn get_address(&self) -> Address { self.0 }
 }
 
 pub fn attach_current_thread() {
@@ -103,7 +100,7 @@ pub unsafe fn post_write_barrier(object_base: *mut u8, slot: *mut ValueRepr, new
         with_mutator(|mutator| {
             let src = ObjectReference::from_raw_address(Address::from_ptr(object_base))
                 .expect("post barrier: null src");
-            let vm_slot = VMSlot::from(Address::from_ptr(slot.cast::<u8>()));
+            let vm_slot = Slot::from(Address::from_ptr(slot.cast::<u8>()));
             let target = ObjectReference::from_raw_address(Address::from_ptr(new_val as *mut u8));
             memory_manager::object_reference_write_post::<NapalmVM>(
                 mutator, src, vm_slot, target
@@ -119,7 +116,7 @@ pub unsafe fn pre_write_barrier(object_base: *mut u8, slot: *mut ValueRepr) {
         with_mutator(|mutator| {
             let src = ObjectReference::from_raw_address(Address::from_ptr(object_base))
                 .expect("pre barrier: null src");
-            let vm_slot = VMSlot::from(Address::from_ptr(slot.cast::<u8>()));
+            let vm_slot = Slot::from(Address::from_ptr(slot.cast::<u8>()));
             let old = ObjectReference::from_raw_address(Address::from_ptr(old_v as *mut u8));
             memory_manager::object_reference_write_pre::<NapalmVM>(
                 mutator, src, vm_slot, old

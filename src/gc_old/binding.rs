@@ -1,6 +1,12 @@
 // src/gc/binding.rs
 use mmtk::vm::VMBinding;
-
+use mmtk::vm::collection::GCThreadContext;
+use mmtk::vm::active_plan;
+use mmtk::vm::reference_glue;
+use mmtk::vm::VMSlotTrait;
+use mmtk::util::Address;
+use mmtk::util::ObjectReference;
+use mmtk::vm::collection;
 pub struct NapalmVM;
 impl Default for NapalmVM { fn default() -> Self { NapalmVM } }
 
@@ -23,13 +29,10 @@ pub mod support {
     use core::ptr::NonNull;
     use once_cell::sync::Lazy;
     use parking_lot::RwLock;
+    use parking_lot::Mutex;
 
     use mmtk::{Mutator};
     use mmtk::memory_manager;
-    use mmtk::vm::{
-        active_plan, collection, reference_glue,
-        collection::GCThreadContext,
-    };
     use mmtk::scheduler::GCWorker;
     use mmtk::util::opaque_pointer::{OpaquePointer, VMThread, VMMutatorThread, VMWorkerThread};
     use mmtk::util::{Address, ObjectReference};
@@ -70,7 +73,7 @@ pub mod support {
 
     // We map VMThread -> Mutator*. We only touch this from VM threads (mutator attach/detach),
     // and GC threads (stop_all_mutators). Access is guarded by RwLock for simplicity.
-    static REGISTRY: Lazy<RwLock<Vec<(VMThread, NonNull<Mutator<crate::gc::binding::NapalmVM>>)>>> = Lazy::new(|| RwLock::new(Vec::new()));
+    static REGISTRY: Lazy<RwLock<Vec<(VMThread, Mutex<Mutator<crate::gc::binding::NapalmVM>>)>>> = Lazy::new(|| RwLock::new(Vec::new()));
 
     /// Called after bind_mutator on the current (mutator) thread.
     pub unsafe fn register_current_thread_mutator(m: &mut Mutator<crate::gc::binding::NapalmVM>) {

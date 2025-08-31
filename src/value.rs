@@ -1,11 +1,13 @@
 #![allow(dead_code)]
 #![allow(unsafe_op_in_unsafe_fn)]
 
-#[cfg(feature = "gc_mmtk")]
-use crate::gc::api::{alloc_raw, alloc_slow_path, post_alloc_object};
-use crate::gc::post_write_barrier;
-
+use core::mem;
 use ahash::AHashMap as HashMap;
+use std::ptr;
+use crate::gc::NAPALM_GC;
+
+//use crate::gc::api::{alloc_raw, alloc_slow_path, post_alloc_object};
+//use crate::gc::post_write_barrier;
 
 // ============================================================================
 // Value representation
@@ -62,14 +64,14 @@ pub fn box_f64(x: f64) -> ValueRepr {
     unsafe {
         let size = mem::size_of::<BoxedF64>();
         let align = mem::align_of::<BoxedF64>();
-        let mut p = alloc_raw(size, align);
-        if p.is_null() { p = alloc_slow_path(size, align); }
+        let mut p = NAPALM_GC.alloc_raw(size, align);
+        if p.is_null() { p = NAPALM_GC.alloc_slow_path(size, align); }
         let obj = p as *mut BoxedF64;
         core::ptr::write(
             obj,
             BoxedF64 { hdr: ObjHeader { tag: TAG_BOXED_F64, aux: 0 }, val: x }
         );
-        post_alloc_object(p, size);
+        NAPALM_GC.post_alloc_object(p, size);
         p as ValueRepr
     }
 }
@@ -115,8 +117,8 @@ pub fn box_array_with_len(len: usize) -> ValueRepr {
     unsafe {
         let size  = mem::size_of::<BoxedArray>();
         let align = mem::align_of::<BoxedArray>();
-        let mut p = alloc_raw(size, align);
-        if p.is_null() { p = alloc_slow_path(size, align); }
+        let mut p = NAPALM_GC.alloc_raw(size, align);
+        if p.is_null() { p = NAPALM_GC.alloc_slow_path(size, align); }
         let obj = p as *mut BoxedArray;
 
         // Build Vec on the Rust heap (capacity=len, length=len), filled with uninitialized i64.
@@ -127,7 +129,7 @@ pub fn box_array_with_len(len: usize) -> ValueRepr {
             obj,
             BoxedArray { hdr: ObjHeader { tag: TAG_ARRAY, aux: 0 }, buf }
         );
-        post_alloc_object(p, size);
+        NAPALM_GC.post_alloc_object(p, size);
         p as ValueRepr
     }
 }
@@ -153,14 +155,14 @@ pub fn box_str_borrowed(bytes: &[u8]) -> ValueRepr {
     unsafe {
         let size  = mem::size_of::<BoxedStr>();
         let align = mem::align_of::<BoxedStr>();
-        let mut p = alloc_raw(size, align);
-        if p.is_null() { p = alloc_slow_path(size, align); }
+        let mut p = NAPALM_GC.alloc_raw(size, align);
+        if p.is_null() { p = NAPALM_GC.alloc_slow_path(size, align); }
         let obj = p as *mut BoxedStr;
         core::ptr::write(
             obj,
             BoxedStr { hdr: ObjHeader { tag: TAG_STRING, aux: 0 }, len: bytes.len(), data: bytes.as_ptr() }
         );
-        post_alloc_object(p, size);
+        NAPALM_GC.post_alloc_object(p, size);
         p as ValueRepr
     }
 }
@@ -181,8 +183,8 @@ pub fn obj_new() -> ValueRepr {
     unsafe {
         let size  = mem::size_of::<BoxedObj>();
         let align = mem::align_of::<BoxedObj>();
-        let mut p = alloc_raw(size, align);
-        if p.is_null() { p = alloc_slow_path(size, align); }
+        let mut p = NAPALM_GC.alloc_raw(size, align);
+        if p.is_null() { p = NAPALM_GC.alloc_slow_path(size, align); }
         let obj = p as *mut BoxedObj;
         core::ptr::write(
             obj,
@@ -192,7 +194,7 @@ pub fn obj_new() -> ValueRepr {
                 by_str: HashMap::new(),
             }
         );
-        post_alloc_object(p, size);
+        NAPALM_GC.post_alloc_object(p, size);
         p as ValueRepr
     }
 }
@@ -218,7 +220,7 @@ pub unsafe fn obj_set_field(obj_v: ValueRepr, fid: u32, val: ValueRepr) -> Value
     *cell = val;
 
     // Post-write barrier
-    post_write_barrier(obj_v as *mut u8, slot, val);
+    NAPALM_GC.post_write_barrier(obj_v as *mut u8, slot, val);
     val
 }
 
@@ -249,7 +251,7 @@ pub unsafe fn obj_set_str(obj_v: ValueRepr, key: &str, val: ValueRepr) -> ValueR
     let slot: *mut ValueRepr = cell as *mut ValueRepr;
     *cell = val;
 
-    post_write_barrier(obj_v as *mut u8, slot, val);
+    NAPALM_GC.post_write_barrier(obj_v as *mut u8, slot, val);
     val
 }
 
