@@ -8,6 +8,7 @@ use smallvec::SmallVec;
 use std::cell::RefCell;
 use core::{ptr};
 use std::sync::atomic::AtomicUsize;
+use std::cell::Cell;
 
 use mmtk::{
     util::{
@@ -17,7 +18,7 @@ use mmtk::{
         ObjectReference,
         options::{Options, PlanSelector}
     },
-    vm::{slot, slot::Slot as TraitSlot, ObjectModel, VMBinding, Scanning, Collection, ActivePlan, ReferenceGlue, GCThreadContext},
+    vm::{slot, slot::Slot, ObjectModel, VMBinding, Scanning, Collection, ActivePlan, ReferenceGlue, GCThreadContext, slot::MemorySlice},
     AllocationSemantics,
     memory_manager,
     Mutator,
@@ -37,6 +38,7 @@ use mmtk::{
     // For Scanning impl:
     vm::{RootsWorkFactory, ObjectTracerContext},
 };
+use mmtk::util::constants::LOG_BYTES_IN_ADDRESS;
 
 use std::sync::atomic::{AtomicBool, Ordering::{Acquire, Release}};
 use parking_lot::{Mutex as ParkMutex, Condvar as ParkCondvar};
@@ -61,7 +63,7 @@ static MUTATOR_COUNT: AtomicUsize = AtomicUsize::new(0);
 // We use raw pointers so we can hand out &'static mut Mutator<_> when MMTk asks.
 // Safety: MMTk calls into this only at STW points or GC worker context,
 // so aliasing is controlled by the GC protocol.
-static ALL_MUTATORS: Lazy<std::sync::Mutex<Vec<*mut Mutator<NapalmVM>>>> = Lazy::new(|| std::sync::Mutex::new(Vec::new()));
+static ALL_MUTATORS: Lazy<Mutex<Vec<*mut Mutator<NapalmVM>>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 // =================================================================
 // ==================== Helpers ====================================
@@ -109,19 +111,127 @@ fn size_of_object_from_tag(base: *const u8) -> usize {
 #[inline(always)]
 fn emit_shadow_roots_to_factory<T: RootsWorkFactory<NapalmVM>>(factory: &mut T) {
     // Batch edges to reduce packets.
-    let mut edges: SmallVec<[Slot; 64]> = SmallVec::new();
+    let mut edges: SmallVec<[SlotItem; 64]> = SmallVec::new();
 
     ShadowStack::with_roots(|slot: *mut i64| {
-        let edge = Slot(Address::from_ptr(slot.cast::<u8>()));
+        let edge = SlotItem(Address::from_ptr(slot.cast::<u8>()));
         edges.push(edge);
         if edges.len() >= 64 {
-            factory.create_process_edges_work::<Slot>(&edges[..]);
+            factory.create_process_edges_work::<SlotItem>(&edges[..]);
             edges.clear();
         }
     });
 
     if !edges.is_empty() {
-        factory.create_process_edges_work::<Slot>(&edges[..]);
+        factory.create_process_edges_work::<SlotItem>(&edges[..]);
+    }
+}
+
+// ==================================================================
+// ==================== Slot ========================================
+// ==================================================================
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SlotItem(pub Address);
+
+impl From<Address> for SlotItem { fn from(a: Address) -> Self { SlotItem(a) } }
+
+impl Slot for SlotItem {
+    #[inline(always)]
+    fn load(&self) -> Option<ObjectReference> {
+        let p = self.0.to_ptr::<ValueRepr>();
+        let v = unsafe { ptr::read(p) };
+        if is_ptr(v) && v != NULL {
+            ObjectReference::from_raw_address(Address::from_ptr(v as *mut u8))
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    fn store(&self, obj: ObjectReference) {
+        // MMTk only calls this for actual reference slots.
+        let p = self.0.to_mut_ptr::<ValueRepr>();
+        let val: ValueRepr = obj.to_raw_address().to_ptr::<u8>() as i64;
+        unsafe { ptr::write(p, val) };
+    }
+}
+
+// ==================================================================
+// ==================== MemSlice ====================================
+// ==================================================================
+
+/// A concrete memory slice over a contiguous region of **heap** memory.
+/// We optionally carry the owning object for better maturity checks.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MemSlice {
+    start: Address,
+    bytes: usize,
+    owner: Option<ObjectReference>,
+}
+
+impl MemSlice {
+    #[inline(always)]
+    pub fn new(start: Address, bytes: usize) -> Self {
+        Self { start, bytes, owner: None }
+    }
+    #[inline(always)]
+    pub fn for_object(owner: ObjectReference, start: Address, bytes: usize) -> Self {
+        Self { start, bytes, owner: Some(owner) }
+    }
+}
+
+/// Iterator that yields our `Slot` over each machine word in the slice.
+pub struct MemSliceIter {
+    inner: mmtk::vm::slot::AddressRangeIterator,
+}
+
+impl Iterator for MemSliceIter {
+    type Item = SlotItem; // your custom Slot newtype
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(SlotItem::from)
+    }
+}
+
+impl MemorySlice for MemSlice {
+    type SlotType = SlotItem;
+    type SlotIterator = MemSliceIter;
+
+    #[inline(always)]
+    fn iter_slots(&self) -> Self::SlotIterator {
+        MemSliceIter {
+            inner: mmtk::vm::slot::AddressRangeIterator {
+                cursor: self.start,
+                limit:  self.start + self.bytes,
+            },
+        }
+    }
+
+    #[inline(always)]
+    fn object(&self) -> Option<ObjectReference> {
+        self.owner
+    }
+
+    #[inline(always)]
+    fn start(&self) -> Address { self.start }
+
+    #[inline(always)]
+    fn bytes(&self) -> usize { self.bytes }
+
+    #[inline(always)]
+    fn copy(src: &Self, tgt: &Self) {
+        debug_assert_eq!(src.bytes, tgt.bytes, "memcpy slices must be same size");
+        debug_assert_eq!(
+            src.bytes & ((1 << LOG_BYTES_IN_ADDRESS) - 1),
+            0,
+            "slice size must be a multiple of word size"
+        );
+        unsafe {
+            let words = tgt.bytes >> LOG_BYTES_IN_ADDRESS;
+            let sp = src.start.to_ptr::<usize>();
+            let dp = tgt.start.to_mut_ptr::<usize>();
+            std::ptr::copy(sp, dp, words);
+        }
     }
 }
 
@@ -134,9 +244,6 @@ fn emit_shadow_roots_to_factory<T: RootsWorkFactory<NapalmVM>>(factory: &mut T) 
 #[derive(Clone, Copy, Debug, Default)] pub struct VMCollection;
 #[derive(Clone, Copy, Debug, Default)] pub struct VMActivePlan;
 #[derive(Clone, Copy, Debug, Default)] pub struct VMRefGlue;
-
-pub type Slot     = slot::SimpleSlot;
-pub type MemSlice = slot::UnimplementedMemorySlice;
 
 impl ObjectModel<NapalmVM> for VMObjModel {
     // ---- Where per-object metadata lives ----
@@ -159,7 +266,7 @@ impl ObjectModel<NapalmVM> for VMObjModel {
         VMLocalMarkBitSpec::side_after(Self::LOCAL_FORWARDING_BITS_SPEC.as_spec());
 
     const LOCAL_LOS_MARK_NURSERY_SPEC: VMLocalLOSMarkNurserySpec =
-        VMLocalLOSMarkNurserySpec::side_after(Self::LOCAL_PINNING_BIT_SPEC.as_spec());
+        VMLocalLOSMarkNurserySpec::side_after(Self::LOCAL_MARK_BIT_SPEC.as_spec());
 
     // ---- Object ref <-> object start invariants ----
     // Napalm uses "object ref == object start".
@@ -232,7 +339,7 @@ impl ObjectModel<NapalmVM> for VMObjModel {
         let bytes = Self::get_size_when_copied(from);
         let align = Self::get_align_when_copied(from);
         let align_off = Self::get_align_offset_when_copied(from);
-        let dst_region = copy_context.alloc_copy(bytes, align, align_off, semantics);
+        let dst_region = copy_context.alloc_copy(from, align, align_off, bytes, semantics);
         let to_ref = Self::get_reference_when_copied_to(from, dst_region);
         let end = Self::copy_to(from, to_ref, dst_region);
         debug_assert_eq!(end, dst_region.add(bytes));
@@ -367,8 +474,8 @@ impl Scanning<NapalmVM> for VMScanning {
                     let len = arr.buf.len();
                     for _ in 0..len {
                         let slot_ptr = p as *mut i64;
-                        let edge = Slot(Address::from_ptr(slot_ptr.cast::<u8>()));
-                        tracer.trace_slot(edge);
+                        let edge = SlotItem(Address::from_ptr(slot_ptr.cast::<u8>()));
+                        tracer.process_edge(edge);
                         p = p.add(1);
                     }
                 }
@@ -378,13 +485,13 @@ impl Scanning<NapalmVM> for VMScanning {
 
                     for (_k, vref) in obj.by_id.iter() {
                         let slot_ptr = (vref as *const i64) as *mut i64;
-                        let edge = Slot(Address::from_ptr(slot_ptr.cast::<u8>()));
-                        tracer.trace_slot(edge);
+                        let edge = SlotItem(Address::from_ptr(slot_ptr.cast::<u8>()));
+                        tracer.process_edge(edge);
                     }
                     for (_k, vref) in obj.by_str.iter() {
                         let slot_ptr = (vref as *const i64) as *mut i64;
-                        let edge = Slot(Address::from_ptr(slot_ptr.cast::<u8>()));
-                        tracer.trace_slot(edge);
+                        let edge = SlotItem(Address::from_ptr(slot_ptr.cast::<u8>()));
+                        tracer.process_edge(edge);
                     }
                 }
 
@@ -470,7 +577,7 @@ impl Collection<NapalmVM> for VMCollection {
         if !STW_REQUESTED.load(Acquire) { return; }
         let guard = STW_LOCK.lock();
         while STW_REQUESTED.load(Acquire) {
-            STW_CV.wait(&guard);
+            STW_CV.wait(&mut guard);
         }
     }
 
@@ -573,45 +680,16 @@ impl VMBinding for NapalmVM {
     type VMReferenceGlue = VMRefGlue;
 
     // Your VM’s slot & memory slice types
-    type VMSlot         = Slot;     // you defined: pub type Slot = slot::SimpleSlot;
-    type VMMemorySlice  = MemSlice; // you defined: pub type MemSlice = slot::UnimplementedMemorySlice;
-}
-
-// ==================================================================
-// ==================== Slot ========================================
-// ==================================================================
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct SlotItem(pub Address);
-
-impl From<Address> for SlotItem { fn from(a: Address) -> Self { SlotItem(a) } }
-
-impl mmtk::vm::slot::Slot for SlotItem {
-    #[inline(always)]
-    fn load(&self) -> Option<ObjectReference> {
-        let p = self.0.to_ptr::<ValueRepr>();
-        let v = unsafe { ptr::read(p) };
-        if is_ptr(v) && v != NULL {
-            ObjectReference::from_raw_address(Address::from_ptr(v as *mut u8))
-        } else {
-            None
-        }
-    }
-
-    #[inline(always)]
-    fn store(&self, obj: ObjectReference) {
-        // MMTk only calls this for actual reference slots.
-        let p = self.0.to_mut_ptr::<ValueRepr>();
-        let val: ValueRepr = obj.to_raw_address().to_ptr::<u8>() as i64;
-        unsafe { ptr::write(p, val) };
-    }
+    type VMSlot         = SlotItem;
+    type VMMemorySlice  = MemSlice;
 }
 
 // ==================================================================
 // ==================== Mutators ====================================
 // ==================================================================
 thread_local! {
-    static TLS_MUTATOR: std::cell::RefCell<Option<Box<Mutator<NapalmVM>>>> = const { std::cell::RefCell::new(None) };
-    static TLS_MUT_PTR: std::cell::Cell<*mut Mutator<NapalmVM>> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+    static TLS_MUTATOR: RefCell<Option<Box<Mutator<NapalmVM>>>> = const { RefCell::new(None) };
+    static TLS_MUT_PTR: Cell<*mut Mutator<NapalmVM>> = const { Cell::new(std::ptr::null_mut()) };
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
@@ -623,8 +701,8 @@ impl MutatorThread {
         TLS_MUTATOR.with(|c| {
             if c.borrow().is_none() {
                 let mmtk = get_mmtk();
-                let mt = MutatorThread::current();
-                let mutator = memory_manager::bind_mutator::<NapalmVM>(mmtk, mt);
++               let tls = VMMutatorThread::UNINITIALIZED;
+                let mutator = memory_manager::bind_mutator::<NapalmVM>(mmtk, tls);
 
                 // Keep Box in TLS, stash a raw pointer for fast access.
                 let raw: *mut Mutator<NapalmVM> = &mut *mutator;
@@ -644,7 +722,7 @@ impl MutatorThread {
     #[inline(always)]
     pub fn detach_current_thread() {
         TLS_MUTATOR.with(|c| {
-            if let Some(mutator_box) = c.borrow_mut().take() {
+            if let Some(mut mutator_box) = c.borrow_mut().take() {
                 // Remove from global registry.
                 let raw: *mut Mutator<NapalmVM> = &mut *mutator_box;
                 {
@@ -661,7 +739,7 @@ impl MutatorThread {
     }
 
     #[inline(always)]
-    pub(crate) fn with_mutator<R>(f: impl FnOnce(&mut Mutator<NapalmVM>) -> R) -> R {
+    pub fn with_mutator<R>(f: impl FnOnce(&mut Mutator<NapalmVM>) -> R) -> R {
         TLS_MUTATOR.with(|c| {
             let mut guard = c.borrow_mut();
             let m = guard
@@ -734,7 +812,7 @@ impl NapalmGc {
 
     #[inline(always)]
     pub unsafe fn alloc_raw(&self, bytes: usize, align: usize) -> *mut u8 {
-        self.mutator.with_mutator(|mutator| {
+        MutatorThread::with_mutator(|mutator| {
             let addr = memory_manager::alloc::<NapalmVM>(
                 mutator, bytes, align, 0, AllocationSemantics::Default,
             );
@@ -744,7 +822,7 @@ impl NapalmGc {
 
     #[inline(always)]
     pub unsafe fn alloc_slow_path(&self, bytes: usize, align: usize) -> *mut u8 {
-        self.mutator.with_mutator(|mutator| {
+        MutatorThread::with_mutator(|mutator| {
             let addr = memory_manager::alloc_slow::<NapalmVM>(
                 mutator, bytes, align, 0, AllocationSemantics::Default,
             );
@@ -755,7 +833,7 @@ impl NapalmGc {
 
     #[inline(always)]
     pub unsafe fn post_alloc_object(&self, obj_ptr: *mut u8, bytes: usize) {
-        self.mutator.with_mutator(|mutator| {
+        MutatorThread::with_mutator(|mutator| {
             let objref = ObjectReference::from_raw_address(Address::from_mut_ptr(obj_ptr))
                 .expect("post_alloc_object: null obj_ptr");
             memory_manager::post_alloc::<NapalmVM>(
@@ -767,10 +845,10 @@ impl NapalmGc {
     #[inline(always)]
     pub unsafe fn post_write_barrier(&self, object_base: *mut u8, slot: *mut ValueRepr, new_val: ValueRepr) {
         if is_ptr(new_val) && new_val != NULL {
-            self.mutator.with_mutator(|mutator| {
+            MutatorThread::with_mutator(|mutator| {
                 let src = ObjectReference::from_raw_address(Address::from_ptr(object_base))
                     .expect("post barrier: null src");
-                let vm_slot = Slot::from(Address::from_ptr(slot.cast::<u8>()));
+                let vm_slot = SlotItem::from(Address::from_ptr(slot.cast::<u8>()));
                 let target = ObjectReference::from_raw_address(Address::from_ptr(new_val as *mut u8));
                 memory_manager::object_reference_write_post::<NapalmVM>(
                     mutator, src, vm_slot, target
@@ -783,10 +861,10 @@ impl NapalmGc {
     pub unsafe fn pre_write_barrier(&self, object_base: *mut u8, slot: *mut ValueRepr) {
         let old_v: ValueRepr = unsafe { core::ptr::read(slot) };
         if is_ptr(old_v) && old_v != NULL {
-            self.mutator.with_mutator(|mutator| {
+            MutatorThread::with_mutator(|mutator| {
                 let src = ObjectReference::from_raw_address(Address::from_ptr(object_base))
                     .expect("pre barrier: null src");
-                let vm_slot = Slot::from(Address::from_ptr(slot.cast::<u8>()));
+                let vm_slot = SlotItem::from(Address::from_ptr(slot.cast::<u8>()));
                 let old = ObjectReference::from_raw_address(Address::from_ptr(old_v as *mut u8));
                 memory_manager::object_reference_write_pre::<NapalmVM>(
                     mutator, src, vm_slot, old
@@ -798,7 +876,7 @@ impl NapalmGc {
     /// Bind the current thread as a mutator (safe to call multiple times).
     #[inline(always)]
     pub fn bind_current_thread(&self) {
-        self.mutator.bind_current_thread();
+        MutatorThread::attach_current_thread();
     }
 
     /// Optional shutdown (useful in tests).
