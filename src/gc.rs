@@ -109,7 +109,7 @@ fn size_of_object_from_tag(base: *const u8) -> usize {
 
 
 #[inline(always)]
-fn emit_shadow_roots_to_factory<T: RootsWorkFactory<NapalmVM>>(factory: &mut T) {
+fn emit_shadow_roots_to_factory<T: RootsWorkFactory<SlotItem>>(factory: &mut T) {
     // Batch edges to reduce packets.
     let mut edges: SmallVec<[SlotItem; 64]> = SmallVec::new();
 
@@ -117,13 +117,13 @@ fn emit_shadow_roots_to_factory<T: RootsWorkFactory<NapalmVM>>(factory: &mut T) 
         let edge = SlotItem(Address::from_ptr(slot.cast::<u8>()));
         edges.push(edge);
         if edges.len() >= 64 {
-            factory.create_process_edges_work::<SlotItem>(&edges[..]);
+            factory.create_process_roots_work(edges.to_vec());
             edges.clear();
         }
     });
 
     if !edges.is_empty() {
-        factory.create_process_edges_work::<SlotItem>(&edges[..]);
+        factory.create_process_roots_work(edges.to_vec());
     }
 }
 
@@ -456,43 +456,60 @@ impl Scanning<NapalmVM> for VMScanning {
     ) {
         use crate::value::{
             ObjHeader, BoxedF64, BoxedStr, BoxedArray, BoxedObj,
-            TAG_BOXED_F64, TAG_STRING, TAG_ARRAY, TAG_OBJECT,
+            TAG_BOXED_F64, TAG_STRING, TAG_ARRAY, TAG_OBJECT, is_ptr, NULL,
         };
+        use mmtk::util::Address;
 
         unsafe {
             let base = object.to_raw_address().to_ptr::<u8>();
             let hdr  = &*(base as *const ObjHeader);
 
             match hdr.tag {
-                TAG_BOXED_F64 | TAG_STRING => {
-                    // No children.
-                }
+                TAG_BOXED_F64 | TAG_STRING => { /* no children */ }
 
                 TAG_ARRAY => {
-                    let arr = &*(base as *const BoxedArray);
-                    let mut p = arr.buf.as_ptr();
+                    let arr = &mut *(base as *mut BoxedArray);
                     let len = arr.buf.len();
-                    for _ in 0..len {
-                        let slot_ptr = p as *mut i64;
-                        let edge = SlotItem(Address::from_ptr(slot_ptr.cast::<u8>()));
-                        tracer.process_edge(edge);
-                        p = p.add(1);
-                    }
+                    let ptr = arr.buf.as_mut_ptr();
+                    tracer.with_tracer(|t| {
+                        for i in 0..len {
+                            let slot = ptr.add(i);
+                            let val  = *slot;
+                            if is_ptr(val) && val != NULL {
+                                let old = ObjectReference::from_raw_address(Address::from_ptr(val as *mut u8)).unwrap();
+                                let new = t.trace_object(old);
+                                if new != old {
+                                    *slot = new.to_raw_address().to_ptr::<u8>() as i64;
+                                }
+                            }
+                        }
+                    });
                 }
 
                 TAG_OBJECT => {
-                    let obj = &*(base as *const BoxedObj);
-
-                    for (_k, vref) in obj.by_id.iter() {
-                        let slot_ptr = (vref as *const i64) as *mut i64;
-                        let edge = SlotItem(Address::from_ptr(slot_ptr.cast::<u8>()));
-                        tracer.process_edge(edge);
-                    }
-                    for (_k, vref) in obj.by_str.iter() {
-                        let slot_ptr = (vref as *const i64) as *mut i64;
-                        let edge = SlotItem(Address::from_ptr(slot_ptr.cast::<u8>()));
-                        tracer.process_edge(edge);
-                    }
+                    let obj = &mut *(base as *mut BoxedObj);
+                    tracer.with_tracer(|t| {
+                        for v in obj.by_id.values_mut() {
+                            let val = *v;
+                            if is_ptr(val) && val != NULL {
+                                let old = ObjectReference::from_raw_address(Address::from_ptr(val as *mut u8)).unwrap();
+                                let new = t.trace_object(old);
+                                if new != old {
+                                    *v = new.to_raw_address().to_ptr::<u8>() as i64;
+                                }
+                            }
+                        }
+                        for v in obj.by_str.values_mut() {
+                            let val = *v;
+                            if is_ptr(val) && val != NULL {
+                                let old = ObjectReference::from_raw_address(Address::from_ptr(val as *mut u8)).unwrap();
+                                let new = t.trace_object(old);
+                                if new != old {
+                                    *v = new.to_raw_address().to_ptr::<u8>() as i64;
+                                }
+                            }
+                        }
+                    });
                 }
 
                 _ => {
@@ -504,10 +521,10 @@ impl Scanning<NapalmVM> for VMScanning {
     }
 
     #[inline(always)]
-    fn scan_vm_specific_roots(
+    fn scan_vm_specific_roots<T: RootsWorkFactory<SlotItem>>(
         _tls: VMWorkerThread,
-        _factory: &mut RootsWorkFactory<NapalmVM>,
-    ) {
+        _factory: &mut T,
+    ) {
         // Add global roots here when you have them (intern tables, PIC caches, etc.)
     }
 
@@ -528,7 +545,7 @@ impl Scanning<NapalmVM> for VMScanning {
         mut factory: F,
     )
     where
-        F: RootsWorkFactory<NapalmVM>
+        F: RootsWorkFactory<SlotItem>
     {
         emit_shadow_roots_to_factory(&mut factory);
     }
@@ -575,7 +592,7 @@ impl Collection<NapalmVM> for VMCollection {
         _mutator: &'static mut Mutator<NapalmVM>,
     ) {
         if !STW_REQUESTED.load(Acquire) { return; }
-        let guard = STW_LOCK.lock();
+        let mut guard = STW_LOCK.lock();
         while STW_REQUESTED.load(Acquire) {
             STW_CV.wait(&mut guard);
         }
@@ -697,12 +714,16 @@ pub struct MutatorThread;
 
 impl MutatorThread {
     #[inline(always)]
+    pub fn bind_current_thread(&self) {
+        Self::attach_current_thread();
+    }
+
+    #[inline(always)]
     pub fn attach_current_thread() {
         TLS_MUTATOR.with(|c| {
             if c.borrow().is_none() {
                 let mmtk = get_mmtk();
-+               let tls = VMMutatorThread::UNINITIALIZED;
-                let mutator = memory_manager::bind_mutator::<NapalmVM>(mmtk, tls);
++               let mutator = memory_manager::bind_mutator::<NapalmVM>(mmtk, VMMutatorThread(tls::IntoVMThread::current()));
 
                 // Keep Box in TLS, stash a raw pointer for fast access.
                 let raw: *mut Mutator<NapalmVM> = &mut *mutator;
