@@ -728,7 +728,7 @@ impl NapalmGc {
     }
 
     #[inline(always)]
-    pub fn visit_value(&self) { // No, I won't place it in the VM, because there's no VM.
+    pub fn visit_value(&self) {
         unimplemented!()
     }
 
@@ -915,16 +915,16 @@ impl NapalmGc {
         if !STW_REQUESTED.load(Acquire) { return; }
 
         // Park cooperatively until GC clears the flag.
-        let guard = STW_LOCK.lock();
+        let mut guard = STW_LOCK.lock();
         // Re-check under the mutex to avoid races.
         while STW_REQUESTED.load(Acquire) {
-            STW_CV.wait(&guard);
+            STW_CV.wait(&mut guard);
         }
         // guard drops here
     }
 
     #[inline(always)]
-    fn maybe_safepoint(&mut self) {
+    pub fn maybe_safepoint(&mut self) {
         self.safepoint_tick = self.safepoint_tick.wrapping_add(1);
         if self.safepoint_tick == 4096 {
             self.safepoint_tick = 0;
@@ -933,7 +933,7 @@ impl NapalmGc {
     }
 }
 
-pub static NAPALM_GC: OnceCell<NapalmGc> = OnceCell::new();
+pub static mut NAPALM_GC: Lazy<NapalmGc> = Lazy::new(|| NapalmGc::new());
 
 // ======================================================
 // ==================== Shadow Stack ====================
@@ -946,7 +946,7 @@ thread_local! {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ShadowStack;
 
-// TODO It's inert for now, but the API is stable.
+// It's inert for now, but the API is stable.
 impl ShadowStack {
     #[inline(always)]
     pub unsafe fn push_range(base: *mut i64, slots: usize) {

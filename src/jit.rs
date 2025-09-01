@@ -1644,7 +1644,7 @@ pub extern "C" fn wir_array_map(arr: i64, clo_ptr: i64) -> i64 {
         let args = [x];
         let y = wir_call_closure(clo_ptr, args.as_ptr(), 1);
         out.push(y);
-        NAPALM_GC.maybe_safepoint();
+        unsafe { NAPALM_GC.maybe_safepoint(); }
     }
     let b = Box::new(WirArray { buf: out });
     Box::into_raw(b) as i64
@@ -1657,7 +1657,7 @@ pub extern "C" fn wir_array_for_each(arr: i64, clo_ptr: i64) -> i64 {
     for &x in &a.buf {
         let args = [x];
         let _ = wir_call_closure(clo_ptr, args.as_ptr(), 1);
-        NAPALM_GC.maybe_safepoint();
+        unsafe { NAPALM_GC.maybe_safepoint(); }
     }
     0
 }
@@ -1670,7 +1670,7 @@ pub extern "C" fn wir_array_find(arr: i64, clo_ptr: i64) -> i64 {
         let args = [x];
         let ok = wir_call_closure(clo_ptr, args.as_ptr(), 1);
         if ok != 0 { return x; }
-        NAPALM_GC.maybe_safepoint();
+        unsafe { NAPALM_GC.maybe_safepoint(); }
     }
     0
 }
@@ -1683,7 +1683,7 @@ pub extern "C" fn wir_array_find_index(arr: i64, clo_ptr: i64) -> i64 {
         let args = [x];
         let ok = wir_call_closure(clo_ptr, args.as_ptr(), 1);
         if ok != 0 { return smi(i as i64); }
-        NAPALM_GC.maybe_safepoint();
+        unsafe { NAPALM_GC.maybe_safepoint(); }
     }
     smi(-1)
 }
@@ -1697,7 +1697,7 @@ pub extern "C" fn wir_array_filter(arr: i64, clo_ptr: i64) -> i64 {
         let args = [x];
         let ok = wir_call_closure(clo_ptr, args.as_ptr(), 1);
         if ok != 0 { out.push(x); }
-        NAPALM_GC.maybe_safepoint();
+        unsafe { NAPALM_GC.maybe_safepoint(); }
     }
     let b = Box::new(WirArray { buf: out });
     Box::into_raw(b) as i64
@@ -1715,7 +1715,7 @@ pub extern "C" fn wir_array_reduce(arr: i64, clo_ptr: i64, has_init: i64, init: 
     for x in it {
         let args = [acc, x];
         acc = wir_call_closure(clo_ptr, args.as_ptr(), 2);
-        NAPALM_GC.maybe_safepoint();
+        unsafe { NAPALM_GC.maybe_safepoint(); }
     }
     acc
 }
@@ -1730,7 +1730,7 @@ pub extern "C" fn wir_array_fill(arr: i64, val: i64) -> i64 {
             let slot = base.add(i);
             *slot = val;
             NAPALM_GC.post_write_barrier(arr as *mut u8, slot, val);
-            NAPALM_GC.maybe_safepoint();
+            unsafe { NAPALM_GC.maybe_safepoint(); }
         }
     }
     0

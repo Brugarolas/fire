@@ -44,7 +44,7 @@ pub extern "C" fn wir_is_str(v: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn napalm_yieldpoint() -> i64 {
-    NAPALM_GC.yieldpoint();
+    unsafe { NAPALM_GC.yieldpoint(); }
     0
 }
 
