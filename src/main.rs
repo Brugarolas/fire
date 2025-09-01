@@ -4,7 +4,7 @@ mod wir;
 mod front;
 //mod opt;
 //mod gc_new;
-mod gc_old;
+//mod gc_old;
 mod gc;
 mod runtime;
 mod jit;
