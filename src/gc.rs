@@ -18,7 +18,17 @@ use mmtk::{
         ObjectReference,
         options::{Options, PlanSelector}
     },
-    vm::{slot, slot::Slot, ObjectModel, VMBinding, Scanning, Collection, ActivePlan, ReferenceGlue, GCThreadContext, slot::MemorySlice},
+    vm::{
+        slot::{Slot, MemorySlice},
+        ObjectModel,
+        VMBinding,
+        Scanning,
+        Collection,
+        ActivePlan,
+        ReferenceGlue,
+        GCThreadContext,
+        ObjectTracer
+    },
     AllocationSemantics,
     memory_manager,
     Mutator,
@@ -63,7 +73,17 @@ static MUTATOR_COUNT: AtomicUsize = AtomicUsize::new(0);
 // We use raw pointers so we can hand out &'static mut Mutator<_> when MMTk asks.
 // Safety: MMTk calls into this only at STW points or GC worker context,
 // so aliasing is controlled by the GC protocol.
-static ALL_MUTATORS: Lazy<Mutex<Vec<*mut Mutator<NapalmVM>>>> = Lazy::new(|| Mutex::new(Vec::new()));
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+struct MutatorRaw(*mut Mutator<NapalmVM>);
+unsafe impl Send for MutatorRaw {}
+unsafe impl Sync for MutatorRaw {}
+impl MutatorRaw {
+    fn as_mut(&self) -> &'static mut Mutator<NapalmVM> {
+        unsafe { &mut *self.0 }
+    }
+}
+
+static ALL_MUTATORS: Lazy<Mutex<Vec<MutatorRaw>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 // =================================================================
 // ==================== Helpers ====================================
@@ -449,10 +469,10 @@ impl ObjectModel<NapalmVM> for VMObjModel {
 
 impl Scanning<NapalmVM> for VMScanning {
     #[inline(always)]
-    fn scan_object<T: ObjectTracerContext<NapalmVM>>(
+    fn scan_object<SV: mmtk::vm::SlotVisitor<SlotItem>>(
         _tls: VMWorkerThread,
         object: ObjectReference,
-        mut tracer: T,
+        slot_visitor: &mut SV,
     ) {
         use crate::value::{
             ObjHeader, BoxedF64, BoxedStr, BoxedArray, BoxedObj,
@@ -465,51 +485,44 @@ impl Scanning<NapalmVM> for VMScanning {
             let hdr  = &*(base as *const ObjHeader);
 
             match hdr.tag {
-                TAG_BOXED_F64 | TAG_STRING => { /* no children */ }
+                TAG_BOXED_F64 | TAG_STRING => {
+                    // No outgoing references.
+                }
 
                 TAG_ARRAY => {
                     let arr = &mut *(base as *mut BoxedArray);
                     let len = arr.buf.len();
                     let ptr = arr.buf.as_mut_ptr();
-                    tracer.with_tracer(|t| {
-                        for i in 0..len {
-                            let slot = ptr.add(i);
-                            let val  = *slot;
-                            if is_ptr(val) && val != NULL {
-                                let old = ObjectReference::from_raw_address(Address::from_ptr(val as *mut u8)).unwrap();
-                                let new = t.trace_object(old);
-                                if new != old {
-                                    *slot = new.to_raw_address().to_ptr::<u8>() as i64;
-                                }
-                            }
+                    for i in 0..len {
+                        let slot_ptr: *mut i64 = ptr.add(i);
+                        // optional: cheap filter to avoid handing non-ptr immediates to MMTk
+                        let val = *slot_ptr;
+                        if is_ptr(val) && val != NULL {
+                            let edge = SlotItem(Address::from_ptr(slot_ptr.cast::<u8>()));
+                            slot_visitor.visit_slot(edge);
                         }
-                    });
+                    }
                 }
 
                 TAG_OBJECT => {
                     let obj = &mut *(base as *mut BoxedObj);
-                    tracer.with_tracer(|t| {
-                        for v in obj.by_id.values_mut() {
-                            let val = *v;
-                            if is_ptr(val) && val != NULL {
-                                let old = ObjectReference::from_raw_address(Address::from_ptr(val as *mut u8)).unwrap();
-                                let new = t.trace_object(old);
-                                if new != old {
-                                    *v = new.to_raw_address().to_ptr::<u8>() as i64;
-                                }
-                            }
+
+                    for v in obj.by_id.values_mut() {
+                        let slot_ptr: *mut i64 = v as *mut i64;
+                        let val = *slot_ptr;
+                        if is_ptr(val) && val != NULL {
+                            let edge = SlotItem(Address::from_ptr(slot_ptr.cast::<u8>()));
+                            slot_visitor.visit_slot(edge);
                         }
-                        for v in obj.by_str.values_mut() {
-                            let val = *v;
-                            if is_ptr(val) && val != NULL {
-                                let old = ObjectReference::from_raw_address(Address::from_ptr(val as *mut u8)).unwrap();
-                                let new = t.trace_object(old);
-                                if new != old {
-                                    *v = new.to_raw_address().to_ptr::<u8>() as i64;
-                                }
-                            }
+                    }
+                    for v in obj.by_str.values_mut() {
+                        let slot_ptr: *mut i64 = v as *mut i64;
+                        let val = *slot_ptr;
+                        if is_ptr(val) && val != NULL {
+                            let edge = SlotItem(Address::from_ptr(slot_ptr.cast::<u8>()));
+                            slot_visitor.visit_slot(edge);
                         }
-                    });
+                    }
                 }
 
                 _ => {
@@ -521,11 +534,11 @@ impl Scanning<NapalmVM> for VMScanning {
     }
 
     #[inline(always)]
-    fn scan_vm_specific_roots<T: RootsWorkFactory<SlotItem>>(
+    fn scan_vm_specific_roots(
         _tls: VMWorkerThread,
-        _factory: &mut T,
-    ) {
-        // Add global roots here when you have them (intern tables, PIC caches, etc.)
+        mut factory: impl RootsWorkFactory<SlotItem>,
+    ) {
+        emit_shadow_roots_to_factory(&mut factory);
     }
 
     // ===== extra items your MMTk requires =====
@@ -539,14 +552,11 @@ impl Scanning<NapalmVM> for VMScanning {
     /// Scan roots while running on the *mutator* thread (instead of a GC worker).
     /// We emit the same shadow-stack roots; the mutator reference is not needed yet.
     #[inline(always)]
-    fn scan_roots_in_mutator_thread<F>(
+    fn scan_roots_in_mutator_thread(
         _tls: VMWorkerThread,
         _mutator: &'static mut Mutator<NapalmVM>,
-        mut factory: F,
-    )
-    where
-        F: RootsWorkFactory<SlotItem>
-    {
+        mut factory: impl RootsWorkFactory<SlotItem>,
+    ) {
         emit_shadow_roots_to_factory(&mut factory);
     }
 
@@ -567,13 +577,20 @@ impl Collection<NapalmVM> for VMCollection {
     /// Request a stop-the-world. In cooperative mode we just set a flag;
     /// mutators will park at the next `yieldpoint()`.
     #[inline(always)]
-    fn stop_all_mutators(
-        _vm: &'static MMTK<NapalmVM>,
-        _tls: VMWorkerThread,
-    ) {
+    fn stop_all_mutators<F>( _tls: VMWorkerThread, mut mutator_visitor: F )
+    where
+        F: FnMut(&'static mut Mutator<NapalmVM>),
+    {
         STW_REQUESTED.store(true, Release);
-        // No further action: mutators block in their next yieldpoint().
-        // If you want to nudge them harder later, you can add a signal/pollpage path here.
+
+        let ptrs: Vec<MutatorRaw> = {
+            let list = ALL_MUTATORS.lock();
+            list.as_slice().to_vec()
+        };
+        for MutatorRaw(p) in ptrs {
+            let m: &'static mut Mutator<NapalmVM> = unsafe { &mut *p };
+            mutator_visitor(m);
+        }
     }
 
     /// Resume mutators by clearing the flag and waking all parked threads.
@@ -588,34 +605,27 @@ impl Collection<NapalmVM> for VMCollection {
     /// Called by MMTk on a mutator thread that needs to be blocked for GC.
     /// Park until `resume_mutators` clears the flag.
     #[inline(always)]
-    fn block_for_gc(
-        _mutator: &'static mut Mutator<NapalmVM>,
-    ) {
+    fn block_for_gc(_mutator: VMMutatorThread) {
         if !STW_REQUESTED.load(Acquire) { return; }
-        let mut guard = STW_LOCK.lock();
+        let mut guard = STW_LOCK.lock();        // <- make it mutable
         while STW_REQUESTED.load(Acquire) {
-            STW_CV.wait(&mut guard);
+            STW_CV.wait(&mut guard);            // <- pass &mut guard
         }
     }
 
     /// Spawn a GC worker thread and run the provided closure on it.
     /// MMTk passes a `GCThreadContext` and a closure `f(worker_tls)` that starts the worker.
     #[inline(always)]
-    fn spawn_gc_thread<F>(
-        tls: VMThread,
-        _ctx: GCThreadContext<NapalmVM>,
-        f: F,
-    )
-    where
-        F: FnOnce(VMWorkerThread) + Send + 'static,
-    {
+    fn spawn_gc_thread(tls: VMThread, ctx: GCThreadContext<NapalmVM>) {
         std::thread::Builder::new()
             .name("mmtk-gc-worker".to_string())
             .spawn(move || {
-                // SAFETY: MMTk’s opaque TLS types are just opaque pointers; it is
-                // common to transmute VMThread→VMWorkerThread for worker startup.
                 let worker_tls: VMWorkerThread = unsafe { std::mem::transmute(tls) };
-                f(worker_tls);
+                match ctx {
+                    mmtk::vm::GCThreadContext::Worker(worker) => {
+                        worker.run(worker_tls, get_mmtk())
+                    }
+                }
             })
             .expect("spawn GC worker");
     }
@@ -638,17 +648,12 @@ impl ActivePlan<NapalmVM> for VMActivePlan {
 
     #[inline(always)]
     fn mutators<'a>() -> Box<dyn Iterator<Item = &'a mut Mutator<NapalmVM>> + 'a> {
-        // Snapshot the raw pointer list to avoid holding the lock
-        // across iteration (MMTk will iterate under STW anyway).
-        let ptrs: Vec<*mut Mutator<NapalmVM>> = {
+        let ptrs: Vec<MutatorRaw> = {
             let list = ALL_MUTATORS.lock();
             list.as_slice().to_vec()
         };
-
-        // Map to &'static mut and return an owning iterator.
-        // &'static mut coerces to &'a mut (since 'static: 'a).
         let refs: Vec<&'static mut Mutator<NapalmVM>> = unsafe {
-            ptrs.into_iter().map(|p| &mut *p).collect()
+            ptrs.into_iter().map(|p| &mut *p.0).collect()
         };
         Box::new(refs.into_iter())
     }
@@ -723,18 +728,18 @@ impl MutatorThread {
         TLS_MUTATOR.with(|c| {
             if c.borrow().is_none() {
                 let mmtk = get_mmtk();
-+               let mutator = memory_manager::bind_mutator::<NapalmVM>(mmtk, VMMutatorThread(tls::IntoVMThread::current()));
 
-                // Keep Box in TLS, stash a raw pointer for fast access.
+                // No real TLS handle yet → use an opaque “uninitialized” token.
+                let tls = VMMutatorThread(VMThread::UNINITIALIZED);
+
+                let mut mutator = memory_manager::bind_mutator::<NapalmVM>(mmtk, tls);
+
                 let raw: *mut Mutator<NapalmVM> = &mut *mutator;
                 *c.borrow_mut() = Some(mutator);
                 TLS_MUT_PTR.with(|p| p.set(raw));
 
-                // Register globally.
-                {
-                    let mut list = ALL_MUTATORS.lock();
-                    list.push(raw);
-                }
+                let mut list = ALL_MUTATORS.lock();
+                list.push(MutatorRaw(raw));
                 MUTATOR_COUNT.fetch_add(1, AcqRel);
             }
         });
@@ -748,7 +753,7 @@ impl MutatorThread {
                 let raw: *mut Mutator<NapalmVM> = &mut *mutator_box;
                 {
                     let mut list = ALL_MUTATORS.lock();
-                    if let Some(i) = list.iter().position(|&p| p == raw) {
+                    if let Some(i) = list.iter().position(|&MutatorRaw(p)| p == raw) {
                         list.swap_remove(i);
                     }
                 }
@@ -768,6 +773,21 @@ impl MutatorThread {
                 .expect("MMTk mutator not attached on this thread. Call gc::attach_current_thread().");
             f(m)
         })
+    }
+
+    pub fn mutator_visitor<F>(mut mutator_visitor: F)
+    where
+        F: FnMut(&'static mut Mutator<NapalmVM>),
+    {
+        let ptrs: Vec<MutatorRaw> = {
+            let list = ALL_MUTATORS.lock();
+            list.as_slice().to_vec()
+        };
+
+        for MutatorRaw(p) in ptrs {
+            let m: &'static mut Mutator<NapalmVM> = unsafe { &mut *p };
+            mutator_visitor(m);
+        }
     }
 }
 
