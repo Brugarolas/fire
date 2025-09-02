@@ -794,12 +794,6 @@ impl MutatorThread {
 // ==================================================================
 // ==================== Global Garbage Collector ====================
 // ==================================================================
-static MMTK: OnceCell<MMTK<NapalmVM>> = OnceCell::new();
-
-pub fn get_mmtk() -> &'static MMTK<NapalmVM> {
-    MMTK.get().expect("MMTk not initialized")
-}
-
 static MMTK_GC: Lazy<MMTK<NapalmVM>> = Lazy::new(|| {
     // ① Options – pick Gen-Immix plan (our only supported configuration).
     let mut opts = Options::default();
@@ -819,39 +813,70 @@ pub fn init() {
     Lazy::force(&MMTK_GC);
 }
 
+#[inline(always)]
+pub fn get_mmtk() -> &'static MMTK<NapalmVM> {
+    &*MMTK_GC
+}
+
 thread_local! {
     static SAFEPOINT_TICK: Cell<usize> = Cell::new(0);
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone)]
 pub struct NapalmGc {
     pub mutator: MutatorThread,
     pub stack_guess: usize,
+    pub gc: &'static MMTK<NapalmVM>,
 }
 
 impl NapalmGc {
     pub fn new() -> Self {
-        NapalmGc { mutator: MutatorThread::default(), stack_guess: 1 << 20 } // 1 MiB
+        init();
+
+        NapalmGc {
+            mutator: MutatorThread::default(),
+            stack_guess: 1 << 20, // 1 MiB
+            gc: get_mmtk()
+        }
     }
 
     #[inline(always)]
-    pub fn push_any_visitor(&self) {
-        unimplemented!()
+    pub fn collect_now(&self) -> bool {
+        use mmtk::memory_manager::handle_user_collection_request;
+
+        // Any mutator thread token is fine for the request hint. If you want,
+        // plumb a real per-thread VMThread here.
+        handle_user_collection_request::<NapalmVM>(self.gc, VMMutatorThread(VMThread::UNINITIALIZED))
+    }
+
+    /// Visit all root slots currently on the shadow stack with a callback.
+    #[inline(always)]
+    pub fn visit_value_slots<F: FnMut(*mut ValueRepr)>(&self, mut f: F) {
+        ShadowStack::with_roots(|slot| f(slot));
+    }
+
+    /// A convenience 'visit_value' that conditionally applies a function to a single slot
+    /// if it looks like a pointer (useful for ad-hoc verifiers).
+    #[inline(always)]
+    pub fn visit_value<F: FnMut(*mut ValueRepr)>(&self, slot: *mut ValueRepr, mut f: F) {
+        unsafe {
+            let v = core::ptr::read(slot);
+            if is_ptr(v) && v != NULL {
+                f(slot);
+            }
+        }
+    }
+
+    /// “Any visitor” push/pop helpers are often just wrappers around ShadowStack.
+    /// If you meant 'push a range of locals' for a frame, expose that explicitly:
+    #[inline(always)]
+    pub unsafe fn push_any_visitor(&self, base: *mut ValueRepr, slots: usize) {
+        ShadowStack::push_range(base as *mut i64, slots);
     }
 
     #[inline(always)]
-    pub fn visit_value_slots(&self) {
-        unimplemented!()
-    }
-
-    #[inline(always)]
-    pub fn scan_object_precise(&self) {
-        unimplemented!()
-    }
-
-    #[inline(always)]
-    pub fn visit_value(&self) {
-        unimplemented!()
+    pub fn pop_any_visitor(&self) {
+        ShadowStack::pop_range();
     }
 
     #[inline(always)]
@@ -953,6 +978,33 @@ impl NapalmGc {
             bounds
         } else {
             self.stack_bounds_guess()
+        }
+    }
+
+    /// A stand-alone precise scanner (debug): enumerate a *heap object’s* references
+    /// in the same way your MMTk scan does.
+    #[inline(always)]
+    pub fn scan_object_precise<F: FnMut(*mut ValueRepr)>(&self, obj: ObjectReference, mut f: F) {
+        unsafe {
+            let base = obj.to_raw_address().to_ptr::<u8>();
+            let hdr  = &*(base as *const ObjHeader);
+            match hdr.tag {
+                TAG_BOXED_F64 | TAG_STRING => {}
+                TAG_ARRAY => {
+                    let arr = &mut *(base as *mut crate::value::BoxedArray);
+                    let len = arr.buf.len();
+                    let ptr = arr.buf.as_mut_ptr();
+                    for i in 0..len {
+                        f(ptr.add(i));
+                    }
+                }
+                TAG_OBJECT => {
+                    let o = &mut *(base as *mut crate::value::BoxedObj);
+                    for v in o.by_id.values_mut()  { f(v as *mut _); }
+                    for v in o.by_str.values_mut() { f(v as *mut _); }
+                }
+                _ => {}
+            }
         }
     }
 

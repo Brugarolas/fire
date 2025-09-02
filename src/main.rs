@@ -26,7 +26,7 @@ fn default_script() -> &'static str {
             }
             return fibonacci(n - 1) + fibonacci(n - 2);
         }
-        print(fibonacci(40));
+        print(fibonacci(45));
     "#
 }
 
@@ -63,6 +63,9 @@ fn main() {
 
     //let optimizer = early_pipeline();
     //optimizer.optimize_module(&mut module);
+
+    let _gc = gc::NapalmGc::new();
+    _gc.bind_current_thread();
 
     // 4) JIT compile ALL functions
     let mut jit = jit::JIT::default();
