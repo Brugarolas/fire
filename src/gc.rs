@@ -48,7 +48,7 @@ use mmtk::{
     // For Scanning impl:
     vm::{RootsWorkFactory, ObjectTracerContext},
 };
-use mmtk::util::constants::LOG_BYTES_IN_ADDRESS;
+use mmtk::util::constants::{BYTES_IN_ADDRESS, LOG_BYTES_IN_ADDRESS};
 
 use std::sync::atomic::{AtomicBool, Ordering::{Acquire, Release}};
 use parking_lot::{Mutex as ParkMutex, Condvar as ParkCondvar};
@@ -202,14 +202,22 @@ impl MemSlice {
 
 /// Iterator that yields our `Slot` over each machine word in the slice.
 pub struct MemSliceIter {
-    inner: mmtk::vm::slot::AddressRangeIterator,
+    cursor: Address,
+    limit: Address,
 }
 
 impl Iterator for MemSliceIter {
-    type Item = SlotItem; // your custom Slot newtype
+    type Item = SlotItem;
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(SlotItem::from)
+        if self.cursor >= self.limit {
+            None
+        } else {
+            let slot = self.cursor;
+            // advance one machine word
+            self.cursor = self.cursor + BYTES_IN_ADDRESS;
+            Some(SlotItem::from(slot))
+        }
     }
 }
 
@@ -220,17 +228,13 @@ impl MemorySlice for MemSlice {
     #[inline(always)]
     fn iter_slots(&self) -> Self::SlotIterator {
         MemSliceIter {
-            inner: mmtk::vm::slot::AddressRangeIterator {
-                cursor: self.start,
-                limit:  self.start + self.bytes,
-            },
+            cursor: self.start,
+            limit:  self.start + self.bytes,
         }
     }
 
     #[inline(always)]
-    fn object(&self) -> Option<ObjectReference> {
-        self.owner
-    }
+    fn object(&self) -> Option<ObjectReference> { self.owner }
 
     #[inline(always)]
     fn start(&self) -> Address { self.start }
@@ -241,11 +245,7 @@ impl MemorySlice for MemSlice {
     #[inline(always)]
     fn copy(src: &Self, tgt: &Self) {
         debug_assert_eq!(src.bytes, tgt.bytes, "memcpy slices must be same size");
-        debug_assert_eq!(
-            src.bytes & ((1 << LOG_BYTES_IN_ADDRESS) - 1),
-            0,
-            "slice size must be a multiple of word size"
-        );
+        debug_assert_eq!(src.bytes & ((1 << LOG_BYTES_IN_ADDRESS) - 1), 0, "slice size must be word-aligned");
         unsafe {
             let words = tgt.bytes >> LOG_BYTES_IN_ADDRESS;
             let sp = src.start.to_ptr::<usize>();
@@ -819,16 +819,19 @@ pub fn init() {
     Lazy::force(&MMTK_GC);
 }
 
+thread_local! {
+    static SAFEPOINT_TICK: Cell<usize> = Cell::new(0);
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NapalmGc {
     pub mutator: MutatorThread,
     pub stack_guess: usize,
-    pub safepoint_tick: usize,
 }
 
 impl NapalmGc {
     pub fn new() -> Self {
-        NapalmGc { mutator: MutatorThread::default(), stack_guess: 1 << 20, safepoint_tick: 0 } // 1 MiB
+        NapalmGc { mutator: MutatorThread::default(), stack_guess: 1 << 20 } // 1 MiB
     }
 
     #[inline(always)]
@@ -1043,16 +1046,20 @@ impl NapalmGc {
     }
 
     #[inline(always)]
-    pub fn maybe_safepoint(&mut self) {
-        self.safepoint_tick = self.safepoint_tick.wrapping_add(1);
-        if self.safepoint_tick == 4096 {
-            self.safepoint_tick = 0;
-            self.yieldpoint();
-        }
+    pub fn maybe_safepoint(&self) {
+        SAFEPOINT_TICK.with(|tick| {
+            let v = tick.get().wrapping_add(1);
+            if v >= 4096 {
+                tick.set(0);
+                self.yieldpoint();
+            } else {
+                tick.set(v);
+            }
+        });
     }
 }
 
-pub static mut NAPALM_GC: Lazy<NapalmGc> = Lazy::new(|| NapalmGc::new());
+pub static NAPALM_GC: Lazy<NapalmGc> = Lazy::new(|| NapalmGc::new());
 
 // ======================================================
 // ==================== Shadow Stack ====================
