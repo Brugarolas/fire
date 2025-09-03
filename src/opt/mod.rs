@@ -1,9 +1,10 @@
-// opt.rs
-//! Napalm optimization scaffold for WIR.
+//! Napalm optimization scaffold for WIR (optimized).
 //!
-//! - Per-block Inst cursor with prev/next (stack-only).
-//! - Safe, batchable edits against (BlockId, inst_index).
-//! - Unified pass runner with short-circuit per node and local fixups.
+//! - O(1) InstCursor via cached block index.
+//! - Zero-copy opcode peek; no Inst clones on hot path.
+//! - Batch-safe edits with single-pass per-block rebuild.
+//! - ReplaceKind applied in-place during apply.
+//! - Unified pass runner with lazy per-block apply + local fixups.
 //! - Optional dominator utilities (idom + preorder walk).
 //!
 //! Usage:
@@ -19,6 +20,7 @@ pub mod optimization;
 
 use std::any::Any;
 use std::cmp::Ordering;
+use std::mem::{discriminant, Discriminant};
 
 // ----- pull WIR types -----
 use crate::wir::{
@@ -26,16 +28,16 @@ use crate::wir::{
 };
 
 /// =======================================
-/// Vec-backed "doubly linked" cursor (stack)
+/// Vec-backed O(1) cursor (stack)
 /// =======================================
 
 /// A cursor into a block's instruction list (`block.insts: Vec<InstId>`).
-/// Holds indices + a raw pointer to `Function` so we can reborrow safely in closures
+/// Holds the block index + a raw pointer to `Function` so we can reborrow safely in closures
 /// without heap allocations. The cursor itself is a tiny stack object.
 pub struct InstCursor<'f> {
     func: *mut Function,
-    block: BlockId,
-    pos: usize, // index into block.insts
+    block_ix: usize, // index into func.blocks
+    pos: usize,      // index into block.insts
     _marker: std::marker::PhantomData<&'f mut Function>,
 }
 
@@ -43,58 +45,85 @@ impl<'f> InstCursor<'f> {
     /// # Safety
     /// `func` must outlive the cursor and remain valid.
     pub fn new(func: &'f mut Function, block: BlockId, pos: usize) -> Self {
-        Self { func, block, pos, _marker: std::marker::PhantomData }
+        let block_ix = unsafe {
+            (*(&*func as *const Function as *mut Function))
+                .blocks
+                .iter()
+                .position(|bb| bb.id == block)
+        }
+        .expect("invalid BlockId");
+        Self { func, block_ix, pos, _marker: std::marker::PhantomData }
     }
 
-    #[inline] pub fn block(&self) -> BlockId { self.block }
+    #[inline] pub fn block(&self) -> BlockId { unsafe { (*self.func).blocks[self.block_ix].id } }
     #[inline] pub fn pos(&self) -> usize { self.pos }
 
     /// Length (instruction count) of the current block.
     #[inline]
     pub fn len(&self) -> usize {
-        unsafe { (*self.func).block_by_id(self.block).insts.len() }
+        unsafe { (*self.func).blocks[self.block_ix].insts.len() }
     }
 
     /// Current InstId.
     #[inline]
     pub fn cur_id(&self) -> InstId {
-        unsafe { (*self.func).block_by_id(self.block).insts[self.pos] }
+        unsafe { (*self.func).blocks[self.block_ix].insts[self.pos] }
     }
 
-    /// Read-only clone of current instruction kind (cheap to pattern-match on).
+    /// Zero-copy peek of the current opcode/kind.
+    #[inline]
+    pub fn peek_cur<R>(&self, f: impl FnOnce(&Inst) -> R) -> R {
+        let id = self.cur_id();
+        unsafe { f(&(*self.func).nodes[id.0 as usize].kind) }
+    }
+
+    /// Cheap tag (discriminant) for opcode dispatch.
+    #[inline]
+    pub fn cur_tag(&self) -> Discriminant<Inst> {
+        let id = self.cur_id();
+        unsafe { discriminant(&(*self.func).nodes[id.0 as usize].kind) }
+    }
+
+    /// Read-only clone of current instruction kind (compat shim).
+    /// Prefer `peek_cur` or `cur_tag` to avoid cloning on the hot path.
     #[inline]
     pub fn cur_kind(&self) -> Inst {
-        unsafe { (*self.func).nodes[self.cur_id().0 as usize].kind.clone() }
+        let id = self.cur_id();
+        unsafe { (*self.func).nodes[id.0 as usize].kind.clone() }
     }
 
     /// Mutate the current node via a scoped closure.
+    #[inline]
     pub fn with_cur<R>(&mut self, f: impl FnOnce(&mut crate::wir::Node) -> R) -> R {
         let id = self.cur_id();
         unsafe { f(&mut (*self.func).nodes[id.0 as usize]) }
     }
 
     /// Mutate the previous node (if any) via a scoped closure.
+    #[inline]
     pub fn with_prev<R>(&mut self, f: impl FnOnce(&mut crate::wir::Node) -> R) -> Option<R> {
         if self.pos == 0 { return None; }
-        let prev_id = unsafe { (*self.func).block_by_id(self.block).insts[self.pos - 1] };
+        let prev_id = unsafe { (*self.func).blocks[self.block_ix].insts[self.pos - 1] };
         Some(unsafe { f(&mut (*self.func).nodes[prev_id.0 as usize]) })
     }
 
     /// Mutate the next node (if any) via a scoped closure.
+    #[inline]
     pub fn with_next<R>(&mut self, f: impl FnOnce(&mut crate::wir::Node) -> R) -> Option<R> {
         let len = self.len();
         if self.pos + 1 >= len { return None; }
-        let next_id = unsafe { (*self.func).block_by_id(self.block).insts[self.pos + 1] };
+        let next_id = unsafe { (*self.func).blocks[self.block_ix].insts[self.pos + 1] };
         Some(unsafe { f(&mut (*self.func).nodes[next_id.0 as usize]) })
     }
 
     /// Access to the owning function (scoped, exclusive).
+    #[inline]
     pub fn with_func<R>(&mut self, f: impl FnOnce(&mut Function) -> R) -> R {
         unsafe { f(&mut *self.func) }
     }
 }
 
-/// Helper on Function for internal use.
+/// Helper on Function for internal use (non-hot path).
 trait FuncExt {
     fn block_by_id(&mut self, b: BlockId) -> &mut Block;
 }
@@ -140,97 +169,191 @@ impl WirEditQueue {
         self.edits.push(WirEdit::SpliceRange{ bb, start, end, insts });
     }
 
-    /// Deterministic in-place application:
-    /// Per (bb, anchor) order: InsertBefore → ReplaceKind/Erase/Splice → InsertAfter.
-    pub fn apply(&mut self, f: &mut Function) {
+    /// How many edits are queued for a given block (excluding ReplaceKind).
+    #[inline]
+    pub fn len_for_block(&self, bb: BlockId) -> usize {
+        self.edits.iter().filter(|e| match e {
+            WirEdit::ReplaceKind{..} => false,
+            WirEdit::InsertBefore{bb: b, ..}
+            | WirEdit::InsertAfter{bb: b, ..}
+            | WirEdit::Erase{bb: b, ..}
+            | WirEdit::SpliceRange{bb: b, ..} => *b == bb,
+        }).count()
+    }
+    #[inline]
+    pub fn has_any_for_block(&self, bb: BlockId) -> bool { self.len_for_block(bb) > 0 }
+
+    /// Apply all queued edits for the specified block in a single pass.
+    /// Also applies *all* ReplaceKind edits (anchorless) immediately.
+    pub fn apply_block(&mut self, f: &mut Function, bb: BlockId) {
         if self.edits.is_empty() { return; }
 
-        #[derive(Clone)]
-        struct Key { bb: BlockId, at: usize, phase: u8 }
-        let mut expanded: Vec<(Key, WirEdit)> = Vec::with_capacity(self.edits.len());
+        // 1) Apply all ReplaceKind in-place and drop them.
+        let mut i = 0;
+        while i < self.edits.len() {
+            if let WirEdit::ReplaceKind { id, new_kind } = &self.edits[i] {
+                f.nodes[id.0 as usize].kind = new_kind.clone();
+                self.edits.swap_remove(i);
+            } else { i += 1; }
+        }
 
-        for e in self.edits.drain(..) {
-            match &e {
-                WirEdit::InsertBefore{ bb, at, .. } => expanded.push((Key{bb:*bb, at:*at, phase:0}, e)),
-                WirEdit::ReplaceKind { .. }          => expanded.push((Key{bb:BlockId(u32::MAX), at:usize::MAX, phase:1}, e)), // no anchor
-                WirEdit::Erase{ bb, at }             => expanded.push((Key{bb:*bb, at:*at, phase:2}, e)),
-                WirEdit::SpliceRange{ bb, start, .. }=> expanded.push((Key{bb:*bb, at:*start, phase:2}, e)),
-                WirEdit::InsertAfter{ bb, at, .. }   => expanded.push((Key{bb:*bb, at:*at, phase:3}, e)),
+        // Collect and drain edits for this block. Keep insertion order for determinism.
+        let mut block_edits: Vec<(usize /*seq*/, WirEdit)> = Vec::new();
+        let mut seq: usize = 0;
+        let mut j = 0;
+        while j < self.edits.len() {
+            let take = match &self.edits[j] {
+                WirEdit::InsertBefore{bb:b, ..}
+                | WirEdit::InsertAfter{bb:b, ..}
+                | WirEdit::Erase{bb:b, ..}
+                | WirEdit::SpliceRange{bb:b, ..} => *b == bb,
+                WirEdit::ReplaceKind{..} => false, // already removed above
+            };
+            if take {
+                let e = self.edits.swap_remove(j);
+                block_edits.push((seq, e));
+                seq += 1;
+            } else {
+                j += 1;
             }
         }
-        expanded.sort_by(|a, b| {
-            let ka = &a.0; let kb = &b.0;
-            match ka.bb.cmp(&kb.bb) {
-                Ordering::Less => Ordering::Less,
-                Ordering::Greater => Ordering::Greater,
-                Ordering::Equal => match ka.at.cmp(&kb.at) {
-                    Ordering::Less => Ordering::Less,
-                    Ordering::Greater => Ordering::Greater,
-                    Ordering::Equal => ka.phase.cmp(&kb.phase),
+        if block_edits.is_empty() { return; }
+
+        // Snapshot old insts.
+        let block_ix = f.blocks.iter().position(|b| b.id == bb).expect("invalid bb in edits");
+        let old = f.blocks[block_ix].insts.clone();
+        let old_len = old.len();
+
+        // Prepare per-anchor inserts and range edits.
+        #[derive(Clone)]
+        struct RangeEdit { start: usize, end: usize, repl: Vec<InstId>, seq: usize }
+
+        let mut before_map: Vec<Vec<InstId>> = vec![Vec::new(); old_len + 1]; // allow before at old_len (append)
+        let mut after_map:  Vec<Vec<InstId>> = vec![Vec::new(); old_len];     // valid after anchors: 0..old_len-1
+        let mut ranges: Vec<RangeEdit> = Vec::new();
+
+        for (seq, e) in block_edits.into_iter() {
+            match e {
+                WirEdit::InsertBefore{ at, insts, .. } => {
+                    let at = at.min(old_len);
+                    before_map[at].extend(insts);
                 }
+                WirEdit::InsertAfter{ at, insts, .. } => {
+                    if old_len == 0 { // treat as append
+                        before_map[0].extend(insts);
+                    } else {
+                        let at = at.min(old_len - 1);
+                        after_map[at].extend(insts);
+                    }
+                }
+                WirEdit::Erase{ at, .. } => {
+                    if at < old_len {
+                        ranges.push(RangeEdit{ start: at, end: at+1, repl: Vec::new(), seq });
+                    }
+                }
+                WirEdit::SpliceRange{ start, end, insts, .. } => {
+                    let s = start.min(old_len);
+                    let e = end.min(old_len).max(s);
+                    ranges.push(RangeEdit{ start: s, end: e, repl: insts, seq });
+                }
+                WirEdit::ReplaceKind{ .. } => { /* already applied */ }
             }
+        }
+
+        // Sort ranges by (start, seq) for determinism.
+        ranges.sort_by(|a, b| match a.start.cmp(&b.start) {
+            Ordering::Less => Ordering::Less,
+            Ordering::Greater => Ordering::Greater,
+            Ordering::Equal => a.seq.cmp(&b.seq),
         });
 
-        // Apply, block by block.
-        let mut i = 0;
-        while i < expanded.len() {
-            let bb = expanded[i].0.bb;
+        // Single-pass rebuild.
+        let total_inserts: usize =
+            before_map.iter().map(|v| v.len()).sum::<usize>()
+          + after_map.iter().map(|v| v.len()).sum::<usize>()
+          + ranges.iter().map(|r| r.repl.len()).sum::<usize>();
+        let mut out: Vec<InstId> = Vec::with_capacity(old_len + total_inserts);
 
-            // Handle anchorless ReplaceKind (bb==MAX sentinel) inline and skip.
-            if bb.0 == u32::MAX {
-                let (_, e) = &expanded[i];
-                if let WirEdit::ReplaceKind { id, new_kind } = e {
-                    f.nodes[id.0 as usize].kind = new_kind.clone();
-                }
-                i += 1;
+        let mut i_old = 0usize;
+        let mut r_ix = 0usize;
+
+        while i_old < old_len {
+            // Before at this anchor
+            if !before_map[i_old].is_empty() {
+                out.extend_from_slice(&before_map[i_old]);
+            }
+
+            // Apply any range edits that start here, in queued order.
+            let mut applied_range = false;
+            while r_ix < ranges.len() && ranges[r_ix].start == i_old {
+                let r = &ranges[r_ix];
+                if !r.repl.is_empty() { out.extend_from_slice(&r.repl); }
+                i_old = r.end; // skip replaced/erased region
+                r_ix += 1;
+                applied_range = true;
+                // Allow multiple edits with same start; continue to check next.
+            }
+            if applied_range {
+                // We jumped `i_old`; loop back without copying old element.
                 continue;
             }
 
-            // collect contiguous edits for this block
-            let start = i;
-            while i < expanded.len() && expanded[i].0.bb == bb { i += 1; }
-            let end = i;
+            // Copy the original instruction.
+            out.push(old[i_old]);
 
-            // we'll map indices with offset as we mutate the inst vector
-            let insts = &mut f.block_by_id(bb).insts;
-            let mut offset: isize = 0;
-            for (_k, e) in &expanded[start..end] {
-                match e {
-                    WirEdit::InsertBefore{ at, insts: add, .. } => {
-                        let pos = map_with_offset(*at, offset, insts.len());
-                        insts.splice(pos..pos, add.clone());
-                        offset += add.len() as isize;
-                    }
-                    WirEdit::InsertAfter{ at, insts: add, .. } => {
-                        let pos = map_with_offset(*at, offset, insts.len()) + 1;
-                        insts.splice(pos..pos, add.clone());
-                        offset += add.len() as isize;
-                    }
-                    WirEdit::Erase{ at, .. } => {
-                        let pos = map_with_offset(*at, offset, insts.len());
-                        insts.remove(pos);
-                        offset -= 1;
-                    }
-                    WirEdit::SpliceRange{ start, end, insts: add, .. } => {
-                        let s = map_with_offset(*start, offset, insts.len());
-                        let e = map_with_offset(*end,   offset, insts.len());
-                        let removed = e - s;
-                        insts.splice(s..e, add.clone());
-                        offset += add.len() as isize - removed as isize;
-                    }
-                    WirEdit::ReplaceKind{ .. } => {
-                        // Already handled in the anchorless phase above.
-                        // Intentionally no-op here to avoid borrow conflicts with `insts`.
-                    }
-                }
+            // After at this element
+            if !after_map[i_old].is_empty() {
+                out.extend_from_slice(&after_map[i_old]);
             }
+
+            i_old += 1;
         }
 
-        #[inline]
-        fn map_with_offset(idx: usize, offset: isize, len_now: usize) -> usize {
-            let v = (idx as isize) + offset;
-            debug_assert!(v >= 0 && (v as usize) <= len_now);
-            v as usize
+        // "before" at end appends.
+        if !before_map[old_len].is_empty() {
+            out.extend_from_slice(&before_map[old_len]);
+        }
+
+        // Commit new inst list.
+        f.blocks[block_ix].insts = out;
+    }
+
+    /// Back-compat: apply all queued edits (old API).
+    /// Internally uses the optimized per-block single-pass rebuild.
+    #[inline]
+    pub fn apply(&mut self, f: &mut Function) {
+        self.apply_all(f)
+    }
+
+    /// Apply all queued edits across all affected blocks.
+    pub fn apply_all(&mut self, f: &mut Function) {
+        if self.edits.is_empty() { return; }
+
+        // Apply ReplaceKind globally up-front.
+        let mut i = 0;
+        while i < self.edits.len() {
+            if let WirEdit::ReplaceKind { id, new_kind } = &self.edits[i] {
+                f.nodes[id.0 as usize].kind = new_kind.clone();
+                self.edits.swap_remove(i);
+            } else { i += 1; }
+        }
+        if self.edits.is_empty() { return; }
+
+        // Gather unique blocks.
+        let mut blocks: Vec<BlockId> = Vec::new();
+        for e in &self.edits {
+            match e {
+                WirEdit::InsertBefore{bb, ..}
+                | WirEdit::InsertAfter{bb, ..}
+                | WirEdit::Erase{bb, ..}
+                | WirEdit::SpliceRange{bb, ..} => {
+                    if !blocks.contains(bb) { blocks.push(*bb); }
+                }
+                WirEdit::ReplaceKind{..} => {}
+            }
+        }
+        for bb in blocks {
+            self.apply_block(f, bb);
         }
     }
 }
@@ -247,6 +370,10 @@ pub trait OptimizationWIR {
     fn set_metadata_any(&mut self, _data: &dyn Any) {}
 
     fn optimize_node(&mut self, cur: &mut InstCursor, q: &mut WirEditQueue) -> bool;
+
+    /// Optional: override if you want to do a quick early-out based on opcode tag.
+    /// Default `None` runs the opt for all nodes.
+    fn maybe_interesting(&self, _tag: Discriminant<Inst>) -> bool { true }
 }
 
 /// A pass wraps a set of optimizations and optional per-pass metadata broadcast.
@@ -272,36 +399,51 @@ impl OptimizationPass {
     /// Run across all blocks and instructions with local fixups.
     /// `recheck_window=1..=3` is typically enough.
     pub fn pass_optimizations(&mut self, func: &mut Function, recheck_window: usize) {
-        let mut q = WirEditQueue::new();
+        const EDIT_APPLY_THRESHOLD: usize = 16;
 
-        // Visit each block (by index to keep order stable even if we edit other blocks).
+        // Visit each block by index to keep order stable even if we edit other blocks.
+        let mut q = WirEditQueue::new();
         for b_ix in 0..func.blocks.len() {
             let bb = func.blocks[b_ix].id;
 
             // Manual while-loop to allow local fixups.
             let mut i = 0usize;
             loop {
-                let len = func.block_by_id(bb).insts.len();
+                let len = func.blocks[b_ix].insts.len();
                 if i >= len { break; }
 
                 // Build a cursor at (bb, i).
                 let mut cur = InstCursor::new(func, bb, i);
+                let tag = cur.cur_tag();
+
                 for opt in self.optimizations.iter_mut() {
+                    if !opt.maybe_interesting(tag) { continue; }
                     if opt.optimize_node(&mut cur, &mut q) {
                         break;
                     }
                 }
 
-                if q.is_empty() {
-                    i += 1;
-                } else {
-                    // Apply edits; then recheck a small window around `i`.
-                    q.apply(func);
-                    let new_len = func.block_by_id(bb).insts.len();
+                if q.has_any_for_block(bb) && q.len_for_block(bb) >= EDIT_APPLY_THRESHOLD {
+                    // Apply accumulated edits for this block; then recheck a small window around `i`.
+                    q.apply_block(func, bb);
+                    let new_len = func.blocks[b_ix].insts.len();
                     if new_len == 0 { break; }
                     i = i.saturating_sub(recheck_window).min(new_len - 1);
+                } else {
+                    i += 1;
                 }
             }
+
+            // Flush tail edits for this block (if any), then recheck the tail window once.
+            if q.has_any_for_block(bb) {
+                q.apply_block(func, bb);
+                // A final local recheck is optional; we skip to keep passes linear.
+            }
+        }
+
+        // Safety net: if anything else accumulated (other blocks), flush.
+        if !q.is_empty() {
+            q.apply_all(func);
         }
     }
 }
@@ -509,6 +651,7 @@ impl<'f> InstFactory<'f> {
             effect_out,
             results: results.clone(),
         });
+        self.func.values.reserve(result_tys.len());
         for (i, rty) in result_tys.iter().enumerate() {
             self.func.values.push(Value {
                 id: ValueId(self.func.values.len() as u32),

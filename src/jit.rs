@@ -15,6 +15,7 @@ use std::cell::Cell;
 
 use crate::gc::NAPALM_GC;
 
+use crate::value::{ObjHeader, TAG_ARRAY};
 use crate::wir::{
     Constant, Function as WirFunction, Inst, IntBinOp, Value as WirValue, ValueDef, ValueId, FuncId,
 };
@@ -154,7 +155,7 @@ impl Default for JIT {
                 "wir_obj_new",
                 wir_obj_new as *const extern "C" fn() -> i64 as *const u8,
             );
-            jb.symbol("wir_is_str", wir_is_str as *const u8);
+            jb.symbol("wir_is_str", wir_is_str as *const extern "C" fn(i64) -> i64 as *const u8);
 
             jb.symbol(
                 "wir_obj_get_field",
@@ -195,14 +196,17 @@ impl Default for JIT {
                 napalm_yieldpoint as *const extern "C" fn() -> i64 as *const u8,
             );
 
-            jb.symbol("wir_memo_get", wir_memo_get as *const extern "C" fn(i64, i64, *mut i64) -> i64 as *const u8);
-            jb.symbol("wir_memo_put", wir_memo_put as *const extern "C" fn(i64, i64, i64) -> i64 as *const u8);
-            jb.symbol("wir_memo_get2", wir_memo_get as *const extern "C" fn(i64, i64, *mut i64) -> i64 as *const u8);
-            jb.symbol("wir_memo_put2", wir_memo_put as *const extern "C" fn(i64, i64, i64) -> i64 as *const u8);
-            jb.symbol("wir_memo_get3", wir_memo_get as *const extern "C" fn(i64, i64, *mut i64) -> i64 as *const u8);
-            jb.symbol("wir_memo_put3", wir_memo_put as *const extern "C" fn(i64, i64, i64) -> i64 as *const u8);
-            jb.symbol("wir_memo_get4", wir_memo_get as *const extern "C" fn(i64, i64, *mut i64) -> i64 as *const u8);
-            jb.symbol("wir_memo_put4", wir_memo_put as *const extern "C" fn(i64, i64, i64) -> i64 as *const u8);
+            jb.symbol("wir_memo_get",  wir_memo_get  as *const extern "C" fn(i64, i64, *mut i64) -> i64 as *const u8);
+            jb.symbol("wir_memo_put",  wir_memo_put  as *const extern "C" fn(i64, i64, i64)      -> i64 as *const u8);
+
+            jb.symbol("wir_memo_get2", wir_memo_get2 as *const extern "C" fn(i64, i64, i64, *mut i64) -> i64 as *const u8);
+            jb.symbol("wir_memo_put2", wir_memo_put2 as *const extern "C" fn(i64, i64, i64, i64)      -> i64 as *const u8);
+
+            jb.symbol("wir_memo_get3", wir_memo_get3 as *const extern "C" fn(i64, i64, i64, i64, *mut i64) -> i64 as *const u8);
+            jb.symbol("wir_memo_put3", wir_memo_put3 as *const extern "C" fn(i64, i64, i64, i64, i64)      -> i64 as *const u8);
+
+            jb.symbol("wir_memo_get4", wir_memo_get4 as *const extern "C" fn(i64, i64, i64, i64, i64, *mut i64) -> i64 as *const u8);
+            jb.symbol("wir_memo_put4", wir_memo_put4 as *const extern "C" fn(i64, i64, i64, i64, i64, i64)      -> i64 as *const u8);
         }
 
         let module = cranelift_jit::JITModule::new(jb);
@@ -838,6 +842,7 @@ impl JIT {
                             // JIT function code ptr for wir_f_<id> (direct within code heap).
                             let ptr_ty   = self.module.target_config().pointer_type();
                             let mut jsig = self.module.make_signature();
+                            jsig.call_conv = self.module.isa().default_call_conv();
                             jsig.params.push(AbiParam::new(ptr_ty));
                             jsig.params.push(AbiParam::new(types::I64));
                             jsig.returns.push(AbiParam::new(types::I64));
@@ -865,38 +870,48 @@ impl JIT {
                         }
 
                         Inst::CallClosure { fun: fun_val, args, .. } => {
-                            use cranelift::prelude::{AbiParam, types};
-                            use cranelift::codegen::ir::{StackSlotData, StackSlotKind};
+                            use cranelift::prelude::{AbiParam, types, MemFlags};
 
-                            // Pack args on stack (8-byte slots).
-                            let n: u32 = args.len() as u32;
-                            let slot = fb.create_sized_stack_slot(StackSlotData::new(
-                                StackSlotKind::ExplicitSlot,
-                                n * 8,
-                                3,
-                            ));
+                            let ptr_ty = self.ptr_ty();
+
+                            // 1) Allocate argv on the heap so it's naturally 8-byte aligned for i64
+                            let n_i64 = fb.ins().iconst(types::I64, args.len() as i64);
+                            let argv  = self.call_import(
+                                &mut fb,
+                                "wir_alloc_words",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64));   // n
+                                    s.returns.push(AbiParam::new(ptr_ty));      // *mut i64
+                                },
+                                &[n_i64],
+                            )?;
+
+                            // 2) Store each argument at argv + i*8
                             for (i, a) in args.iter().enumerate() {
-                                let v = vmap.get_or_emit(*a, &mut fb, args_base, fun_ir);
-                                fb.ins().stack_store(v, slot, (i as i32) * 8);
+                                let v    = vmap.get_or_emit(*a, &mut fb, args_base, fun_ir);
+                                let addr = fb.ins().iadd_imm(argv, (i as i64) * 8);
+                                fb.ins().store(MemFlags::trusted(), v, addr, 0);
                             }
-                            let ptr_ty  = self.module.target_config().pointer_type();
-                            let argv    = fb.ins().stack_addr(ptr_ty, slot, 0);
-                            let argc    = fb.ins().iconst(types::I64, n as i64);
-                            let clo_ptr = vmap.get_or_emit(*fun_val, &mut fb, args_base, fun_ir);
 
-                            // wir_call_closure(clo, argv, argc) — indirect
+                            // 3) Call the runtime trampoline (it will prepend env internally)
+                            let clo_ptr = vmap.get_or_emit(*fun_val, &mut fb, args_base, fun_ir);
+                            let argc    = n_i64; // same as args.len()
+
                             let out = self.call_import(
                                 &mut fb,
                                 "wir_call_closure",
                                 |s| {
-                                    s.params.push(AbiParam::new(types::I64)); // closure
-                                    s.params.push(AbiParam::new(ptr_ty));     // argv*
-                                    s.params.push(AbiParam::new(types::I64)); // argc
-                                    s.returns.push(AbiParam::new(types::I64)); // result
+                                    s.params.push(AbiParam::new(types::I64));   // closure pointer (i64)
+                                    s.params.push(AbiParam::new(ptr_ty));       // argv*
+                                    s.params.push(AbiParam::new(types::I64));   // argc
+                                    s.returns.push(AbiParam::new(types::I64));  // result
                                 },
                                 &[clo_ptr, argv, argc],
                             )?;
-                            if res_count >= 1 { vmap.bind(node.results[0], out); }
+
+                            if res_count >= 1 {
+                                vmap.bind(node.results[0], out);
+                            }
                         }
 
                         // ---------------- Native calls (host) ----------------
@@ -1201,11 +1216,14 @@ impl JIT {
                         }
 
                         Inst::Branch { cond, then_b, else_b } => {
-                            let c = vmap.get_or_emit(*cond, &mut fb, args_base, fun);
+                            use cranelift::prelude::{types, IntCC};
+                            let ci64 = vmap.get_or_emit(*cond, &mut fb, args_base, fun);
+                            let z    = fb.ins().iconst(types::I64, 0);
+                            let cb1  = fb.ins().icmp(IntCC::NotEqual, ci64, z);
                             fb.ins().brif(
-                                c,
-                                clif_of[then_b.0 as usize], &[] as &[cranelift::codegen::ir::instructions::BlockArg],
-                                clif_of[else_b.0 as usize],  &[] as &[cranelift::codegen::ir::instructions::BlockArg],
+                                cb1,
+                                clif_of[then_b.0 as usize], &[] as &[_],
+                                clif_of[else_b.0 as usize], &[] as &[_],
                             );
                             block_terminated = true;
                         }
@@ -1756,6 +1774,7 @@ pub extern "C" fn wir_cmp_ge_slow(a: i64, b: i64) -> i64 {
 
 #[repr(C)]
 struct WirArray {
+    hdr: ObjHeader,
     buf: Vec<i64>,
 }
 
@@ -1765,8 +1784,11 @@ fn smi_to_i64_wrapped(v: i64) -> i64 { v >> 1 } // arithmetic shift; matches ear
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_array_new(len: i64) -> i64 {
     let n = smi_to_i64_wrapped(len).max(0) as usize;
-    let arr = Box::new(WirArray { buf: vec![0; n] });
-    Box::into_raw(arr) as i64
+    let a = Box::new(WirArray {
+        hdr: ObjHeader { tag: TAG_ARRAY, aux: 0 },
+        buf: vec![0; n],
+    });
+    Box::into_raw(a) as i64
 }
 
 #[unsafe(no_mangle)]
@@ -1858,7 +1880,7 @@ pub extern "C" fn wir_array_slice(arr: i64, start: i64, end: i64) -> i64 {
     let e = smi_to_i64_wrapped(end).clamp(s as i64, n) as usize;
     let mut out = Vec::with_capacity(e - s);
     out.extend_from_slice(&a.buf[s..e]);
-    let b = Box::new(WirArray { buf: out });
+    let b = Box::new(WirArray { hdr: ObjHeader { tag: TAG_ARRAY, aux: 0 }, buf: out });
     Box::into_raw(b) as i64
 }
 
@@ -1873,7 +1895,7 @@ pub extern "C" fn wir_array_map(arr: i64, clo_ptr: i64) -> i64 {
         out.push(y);
         NAPALM_GC.maybe_safepoint();
     }
-    let b = Box::new(WirArray { buf: out });
+    let b = Box::new(WirArray { hdr: ObjHeader { tag: TAG_ARRAY, aux: 0 }, buf: out });
     Box::into_raw(b) as i64
 }
 
@@ -1926,7 +1948,7 @@ pub extern "C" fn wir_array_filter(arr: i64, clo_ptr: i64) -> i64 {
         if ok != 0 { out.push(x); }
         NAPALM_GC.maybe_safepoint();
     }
-    let b = Box::new(WirArray { buf: out });
+    let b = Box::new(WirArray { hdr: ObjHeader { tag: TAG_ARRAY, aux: 0 }, buf: out });
     Box::into_raw(b) as i64
 }
 
