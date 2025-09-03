@@ -1,7 +1,8 @@
 // front.rs
 use logos::Logos;
-use std::collections::{BTreeSet};
+use std::{collections::BTreeSet, ops::Deref};
 use ahash::AHashMap as HashMap;
+use smallbox::SmallBox;
 
 // Bring in the WIR types from your other file/module.
 use crate::wir::{
@@ -136,7 +137,7 @@ pub enum Stmt {
     Var { name: String, init: Option<Expr> },
     If { cond: Expr, then_b: Block, else_b: Option<Block> },
     While { cond: Expr, body: Block },
-    For { init: Option<Box<Stmt>>, cond: Option<Expr>, step: Option<Expr>, body: Block },
+    For { init: Option<SmallBox<Stmt, u8>>, cond: Option<Expr>, step: Option<Expr>, body: Block },
     Return(Option<Expr>),
     Expr(Expr),
 }
@@ -155,14 +156,14 @@ pub enum Expr {
     LitNull,
     Str(String),
     Ident(String),
-    Assign(Box<LValue>, Box<Expr>),
-    Binary { op: BinOp, a: Box<Expr>, b: Box<Expr> },
-    Unary { op: UnOp, e: Box<Expr> },
-    Call { callee: Box<Expr>, args: Vec<Expr> },
-    GetProp { recv: Box<Expr>, name: String },
-    Index { recv: Box<Expr>, index: Box<Expr> },
-    Group(Box<Expr>),
-    FnLit { params: Vec<String>, body: Block },
+    Assign(SmallBox<LValue, u8>, SmallBox<Expr, u8>),
+    Binary { op: BinOp, a: SmallBox<Expr, u8>, b: SmallBox<Expr, u8> },
+    Unary { op: UnOp, e: SmallBox<Expr, u8> },
+    Call { callee: SmallBox<Expr, u8>, args: Vec<Expr> },
+    GetProp { recv: SmallBox<Expr, u8>, name: String },
+    Index { recv: SmallBox<Expr, u8>, index: SmallBox<Expr, u8> },
+    Group(SmallBox<Expr, u8>),
+    FnLit { params: SmallVec<String>, body: Block },
     FnRef { name: String },
     ArrayLit(Vec<Expr>),
 
@@ -170,16 +171,16 @@ pub enum Expr {
     ObjLit(Vec<(PropKey, Expr)>),
 
     // obj.x   or   obj["x"]
-    GetPropObj { obj: Box<Expr>, key: PropKey },
+    GetPropObj { obj: SmallBox<Expr, u8>, key: PropKey },
 
     // obj.x = value   or   obj["x"] = value
-    SetPropObj { obj: Box<Expr>, key: PropKey, value: Box<Expr> },
+    SetPropObj { obj: SmallBox<Expr, u8>, key: PropKey, value: SmallBox<Expr, u8> },
 
     // "<key>" in obj   — key is a general Expr; at lowering we'll coerce to string/symbol
-    In { key: Box<Expr>, obj: Box<Expr> },
+    In { key: SmallBox<Expr, u8>, obj: SmallBox<Expr, u8> },
 
     // delete obj.x / delete obj["x"]
-    DeleteProp { obj: Box<Expr>, key: PropKey },
+    DeleteProp { obj: SmallBox<Expr, u8>, key: PropKey },
 }
 
 
@@ -407,7 +408,7 @@ impl<'src> Parser<'src> {
                     let mut cond2 = self.expr()?;
                     self.expect(Tok::RParen, "expected ')'")?;
                     if negated {
-                        cond2 = Expr::Unary { op: UnOp::Not, e: Box::new(cond2) };
+                        cond2 = Expr::Unary { op: UnOp::Not, e: SmallBox::new(cond2) };
                     }
                     let then2 = self.block()?;
 
@@ -436,7 +437,7 @@ impl<'src> Parser<'src> {
             self.expect(Tok::LParen, "expected '('")?;
             let cond0 = self.expr()?;
             self.expect(Tok::RParen, "expected ')'")?;
-            let cond = Expr::Unary { op: UnOp::Not, e: Box::new(cond0) };
+            let cond = Expr::Unary { op: UnOp::Not, e: SmallBox::new(cond0) };
             let then_b = self.block()?;
 
             // else { … } | else if (…) { … } | else unless (…) { … }
@@ -448,7 +449,7 @@ impl<'src> Parser<'src> {
                     let mut cond2 = self.expr()?;
                     self.expect(Tok::RParen, "expected ')'")?;
                     if was_unless {
-                        cond2 = Expr::Unary { op: UnOp::Not, e: Box::new(cond2) };
+                        cond2 = Expr::Unary { op: UnOp::Not, e: SmallBox::new(cond2) };
                     }
                     let then2 = self.block()?;
 
@@ -489,11 +490,11 @@ impl<'src> Parser<'src> {
                 };
                 let init_e = if self.matches(&Tok::Eq) { Some(self.expr()?) } else { None };
                 self.expect(Tok::Semi, "expected ';' after init")?;
-                Some(Box::new(Stmt::Var { name, init: init_e }))
+                Some(SmallBox::new(Stmt::Var { name, init: init_e }))
             } else {
                 let e = self.expr()?;
                 self.expect(Tok::Semi, "expected ';' after init")?;
-                Some(Box::new(Stmt::Expr(e)))
+                Some(SmallBox::new(Stmt::Expr(e)))
             };
             let cond = if self.matches(&Tok::Semi) {
                 None
@@ -548,8 +549,8 @@ impl<'src> Parser<'src> {
             // Turn `left` into an LValue
             let lv = match left {
                 Expr::Ident(s)                      => LValue::Ident(s),
-                Expr::GetProp { recv, name }        => LValue::GetProp { recv: *recv, name },
-                Expr::Index   { recv, index }       => LValue::Index   { recv: *recv, index: *index },
+                Expr::GetProp { recv, name }        => LValue::GetProp { recv: recv.into_inner().clone(), name },
+                Expr::Index   { recv, index }       => LValue::Index   { recv: recv.into_inner().clone(), index: index.into_inner().clone() },
                 _ => return Err(self.err_here("invalid assignment target")),
             };
 
@@ -562,12 +563,12 @@ impl<'src> Parser<'src> {
             } else {
                 Expr::Binary {
                     op: bop,
-                    a: Box::new(lvalue_to_expr(&lv)),
-                    b: Box::new(rhs),
+                    a: SmallBox::new(lvalue_to_expr(&lv)),
+                    b: SmallBox::new(rhs),
                 }
             };
 
-            Ok(Expr::Assign(Box::new(lv), Box::new(final_rhs)))
+            Ok(Expr::Assign(SmallBox::new(lv), SmallBox::new(final_rhs)))
         } else {
             Ok(left)
         }
@@ -577,7 +578,7 @@ impl<'src> Parser<'src> {
         let mut e = self.parse_and()?;
         while self.matches(&Tok::OrOr) {
             let rhs = self.parse_and()?;
-            e = Expr::Binary { op: BinOp::Or, a: Box::new(e), b: Box::new(rhs) };
+            e = Expr::Binary { op: BinOp::Or, a: SmallBox::new(e), b: SmallBox::new(rhs) };
         }
         Ok(e)
     }
@@ -585,7 +586,7 @@ impl<'src> Parser<'src> {
         let mut e = self.parse_eq()?;
         while self.matches(&Tok::AndAnd) {
             let rhs = self.parse_eq()?;
-            e = Expr::Binary { op: BinOp::And, a: Box::new(e), b: Box::new(rhs) };
+            e = Expr::Binary { op: BinOp::And, a: SmallBox::new(e), b: SmallBox::new(rhs) };
         }
         Ok(e)
     }
@@ -594,10 +595,10 @@ impl<'src> Parser<'src> {
         loop {
             if self.matches(&Tok::EqEq) {
                 let rhs = self.parse_cmp()?;
-                e = Expr::Binary { op: BinOp::Eq, a: Box::new(e), b: Box::new(rhs) };
+                e = Expr::Binary { op: BinOp::Eq, a: SmallBox::new(e), b: SmallBox::new(rhs) };
             } else if self.matches(&Tok::BangEq) {
                 let rhs = self.parse_cmp()?;
-                e = Expr::Binary { op: BinOp::Ne, a: Box::new(e), b: Box::new(rhs) };
+                e = Expr::Binary { op: BinOp::Ne, a: SmallBox::new(e), b: SmallBox::new(rhs) };
             } else { break; }
         }
         Ok(e)
@@ -607,20 +608,20 @@ impl<'src> Parser<'src> {
         loop {
             if self.matches(&Tok::Lt) {
                 let rhs = self.parse_term()?;
-                e = Expr::Binary { op: BinOp::Lt, a: Box::new(e), b: Box::new(rhs) };
+                e = Expr::Binary { op: BinOp::Lt, a: SmallBox::new(e), b: SmallBox::new(rhs) };
             } else if self.matches(&Tok::LtEq) {
                 let rhs = self.parse_term()?;
-                e = Expr::Binary { op: BinOp::Le, a: Box::new(e), b: Box::new(rhs) };
+                e = Expr::Binary { op: BinOp::Le, a: SmallBox::new(e), b: SmallBox::new(rhs) };
             } else if self.matches(&Tok::Gt) {
                 let rhs = self.parse_term()?;
-                e = Expr::Binary { op: BinOp::Gt, a: Box::new(e), b: Box::new(rhs) };
+                e = Expr::Binary { op: BinOp::Gt, a: SmallBox::new(e), b: SmallBox::new(rhs) };
             } else if self.matches(&Tok::GtEq) {
                 let rhs = self.parse_term()?;
-                e = Expr::Binary { op: BinOp::Ge, a: Box::new(e), b: Box::new(rhs) };
+                e = Expr::Binary { op: BinOp::Ge, a: SmallBox::new(e), b: SmallBox::new(rhs) };
             } else if self.matches(&Tok::In) {
                 let rhs = self.parse_term()?;
                 // left "in" right → Expr::In { key: left, obj: right }
-                e = Expr::In { key: Box::new(e), obj: Box::new(rhs) };
+                e = Expr::In { key: SmallBox::new(e), obj: SmallBox::new(rhs) };
             } else {
                 break;
             }
@@ -632,10 +633,10 @@ impl<'src> Parser<'src> {
         loop {
             if self.matches(&Tok::Plus) {
                 let rhs = self.parse_factor()?;
-                e = Expr::Binary { op: BinOp::Add, a: Box::new(e), b: Box::new(rhs) };
+                e = Expr::Binary { op: BinOp::Add, a: SmallBox::new(e), b: SmallBox::new(rhs) };
             } else if self.matches(&Tok::Minus) {
                 let rhs = self.parse_factor()?;
-                e = Expr::Binary { op: BinOp::Sub, a: Box::new(e), b: Box::new(rhs) };
+                e = Expr::Binary { op: BinOp::Sub, a: SmallBox::new(e), b: SmallBox::new(rhs) };
             } else { break; }
         }
         Ok(e)
@@ -645,13 +646,13 @@ impl<'src> Parser<'src> {
         loop {
             if self.matches(&Tok::Star) {
                 let rhs = self.parse_unary()?;
-                e = Expr::Binary { op: BinOp::Mul, a: Box::new(e), b: Box::new(rhs) };
+                e = Expr::Binary { op: BinOp::Mul, a: SmallBox::new(e), b: SmallBox::new(rhs) };
             } else if self.matches(&Tok::Slash) {
                 let rhs = self.parse_unary()?;
-                e = Expr::Binary { op: BinOp::Div, a: Box::new(e), b: Box::new(rhs) };
+                e = Expr::Binary { op: BinOp::Div, a: SmallBox::new(e), b: SmallBox::new(rhs) };
             } else if self.matches(&Tok::Percent) {
                 let rhs = self.parse_unary()?;
-                e = Expr::Binary { op: BinOp::Rem, a: Box::new(e), b: Box::new(rhs) };
+                e = Expr::Binary { op: BinOp::Rem, a: SmallBox::new(e), b: SmallBox::new(rhs) };
             } else { break; }
         }
         Ok(e)
@@ -659,13 +660,13 @@ impl<'src> Parser<'src> {
     fn parse_unary(&mut self) -> PResult<Expr> {
         if self.matches(&Tok::Bang) {
             let e = self.parse_unary()?;
-            Ok(Expr::Unary { op: UnOp::Not, e: Box::new(e) })
+            Ok(Expr::Unary { op: UnOp::Not, e: SmallBox::new(e) })
         } else if self.matches(&Tok::Minus) {
             let e = self.parse_unary()?;
-            Ok(Expr::Unary { op: UnOp::Neg, e: Box::new(e) })
+            Ok(Expr::Unary { op: UnOp::Neg, e: SmallBox::new(e) })
         } else if self.matches(&Tok::Plus) {
             let e = self.parse_unary()?;
-            Ok(Expr::Unary { op: UnOp::Pos, e: Box::new(e) })
+            Ok(Expr::Unary { op: UnOp::Pos, e: SmallBox::new(e) })
         } else {
             self.parse_call()
         }
@@ -682,17 +683,17 @@ impl<'src> Parser<'src> {
                         self.expect(Tok::Comma, "expected ',' in argument list")?;
                     }
                 }
-                e = Expr::Call { callee: Box::new(e), args };
+                e = Expr::Call { callee: SmallBox::new(e), args };
             } else if self.matches(&Tok::Dot) {
                 let name = match self.next().tok {
                     Tok::Ident(s) => s,
                     _ => return Err(self.err_here("expected identifier after '.'")),
                 };
-                e = Expr::GetProp { recv: Box::new(e), name };
+                e = Expr::GetProp { recv: SmallBox::new(e), name };
             } else if self.matches(&Tok::LBracket) {
                 let idx = self.expr()?;
                 self.expect(Tok::RBracket, "expected ']'")?;
-                e = Expr::Index { recv: Box::new(e), index: Box::new(idx) };
+                e = Expr::Index { recv: SmallBox::new(e), index: SmallBox::new(idx) };
             } else {
                 break;
             }
@@ -713,7 +714,7 @@ impl<'src> Parser<'src> {
             Tok::LParen => {
                 let e = self.expr()?;
                 self.expect(Tok::RParen, "expected ')'")?;
-                Ok(Expr::Group(Box::new(e)))
+                Ok(Expr::Group(SmallBox::new(e)))
             }
             Tok::LBracket => {
                 let mut elems = Vec::new();
@@ -820,7 +821,7 @@ impl<'src> Parser<'src> {
                 Tok::Ident(s) => s,
                 _ => return Err(self.err_here("expected identifier after '.' in delete")),
             };
-            return Ok(Expr::DeleteProp { obj: Box::new(recv), key: PropKey::Ident(name) });
+            return Ok(Expr::DeleteProp { obj: SmallBox::new(recv), key: PropKey::Ident(name) });
         } else if self.matches(&Tok::LBracket) {
             // delete obj["x"]  or delete obj[expr]
             // For MVP, support string and identifier statically; fall back to Index for general expr.
@@ -828,12 +829,12 @@ impl<'src> Parser<'src> {
                 Tok::Str(_) => {
                     let s = if let Tok::Str(s) = self.next().tok { s } else { unreachable!() };
                     self.expect(Tok::RBracket, "expected ']'")?;
-                    return Ok(Expr::DeleteProp { obj: Box::new(recv), key: PropKey::Str(s) });
+                    return Ok(Expr::DeleteProp { obj: SmallBox::new(recv), key: PropKey::Str(s) });
                 }
                 Tok::Ident(_) => {
                     let name = if let Tok::Ident(s) = self.next().tok { s } else { unreachable!() };
                     self.expect(Tok::RBracket, "expected ']'")?;
-                    return Ok(Expr::DeleteProp { obj: Box::new(recv), key: PropKey::Ident(name) });
+                    return Ok(Expr::DeleteProp { obj: SmallBox::new(recv), key: PropKey::Ident(name) });
                 }
                 _ => {
                     // general index: delete obj[expr]
@@ -841,7 +842,7 @@ impl<'src> Parser<'src> {
                     self.expect(Tok::RBracket, "expected ']'")?;
                     // Keep an Index-flavored delete as "delete index". If you prefer a distinct node,
                     // add Expr::DeleteIndex and return that instead.
-                    return Ok(Expr::Unary { op: UnOp::Pos, e: Box::new(Expr::Index { recv: Box::new(recv), index: Box::new(idx) }) });
+                    return Ok(Expr::Unary { op: UnOp::Pos, e: SmallBox::new(Expr::Index { recv: SmallBox::new(recv), index: SmallBox::new(idx) }) });
                 }
             }
         } else {
@@ -985,7 +986,7 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
 
                     let init_rw = if let Some(i0) = init.as_deref() {
                         // Rewrite the init using the current for_scope.
-                        let rewritten = Box::new(rw_stmt(i0, used, counter, &for_scope, out_funcs, lam_caps_out));
+                        let rewritten = SmallBox::new(rw_stmt(i0, used, counter, &for_scope, out_funcs, lam_caps_out));
                         // If the init is `var id = ...;`, extend for_scope for the rest.
                         if let Stmt::Var { name, .. } = i0 {
                             for_scope.insert(name.clone());
@@ -1036,7 +1037,7 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
                 body: rw_block(body, used, counter, enclosing_locals, out_funcs, lam_caps_out),
             },
             Stmt::For { init, cond, step, body } => Stmt::For {
-                init: init.as_deref().map(|i| Box::new(rw_stmt(i, used, counter, enclosing_locals, out_funcs, lam_caps_out))),
+                init: init.as_deref().map(|i| SmallBox::new(rw_stmt(i, used, counter, enclosing_locals, out_funcs, lam_caps_out))),
                 cond: cond.as_ref().map(|e| rw_expr(e, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
                 step: step.as_ref().map(|e| rw_expr(e, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
                 body: rw_block(body, used, counter, enclosing_locals, out_funcs, lam_caps_out),
@@ -1075,25 +1076,25 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
     ) -> Expr {
         match e {
             Expr::Assign(lv, rhs) => Expr::Assign(
-                Box::new(rw_lvalue(lv, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
-                Box::new(rw_expr(rhs, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                SmallBox::new(rw_lvalue(lv, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                SmallBox::new(rw_expr(rhs, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
             ),
             Expr::Binary { op, a, b } => Expr::Binary {
                 op: *op,
-                a: Box::new(rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
-                b: Box::new(rw_expr(b, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                a: SmallBox::new(rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                b: SmallBox::new(rw_expr(b, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
             },
-            Expr::Unary { op, e } => Expr::Unary { op: *op, e: Box::new(rw_expr(e, used, counter, enclosing_locals, out_funcs, lam_caps_out)) },
+            Expr::Unary { op, e } => Expr::Unary { op: *op, e: SmallBox::new(rw_expr(e, used, counter, enclosing_locals, out_funcs, lam_caps_out)) },
             Expr::Call { callee, args } => Expr::Call {
-                callee: Box::new(rw_expr(callee, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                callee: SmallBox::new(rw_expr(callee, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
                 args: args.iter().map(|a| rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out)).collect(),
             },
             Expr::GetProp { recv, name } =>
-                Expr::GetProp { recv: Box::new(rw_expr(recv, used, counter, enclosing_locals, out_funcs, lam_caps_out)), name: name.clone() },
+                Expr::GetProp { recv: SmallBox::new(rw_expr(recv, used, counter, enclosing_locals, out_funcs, lam_caps_out)), name: name.clone() },
             Expr::Index { recv, index } =>
-                Expr::Index { recv: Box::new(rw_expr(recv, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
-                              index: Box::new(rw_expr(index, used, counter, enclosing_locals, out_funcs, lam_caps_out)) },
-            Expr::Group(g) => Expr::Group(Box::new(rw_expr(g, used, counter, enclosing_locals, out_funcs, lam_caps_out))),
+                Expr::Index { recv: SmallBox::new(rw_expr(recv, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                              index: SmallBox::new(rw_expr(index, used, counter, enclosing_locals, out_funcs, lam_caps_out)) },
+            Expr::Group(g) => Expr::Group(SmallBox::new(rw_expr(g, used, counter, enclosing_locals, out_funcs, lam_caps_out))),
 
             // CORE: hoist to a top-level function with extra hidden `__env` param; replace with FnRef
             Expr::FnLit { params, body } => {
@@ -1153,29 +1154,29 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
 
             Expr::GetPropObj { obj, key } => {
                 Expr::GetPropObj {
-                    obj: Box::new(rw_expr(obj, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                    obj: SmallBox::new(rw_expr(obj, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
                     key: key.clone(),
                 }
             }
 
             Expr::SetPropObj { obj, key, value } => {
                 Expr::SetPropObj {
-                    obj: Box::new(rw_expr(obj, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                    obj: SmallBox::new(rw_expr(obj, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
                     key: key.clone(),
-                    value: Box::new(rw_expr(value, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                    value: SmallBox::new(rw_expr(value, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
                 }
             }
 
             Expr::In { key, obj } => {
                 Expr::In {
-                    key: Box::new(rw_expr(key, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
-                    obj: Box::new(rw_expr(obj, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                    key: SmallBox::new(rw_expr(key, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                    obj: SmallBox::new(rw_expr(obj, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
                 }
             }
 
             Expr::DeleteProp { obj, key } => {
                 Expr::DeleteProp {
-                    obj: Box::new(rw_expr(obj, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                    obj: SmallBox::new(rw_expr(obj, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
                     key: key.clone(),
                 }
             }
@@ -1494,9 +1495,9 @@ fn lvalue_to_expr(lv: &LValue) -> Expr {
     match lv {
         LValue::Ident(s) => Expr::Ident(s.clone()),
         LValue::GetProp { recv, name } =>
-            Expr::GetProp { recv: Box::new(recv.clone()), name: name.clone() },
+            Expr::GetProp { recv: SmallBox::new(recv.clone()), name: name.clone() },
         LValue::Index { recv, index } =>
-            Expr::Index { recv: Box::new(recv.clone()), index: Box::new(index.clone()) },
+            Expr::Index { recv: SmallBox::new(recv.clone()), index: SmallBox::new(index.clone()) },
     }
 }
 
