@@ -163,6 +163,7 @@ pub fn replace_uses_in_inst(inst: &mut Inst, from: ValueId, to: ValueId) -> usiz
 
         // ---- Calls / closures ----
         Inst::CallDirect { args, .. } => { rv!(args); }
+        Inst::CallDirectMemoized { args, .. } => { rv!(args); }
         Inst::CallIC { recv, args, .. } => { r!(*recv); rv!(args); }
         Inst::MethodLookup { obj, .. } => { r!(*obj); }
 

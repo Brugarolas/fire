@@ -163,7 +163,7 @@ pub enum Expr {
     GetProp { recv: SmallBox<Expr, u8>, name: String },
     Index { recv: SmallBox<Expr, u8>, index: SmallBox<Expr, u8> },
     Group(SmallBox<Expr, u8>),
-    FnLit { params: SmallVec<String>, body: Block },
+    FnLit { params: Vec<String>, body: Block },
     FnRef { name: String },
     ArrayLit(Vec<Expr>),
 
@@ -2553,26 +2553,38 @@ fn lower_expr_free<'m>(
         }
 
         Expr::ArrayLit(elems) => {
+            // Allocate GC array
             let len_v = b.const_i32(elems.len() as i32);
-            let (_nid, box_res) = b.push_node(
-                Inst::CallNative { name: "wir_array_new".into(), args: vec![len_v], pure: false, can_throw: false },
+            let (_nid_new, new_res) = b.push_node(
+                Inst::CallNative {
+                    name: "wir_array_new".into(),
+                    args: vec![len_v],
+                    pure: false,
+                    can_throw: false,
+                },
                 Some(Type::Array(Box::new(None))),
                 1,
-                true
+                true,
             );
-            let arr = box_res[0];
+            let arr_v = new_res[0];
 
             for (i, el) in elems.iter().enumerate() {
                 let v   = lower_expr_free(b, locals, fields, next_field, el, funcs, lam_caps)?;
                 let idx = b.const_i32(i as i32);
                 let _ = b.push_node(
-                    Inst::StoreElem { arr, idx, val: v },
-                    Some(Type::Top),
+                    Inst::CallNative {
+                        name: "wir_array_set".into(),
+                        args: vec![arr_v, idx, v],
+                        pure: false,
+                        can_throw: false,
+                    },
+                    Some(Type::Int32),
                     1,
                     true,
                 );
             }
-            Ok(arr)
+
+            Ok(arr_v)
         }
 
         // Closure creation from hoisted lambda

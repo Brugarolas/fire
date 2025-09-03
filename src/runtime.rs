@@ -125,3 +125,37 @@ pub extern "C" fn wir_obj_del_str(obj: i64, key_ptr: i64) -> i64 {
     let o = unsafe { &mut *(obj as *mut WirObj) };
     if o.by_str.remove(&k).is_some() { 1 } else { 0 }
 }
+
+use std::sync::OnceLock;
+use parking_lot::Mutex;
+
+// Global: func_id -> (key -> value)
+static MEMO_TABLE: OnceLock<Mutex<HashMap<u32, HashMap<i64, i64>>>> = OnceLock::new();
+
+fn memo_lock() -> &'static Mutex<HashMap<u32, HashMap<i64, i64>>> {
+    MEMO_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_memo_get(fid: i64, key: i64, out_ptr: *mut i64) -> i64 {
+    let fid_u = fid as u32;
+    let guard = memo_lock().lock();
+    if let Some(map) = guard.get(&fid_u) {
+        if let Some(&val) = map.get(&key) {
+            unsafe {
+                if !out_ptr.is_null() { *out_ptr = val; }
+            }
+            return 1; // found
+        }
+    }
+    0 // miss
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_memo_put(fid: i64, key: i64, val: i64) -> i64 {
+    let fid_u = fid as u32;
+    let mut guard = memo_lock().lock();
+    let entry = guard.entry(fid_u).or_insert_with(HashMap::new);
+    entry.insert(key, val);
+    0
+}

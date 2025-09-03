@@ -181,7 +181,7 @@ pub struct DeoptPoint {
 
 /// Memory effect classes for side-effecting instructions.
 /// We mostly need an ordering token; this is for analysis/printing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EffectKind {
     Entry,
     Alloc,
@@ -196,17 +196,17 @@ pub enum EffectKind {
 /// -------- Instructions (mid–high level) --------
 
 /// Arithmetic kinds for convenience.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IntBinOp { Add, Sub, Mul, DivS, RemS, And, Or, Xor, Shl, ShrU, Sar }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum F64BinOp { Add, Sub, Mul, Div, Rem }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CmpKind { Eq, Ne, Lt, Le, Gt, Ge }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NumKind { Int32, F64, Num } // helper for mixed-num ops
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CallConv {
     /// Fast internal calling convention (JIT-to-JIT).
     Fast,
@@ -319,6 +319,10 @@ pub enum Inst {
         callee: FuncId,
         args: Vec<ValueId>,
     },
+    CallDirectMemoized {
+        callee: FuncId,         // target function
+        args: Vec<ValueId>,     // MUST be 1 arg to benefit, but we keep Vec for parity
+    },
     // Dynamic/method call that lowers into PIC checks + direct calls.
     CallIC {
         site: SiteId,
@@ -389,6 +393,7 @@ impl Inst {
                 | ArrayReduce { .. }
                 | StrToNumber(_)
                 | CallDirect { .. }
+                | CallDirectMemoized { .. }
                 | CallIC { .. }
                 | CallClosure { .. }
                 | AllocClosure { .. }
@@ -757,6 +762,7 @@ impl EffectKind {
 
             // Calls (user closures / runtime loops)
             crate::wir::Inst::CallDirect { .. }
+            | crate::wir::Inst::CallDirectMemoized { .. }
             | crate::wir::Inst::CallIC { .. }
             | crate::wir::Inst::CallClosure { .. }
             | crate::wir::Inst::CallNative { .. }

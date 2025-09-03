@@ -21,7 +21,8 @@ use crate::wir::{
 use crate::runtime::{
     wir_obj_new, wir_is_str, napalm_yieldpoint,
     wir_obj_get_field, wir_obj_set_field, wir_obj_has_field, wir_obj_del_field,
-    wir_obj_get_str, wir_obj_set_str, wir_obj_has_str, wir_obj_del_str
+    wir_obj_get_str, wir_obj_set_str, wir_obj_has_str, wir_obj_del_str,
+    wir_memo_get, wir_memo_put,
 };
 /// ABI: `unsafe extern "C" fn(argv: *const i64, argc: usize) -> i64`
 pub type JitFnPtr = unsafe extern "C" fn(*const i64, usize) -> i64;
@@ -78,6 +79,9 @@ impl Default for JIT {
 
             fn wir_array_fill(arr: i64, val: i64) -> i64;
             fn wir_array_copy(dst: i64, src: i64, len: i64) -> i64;
+
+            fn wir_memo_get(fid: i64, key: i64, out_ptr: *mut i64) -> i64;
+            fn wir_memo_put(fid: i64, key: i64, val: i64) -> i64;
         }
 
         // --- declare the object natives so we can take typed fn pointers ---
@@ -184,6 +188,9 @@ impl Default for JIT {
                 "napalm_yieldpoint",
                 napalm_yieldpoint as *const extern "C" fn() -> i64 as *const u8,
             );
+
+            jb.symbol("wir_memo_get", wir_memo_get as *const extern "C" fn(i64, i64, *mut i64) -> i64 as *const u8);
+            jb.symbol("wir_memo_put", wir_memo_put as *const extern "C" fn(i64, i64, i64) -> i64 as *const u8);
         }
 
         let module = cranelift_jit::JITModule::new(jb);
@@ -958,6 +965,146 @@ impl JIT {
                             if res_count >= 1 {
                                 vmap.bind(node.results[0], outs[0]);
                             }
+                        }
+
+                        // Engine has the ability to memoize functions, it is implemented natively
+                        Inst::CallDirectMemoized { callee, args } => {
+                            use cranelift::prelude::{AbiParam, types, IntCC};
+                            use cranelift::codegen::ir::{StackSlotData, StackSlotKind};
+
+                            let ptr_ty = self.ptr_ty();
+
+                            // We only memoize 1-arg calls (design choice). If not 1, just fall back to a plain call.
+                            if args.len() != 1 {
+                                // === same lowering as CallDirect ===
+                                let mut sig = self.module.make_signature();
+                                sig.call_conv = self.module.isa().default_call_conv();
+                                sig.params.push(AbiParam::new(ptr_ty));
+                                sig.params.push(AbiParam::new(types::I64));
+                                sig.returns.push(AbiParam::new(types::I64));
+
+                                let sym = format!("wir_f_{}", callee.0);
+                                let func_id = self.module.declare_function(&sym, Linkage::Import, &sig)
+                                    .map_err(|e| e.to_string())?;
+
+                                let n = args.len();
+                                let size_bytes: u32 = (n as u32) * 8;
+                                let slot = fb.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size_bytes, 0));
+                                for (i, a) in args.iter().enumerate() {
+                                    let v = vmap.get_or_emit(*a, &mut fb, args_base, fun_ir);
+                                    fb.ins().stack_store(v, slot, (i as i32) * 8);
+                                }
+                                let argv_ptr = fb.ins().stack_addr(ptr_ty, slot, 0);
+                                let argc     = fb.ins().iconst(types::I64, n as i64);
+
+                                let outs = self.call_funcref(
+                                    &mut fb,
+                                    func_id,
+                                    |s| {
+                                        s.params.push(AbiParam::new(ptr_ty));
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.returns.push(AbiParam::new(types::I64));
+                                    },
+                                    &[argv_ptr, argc],
+                                )?;
+                                if res_count >= 1 { vmap.bind(node.results[0], outs[0]); }
+                                continue;
+                            }
+
+                            // ----- Memoized 1-arg path -----
+                            let key = vmap.get_or_emit(args[0], &mut fb, args_base, fun_ir);
+                            let fid = fb.ins().iconst(types::I64, callee.0 as i64);
+
+                            // out-slot to receive cached value
+                            let out_slot = fb.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 0));
+                            let out_ptr  = fb.ins().stack_addr(self.ptr_ty(), out_slot, 0);
+
+                            // hoist the pointer type out so the closure doesn't touch `self`
+                            let ptr_ty_local = self.ptr_ty();
+
+                            // call wir_memo_get(fid, key, &out)
+                            let found = self.call_import(
+                                &mut fb,
+                                "wir_memo_get",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64));      // fid
+                                    s.params.push(AbiParam::new(types::I64));      // key
+                                    s.params.push(AbiParam::new(ptr_ty_local));    // out*
+                                    s.returns.push(AbiParam::new(types::I64));     // 0/1
+                                },
+                                &[fid, key, out_ptr],
+                            )?;
+
+                            // Control-flow split: hit vs miss
+                            let bb_hit  = fb.create_block();
+                            let bb_miss = fb.create_block();
+                            let bb_join = fb.create_block();
+
+                            // Join block gets a single param: the call result
+                            let res_phi = fb.append_block_param(bb_join, types::I64);
+
+                            let zero = fb.ins().iconst(types::I64, 0);
+                            let is_hit = fb.ins().icmp(IntCC::NotEqual, found, zero);
+                            fb.ins().brif(is_hit, bb_hit, &[] as &[BlockArg], bb_miss, &[] as &[BlockArg]);
+
+                            // ---- HIT: load cached value, jump join
+                            fb.switch_to_block(bb_hit);
+                            let cached = fb.ins().load(types::I64, MemFlags::trusted(), out_ptr, 0);
+                            let mut hit_args = vec![BlockArg::from(cached)];
+                            fb.ins().jump(bb_join, &hit_args[..]);
+
+                            // ---- MISS: call callee, memo_put, jump join
+                            fb.switch_to_block(bb_miss);
+                            // marshal argv of length 1
+                            let slot = fb.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 0));
+                            fb.ins().stack_store(key, slot, 0);
+                            let argv_ptr = fb.ins().stack_addr(ptr_ty, slot, 0);
+                            let argc     = fb.ins().iconst(types::I64, 1);
+
+                            // signature like CallDirect
+                            let mut sig = self.module.make_signature();
+                            sig.call_conv = self.module.isa().default_call_conv();
+                            sig.params.push(AbiParam::new(ptr_ty));
+                            sig.params.push(AbiParam::new(types::I64));
+                            sig.returns.push(AbiParam::new(types::I64));
+
+                            let sym = format!("wir_f_{}", callee.0);
+                            let func_id = self
+                                .module
+                                .declare_function(&sym, Linkage::Import, &sig)
+                                .map_err(|e| e.to_string())?;
+
+                            let outs = self.call_funcref(
+                                &mut fb,
+                                func_id,
+                                |s| {
+                                    s.params.push(AbiParam::new(ptr_ty));
+                                    s.params.push(AbiParam::new(types::I64));
+                                    s.returns.push(AbiParam::new(types::I64));
+                                },
+                                &[argv_ptr, argc],
+                            )?;
+                            let retv = outs[0];
+
+                            // wir_memo_put(fid, key, retv)
+                            let _ = self.call_import(
+                                &mut fb,
+                                "wir_memo_put",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64)); // fid
+                                    s.params.push(AbiParam::new(types::I64)); // key
+                                    s.params.push(AbiParam::new(types::I64)); // val
+                                    s.returns.push(AbiParam::new(types::I64)); // 0
+                                },
+                                &[fid, key, retv],
+                            )?;
+
+                            let mut miss_args = vec![BlockArg::from(retv)];
+                            fb.ins().jump(bb_join, &miss_args[..]);
+
+                            // ---- JOIN: bind result
+                            fb.switch_to_block(bb_join);
+                            if res_count >= 1 { vmap.bind(node.results[0], res_phi); }
                         }
 
                         // ---------------- Control flow ----------------

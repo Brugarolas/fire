@@ -2,13 +2,15 @@
 mod value;
 mod wir;
 mod front;
-//mod opt;
+mod opt;
 //mod gc_new;
 //mod gc_old;
 mod gc;
 mod runtime;
 mod jit;
 
+use crate::opt::Optimize;
+use crate::opt::optimization::optimization_passes;
 use mimalloc::MiMalloc;
 use ahash::AHashMap as HashMap;
 use std::time::Instant;
@@ -61,13 +63,15 @@ fn main() {
         return;
     }
 
-    //let optimizer = early_pipeline();
-    //optimizer.optimize_module(&mut module);
+    // 3.5) Optimize WIR
+    let optimize = optimization_passes();
+    optimize.optimize_module(&mut module);
 
+    // 4.1) Init GC and bind to this thread
     let _gc = gc::NapalmGc::new();
     _gc.bind_current_thread();
 
-    // 4) JIT compile ALL functions
+    // 4.2) JIT compile ALL functions
     let mut jit = jit::JIT::default();
     let mut fptrs = HashMap::new();
     for f in &module.funcs {
