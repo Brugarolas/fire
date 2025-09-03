@@ -1,11 +1,16 @@
-//! Napalm optimization scaffold for WIR (optimized).
+//! Napalm optimizer core (worklist + tag bucketing, BC fixed).
 //!
-//! - O(1) InstCursor via cached block index.
-//! - Zero-copy opcode peek; no Inst clones on hot path.
-//! - Batch-safe edits with single-pass per-block rebuild.
-//! - ReplaceKind applied in-place during apply.
-//! - Unified pass runner with lazy per-block apply + local fixups.
-//! - Optional dominator utilities (idom + preorder walk).
+//! - Per-block worklist: only revisit affected instructions.
+//! - Amortized pre-bucketing: opcode tag → relevant optimizations.
+//! - Per-block edit queues (O(1) route/drain) + **BlockId-compatible APIs**.
+//! - O(1) InstId→(block_ix,pos) map; incrementally maintained.
+//! - Peephole window (prev2..next2) built once per visit.
+//! - ReplaceKind uses `mem::replace` (no clones).
+//! - `SmallVec` in all hot/transient paths.
+//!
+//! Legacy APIs restored:
+//!   - `InstCursor::cur_kind()`
+//!   - `WirEditQueue::{apply, erase, insert_before, insert_after, splice_range, replace_kind}`
 //!
 //! Usage:
 //!   let mut opt = Optimize::new().with_pass(your_pass());
@@ -19,31 +24,26 @@ pub mod pass;
 pub mod optimization;
 
 use std::any::Any;
-use std::cmp::Ordering;
-use std::mem::{discriminant, Discriminant};
+use std::collections::{HashMap, VecDeque};
+use std::mem::{discriminant, Discriminant, replace};
+
+use smallvec::SmallVec;
 
 // ----- pull WIR types -----
-use crate::wir::{
-    Block, BlockId, Function, Inst, InstId, Module, Type, Value, ValueDef, ValueId,
-};
+use crate::wir::{BlockId, Function, Inst, InstId, Module, Type, Value, ValueDef, ValueId};
 
 /// =======================================
-/// Vec-backed O(1) cursor (stack)
+/// O(1) cursor into a block (no BlockId scans)
 /// =======================================
-
-/// A cursor into a block's instruction list (`block.insts: Vec<InstId>`).
-/// Holds the block index + a raw pointer to `Function` so we can reborrow safely in closures
-/// without heap allocations. The cursor itself is a tiny stack object.
 pub struct InstCursor<'f> {
     func: *mut Function,
-    block_ix: usize, // index into func.blocks
-    pos: usize,      // index into block.insts
+    block_ix: usize,
+    pos: usize,
     _marker: std::marker::PhantomData<&'f mut Function>,
 }
 
 impl<'f> InstCursor<'f> {
-    /// # Safety
-    /// `func` must outlive the cursor and remain valid.
+    #[inline]
     pub fn new(func: &'f mut Function, block: BlockId, pos: usize) -> Self {
         let block_ix = unsafe {
             (*(&*func as *const Function as *mut Function))
@@ -55,407 +55,535 @@ impl<'f> InstCursor<'f> {
         Self { func, block_ix, pos, _marker: std::marker::PhantomData }
     }
 
-    #[inline] pub fn block(&self) -> BlockId { unsafe { (*self.func).blocks[self.block_ix].id } }
-    #[inline] pub fn pos(&self) -> usize { self.pos }
-
-    /// Length (instruction count) of the current block.
     #[inline]
-    pub fn len(&self) -> usize {
-        unsafe { (*self.func).blocks[self.block_ix].insts.len() }
+    pub fn new_ix(func: &'f mut Function, block_ix: usize, pos: usize) -> Self {
+        Self { func: (func as *mut Function), block_ix, pos, _marker: std::marker::PhantomData }
     }
 
-    /// Current InstId.
+    #[inline] pub fn block_id(&self) -> BlockId { unsafe { (*self.func).blocks[self.block_ix].id } }
+    #[inline] pub fn block_index(&self) -> usize { self.block_ix }
+    #[inline] pub fn pos(&self) -> usize { self.pos }
+    #[inline] pub fn len(&self) -> usize { unsafe { (*self.func).blocks[self.block_ix].insts.len() } }
+
     #[inline]
     pub fn cur_id(&self) -> InstId {
-        unsafe { (*self.func).blocks[self.block_ix].insts[self.pos] }
+        unsafe {
+            let insts = &(*self.func).blocks[self.block_ix].insts;
+            *insts
+                .get(self.pos)
+                .expect("InstCursor::cur_id OOB (stale pos); guard before constructing cursor")
+        }
     }
 
-    /// Zero-copy peek of the current opcode/kind.
-    #[inline]
-    pub fn peek_cur<R>(&self, f: impl FnOnce(&Inst) -> R) -> R {
-        let id = self.cur_id();
-        unsafe { f(&(*self.func).nodes[id.0 as usize].kind) }
-    }
-
-    /// Cheap tag (discriminant) for opcode dispatch.
-    #[inline]
-    pub fn cur_tag(&self) -> Discriminant<Inst> {
+    /// Cheap tag for dispatch.
+    #[inline] pub fn cur_tag(&self) -> Discriminant<Inst> {
         let id = self.cur_id();
         unsafe { discriminant(&(*self.func).nodes[id.0 as usize].kind) }
     }
 
-    /// Read-only clone of current instruction kind (compat shim).
-    /// Prefer `peek_cur` or `cur_tag` to avoid cloning on the hot path.
-    #[inline]
-    pub fn cur_kind(&self) -> Inst {
+    /// Back-compat: clone of current kind (avoid in hot paths if possible).
+    #[inline] pub fn cur_kind(&self) -> Inst {
         let id = self.cur_id();
         unsafe { (*self.func).nodes[id.0 as usize].kind.clone() }
     }
 
-    /// Mutate the current node via a scoped closure.
-    #[inline]
-    pub fn with_cur<R>(&mut self, f: impl FnOnce(&mut crate::wir::Node) -> R) -> R {
+    #[inline] pub fn peek_cur<R>(&self, f: impl FnOnce(&Inst) -> R) -> R {
+        let id = self.cur_id();
+        unsafe { f(&(*self.func).nodes[id.0 as usize].kind) }
+    }
+
+    #[inline] pub fn with_cur<R>(&mut self, f: impl FnOnce(&mut crate::wir::Node) -> R) -> R {
         let id = self.cur_id();
         unsafe { f(&mut (*self.func).nodes[id.0 as usize]) }
     }
 
-    /// Mutate the previous node (if any) via a scoped closure.
-    #[inline]
-    pub fn with_prev<R>(&mut self, f: impl FnOnce(&mut crate::wir::Node) -> R) -> Option<R> {
+    #[inline] pub fn with_prev<R>(&mut self, f: impl FnOnce(&mut crate::wir::Node) -> R) -> Option<R> {
         if self.pos == 0 { return None; }
         let prev_id = unsafe { (*self.func).blocks[self.block_ix].insts[self.pos - 1] };
         Some(unsafe { f(&mut (*self.func).nodes[prev_id.0 as usize]) })
     }
 
-    /// Mutate the next node (if any) via a scoped closure.
-    #[inline]
-    pub fn with_next<R>(&mut self, f: impl FnOnce(&mut crate::wir::Node) -> R) -> Option<R> {
+    #[inline] pub fn with_next<R>(&mut self, f: impl FnOnce(&mut crate::wir::Node) -> R) -> Option<R> {
         let len = self.len();
         if self.pos + 1 >= len { return None; }
         let next_id = unsafe { (*self.func).blocks[self.block_ix].insts[self.pos + 1] };
         Some(unsafe { f(&mut (*self.func).nodes[next_id.0 as usize]) })
     }
 
-    /// Access to the owning function (scoped, exclusive).
-    #[inline]
-    pub fn with_func<R>(&mut self, f: impl FnOnce(&mut Function) -> R) -> R {
+    #[inline] pub fn with_func<R>(&mut self, f: impl FnOnce(&mut Function) -> R) -> R {
         unsafe { f(&mut *self.func) }
     }
 }
 
-/// Helper on Function for internal use (non-hot path).
-trait FuncExt {
-    fn block_by_id(&mut self, b: BlockId) -> &mut Block;
+/// =======================================
+/// Peephole window (prev2..next2)
+/// =======================================
+#[derive(Clone, Copy)]
+pub struct Window {
+    pub prev2: Option<InstId>,
+    pub prev1: Option<InstId>,
+    pub cur:   InstId,
+    pub next1: Option<InstId>,
+    pub next2: Option<InstId>,
 }
-impl FuncExt for Function {
+
+impl<'f> InstCursor<'f> {
     #[inline]
-    fn block_by_id(&mut self, b: BlockId) -> &mut Block {
-        self.blocks.iter_mut().find(|bb| bb.id == b).expect("invalid BlockId")
+    pub fn window5(&self) -> Window {
+        let len = self.len();
+        let p = self.pos;
+        let block = unsafe { &(*self.func).blocks[self.block_ix] };
+        let at = |i: usize| block.insts.get(i).copied();
+        Window {
+            prev2: if p >= 2 { at(p - 2) } else { None },
+            prev1: if p >= 1 { at(p - 1) } else { None },
+            cur: at(p).unwrap(),
+            next1: if p + 1 < len { at(p + 1) } else { None },
+            next2: if p + 2 < len { at(p + 2) } else { None },
+        }
     }
 }
 
 /// =======================================
-/// Batch-safe edits (per block, by index)
+/// Per-block edits (fast) + BlockId-compatible layer
 /// =======================================
-
 #[derive(Debug, Clone)]
 pub enum WirEdit {
-    /// Insert existing InstIds before index `at` in block `bb`.
-    InsertBefore { bb: BlockId, at: usize, insts: Vec<InstId> },
-    /// Insert after index `at` in block `bb`.
-    InsertAfter  { bb: BlockId, at: usize, insts: Vec<InstId> },
-    /// Replace the opcode/kind of an instruction in place (keeps ids/results/effects as-is).
-    ReplaceKind  { id: InstId, new_kind: Inst },
-    /// Remove one instruction at index `at` in block `bb`.
-    Erase        { bb: BlockId, at: usize },
-    /// Replace a half-open range [start, end) in a block with given InstIds.
-    SpliceRange  { bb: BlockId, start: usize, end: usize, insts: Vec<InstId> },
+    InsertBefore { at: usize, insts: SmallVec<[InstId; 4]> },
+    InsertAfter  { at: usize, insts: SmallVec<[InstId; 4]> },
+    ReplaceKind  { id: InstId, new_kind: Inst }, // global
+    Erase        { at: usize },
+    SpliceRange  { start: usize, end: usize, insts: SmallVec<[InstId; 4]> },
 }
+
+/// Compatibility wrapper for old BlockId-based APIs.
+#[derive(Debug, Clone)]
+enum CompatKind {
+    InsertBefore { at: usize, insts: SmallVec<[InstId; 4]> },
+    InsertAfter  { at: usize, insts: SmallVec<[InstId; 4]> },
+    Erase        { at: usize },
+    SpliceRange  { start: usize, end: usize, insts: SmallVec<[InstId; 4]> },
+}
+#[derive(Debug, Clone)]
+struct CompatEdit { bb: BlockId, kind: CompatKind }
 
 #[derive(Default)]
 pub struct WirEditQueue {
-    edits: Vec<WirEdit>,
+    /// Per-block edit lists; index by block_ix.
+    by_block: Vec<SmallVec<[WirEdit; 8]>>,
+    /// Global replace-kind buffer (anchorless).
+    replaces: SmallVec<[(InstId, Inst); 16]>,
+    /// Back-compat edits addressed by BlockId (routed lazily).
+    compat: SmallVec<[CompatEdit; 32]>,
 }
+
 impl WirEditQueue {
-    pub fn new() -> Self { Self { edits: Vec::new() } }
-    pub fn is_empty(&self) -> bool { self.edits.is_empty() }
-    pub fn clear(&mut self) { self.edits.clear(); }
-
-    #[inline] pub fn insert_before(&mut self, bb: BlockId, at: usize, insts: Vec<InstId>) { self.edits.push(WirEdit::InsertBefore{bb, at, insts}); }
-    #[inline] pub fn insert_after (&mut self, bb: BlockId, at: usize, insts: Vec<InstId>) { self.edits.push(WirEdit::InsertAfter {bb, at, insts}); }
-    #[inline] pub fn replace_kind  (&mut self, id: InstId, new_kind: Inst) { self.edits.push(WirEdit::ReplaceKind{ id, new_kind }); }
-    #[inline] pub fn erase         (&mut self, bb: BlockId, at: usize) { self.edits.push(WirEdit::Erase{ bb, at }); }
-    #[inline] pub fn splice_range  (&mut self, bb: BlockId, start: usize, end: usize, insts: Vec<InstId>) {
-        self.edits.push(WirEdit::SpliceRange{ bb, start, end, insts });
+    /// Create with block count (fast path).
+    pub fn new() -> Self {
+        Self { by_block: vec![SmallVec::new(); 16], replaces: SmallVec::new(), compat: SmallVec::new() }
     }
 
-    /// How many edits are queued for a given block (excluding ReplaceKind).
-    #[inline]
-    pub fn len_for_block(&self, bb: BlockId) -> usize {
-        self.edits.iter().filter(|e| match e {
-            WirEdit::ReplaceKind{..} => false,
-            WirEdit::InsertBefore{bb: b, ..}
-            | WirEdit::InsertAfter{bb: b, ..}
-            | WirEdit::Erase{bb: b, ..}
-            | WirEdit::SpliceRange{bb: b, ..} => *b == bb,
-        }).count()
+    /// Back-compat constructor when you don't know #blocks yet.
+    pub fn new_uninit() -> Self { Self::default() }
+
+    #[inline] pub fn clear(&mut self) {
+        for v in &mut self.by_block { v.clear(); }
+        self.replaces.clear();
+        self.compat.clear();
     }
-    #[inline]
-    pub fn has_any_for_block(&self, bb: BlockId) -> bool { self.len_for_block(bb) > 0 }
 
-    /// Apply all queued edits for the specified block in a single pass.
-    /// Also applies *all* ReplaceKind edits (anchorless) immediately.
-    pub fn apply_block(&mut self, f: &mut Function, bb: BlockId) {
-        if self.edits.is_empty() { return; }
+    #[inline] pub fn is_empty(&self) -> bool {
+        self.replaces.is_empty()
+            && self.compat.is_empty()
+            && self.by_block.iter().all(|v| v.is_empty())
+    }
 
-        // 1) Apply all ReplaceKind in-place and drop them.
-        let mut i = 0;
-        while i < self.edits.len() {
-            if let WirEdit::ReplaceKind { id, new_kind } = &self.edits[i] {
-                f.nodes[id.0 as usize].kind = new_kind.clone();
-                self.edits.swap_remove(i);
-            } else { i += 1; }
-        }
+    // ---------- Fast IX-based API (preferred) ----------
+    #[inline] pub fn insert_before_ix(&mut self, bix: usize, at: usize, insts: impl Into<SmallVec<[InstId; 4]>>) {
+        self.ensure_blocks(bix + 1);
+        self.by_block[bix].push(WirEdit::InsertBefore { at, insts: insts.into() });
+    }
+    #[inline] pub fn insert_after_ix (&mut self, bix: usize, at: usize, insts: impl Into<SmallVec<[InstId; 4]>>) {
+        self.ensure_blocks(bix + 1);
+        self.by_block[bix].push(WirEdit::InsertAfter { at, insts: insts.into() });
+    }
+    #[inline] pub fn erase_ix(&mut self, bix: usize, at: usize) {
+        self.ensure_blocks(bix + 1);
+        self.by_block[bix].push(WirEdit::Erase { at });
+    }
+    #[inline] pub fn splice_range_ix(&mut self, bix: usize, start: usize, end: usize, insts: impl Into<SmallVec<[InstId; 4]>>) {
+        self.ensure_blocks(bix + 1);
+        self.by_block[bix].push(WirEdit::SpliceRange { start, end, insts: insts.into() });
+    }
+    #[inline] pub fn replace_kind (&mut self, id: InstId, new_kind: Inst) {
+        self.replaces.push((id, new_kind));
+    }
 
-        // Collect and drain edits for this block. Keep insertion order for determinism.
-        let mut block_edits: Vec<(usize /*seq*/, WirEdit)> = Vec::new();
-        let mut seq: usize = 0;
-        let mut j = 0;
-        while j < self.edits.len() {
-            let take = match &self.edits[j] {
-                WirEdit::InsertBefore{bb:b, ..}
-                | WirEdit::InsertAfter{bb:b, ..}
-                | WirEdit::Erase{bb:b, ..}
-                | WirEdit::SpliceRange{bb:b, ..} => *b == bb,
-                WirEdit::ReplaceKind{..} => false, // already removed above
-            };
-            if take {
-                let e = self.edits.swap_remove(j);
-                block_edits.push((seq, e));
-                seq += 1;
-            } else {
-                j += 1;
+    // ---------- Back-compat BlockId API (legacy signatures) ----------
+    #[inline] pub fn insert_before(&mut self, bb: BlockId, at: usize, insts: impl Into<SmallVec<[InstId; 4]>>) {
+        self.compat.push(CompatEdit { bb, kind: CompatKind::InsertBefore{ at, insts: insts.into() } });
+    }
+    #[inline] pub fn insert_after (&mut self, bb: BlockId, at: usize, insts: impl Into<SmallVec<[InstId; 4]>>) {
+        self.compat.push(CompatEdit { bb, kind: CompatKind::InsertAfter{ at, insts: insts.into() } });
+    }
+    #[inline] pub fn erase(&mut self, bb: BlockId, at: usize) { // <— restored
+        self.compat.push(CompatEdit { bb, kind: CompatKind::Erase{ at } });
+    }
+    #[inline] pub fn splice_range(&mut self, bb: BlockId, start: usize, end: usize, insts: impl Into<SmallVec<[InstId; 4]>>) {
+        self.compat.push(CompatEdit { bb, kind: CompatKind::SpliceRange{ start, end, insts: insts.into() } });
+    }
+
+    /// Legacy global apply (no FuncState in signature). Routes compat edits and applies all.
+    pub fn apply(&mut self, f: &mut Function) { // <— restored
+        // Build func-local state for position updates.
+        let mut fs = FuncState::new(f);
+        // Ensure by_block is sized.
+        self.ensure_blocks(f.blocks.len());
+        // Route legacy compat edits to by_block.
+        self.route_all_compat(f);
+        // Apply replaces once, then each block that has work.
+        if !self.replaces.is_empty() || self.by_block.iter().any(|v| !v.is_empty()) {
+            // Apply replaces globally (drains).
+            for (id, mut nk) in self.replaces.drain(..) {
+                let node = &mut f.nodes[id.0 as usize];
+                nk = replace(&mut node.kind, nk);
+                let _ = nk;
+            }
+            for bix in 0..f.blocks.len() {
+                if !self.by_block[bix].is_empty() {
+                    self.apply_block(f, &mut fs, bix);
+                }
             }
         }
-        if block_edits.is_empty() { return; }
+    }
 
-        // Snapshot old insts.
-        let block_ix = f.blocks.iter().position(|b| b.id == bb).expect("invalid bb in edits");
-        let old = f.blocks[block_ix].insts.clone();
+    #[inline] pub fn has_any_for_block_ix(&self, bix: usize) -> bool {
+        self.by_block.get(bix).map_or(false, |v| !v.is_empty())
+            || self.compat.iter().any(|c| /* cheap check; rare */ c_bb_index_eq(self, bix))
+    }
+
+    /// Apply to one block; also updates `FuncState` position map.
+    pub fn apply_block(&mut self, f: &mut Function, fs: &mut FuncState, bix: usize) {
+        self.ensure_blocks(f.blocks.len());
+        // Route compat edits for this block (if any).
+        self.route_compat_for_block(f, bix);
+
+        let empty_block = self.by_block[bix].is_empty();
+        let have_repl = !self.replaces.is_empty();
+        if empty_block && !have_repl { return; }
+
+        // Apply ReplaceKind globally (drains).
+        if have_repl {
+            for (id, mut nk) in self.replaces.drain(..) {
+                let node = &mut f.nodes[id.0 as usize];
+                nk = replace(&mut node.kind, nk);
+                let _ = nk;
+            }
+        }
+        if empty_block { return; }
+
+        // Drain edits (stable order).
+        let mut edits: SmallVec<[WirEdit; 16]> = SmallVec::new();
+        edits.extend(self.by_block[bix].drain(..));
+
+        // Old insts snapshot.
+        let old = f.blocks[bix].insts.clone();
         let old_len = old.len();
 
-        // Prepare per-anchor inserts and range edits.
+        // Per-anchor inserts and ranges.
         #[derive(Clone)]
-        struct RangeEdit { start: usize, end: usize, repl: Vec<InstId>, seq: usize }
+        struct RangeEdit { start: usize, end: usize, repl: SmallVec<[InstId; 4]>, seq: usize }
 
-        let mut before_map: Vec<Vec<InstId>> = vec![Vec::new(); old_len + 1]; // allow before at old_len (append)
-        let mut after_map:  Vec<Vec<InstId>> = vec![Vec::new(); old_len];     // valid after anchors: 0..old_len-1
-        let mut ranges: Vec<RangeEdit> = Vec::new();
+        let mut before_map: Vec<SmallVec<[InstId; 4]>> = vec![SmallVec::new(); old_len + 1];
+        let mut after_map:  Vec<SmallVec<[InstId; 4]>> = vec![SmallVec::new(); old_len];
+        let mut ranges: SmallVec<[RangeEdit; 16]> = SmallVec::new();
 
-        for (seq, e) in block_edits.into_iter() {
+        let mut seq = 0usize;
+        for e in edits {
             match e {
-                WirEdit::InsertBefore{ at, insts, .. } => {
+                WirEdit::InsertBefore{ at, insts } => {
                     let at = at.min(old_len);
                     before_map[at].extend(insts);
                 }
-                WirEdit::InsertAfter{ at, insts, .. } => {
-                    if old_len == 0 { // treat as append
-                        before_map[0].extend(insts);
-                    } else {
-                        let at = at.min(old_len - 1);
-                        after_map[at].extend(insts);
-                    }
+                WirEdit::InsertAfter{ at, insts } => {
+                    if old_len == 0 { before_map[0].extend(insts); }
+                    else { let at = at.min(old_len - 1); after_map[at].extend(insts); }
                 }
-                WirEdit::Erase{ at, .. } => {
-                    if at < old_len {
-                        ranges.push(RangeEdit{ start: at, end: at+1, repl: Vec::new(), seq });
-                    }
+                WirEdit::Erase{ at } => {
+                    if at < old_len { ranges.push(RangeEdit{ start: at, end: at+1, repl: SmallVec::new(), seq }); seq += 1; }
                 }
-                WirEdit::SpliceRange{ start, end, insts, .. } => {
+                WirEdit::SpliceRange{ start, end, insts } => {
                     let s = start.min(old_len);
                     let e = end.min(old_len).max(s);
-                    ranges.push(RangeEdit{ start: s, end: e, repl: insts, seq });
+                    ranges.push(RangeEdit{ start: s, end: e, repl: insts, seq }); seq += 1;
                 }
-                WirEdit::ReplaceKind{ .. } => { /* already applied */ }
+                WirEdit::ReplaceKind{ .. } => {}
             }
         }
 
-        // Sort ranges by (start, seq) for determinism.
         ranges.sort_by(|a, b| match a.start.cmp(&b.start) {
-            Ordering::Less => Ordering::Less,
-            Ordering::Greater => Ordering::Greater,
-            Ordering::Equal => a.seq.cmp(&b.seq),
+            std::cmp::Ordering::Less => std::cmp::Ordering::Less,
+            std::cmp::Ordering::Greater => std::cmp::Ordering::Greater,
+            std::cmp::Ordering::Equal => a.seq.cmp(&b.seq),
         });
 
-        // Single-pass rebuild.
         let total_inserts: usize =
             before_map.iter().map(|v| v.len()).sum::<usize>()
           + after_map.iter().map(|v| v.len()).sum::<usize>()
           + ranges.iter().map(|r| r.repl.len()).sum::<usize>();
-        let mut out: Vec<InstId> = Vec::with_capacity(old_len + total_inserts);
 
+        let mut out: SmallVec<[InstId; 32]> = SmallVec::with_capacity(old_len + total_inserts);
+
+        // Rebuild.
         let mut i_old = 0usize;
         let mut r_ix = 0usize;
-
         while i_old < old_len {
-            // Before at this anchor
-            if !before_map[i_old].is_empty() {
-                out.extend_from_slice(&before_map[i_old]);
-            }
+            if !before_map[i_old].is_empty() { out.extend_from_slice(&before_map[i_old]); }
 
-            // Apply any range edits that start here, in queued order.
             let mut applied_range = false;
             while r_ix < ranges.len() && ranges[r_ix].start == i_old {
                 let r = &ranges[r_ix];
                 if !r.repl.is_empty() { out.extend_from_slice(&r.repl); }
-                i_old = r.end; // skip replaced/erased region
+                i_old = r.end;
                 r_ix += 1;
                 applied_range = true;
-                // Allow multiple edits with same start; continue to check next.
             }
-            if applied_range {
-                // We jumped `i_old`; loop back without copying old element.
-                continue;
-            }
+            if applied_range { continue; }
 
-            // Copy the original instruction.
             out.push(old[i_old]);
-
-            // After at this element
-            if !after_map[i_old].is_empty() {
-                out.extend_from_slice(&after_map[i_old]);
-            }
-
+            if !after_map[i_old].is_empty() { out.extend_from_slice(&after_map[i_old]); }
             i_old += 1;
         }
+        if !before_map[old_len].is_empty() { out.extend_from_slice(&before_map[old_len]); }
 
-        // "before" at end appends.
-        if !before_map[old_len].is_empty() {
-            out.extend_from_slice(&before_map[old_len]);
+        // Commit and update positions for this block only.
+        let new_insts = out.into_vec();
+        for &id in &f.blocks[bix].insts { fs.pos_of_inst[id.0 as usize] = None; }
+        for (i, &id) in new_insts.iter().enumerate() {
+            fs.pos_of_inst[id.0 as usize] = Some((bix, i));
         }
-
-        // Commit new inst list.
-        f.blocks[block_ix].insts = out;
+        f.blocks[bix].insts = new_insts;
     }
 
-    /// Back-compat: apply all queued edits (old API).
-    /// Internally uses the optimized per-block single-pass rebuild.
-    #[inline]
-    pub fn apply(&mut self, f: &mut Function) {
-        self.apply_all(f)
+    // ---------- internal helpers ----------
+    #[inline] fn ensure_blocks(&mut self, n: usize) {
+        if self.by_block.len() < n {
+            self.by_block.resize_with(n, SmallVec::new);
+        }
     }
 
-    /// Apply all queued edits across all affected blocks.
-    pub fn apply_all(&mut self, f: &mut Function) {
-        if self.edits.is_empty() { return; }
-
-        // Apply ReplaceKind globally up-front.
-        let mut i = 0;
-        while i < self.edits.len() {
-            if let WirEdit::ReplaceKind { id, new_kind } = &self.edits[i] {
-                f.nodes[id.0 as usize].kind = new_kind.clone();
-                self.edits.swap_remove(i);
-            } else { i += 1; }
-        }
-        if self.edits.is_empty() { return; }
-
-        // Gather unique blocks.
-        let mut blocks: Vec<BlockId> = Vec::new();
-        for e in &self.edits {
-            match e {
-                WirEdit::InsertBefore{bb, ..}
-                | WirEdit::InsertAfter{bb, ..}
-                | WirEdit::Erase{bb, ..}
-                | WirEdit::SpliceRange{bb, ..} => {
-                    if !blocks.contains(bb) { blocks.push(*bb); }
+    /// Route all legacy compat edits into by_block using the current Function.
+    fn route_all_compat(&mut self, f: &Function) {
+        if self.compat.is_empty() { return; }
+        // Build BlockId -> index map once.
+        let mut ix_of: HashMap<BlockId, usize> = HashMap::with_capacity(f.blocks.len());
+        for (i, b) in f.blocks.iter().enumerate() { ix_of.insert(b.id, i); }
+        let drained: SmallVec<[CompatEdit; 32]> = self.compat.drain(..).collect();
+        for c in drained {
+            if let Some(&bix) = ix_of.get(&c.bb) {
+                self.ensure_blocks(bix + 1);
+                match c.kind {
+                    CompatKind::InsertBefore{ at, insts } => self.by_block[bix].push(WirEdit::InsertBefore{ at, insts }),
+                    CompatKind::InsertAfter{  at, insts } => self.by_block[bix].push(WirEdit::InsertAfter{  at, insts }),
+                    CompatKind::Erase{ at }               => self.by_block[bix].push(WirEdit::Erase{ at }),
+                    CompatKind::SpliceRange{ start, end, insts } =>
+                        self.by_block[bix].push(WirEdit::SpliceRange{ start, end, insts }),
                 }
-                WirEdit::ReplaceKind{..} => {}
+            } else {
+                debug_assert!(false, "Compat edit with invalid BlockId");
             }
         }
-        for bb in blocks {
-            self.apply_block(f, bb);
+    }
+
+    /// Route only compat edits for a specific block index.
+    fn route_compat_for_block(&mut self, f: &Function, bix: usize) {
+        if self.compat.is_empty() { return; }
+        let bb_id = f.blocks[bix].id;
+        // partition_drain manually (SmallVec has no retain_drain).
+        let mut i = 0;
+        while i < self.compat.len() {
+            if self.compat[i].bb == bb_id {
+                let c = self.compat.swap_remove(i);
+                self.ensure_blocks(bix + 1);
+                match c.kind {
+                    CompatKind::InsertBefore{ at, insts } => self.by_block[bix].push(WirEdit::InsertBefore{ at, insts }),
+                    CompatKind::InsertAfter{ at, insts }  => self.by_block[bix].push(WirEdit::InsertAfter{  at, insts }),
+                    CompatKind::Erase{ at }               => self.by_block[bix].push(WirEdit::Erase{ at }),
+                    CompatKind::SpliceRange{ start, end, insts } =>
+                        self.by_block[bix].push(WirEdit::SpliceRange{ start, end, insts }),
+                }
+            } else {
+                i += 1;
+            }
         }
     }
 }
 
-/// =======================================
-/// Optimization API
-/// =======================================
+// Tiny helper for has_any_for_block_ix compat probe.
+#[inline]
+fn c_bb_index_eq(q: &WirEditQueue, bix: usize) -> bool {
+    // Without Function we can't resolve; conservatively return false here.
+    // `has_any_for_block_ix` is used during a pass with a Function, so we don't rely on this path.
+    let _ = q; let _ = bix; false
+}
 
-/// Trait for node-local optimizations.
-/// Return:
-///  - `true`  => stop running further optimizations for this node (advance)
-///  - `false` => keep trying the remaining optimizations on this same node
+/// =======================================
+/// Function-local fast state (positions)
+/// =======================================
+struct FuncState {
+    /// InstId (index into nodes) → Some((block_ix, pos)) or None if not in any block.
+    pos_of_inst: Vec<Option<(usize, usize)>>,
+}
+
+impl FuncState {
+    fn new(func: &Function) -> Self {
+        let mut pos = vec![None; func.nodes.len()];
+        for (bix, bb) in func.blocks.iter().enumerate() {
+            for (i, &id) in bb.insts.iter().enumerate() {
+                pos[id.0 as usize] = Some((bix, i));
+            }
+        }
+        Self { pos_of_inst: pos }
+    }
+    #[inline] fn pos_of(&self, id: InstId) -> Option<(usize, usize)> {
+        self.pos_of_inst.get(id.0 as usize).and_then(|o| *o)
+    }
+}
+
+/// =======================================
+/// Optimization API (unchanged externally)
+/// =======================================
 pub trait OptimizationWIR {
     fn set_metadata_any(&mut self, _data: &dyn Any) {}
-
     fn optimize_node(&mut self, cur: &mut InstCursor, q: &mut WirEditQueue) -> bool;
-
-    /// Optional: override if you want to do a quick early-out based on opcode tag.
-    /// Default `None` runs the opt for all nodes.
+    /// Optional: prefilter by opcode tag (used in amortized bucketing).
     fn maybe_interesting(&self, _tag: Discriminant<Inst>) -> bool { true }
 }
 
-/// A pass wraps a set of optimizations and optional per-pass metadata broadcast.
+/// A pass holds optimizations, metadata, tag buckets, and a tiny cache.
 pub struct OptimizationPass {
-    pub optimizations: Vec<Box<dyn OptimizationWIR>>,
+    pub optimizations: SmallVec<[Box<dyn OptimizationWIR>; 8]>,
     pass_meta: Option<Box<dyn Any>>,
+    /// Cache: opcode tag → indices of optimizations that care about it.
+    by_tag: HashMap<Discriminant<Inst>, SmallVec<[usize; 8]>>,
 }
+
 impl OptimizationPass {
     pub fn new(optimizations: Vec<Box<dyn OptimizationWIR>>) -> Self {
-        Self { optimizations, pass_meta: None }
+        Self {
+            optimizations: SmallVec::from_vec(optimizations),
+            pass_meta: None,
+            by_tag: HashMap::new(),
+        }
     }
 
-    /// Broadcast pass-level metadata to every optimization.
-    /// `meta` is stored so that the reference we hand out stays valid.
     pub fn initialize(&mut self, meta: impl Any) {
         self.pass_meta = Some(Box::new(meta));
         let meta_ref: &dyn Any = self.pass_meta.as_deref().unwrap();
-        for o in &mut self.optimizations {
-            o.set_metadata_any(meta_ref);
-        }
+        for o in &mut self.optimizations { o.set_metadata_any(meta_ref); }
+        self.by_tag.clear();
     }
 
-    /// Run across all blocks and instructions with local fixups.
-    /// `recheck_window=1..=3` is typically enough.
+    /// Return a *cloned* tiny list to avoid aliasing/borrow issues; cache the original.
+    #[inline]
+    fn interested_for(&mut self, tag: Discriminant<Inst>) -> SmallVec<[usize; 8]> {
+        if let Some(v) = self.by_tag.get(&tag) { return v.clone(); }
+        let mut v: SmallVec<[usize; 8]> = SmallVec::new();
+        for (i, opt) in self.optimizations.iter().enumerate() {
+            if opt.maybe_interesting(tag) { v.push(i); }
+        }
+        self.by_tag.insert(tag, v.clone());
+        v
+    }
+
+    /// Worklist, per-block; only revisit affected instructions.
     pub fn pass_optimizations(&mut self, func: &mut Function, recheck_window: usize) {
-        const EDIT_APPLY_THRESHOLD: usize = 16;
-
-        // Visit each block by index to keep order stable even if we edit other blocks.
+        // Rebuild func-local state once per pass.
+        let mut fs = FuncState::new(func);
         let mut q = WirEditQueue::new();
-        for b_ix in 0..func.blocks.len() {
-            let bb = func.blocks[b_ix].id;
 
-            // Manual while-loop to allow local fixups.
-            let mut i = 0usize;
-            loop {
-                let len = func.blocks[b_ix].insts.len();
-                if i >= len { break; }
+        // ticketed "seen" bitmap to avoid requeue storms; one per function.
+        let mut seen_ticket: Vec<u32> = vec![0; func.nodes.len()];
+        let mut current_ticket: u32 = 1;
 
-                // Build a cursor at (bb, i).
-                let mut cur = InstCursor::new(func, bb, i);
+        // Process per block.
+        for bix in 0..func.blocks.len() {
+            // Fresh ticket per block run.
+            current_ticket = current_ticket.wrapping_add(1);
+            if current_ticket == 0 { current_ticket = 1; seen_ticket.fill(0); }
+
+            // Seed worklist with a snapshot of ids.
+            let seed = func.blocks[bix].insts.clone();
+            let mut wl: VecDeque<InstId> = VecDeque::with_capacity(seed.len());
+            for id in seed {
+                wl.push_back(id);
+                seen_ticket[id.0 as usize] = current_ticket;
+            }
+
+            // Pop/process.
+            while let Some(id) = wl.pop_front() {
+                let Some((cur_bix, mut pos)) = fs.pos_of(id) else { continue }; // deleted/moved
+                if cur_bix != bix { continue; } // moved to another block
+
+                let blen = func.blocks[bix].insts.len();
+                if blen == 0 || pos >= blen {
+                    continue; // id deleted/moved; skip
+                }
+                let mut cur = InstCursor::new_ix(func, bix, pos);
                 let tag = cur.cur_tag();
 
-                for opt in self.optimizations.iter_mut() {
-                    if !opt.maybe_interesting(tag) { continue; }
-                    if opt.optimize_node(&mut cur, &mut q) {
-                        break;
+                // Run only interested opts.
+                let interested = self.interested_for(tag);
+                for ix in interested {
+                    if self.optimizations[ix].optimize_node(&mut cur, &mut q) { break; }
+                }
+
+                // If edits for this block accumulated, apply and requeue local window.
+                if q.has_any_for_block_ix(bix) {
+                    q.apply_block(func, &mut fs, bix);
+
+                    // Update pos of current id post-rebuild if it still exists here.
+                    if let Some((nbix, npos)) = fs.pos_of(id) {
+                        if nbix == bix { pos = npos; } else { continue; }
+                    } else {
+                        // Deleted: still requeue around former pos (best effort)
+                    }
+
+                    // Window [pos - recheck_window, pos + recheck_window]
+                    let len = func.blocks[bix].insts.len();
+                    if len == 0 { continue; }
+                    let start = pos.saturating_sub(recheck_window);
+                    let end   = (pos + recheck_window + 1).min(len);
+                    for i in start..end {
+                        let nid = func.blocks[bix].insts[i];
+                        if seen_ticket[nid.0 as usize] != current_ticket {
+                            seen_ticket[nid.0 as usize] = current_ticket;
+                            wl.push_back(nid);
+                        }
                     }
                 }
+            }
 
-                if q.has_any_for_block(bb) && q.len_for_block(bb) >= EDIT_APPLY_THRESHOLD {
-                    // Apply accumulated edits for this block; then recheck a small window around `i`.
-                    q.apply_block(func, bb);
-                    let new_len = func.blocks[b_ix].insts.len();
-                    if new_len == 0 { break; }
-                    i = i.saturating_sub(recheck_window).min(new_len - 1);
-                } else {
-                    i += 1;
+            // Safety net: flush anything routed to other blocks (rare).
+            if !q.is_empty() {
+                q.route_all_compat(func);
+                for obix in 0..func.blocks.len() {
+                    if q.has_any_for_block_ix(obix) {
+                        q.apply_block(func, &mut fs, obix);
+                    }
                 }
             }
-
-            // Flush tail edits for this block (if any), then recheck the tail window once.
-            if q.has_any_for_block(bb) {
-                q.apply_block(func, bb);
-                // A final local recheck is optional; we skip to keep passes linear.
-            }
-        }
-
-        // Safety net: if anything else accumulated (other blocks), flush.
-        if !q.is_empty() {
-            q.apply_all(func);
         }
     }
 }
 
 /// =======================================
-/// Optimizer façade
+/// Optimizer façade (unchanged externally)
 /// =======================================
-
 pub struct Optimize {
-    passes: Vec<OptimizationPass>,
+    passes: SmallVec<[OptimizationPass; 4]>,
 }
-impl Default for Optimize { fn default() -> Self { Self { passes: Vec::new() } } }
+impl Default for Optimize { fn default() -> Self { Self { passes: SmallVec::new() } } }
 impl Optimize {
     pub fn new() -> Self { Self::default() }
     pub fn with_pass(mut self, pass: OptimizationPass) -> Self { self.passes.push(pass); self }
@@ -476,160 +604,12 @@ impl Optimize {
 }
 
 /// =======================================
-/// Dominator utilities (optional)
+/// Minimal helpers to allocate new nodes/values
 /// =======================================
-
-/// Get successor blocks from a block's terminator.
-pub fn block_succs(func: &Function, b: BlockId) -> Vec<BlockId> {
-    let blk = func.blocks.iter().find(|bb| bb.id == b).unwrap();
-    let last_inst = match blk.insts.last() {
-        Some(id) => &func.nodes[id.0 as usize].kind,
-        None => return vec![],
-    };
-    use Inst::*;
-    match last_inst {
-        // explicit control
-        Jump(tgt, _)                      => vec![*tgt],
-        Branch { then_b, else_b, .. }     => vec![*then_b, *else_b],
-        Switch { default_b, table, .. }   => {
-            let mut v = Vec::with_capacity(1 + table.len());
-            v.push(*default_b);
-            for (_, bb) in table { v.push(*bb); }
-            v
-        }
-        Return(_) | Throw(_)              => vec![],
-        _                                 => vec![], // no fallthrough in this WIR
-    }
-}
-
-/// Compute immediate dominators using a simple iterative algorithm.
-/// Returns `idom[i]` as an `Option<BlockId>` aligned with `func.blocks` order.
-/// `idom[entry_index] = None`.
-pub fn compute_idoms(func: &Function, entry: BlockId) -> Vec<Option<BlockId>> {
-    let n = func.blocks.len();
-    assert!(n > 0, "function has no blocks");
-
-    // Map BlockId <-> index in func.blocks
-    use std::collections::HashMap;
-    let mut index_of: HashMap<BlockId, usize> = HashMap::new();
-    for (i, b) in func.blocks.iter().enumerate() { index_of.insert(b.id, i); }
-
-    // Build predecessors (by indices)
-    let mut preds: Vec<Vec<usize>> = vec![vec![]; n];
-    for (i, b) in func.blocks.iter().enumerate() {
-        for s in block_succs(func, b.id) {
-            let si = *index_of.get(&s).expect("succ not in function blocks");
-            preds[si].push(i);
-        }
-    }
-
-    let entry_i = *index_of.get(&entry).expect("invalid entry id");
-    let mut idom_idx: Vec<Option<usize>> = vec![None; n];
-    idom_idx[entry_i] = None;
-
-    // Iterative dataflow for idoms.
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for b in 0..n {
-            if b == entry_i { continue; }
-            // choose a predecessor with a defined idom (or entry)
-            let mut new_idom: Option<usize> = None;
-            for &p in &preds[b] {
-                if p == b { continue; }
-                if idom_idx[p].is_some() || p == entry_i { new_idom = Some(p); break; }
-            }
-            if new_idom.is_none() { continue; }
-            let mut cand = new_idom.unwrap();
-            for &p in &preds[b] {
-                if p == b { continue; }
-                if idom_idx[p].is_some() || p == entry_i {
-                    cand = intersect(&idom_idx, cand, p, entry_i);
-                }
-            }
-            if idom_idx[b] != Some(cand) { idom_idx[b] = Some(cand); changed = true; }
-        }
-    }
-
-    // Map back to BlockIds aligned with func.blocks order.
-    let by_index: Vec<BlockId> = func.blocks.iter().map(|b| b.id).collect();
-    idom_idx.into_iter().map(|o| o.map(|i| by_index[i])).collect()
-}
-
-fn intersect(idom: &Vec<Option<usize>>, mut a: usize, mut b: usize, entry: usize) -> usize {
-    // Compute depths lazily and walk up the deeper node until they meet.
-    let mut depth = |mut x: usize| { let mut d = 0; while x != entry { x = idom[x].unwrap_or(entry); d += 1; } d };
-    let mut da = depth(a);
-    let mut db = depth(b);
-    while a != b {
-        while da > db { a = idom[a].unwrap_or(entry); da -= 1; }
-        while db > da { b = idom[b].unwrap_or(entry); db -= 1; }
-        if a != b {
-            a = idom[a].unwrap_or(entry);
-            b = idom[b].unwrap_or(entry);
-            if da > 0 { da -= 1; }
-            if db > 0 { db -= 1; }
-        }
-    }
-    a
-}
-
-/// Build dom-children adjacency aligned with `func.blocks` order.
-/// `children[i]` contains BlockIds of nodes immediately dominated by `func.blocks[i].id`.
-pub fn build_dom_tree(func: &Function, idom: &[Option<BlockId>]) -> Vec<Vec<BlockId>> {
-    use std::collections::HashMap;
-    let mut index_of: HashMap<BlockId, usize> = HashMap::new();
-    for (i, b) in func.blocks.iter().enumerate() { index_of.insert(b.id, i); }
-
-    let mut children: Vec<Vec<BlockId>> = vec![Vec::new(); func.blocks.len()];
-    for (i, parent) in idom.iter().enumerate() {
-        if let Some(p) = parent {
-            let pi = index_of[p];
-            children[pi].push(func.blocks[i].id);
-        }
-    }
-    children
-}
-
-/// Convenience: compute idoms and walk in dom-preorder, calling `visit(BlockId)`.
-pub fn dom_preorder_walk_func(func: &Function, entry: BlockId, mut visit: impl FnMut(BlockId)) {
-    use std::collections::HashMap;
-    let idom = compute_idoms(func, entry);
-    let children = build_dom_tree(func, &idom);
-
-    let mut idx_of: HashMap<BlockId, usize> = HashMap::new();
-    for (i, b) in func.blocks.iter().enumerate() { idx_of.insert(b.id, i); }
-
-    fn dfs(visit: &mut impl FnMut(BlockId),
-           kids: &Vec<Vec<BlockId>>,
-           idx_of: &std::collections::HashMap<BlockId, usize>,
-           at: BlockId) {
-        visit(at);
-        let i = idx_of[&at];
-        for &c in &kids[i] { dfs(visit, kids, idx_of, c); }
-    }
-
-    dfs(&mut visit, &children, &idx_of, entry);
-}
-
-/// =======================================
-/// Minimal helpers to allocate new instructions (optional)
-/// =======================================
-
-/// Helper to allocate new nodes/values in a `Function`. Use it when you need to
-/// create instructions to later insert via `WirEditQueue::insert_*`/`splice_range`.
-pub struct InstFactory<'f> {
-    func: &'f mut Function,
-}
+pub struct InstFactory<'f> { func: &'f mut Function }
 impl<'f> InstFactory<'f> {
     pub fn new(func: &'f mut Function) -> Self { Self { func } }
 
-    /// Append a new node + result values to `func.nodes/values`, returning its InstId and result ValueIds.
-    /// You can then queue its InstId for insertion via `WirEditQueue`.
-    ///
-    /// NOTE:
-    ///  - This does **not** auto-thread effect tokens; pass appropriate effect_in/out if relevant.
-    ///  - `result_tys` is per-result; `node_ty` mirrors your Node.ty convenience field.
     pub fn create(
         &mut self,
         kind: Inst,
@@ -639,17 +619,18 @@ impl<'f> InstFactory<'f> {
         effect_out: Option<ValueId>,
     ) -> (InstId, Vec<ValueId>) {
         let id = InstId(self.func.nodes.len() as u32);
-        let mut results = Vec::with_capacity(result_tys.len());
+        let mut results: SmallVec<[ValueId; 4]> = SmallVec::with_capacity(result_tys.len());
         for _ in 0..result_tys.len() {
             results.push(ValueId(self.func.values.len() as u32 + results.len() as u32));
         }
+        let results_vec = results.clone().into_vec();
         self.func.nodes.push(crate::wir::Node {
             id,
             kind,
             ty: node_ty.clone(),
             effect_in,
             effect_out,
-            results: results.clone(),
+            results: results_vec.clone(),
         });
         self.func.values.reserve(result_tys.len());
         for (i, rty) in result_tys.iter().enumerate() {
@@ -659,6 +640,35 @@ impl<'f> InstFactory<'f> {
                 def: ValueDef::InstResult(id, i as u8),
             });
         }
-        (id, results)
+        (id, results_vec)
+    }
+}
+
+/// =======================================
+/// Convenience shims for opts (IX-based API)
+/// =======================================
+pub trait EditQueueExt {
+    fn insert_before_cur(&mut self, cur: &InstCursor, insts: impl Into<SmallVec<[InstId; 4]>>);
+    fn insert_after_cur (&mut self, cur: &InstCursor, insts: impl Into<SmallVec<[InstId; 4]>>);
+    fn erase_cur        (&mut self, cur: &InstCursor);
+    fn replace_cur_kind (&mut self, cur: &mut InstCursor, new_kind: Inst);
+    fn splice_cur_range (&mut self, cur: &InstCursor, start: usize, end: usize, insts: impl Into<SmallVec<[InstId; 4]>>);
+}
+
+impl EditQueueExt for WirEditQueue {
+    #[inline] fn insert_before_cur(&mut self, cur: &InstCursor, insts: impl Into<SmallVec<[InstId; 4]>>) {
+        self.insert_before_ix(cur.block_index(), cur.pos(), insts)
+    }
+    #[inline] fn insert_after_cur (&mut self, cur: &InstCursor, insts: impl Into<SmallVec<[InstId; 4]>>) {
+        self.insert_after_ix(cur.block_index(), cur.pos(), insts)
+    }
+    #[inline] fn erase_cur        (&mut self, cur: &InstCursor) {
+        self.erase_ix(cur.block_index(), cur.pos())
+    }
+    #[inline] fn replace_cur_kind (&mut self, cur: &mut InstCursor, new_kind: Inst) {
+        cur.with_cur(|n| { let _old = replace(&mut n.kind, new_kind); });
+    }
+    #[inline] fn splice_cur_range (&mut self, cur: &InstCursor, start: usize, end: usize, insts: impl Into<SmallVec<[InstId; 4]>>) {
+        self.splice_range_ix(cur.block_index(), start, end, insts)
     }
 }

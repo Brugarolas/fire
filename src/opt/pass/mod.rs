@@ -7,7 +7,6 @@ pub mod tail_call;
 pub mod dead_code_elim;
 
 pub mod branch_fold;
-pub mod guards;
 
 pub mod licm;
 pub mod sccp;
