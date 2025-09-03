@@ -1243,15 +1243,22 @@ impl<'m> Lowerer<'m> {
     }
 
     fn lower_fn(&mut self, fdecl: &FuncDecl) -> LResult<FuncId> {
-        // Params: i32 for demo; return: i32
-        let param_tys = fdecl.params.iter().map(|_| Type::Int32).collect::<Vec<_>>();
-        let ret_tys   = vec![Type::Int32];
+        let lam_caps_for_this = self
+            .lam_captures
+            .get(&fdecl.name)
+            .cloned()
+            .unwrap_or_default();
+
+        // Build param types: default i32, but "__env" (if present) is an Array (env).
+        let mut param_tys: Vec<Type> = fdecl.params.iter().map(|_| Type::Int32).collect();
+        if matches!(fdecl.params.first().map(|s| s.as_str()), Some("__env")) {
+            param_tys[0] = Type::Array(Box::new(None));
+        }
 
         // Snapshot function table for free helpers (no &mut self borrow during build)
         let funcs_snapshot = self.funcs.clone();
-
         let func_name = fdecl.name.clone();
-        let lam_caps_for_this = self.lam_captures.get(&func_name).cloned().unwrap_or_default();
+        let ret_tys = vec![Type::Int32];
 
         // Build function
         let mut func = {
@@ -1269,10 +1276,15 @@ impl<'m> Lowerer<'m> {
                 for (i, cap) in lam_caps_for_this.iter().enumerate() {
                     let idx = b.const_i32(i as i32);
                     let (_nid, boxv) = b.push_node(
-                        Inst::LoadElem { arr: env_arr, idx },
-                        None, // it’s a box (array), element type is unknown Top/None here
+                        Inst::CallNative {
+                            name: "wir_array_get".into(),
+                            args: vec![env_arr, idx],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        None,
                         1,
-                        false,
+                        true,
                     );
                     // Bind the captured name to its box, and mark it boxed.
                     locals.insert(cap.clone(), boxv[0]);
@@ -1987,7 +1999,7 @@ fn lower_expr_free<'m>(
     next_field: &mut u32,
     e: &Expr,
     funcs: &HashMap<String, FuncId>,
-    lam_caps: &HashMap<String, Vec<String>>,   // <-- new
+    lam_caps: &HashMap<String, Vec<String>>,
 ) -> LResult<ValueId> {
     use BinOp::*;
 
@@ -2541,13 +2553,13 @@ fn lower_expr_free<'m>(
 
         Expr::ArrayLit(elems) => {
             let len_v = b.const_i32(elems.len() as i32);
-            let (_nid, arr_res) = b.push_node(
-                Inst::AllocArray { elem_hint: Some(Type::Int32), len: len_v },
-                Some(Type::Array(Box::new(Some(Type::Int32)))),
+            let (_nid, box_res) = b.push_node(
+                Inst::CallNative { name: "wir_array_new".into(), args: vec![len_v], pure: false, can_throw: false },
+                Some(Type::Array(Box::new(None))),
                 1,
-                true,
+                true
             );
-            let arr = arr_res[0];
+            let arr = box_res[0];
 
             for (i, el) in elems.iter().enumerate() {
                 let v   = lower_expr_free(b, locals, fields, next_field, el, funcs, lam_caps)?;
@@ -2574,19 +2586,15 @@ fn lower_expr_free<'m>(
                     let cur = *locals.get(cap).ok_or_else(|| LowerError::UnknownVar(cap.clone()))?;
                     let one = b.const_i32(1);
                     let (_nid, box_res) = b.push_node(
-                        Inst::AllocArray { elem_hint: Some(Type::Int32), len: one },
-                        Some(Type::Array(Box::new(Some(Type::Int32)))),
-                        1,
-                        true,
-                    );
+                        Inst::CallNative { name: "wir_array_new".into(), args: vec![one], pure: false, can_throw: false },
+                        Some(Type::Array(Box::new(None))),
+                        1, true);
                     let box_arr = box_res[0];
                     let zero = b.const_i32(0);
                     let _ = b.push_node(
                         Inst::CallNative { name: "wir_array_set".into(), args: vec![box_arr, zero, cur], pure: false, can_throw: false },
                         Some(Type::Int32),
-                        1,
-                        true,
-                    );
+                        1, true);
                     locals.insert(cap.clone(), box_arr);
                     locals.insert(boxed_key(cap), box_arr);
                 }
@@ -2595,22 +2603,17 @@ fn lower_expr_free<'m>(
             // Build env array out of *boxes* (so inner lambda can mutate them)
             let len = b.const_i32(caps.len() as i32);
             let (_nid, env_res) = b.push_node(
-                Inst::AllocArray { elem_hint: Some(Type::Array(Box::new(None))), len },
+                Inst::CallNative { name: "wir_array_new".into(), args: vec![len], pure: false, can_throw: false },
                 Some(Type::Array(Box::new(None))),
-                1,
-                true,
-            );
+                1, true);
             let env = env_res[0];
-
             for (i, cap) in caps.iter().enumerate() {
                 let idx = b.const_i32(i as i32);
                 let box_arr = *locals.get(cap).expect("boxed local present");
                 let _ = b.push_node(
-                    Inst::StoreElem { arr: env, idx, val: box_arr },
-                    Some(Type::Top),
-                    1,
-                    true,
-                );
+                    Inst::CallNative { name: "wir_array_set".into(), args: vec![env, idx, box_arr], pure: false, can_throw: false },
+                    Some(Type::Int32),
+                    1, true);
             }
 
             let (_nid, clos) = b.push_node(
@@ -2860,7 +2863,6 @@ fn intern_field_local(
     fid
 }
 
-// Put this at module scope in front.rs (or wherever your other IR helpers live)
 fn build_bool_or(b: &mut Builder, lhs: ValueId, rhs: ValueId) -> ValueId {
     // if lhs then true else rhs
     let then_b = b.block();

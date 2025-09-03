@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use core::{ptr};
 use std::sync::atomic::AtomicUsize;
 use std::cell::Cell;
+use likely_stable::{likely, unlikely};
 
 use mmtk::{
     util::{
@@ -130,15 +131,14 @@ fn size_of_object_from_tag(base: *const u8) -> usize {
 
 #[inline(always)]
 fn emit_shadow_roots_to_factory<T: RootsWorkFactory<SlotItem>>(factory: &mut T) {
-    // Batch edges to reduce packets.
     let mut edges: SmallVec<[SlotItem; 64]> = SmallVec::new();
+    edges.reserve_exact(64);
 
     ShadowStack::with_roots(|slot: *mut i64| {
-        let edge = SlotItem(Address::from_ptr(slot.cast::<u8>()));
-        edges.push(edge);
-        if edges.len() >= 64 {
-            factory.create_process_roots_work(edges.to_vec());
-            edges.clear();
+        edges.push(SlotItem(Address::from_ptr(slot.cast::<u8>())));
+        if edges.len() == 64 {
+            factory.create_process_roots_work(edges.to_vec()); // unavoidable copy for work packet
+            edges.clear(); // keeps inline buffer
         }
     });
 
@@ -158,14 +158,17 @@ impl From<Address> for SlotItem { fn from(a: Address) -> Self { SlotItem(a) } }
 impl Slot for SlotItem {
     #[inline(always)]
     fn load(&self) -> Option<ObjectReference> {
-        let p = self.0.to_ptr::<ValueRepr>();
-        let v = unsafe { ptr::read(p) };
-        if is_ptr(v) && v != NULL {
-            ObjectReference::from_raw_address(Address::from_ptr(v as *mut u8))
-        } else {
-            None
+        let v = unsafe { ptr::read(self.0.to_ptr::<ValueRepr>()) };
+
+        // assume: lower tag bit == 0 ⇒ pointer, else immediate
+        if likely(is_ptr(v)) {
+            // NULL check can be folded into is_ptr if you reserve a nonzero null-tag, otherwise keep
+            if v != NULL {
+                return ObjectReference::from_raw_address(Address::from_ptr(v as *mut u8));
+            }
         }
-    }
+        None
+}
 
     #[inline(always)]
     fn store(&self, obj: ObjectReference) {

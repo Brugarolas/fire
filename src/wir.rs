@@ -1,5 +1,5 @@
 // wir.rs
-//! WIR — Wren IR (mid–high level, SSA, speculation-friendly)
+//! WIR — Wyvern IR (mid–high level, SSA, speculation-friendly)
 //!
 //! This is a single-file “real code” skeleton you can drop into a new Rust
 //! crate (e.g., `lib.rs`). It defines the core IR data structures, types,
