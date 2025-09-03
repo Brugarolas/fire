@@ -27,19 +27,15 @@ impl OptimizationWIR for MemoizeRecursion {
 }
 
 fn run_on_function(func: &mut Function) {
-    // 1) single parameter?
-    if func.sig.params.len() != 1 { return; }
+    let arity = func.sig.params.len();
+    if !(1..=4).contains(&arity) { return; }
+    if !func.sig.params.iter().all(is_primitive_ty) { return; }
 
-    // 2) primitive parameter?
-    if !is_primitive_ty(&func.sig.params[0]) { return; }
-
-    // 3 & 4) scan for only self-calls and no external state
     let self_id = func.id;
     let mut saw_self_call = false;
 
     for n in &func.nodes {
         match &n.kind {
-            // allow direct self calls; reject other direct calls
             Inst::CallDirect { callee, .. } => {
                 if *callee == self_id {
                     saw_self_call = true;
@@ -47,38 +43,25 @@ fn run_on_function(func: &mut Function) {
                     return; // calls someone else
                 }
             }
-            // disallow any other call shape
-            Inst::CallIC { .. }
-            | Inst::CallClosure { .. }
-            | Inst::CallNative { .. } => return,
+            // reject any non-direct call shape
+            Inst::CallIC { .. } | Inst::CallClosure { .. } | Inst::CallNative { .. } => return,
 
-            // allowed pure compute/control:
-            Inst::Const(_)
-            | Inst::Mov(_)
-            | Inst::IntBin { .. }
-            | Inst::F64Bin { .. }
-            | Inst::CmpInt { .. }
-            | Inst::CmpF64 { .. }
-            | Inst::Phi(_)
-            | Inst::Jump(_, _)
-            | Inst::Branch { .. }
-            | Inst::Switch { .. }
-            | Inst::Return(_)
-            | Inst::EffectEntry
-            | Inst::Safepoint
-            | Inst::OSRPoint => { /* ok */ }
+            // allowed pure compute/control/markers:
+            Inst::Const(_) | Inst::Mov(_)
+            | Inst::IntBin { .. } | Inst::F64Bin { .. }
+            | Inst::CmpInt { .. } | Inst::CmpF64 { .. }
+            | Inst::Phi(_) | Inst::Jump(_, _) | Inst::Branch { .. } | Inst::Switch { .. }
+            | Inst::Return(_) | Inst::EffectEntry | Inst::Safepoint | Inst::OSRPoint => {}
 
-            // everything else is treated as external state / effects
+            // everything else = effects / external state
             _ => return,
         }
     }
-
     if !saw_self_call { return; }
 
-    // Rewrite direct self-calls to memoized
     for n in &mut func.nodes {
         if let Inst::CallDirect { callee, args, .. } = &n.kind {
-            if *callee == self_id && args.len() == 1 {
+            if *callee == self_id && (1..=4).contains(&args.len()) {
                 n.kind = Inst::CallDirectMemoized { callee: *callee, args: args.clone() };
             }
         }
@@ -88,3 +71,4 @@ fn run_on_function(func: &mut Function) {
 fn is_primitive_ty(t: &Type) -> bool {
     matches!(t, Type::Int32 | Type::F64 | Type::Bool | Type::Null | Type::Num)
 }
+

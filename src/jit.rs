@@ -82,6 +82,12 @@ impl Default for JIT {
 
             fn wir_memo_get(fid: i64, key: i64, out_ptr: *mut i64) -> i64;
             fn wir_memo_put(fid: i64, key: i64, val: i64) -> i64;
+            fn wir_memo_get2(fid: i64, key: i64, out_ptr: *mut i64) -> i64;
+            fn wir_memo_put2(fid: i64, key: i64, val: i64) -> i64;
+            fn wir_memo_get3(fid: i64, key: i64, out_ptr: *mut i64) -> i64;
+            fn wir_memo_put3(fid: i64, key: i64, val: i64) -> i64;
+            fn wir_memo_get4(fid: i64, key: i64, out_ptr: *mut i64) -> i64;
+            fn wir_memo_put4(fid: i64, key: i64, val: i64) -> i64;
         }
 
         // --- declare the object natives so we can take typed fn pointers ---
@@ -191,6 +197,12 @@ impl Default for JIT {
 
             jb.symbol("wir_memo_get", wir_memo_get as *const extern "C" fn(i64, i64, *mut i64) -> i64 as *const u8);
             jb.symbol("wir_memo_put", wir_memo_put as *const extern "C" fn(i64, i64, i64) -> i64 as *const u8);
+            jb.symbol("wir_memo_get2", wir_memo_get as *const extern "C" fn(i64, i64, *mut i64) -> i64 as *const u8);
+            jb.symbol("wir_memo_put2", wir_memo_put as *const extern "C" fn(i64, i64, i64) -> i64 as *const u8);
+            jb.symbol("wir_memo_get3", wir_memo_get as *const extern "C" fn(i64, i64, *mut i64) -> i64 as *const u8);
+            jb.symbol("wir_memo_put3", wir_memo_put as *const extern "C" fn(i64, i64, i64) -> i64 as *const u8);
+            jb.symbol("wir_memo_get4", wir_memo_get as *const extern "C" fn(i64, i64, *mut i64) -> i64 as *const u8);
+            jb.symbol("wir_memo_put4", wir_memo_put as *const extern "C" fn(i64, i64, i64) -> i64 as *const u8);
         }
 
         let module = cranelift_jit::JITModule::new(jb);
@@ -972,10 +984,10 @@ impl JIT {
                             use cranelift::prelude::{AbiParam, types, IntCC};
                             use cranelift::codegen::ir::{StackSlotData, StackSlotKind};
 
-                            let ptr_ty = self.ptr_ty();
+                            let arity = args.len();
 
                             // We only memoize 1-arg calls (design choice). If not 1, just fall back to a plain call.
-                            if args.len() != 1 {
+                            if arity > 4 {
                                 // === same lowering as CallDirect ===
                                 let mut sig = self.module.make_signature();
                                 sig.call_conv = self.module.isa().default_call_conv();
@@ -1011,69 +1023,102 @@ impl JIT {
                                 continue;
                             }
 
-                            // ----- Memoized 1-arg path -----
-                            let key = vmap.get_or_emit(args[0], &mut fb, args_base, fun_ir);
-                            let fid = fb.ins().iconst(types::I64, callee.0 as i64);
+                            let ptr_ty      = self.ptr_ty();
+                            let ptr_ty_local= ptr_ty; // avoid borrowing `self` inside closures
 
-                            // out-slot to receive cached value
+                            // materialize args as i64 values
+                            let mut keys: Vec<Value> = Vec::with_capacity(arity);
+                            for &a in args {
+                                keys.push(vmap.get_or_emit(a, &mut fb, args_base, fun_ir));
+                            }
+
+                            // out slot for cached value
                             let out_slot = fb.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 0));
-                            let out_ptr  = fb.ins().stack_addr(self.ptr_ty(), out_slot, 0);
+                            let out_ptr  = fb.ins().stack_addr(ptr_ty, out_slot, 0);
 
-                            // hoist the pointer type out so the closure doesn't touch `self`
-                            let ptr_ty_local = self.ptr_ty();
+                            // call wir_memo_getN
+                            let fid_i64 = fb.ins().iconst(types::I64, callee.0 as i64);
 
-                            // call wir_memo_get(fid, key, &out)
-                            let found = self.call_import(
-                                &mut fb,
-                                "wir_memo_get",
-                                |s| {
-                                    s.params.push(AbiParam::new(types::I64));      // fid
-                                    s.params.push(AbiParam::new(types::I64));      // key
-                                    s.params.push(AbiParam::new(ptr_ty_local));    // out*
-                                    s.returns.push(AbiParam::new(types::I64));     // 0/1
-                                },
-                                &[fid, key, out_ptr],
-                            )?;
+                            let found = match arity {
+                                1 => {
+                                    let args = [fid_i64, keys[0], out_ptr];
+                                    self.call_import(&mut fb, "wir_memo_get",  |s| {
+                                        s.params.push(AbiParam::new(types::I64));   // fid
+                                        s.params.push(AbiParam::new(types::I64));   // k0
+                                        s.params.push(AbiParam::new(ptr_ty_local)); // out*
+                                        s.returns.push(AbiParam::new(types::I64));  // 0/1
+                                    }, &args)?
+                                }
+                                2 => {
+                                    let args = [fid_i64, keys[0], keys[1], out_ptr];
+                                    self.call_import(&mut fb, "wir_memo_get2", |s| {
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.params.push(AbiParam::new(ptr_ty_local));
+                                        s.returns.push(AbiParam::new(types::I64));
+                                    }, &args)?
+                                }
+                                3 => {
+                                    let args = [fid_i64, keys[0], keys[1], keys[2], out_ptr];
+                                    self.call_import(&mut fb, "wir_memo_get3", |s| {
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.params.push(AbiParam::new(ptr_ty_local));
+                                        s.returns.push(AbiParam::new(types::I64));
+                                    }, &args)?
+                                }
+                                _ => {
+                                    let args = [fid_i64, keys[0], keys[1], keys[2], keys[3], out_ptr];
+                                    self.call_import(&mut fb, "wir_memo_get4", |s| {
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.params.push(AbiParam::new(ptr_ty_local));
+                                        s.returns.push(AbiParam::new(types::I64));
+                                    }, &args)?
+                                }
+                            };
 
-                            // Control-flow split: hit vs miss
+                            // split
+                            use cranelift::codegen::ir::instructions::BlockArg;
                             let bb_hit  = fb.create_block();
                             let bb_miss = fb.create_block();
                             let bb_join = fb.create_block();
-
-                            // Join block gets a single param: the call result
                             let res_phi = fb.append_block_param(bb_join, types::I64);
 
                             let zero = fb.ins().iconst(types::I64, 0);
                             let is_hit = fb.ins().icmp(IntCC::NotEqual, found, zero);
                             fb.ins().brif(is_hit, bb_hit, &[] as &[BlockArg], bb_miss, &[] as &[BlockArg]);
 
-                            // ---- HIT: load cached value, jump join
+                            // HIT: load cached, jump join
                             fb.switch_to_block(bb_hit);
                             let cached = fb.ins().load(types::I64, MemFlags::trusted(), out_ptr, 0);
                             let mut hit_args = vec![BlockArg::from(cached)];
                             fb.ins().jump(bb_join, &hit_args[..]);
 
-                            // ---- MISS: call callee, memo_put, jump join
+                            // MISS: normal CallDirect, then wir_memo_putN, jump join
                             fb.switch_to_block(bb_miss);
-                            // marshal argv of length 1
-                            let slot = fb.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 0));
-                            fb.ins().stack_store(key, slot, 0);
-                            let argv_ptr = fb.ins().stack_addr(ptr_ty, slot, 0);
-                            let argc     = fb.ins().iconst(types::I64, 1);
 
-                            // signature like CallDirect
+                            // marshal argv for the callee
+                            let size_bytes: u32 = (arity as u32) * 8;
+                            let argv_slot = fb.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size_bytes, 0));
+                            for (i, &kv) in keys.iter().enumerate() { fb.ins().stack_store(kv, argv_slot, (i as i32) * 8); }
+                            let argv_ptr = fb.ins().stack_addr(ptr_ty, argv_slot, 0);
+                            let argc     = fb.ins().iconst(types::I64, arity as i64);
+
+                            // import the callee symbol and call (same as your CallDirect path)
                             let mut sig = self.module.make_signature();
                             sig.call_conv = self.module.isa().default_call_conv();
                             sig.params.push(AbiParam::new(ptr_ty));
                             sig.params.push(AbiParam::new(types::I64));
                             sig.returns.push(AbiParam::new(types::I64));
-
                             let sym = format!("wir_f_{}", callee.0);
-                            let func_id = self
-                                .module
-                                .declare_function(&sym, Linkage::Import, &sig)
-                                .map_err(|e| e.to_string())?;
-
+                            let func_id = self.module.declare_function(&sym, Linkage::Import, &sig).map_err(|e| e.to_string())?;
                             let outs = self.call_funcref(
                                 &mut fb,
                                 func_id,
@@ -1086,23 +1131,58 @@ impl JIT {
                             )?;
                             let retv = outs[0];
 
-                            // wir_memo_put(fid, key, retv)
-                            let _ = self.call_import(
-                                &mut fb,
-                                "wir_memo_put",
-                                |s| {
-                                    s.params.push(AbiParam::new(types::I64)); // fid
-                                    s.params.push(AbiParam::new(types::I64)); // key
-                                    s.params.push(AbiParam::new(types::I64)); // val
-                                    s.returns.push(AbiParam::new(types::I64)); // 0
-                                },
-                                &[fid, key, retv],
-                            )?;
+                            // wir_memo_putN
+                            let fid_i64_put = fb.ins().iconst(types::I64, callee.0 as i64);
+
+                            match arity {
+                                1 => {
+                                    let args = [fid_i64_put, keys[0], retv];
+                                    let _ = self.call_import(&mut fb, "wir_memo_put",  |s| {
+                                        s.params.push(AbiParam::new(types::I64)); // fid
+                                        s.params.push(AbiParam::new(types::I64)); // k0
+                                        s.params.push(AbiParam::new(types::I64)); // val
+                                        s.returns.push(AbiParam::new(types::I64));
+                                    }, &args)?;
+                                }
+                                2 => {
+                                    let args = [fid_i64_put, keys[0], keys[1], retv];
+                                    let _ = self.call_import(&mut fb, "wir_memo_put2", |s| {
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.returns.push(AbiParam::new(types::I64));
+                                    }, &args)?;
+                                }
+                                3 => {
+                                    let args = [fid_i64_put, keys[0], keys[1], keys[2], retv];
+                                    let _ = self.call_import(&mut fb, "wir_memo_put3", |s| {
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.returns.push(AbiParam::new(types::I64));
+                                    }, &args)?;
+                                }
+                                _ => {
+                                    let args = [fid_i64_put, keys[0], keys[1], keys[2], keys[3], retv];
+                                    let _ = self.call_import(&mut fb, "wir_memo_put4", |s| {
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.returns.push(AbiParam::new(types::I64));
+                                    }, &args)?;
+                                }
+                            }
 
                             let mut miss_args = vec![BlockArg::from(retv)];
                             fb.ins().jump(bb_join, &miss_args[..]);
 
-                            // ---- JOIN: bind result
+                            // JOIN
                             fb.switch_to_block(bb_join);
                             if res_count >= 1 { vmap.bind(node.results[0], res_phi); }
                         }

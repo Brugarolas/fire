@@ -78,6 +78,7 @@ static MUTATOR_COUNT: AtomicUsize = AtomicUsize::new(0);
 struct MutatorRaw(*mut Mutator<NapalmVM>);
 unsafe impl Send for MutatorRaw {}
 unsafe impl Sync for MutatorRaw {}
+
 impl MutatorRaw {
     fn as_mut(&self) -> &'static mut Mutator<NapalmVM> {
         unsafe { &mut *self.0 }

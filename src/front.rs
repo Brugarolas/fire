@@ -2553,7 +2553,7 @@ fn lower_expr_free<'m>(
         }
 
         Expr::ArrayLit(elems) => {
-            // Allocate GC array
+            // Allocate array
             let len_v = b.const_i32(elems.len() as i32);
             let (_nid_new, new_res) = b.push_node(
                 Inst::CallNative {
@@ -2567,14 +2567,17 @@ fn lower_expr_free<'m>(
                 true,
             );
             let arr_v = new_res[0];
+            // Back-compat alias in case older code still uses `arr`
+            let arr = arr_v;
 
+            // Fill it
             for (i, el) in elems.iter().enumerate() {
                 let v   = lower_expr_free(b, locals, fields, next_field, el, funcs, lam_caps)?;
                 let idx = b.const_i32(i as i32);
                 let _ = b.push_node(
                     Inst::CallNative {
                         name: "wir_array_set".into(),
-                        args: vec![arr_v, idx, v],
+                        args: vec![arr, idx, v],
                         pure: false,
                         can_throw: false,
                     },
@@ -2584,7 +2587,7 @@ fn lower_expr_free<'m>(
                 );
             }
 
-            Ok(arr_v)
+            Ok(arr)
         }
 
         // Closure creation from hoisted lambda

@@ -65,7 +65,7 @@ fn main() {
 
     // 3.5) Optimize WIR
     let optimize = optimization_passes();
-    optimize.optimize_module(&mut module);
+    optimize.optimize_module(&mut module); // TODO Too Slow?
 
     // 4.1) Init GC and bind to this thread
     let _gc = gc::NapalmGc::new();

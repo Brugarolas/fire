@@ -12,10 +12,11 @@ use crate::opt::pass::value_numbering::GlobalValueNumbering;
 use crate::opt::pass::dead_code_elim::MegaDCE;
 use crate::opt::pass::com_subexpr_elim::CommonSubexprElim;
 use crate::opt::pass::recur_memo::MemoizeRecursion;
+use crate::opt::pass::tail_call::TailCallOpt;
 
 pub fn optimization_passes() -> Optimize {
     let early = OptimizationPass::new(vec![
-        Box::new(ConstFold),         // fold consts first
+        /* Box::new(ConstFold),         // fold consts first
         Box::new(PeepholeSimplify),  // then cheap canonical forms
         Box::new(CopyPropagation),   // finally, copy propagation
         Box::new(StrengthReduction), // after copy propagation to catch more patterns
@@ -23,13 +24,14 @@ pub fn optimization_passes() -> Optimize {
         Box::new(MegaDCE::default()), // after local rewrites to clean up dead code
 
         Box::new(BranchFold::default()), // cheap local rewrites first to expose CSE opportunities
-        Box::new(GuardElim::default()),  // guards before GVN so we can delete redundant guards that otherwise block CSE
+        Box::new(GuardElim::default()),  // guards before GVN so we can delete redundant guards that otherwise block CSE */
 
-        Box::new(Licm), // loop invariant code motion to hoist out of loops
-        Box::new(Sccp::default()), // sparse conditional constant propagation to simplify based on known values
-        Box::new(GlobalValueNumbering::default()), // global value numbering to eliminate redundant calculations
-        Box::new(MegaDCE::default()), // final DCE to clean up after all the other passes
+        // Box::new(Licm), // loop invariant code motion to hoist out of loops
+        // Box::new(Sccp::default()), // sparse conditional constant propagation to simplify based on known values
+        // Box::new(GlobalValueNumbering::default()), // global value numbering to eliminate redundant calculations
+        // Box::new(MegaDCE::default()), // final DCE to clean up after all the other passes
 
+        // Box::new(TailCallOpt::new()), // tail call optimization (self-recursive calls to jumps)
         Box::new(MemoizeRecursion::default()), // last, convert direct recursive calls to memoized calls (specific optimizations)
     ]);
 
