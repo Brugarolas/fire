@@ -153,6 +153,8 @@ print(add42(0));  // expect 42
 print(add42(100)); // expect 142
 
 print("===== Promises =====");
+print("(async)");
+
 // sync resolve
 var p = Promise(|resolve, reject| { resolve(42); });
 p.then(|v| print(v));        // expect: 42
@@ -163,6 +165,18 @@ q.catch(|e| print(e));       // expect: 7
 
 // chaining should keep returning the public object now:
 p.then(|v| print(v+1)).catch(|e| print(-1));    // expect: 43
+
+print("===== Deferreds =====");
+print("(async)");
+var d = Deferred();
+d.then(|x| { print(x); });
+
+setTimeout(| | { d.resolve(123); }, 0);
+
+// Rejection path
+var e = Deferred();
+e.catch(|r| { print(999 + r); });
+setTimeout(| | { e.reject(1); }, 0);
 
 print("===== Timers =====");
 setTimeout(fn () { print("Timer"); }, 500);

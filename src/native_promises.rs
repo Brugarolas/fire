@@ -147,3 +147,31 @@ pub extern "C" fn wir_promise_new(executor: i64) -> i64 {
         priv_p
     }
 }
+
+// ================= Deferreds ==================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_deferred_new() -> i64 {
+    // allocate the same BoxedPromise as Promise uses, but don't run an executor
+    let p = BoxedPromise {
+        hdr: ObjHeader { tag: 0, aux: 0 },
+        state: PState::Pending as i32,
+        value: 0,
+        on_fulfilled: Vec::new(),
+        on_rejected: Vec::new(),
+    };
+    Box::into_raw(Box::new(p)) as i64
+}
+
+// Return-the-same-pointer wrappers so you can chain: d.resolve(v).then(...)
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_deferred_resolve(priv_ptr: i64, val: i64) -> i64 {
+    wir_promise_resolve(priv_ptr, val);
+    priv_ptr
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_deferred_reject(priv_ptr: i64, reason: i64) -> i64 {
+    wir_promise_reject(priv_ptr, reason);
+    priv_ptr
+}

@@ -41,6 +41,7 @@ pub enum Tok {
     // Simple builtins
     #[token("Array")] ListBuiltin,
     #[token("Promise")] PromiseBuiltin,
+    #[token("Deferred")] DeferredBuiltin,
 
     // Identifiers & literals
     #[regex(r"[A-Za-z_][A-Za-z0-9_]*", |lex| lex.slice().to_string())]
@@ -713,6 +714,7 @@ impl<'src> Parser<'src> {
             Tok::Ident(s) => Ok(Expr::Ident(s)),
             Tok::ListBuiltin => Ok(Expr::Ident("Array".into())),
             Tok::PromiseBuiltin => Ok(Expr::Ident("Promise".into())),
+            Tok::DeferredBuiltin => Ok(Expr::Ident("Deferred".into())),
             Tok::LParen => {
                 let e = self.expr()?;
                 self.expect(Tok::RParen, "expected ')'")?;
@@ -2316,6 +2318,33 @@ fn lower_expr_free<'m>(
                     return Ok(res[0]);
                 }
 
+                if name == "resolve" {
+                    let p = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
+                    // default to null if no value was given
+                    let (_nid, nul) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
+                    let val = if args.len() >= 1 {
+                        lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?
+                    } else { nul[0] };
+                    let (_nid, res) = b.push_node(
+                        Inst::CallNative { name: "wir_deferred_resolve".into(), args: vec![p, val], pure: false, can_throw: false },
+                        None, 1, true,
+                    );
+                    return Ok(res[0]); // returns the same deferred for optional chaining
+                }
+                if name == "reject" {
+                    let p = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
+                    let (_nid, nul) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
+                    let reason = if args.len() >= 1 {
+                        lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?
+                    } else { nul[0] };
+                    let (_nid, res) = b.push_node(
+                        Inst::CallNative { name: "wir_deferred_reject".into(), args: vec![p, reason], pure: false, can_throw: false },
+                        None, 1, true,
+                    );
+                    return Ok(res[0]);
+                }
+
+
                 // 1) Array methods (existing)
                 if let Some(v) = lower_array_method_call(
                     b, locals, fields, next_field, recv, name, args, funcs, lam_caps
@@ -2420,6 +2449,7 @@ fn lower_expr_free<'m>(
                     );
                     return Ok(res[0]);
                 }
+
                 if name == "Promise" {
                     if args.len() != 1 { return Err(LowerError::NotLowerable("Promise() expects 1 arg")); }
 
@@ -2430,6 +2460,15 @@ fn lower_expr_free<'m>(
                     );
                     return Ok(res[0]);
                 }
+                if name == "Deferred" {
+                    if !args.is_empty() { return Err(LowerError::NotLowerable("Deferred() expects 0 args")); }
+                    let (_nid, res) = b.push_node(
+                        Inst::CallNative { name: "wir_deferred_new".into(), args: vec![], pure: false, can_throw: false },
+                        None, 1, true,
+                    );
+                    return Ok(res[0]);
+                }
+
                 if name == "print" {
                     if args.len() != 1 { return Err(LowerError::NotLowerable("print() expects 1 arg")); }
 
