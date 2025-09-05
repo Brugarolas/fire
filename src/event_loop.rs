@@ -10,6 +10,12 @@ use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicU64, Ordering};
 use ahash::AHashSet as HashSet;
 
+#[derive(Clone, Copy)]
+pub struct MicroTask {
+    pub fun: i64,
+    pub arg: i64,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TimerKind { Timeout, Interval }
 
@@ -33,7 +39,8 @@ struct Inner {
     heap: BinaryHeap<Reverse<Task>>,
     ready: VecDeque<Task>,
     active: usize,
-    canceled: HashSet<u64>, // <— add this
+    canceled: HashSet<u64>,
+    micro: VecDeque<MicroTask>,
 }
 
 pub struct EventLoop {
@@ -43,7 +50,7 @@ pub struct EventLoop {
 }
 
 pub static EVENT_LOOP: Lazy<EventLoop> = Lazy::new(|| EventLoop {
-    m: Mutex::new(Inner { heap: BinaryHeap::new(), ready: VecDeque::new(), active: 0, canceled: HashSet::new() }),
+    m: Mutex::new(Inner { heap: BinaryHeap::new(), ready: VecDeque::new(), active: 0, canceled: HashSet::new(), micro: VecDeque::new() }),
     cv: Condvar::new(),
     next_id: AtomicU64::new(1),
 });
@@ -65,6 +72,29 @@ impl EventLoop {
         g.active += 1;
         self.cv.notify_all();
         id
+    }
+
+    pub fn enqueue_microtask(&self, fun: i64, arg: i64) {
+        let mut g = self.m.lock().unwrap();
+        g.micro.push_back(MicroTask { fun, arg });
+        self.cv.notify_all();
+    }
+
+    pub fn run_microtasks(&self, budget: usize, mut call1: impl FnMut(i64, i64)) -> usize {
+        let mut ran = 0;
+        loop {
+            if ran >= budget { break; }
+            let mt = {
+                let mut g = self.m.lock().unwrap();
+                match g.micro.pop_front() {
+                    Some(m) => m,
+                    None => break,
+                }
+            };
+            call1(mt.fun, mt.arg);
+            ran += 1;
+        }
+        ran
     }
 
     // fix clear():
@@ -148,36 +178,51 @@ impl EventLoop {
     // Block and drive the loop until no pending timers exist.
     pub fn run_until_quiescent(&self, mut call_closure: impl FnMut(i64)) {
         loop {
-            // Move due tasks to ready
-            self.poll_due_and_enqueue();
+            // 1) Always drain microtasks to completion first
+            let _ = self.run_microtasks(usize::MAX, |f, a| {
+                // zero/one-arg closures — here we pass exactly one arg
+                unsafe {
+                    unsafe extern "C" { fn wir_call_closure(clo_ptr: i64, argv: *const i64, argc: i64) -> i64; }
+                    let arg = [a];
+                    let _ = wir_call_closure(f, arg.as_ptr(), 1);
+                }
+            });
 
-            // Run whatever is ready
+            // 2) Move due timers to ready and run what’s ready
+            self.poll_due_and_enqueue();
             let ran = self.run_ready(usize::MAX, &mut call_closure);
 
-            // Check quiescence / wait until next due
+            // 3) Quiescence / wait
             let mut g = self.m.lock().unwrap();
-            if g.active == 0 && g.ready.is_empty() { break; }
+            // If NOTHING left anywhere (no timers, no ready, no micro), we’re done
+            if g.active == 0 && g.ready.is_empty() && g.micro.is_empty() { break; }
+
+            // If there are microtasks queued, loop immediately (no wait)
+            if !g.micro.is_empty() { continue; }
 
             if let Some(Reverse(next)) = g.heap.peek().cloned() {
                 let now = Instant::now();
                 if next.when <= now {
-                    // loop and pick it up immediately
                     continue;
                 }
                 let dur = next.when - now;
                 let (g2, _) = self.cv.wait_timeout(g, dur).unwrap();
                 g = g2;
             } else {
-                // No heap but still ready items? loop; else sleep a bit (shouldn’t happen)
-                if g.ready.is_empty() { let (g2, _) = self.cv.wait_timeout(g, Duration::from_millis(1)).unwrap(); g = g2; }
+                // No heap timers; if nothing ready, wait briefly for microtasks/timers
+                if g.ready.is_empty() {
+                    let (g2, _) = self.cv.wait_timeout(g, Duration::from_millis(1)).unwrap();
+                    g = g2;
+                }
             }
         }
     }
 
-    // Root scanning hook for the GC: visit closure slots in heap/ready
+    // Root scanning hook for the GC: now also visit microtask closures
     pub fn with_root_slots<F: FnMut(*mut i64)>(&self, mut f: F) {
         let g = self.m.lock().unwrap();
-        for Reverse(t) in g.heap.iter() { let ptr = &t.fun as *const i64 as *mut i64; f(ptr); }
-        for t in g.ready.iter()        { let ptr = &t.fun as *const i64 as *mut i64; f(ptr); }
+        for Reverse(t) in g.heap.iter()  { let ptr = &t.fun as *const i64 as *mut i64; f(ptr); }
+        for t in g.ready.iter()          { let ptr = &t.fun as *const i64 as *mut i64; f(ptr); }
+        for m in g.micro.iter()          { let ptr = &m.fun as *const i64 as *mut i64; f(ptr); }
     }
 }

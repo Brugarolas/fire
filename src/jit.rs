@@ -35,6 +35,10 @@ use crate::native_timers::{
     wir_set_timeout, wir_set_interval, wir_clear_timeout, wir_clear_interval,
     event_loop_yieldpoint,
 };
+use crate::native_promises::{
+    wir_promise_new, wir_promise_then, wir_promise_catch,
+    wir_promise_resolve, wir_promise_reject,
+};
 
 /// ABI: `unsafe extern "C" fn(argv: *const i64, argc: usize) -> i64`
 pub type JitFnPtr = unsafe extern "C" fn(*const i64, usize) -> i64;
@@ -126,6 +130,14 @@ impl Default for JIT {
             fn wir_clear_timeout(id: i64) -> i64;
             fn wir_clear_interval(id: i64) -> i64;
             fn event_loop_yieldpoint() -> i64;
+        }
+
+        unsafe extern "C" {
+            fn wir_promise_new(executor: i64) -> i64;
+            fn wir_promise_then(priv_ptr: i64, on_f: i64, on_r: i64) -> i64;
+            fn wir_promise_catch(priv_ptr: i64, on_r: i64) -> i64;
+            fn wir_promise_resolve(priv_ptr: i64, val: i64) -> i64;
+            fn wir_promise_reject(priv_ptr: i64, reason: i64) -> i64;
         }
 
         unsafe {
@@ -229,6 +241,12 @@ impl Default for JIT {
             jb.symbol("wir_clear_timeout", wir_clear_timeout as *const extern "C" fn(i64)->i64     as *const u8);
             jb.symbol("wir_clear_interval",wir_clear_interval as *const extern "C" fn(i64)->i64    as *const u8);
             jb.symbol("event_loop_yieldpoint", event_loop_yieldpoint as *const extern "C" fn()->i64           as *const u8);
+
+            jb.symbol("wir_promise_new",     wir_promise_new     as *const extern "C" fn(i64)->i64 as *const u8);
+            jb.symbol("wir_promise_then",    wir_promise_then    as *const extern "C" fn(i64,i64,i64)->i64 as *const u8);
+            jb.symbol("wir_promise_catch",   wir_promise_catch   as *const extern "C" fn(i64,i64)->i64 as *const u8);
+            jb.symbol("wir_promise_resolve", wir_promise_resolve as *const extern "C" fn(i64,i64)->i64 as *const u8);
+            jb.symbol("wir_promise_reject",  wir_promise_reject  as *const extern "C" fn(i64,i64)->i64 as *const u8);
         }
 
         let module = cranelift_jit::JITModule::new(jb);

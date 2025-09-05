@@ -40,6 +40,7 @@ pub enum Tok {
 
     // Simple builtins
     #[token("Array")] ListBuiltin,
+    #[token("Promise")] PromiseBuiltin,
 
     // Identifiers & literals
     #[regex(r"[A-Za-z_][A-Za-z0-9_]*", |lex| lex.slice().to_string())]
@@ -710,7 +711,8 @@ impl<'src> Parser<'src> {
             Tok::Null => Ok(Expr::LitNull),
             Tok::Str(s) => Ok(Expr::Str(s)),
             Tok::Ident(s) => Ok(Expr::Ident(s)),
-            Tok::ListBuiltin => Ok(Expr::Ident("Array".into())), // treated as function
+            Tok::ListBuiltin => Ok(Expr::Ident("Array".into())),
+            Tok::PromiseBuiltin => Ok(Expr::Ident("Promise".into())),
             Tok::LParen => {
                 let e = self.expr()?;
                 self.expect(Tok::RParen, "expected ')'")?;
@@ -2274,6 +2276,54 @@ fn lower_expr_free<'m>(
 
         // Calls / builtins
         Expr::Call { callee, args } => {
+            // 0) Promise methods: p.then(...) / p.catch(...)
+            if let Expr::GetProp { recv, name } = &**callee {
+                if name == "then" {
+                    // p.then(onFulfilled?, onRejected?)
+                    let p   = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
+                    let z   = b.const_i32(0); // sentinel "no callback"
+                    let onf = if args.len() >= 1 {
+                        lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?
+                    } else { z };
+                    let onr = if args.len() >= 2 {
+                        lower_expr_free(b, locals, fields, next_field, &args[1], funcs, lam_caps)?
+                    } else { z };
+                    let (_nid, res) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_promise_then".into(),
+                            args: vec![p, onf, onr],
+                            pure: false, can_throw: false,
+                        },
+                        None, 1, true,
+                    );
+                    return Ok(res[0]);
+                }
+                if name == "catch" {
+                    // p.catch(onRejected?)
+                    let p   = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
+                    let z   = b.const_i32(0);
+                    let onr = if args.len() >= 1 {
+                        lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?
+                    } else { z };
+                    let (_nid, res) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_promise_catch".into(),
+                            args: vec![p, onr],
+                            pure: false, can_throw: false,
+                        },
+                        None, 1, true,
+                    );
+                    return Ok(res[0]);
+                }
+
+                // 1) Array methods (existing)
+                if let Some(v) = lower_array_method_call(
+                    b, locals, fields, next_field, recv, name, args, funcs, lam_caps
+                )? {
+                    return Ok(v);
+                }
+            }
+
             // 1) Array methods: a.push(x), a.map(f), ...
             if let Expr::GetProp { recv, name } = &**callee {
                 if let Some(v) = lower_array_method_call(
@@ -2367,6 +2417,16 @@ fn lower_expr_free<'m>(
                         Some(Type::Array(Box::new(None))),
                         1,
                         true,
+                    );
+                    return Ok(res[0]);
+                }
+                if name == "Promise" {
+                    if args.len() != 1 { return Err(LowerError::NotLowerable("Promise() expects 1 arg")); }
+
+                    let exec = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+                    let (_nid, res) = b.push_node(
+                        Inst::CallNative { name: "wir_promise_new".into(), args: vec![exec], pure: false, can_throw: false },
+                        None, 1, true,
                     );
                     return Ok(res[0]);
                 }

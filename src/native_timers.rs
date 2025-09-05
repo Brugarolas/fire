@@ -59,18 +59,18 @@ pub fn invoke_and_pump(entry: JitFnPtr, args: &[i64]) -> i64 {
     ret
 }
 
-pub fn pump_due_now() {
-    EVENT_LOOP.poll_due_and_enqueue();
-    let _ = EVENT_LOOP.run_ready(usize::MAX, |fun| unsafe {
-        let _ = wir_call_closure(fun, std::ptr::null(), 0);
-    });
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn event_loop_yieldpoint() -> i64 {
     unsafe {
         unsafe extern "C" { fn wir_call_closure(clo_ptr: i64, argv: *const i64, argc: i64) -> i64; }
 
+        // Drain a chunk of microtasks FIRST
+        let _ = EVENT_LOOP.run_microtasks(32, |f, a| {
+            let arg = [a];
+            let _ = wir_call_closure(f, arg.as_ptr(), 1);
+        });
+
+        // Then poll timers and run a few macrotasks
         EVENT_LOOP.poll_due_and_enqueue();
         // Run just a few ready closures; avoid full drain while inside JIT.
         let _ = EVENT_LOOP.run_ready(4, |fun| {

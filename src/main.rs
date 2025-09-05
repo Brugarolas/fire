@@ -8,6 +8,7 @@ mod runtime;
 mod jit;
 mod event_loop;
 mod native_timers;
+mod native_promises;
 
 use crate::opt::Optimize;
 use crate::opt::optimization::optimization_passes;

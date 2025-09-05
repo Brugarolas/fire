@@ -3,6 +3,9 @@
 print("===== Hello World =====");
 print("Hello, World!"); // expect Hello, World!
 
+// Timer (2)
+setTimeout(fn () { print("Timer (2)"); }, 1000);
+
 print("===== Simple function =====");
 fn add2(a, b) {
     return a + b;
@@ -148,6 +151,18 @@ fn make_adder(x) {
 var add42 = make_adder(42);
 print(add42(0));  // expect 42
 print(add42(100)); // expect 142
+
+print("===== Promises =====");
+// sync resolve
+var p = Promise(|resolve, reject| { resolve(42); });
+p.then(|v| print(v));        // expect: 42
+
+// rejection + catch
+var q = Promise(|resolve, reject| { reject(7); });
+q.catch(|e| print(e));       // expect: 7
+
+// chaining should keep returning the public object now:
+p.then(|v| print(v+1)).catch(|e| print(-1));    // expect: 43
 
 print("===== Timers =====");
 setTimeout(fn () { print("Timer"); }, 500);
