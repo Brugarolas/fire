@@ -1820,7 +1820,10 @@ pub extern "C" fn wir_array_set(arr: i64, idx: i64, val: i64) -> i64 {
     // slot ptr before write
     let slot = a.buf.as_mut_ptr().wrapping_add(iu);
     a.buf[iu] = val;
+
+    #[cfg(feature = "gc")]
     unsafe { NAPALM_GC.post_write_barrier(arr as *mut u8, slot, val) };
+
     0
 }
 
@@ -1867,7 +1870,10 @@ pub extern "C" fn wir_array_unshift(arr: i64, val: i64) -> i64 {
     a.buf.insert(0, val);
     // new element lives at index 0
     let slot = a.buf.as_mut_ptr();
+
+    #[cfg(feature = "gc")]
     unsafe { NAPALM_GC.post_write_barrier(arr as *mut u8, slot, val) };
+
     smi(a.buf.len() as i64)
 }
 
@@ -1893,6 +1899,8 @@ pub extern "C" fn wir_array_map(arr: i64, clo_ptr: i64) -> i64 {
         let args = [x];
         let y = wir_call_closure(clo_ptr, args.as_ptr(), 1);
         out.push(y);
+
+        #[cfg(feature = "gc")]
         NAPALM_GC.maybe_safepoint();
     }
     let b = Box::new(WirArray { hdr: ObjHeader { tag: TAG_ARRAY, aux: 0 }, buf: out });
@@ -1906,6 +1914,8 @@ pub extern "C" fn wir_array_for_each(arr: i64, clo_ptr: i64) -> i64 {
     for &x in &a.buf {
         let args = [x];
         let _ = wir_call_closure(clo_ptr, args.as_ptr(), 1);
+
+        #[cfg(feature = "gc")]
         NAPALM_GC.maybe_safepoint();
     }
     0
@@ -1919,6 +1929,8 @@ pub extern "C" fn wir_array_find(arr: i64, clo_ptr: i64) -> i64 {
         let args = [x];
         let ok = wir_call_closure(clo_ptr, args.as_ptr(), 1);
         if ok != 0 { return x; }
+
+        #[cfg(feature = "gc")]
         NAPALM_GC.maybe_safepoint();
     }
     0
@@ -1932,6 +1944,8 @@ pub extern "C" fn wir_array_find_index(arr: i64, clo_ptr: i64) -> i64 {
         let args = [x];
         let ok = wir_call_closure(clo_ptr, args.as_ptr(), 1);
         if ok != 0 { return smi(i as i64); }
+
+        #[cfg(feature = "gc")]
         NAPALM_GC.maybe_safepoint();
     }
     smi(-1)
@@ -1946,6 +1960,8 @@ pub extern "C" fn wir_array_filter(arr: i64, clo_ptr: i64) -> i64 {
         let args = [x];
         let ok = wir_call_closure(clo_ptr, args.as_ptr(), 1);
         if ok != 0 { out.push(x); }
+
+        #[cfg(feature = "gc")]
         NAPALM_GC.maybe_safepoint();
     }
     let b = Box::new(WirArray { hdr: ObjHeader { tag: TAG_ARRAY, aux: 0 }, buf: out });
@@ -1964,6 +1980,8 @@ pub extern "C" fn wir_array_reduce(arr: i64, clo_ptr: i64, has_init: i64, init: 
     for x in it {
         let args = [acc, x];
         acc = wir_call_closure(clo_ptr, args.as_ptr(), 2);
+
+        #[cfg(feature = "gc")]
         NAPALM_GC.maybe_safepoint();
     }
     acc
@@ -1978,8 +1996,11 @@ pub extern "C" fn wir_array_fill(arr: i64, val: i64) -> i64 {
         unsafe {
             let slot = base.add(i);
             *slot = val;
-            NAPALM_GC.post_write_barrier(arr as *mut u8, slot, val);
-            NAPALM_GC.maybe_safepoint();
+
+            #[cfg(feature = "gc")] {
+                NAPALM_GC.post_write_barrier(arr as *mut u8, slot, val);
+                NAPALM_GC.maybe_safepoint();
+            }
         }
     }
     0
@@ -2004,6 +2025,8 @@ pub extern "C" fn wir_array_copy(dst: i64, src: i64, len: i64) -> i64 {
             let v = *sptr.add(i);
             let slot = dptr.add(i);
             *slot = v;
+
+            #[cfg(feature = "gc")]
             NAPALM_GC.post_write_barrier(dst as *mut u8, slot, v);
         }
     }

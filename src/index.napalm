@@ -49,14 +49,17 @@ print((fn (a, b) { return a + b; })(2, 3));      // 5
 print((|x| x + 1)(41));                  // 42
 print((|a, b| { return a*b; })(6, 7));   // 42
 
-print("===== Closures =====");
-fn make_adder(x) {
-    return |y| x + y;
-}
-
-var add42 = make_adder(42);
-print(add42(0));  // expect 42
-print(add42(100)); // expect 142
+print("===== Objects =====");
+var o = { a: 10, "b": 20 };
+print(o.a);          // 10
+o.a = o.a + 1;
+print(o["a"]);       // 11
+print(o["b"]);       // 20
+print("a" in o);     // 1
+delete o.a;
+print("a" in o);     // 0
+var key_b = "b";
+print(o[key_b]);     // 20
 
 // ===========================
 // Arrays
@@ -137,14 +140,11 @@ print(c.find(|x| (x % 2) == 0 && x >= 4));   // expect 4
 var find_index = 4;
 print(c.findIndex(|x| x == 4));              // expect 4
 
-print("===== Objects =====");
-var o = { a: 10, "b": 20 };
-print(o.a);          // 10
-o.a = o.a + 1;
-print(o["a"]);       // 11
-print(o["b"]);       // 20
-print("a" in o);     // 1
-delete o.a;
-print("a" in o);     // 0
-var key_b = "b";
-print(o[key_b]);     // 20
+print("===== Closures =====");
+fn make_adder(x) {
+    return |y| x + y;
+}
+
+var add42 = make_adder(42);
+print(add42(0));  // expect 42
+print(add42(100)); // expect 142

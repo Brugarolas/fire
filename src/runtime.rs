@@ -46,7 +46,9 @@ pub extern "C" fn wir_is_str(v: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn napalm_yieldpoint() -> i64 {
+    #[cfg(feature = "gc")]
     unsafe { NAPALM_GC.yieldpoint(); }
+
     0
 }
 
@@ -69,7 +71,10 @@ pub extern "C" fn wir_obj_set_field(obj: i64, field_id_smi: i64, val: i64) -> i6
     let cell = o.by_id.entry(id).or_insert(0);
     let slot: *mut i64 = cell as *mut i64;
     *cell = val;
+
+    #[cfg(feature = "gc")]
     unsafe { NAPALM_GC.post_write_barrier(obj as *mut u8, slot, val) };
+
     0
 }
 

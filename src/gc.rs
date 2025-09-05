@@ -61,8 +61,8 @@ static STW_CV: ParkCondvar = ParkCondvar::new();
 
 use crate::value::{
     ObjHeader,
-    TAG_BOXED_F64, TAG_STRING, TAG_ARRAY, TAG_OBJECT,
-    ValueRepr, BoxedF64, BoxedStr, BoxedObj,
+    TAG_BOXED_F64, TAG_STRING, TAG_ARRAY, TAG_CLOSURE, TAG_OBJECT,
+    ValueRepr, BoxedF64, BoxedStr, BoxedClosure, BoxedObj,
     ARRAY_LEN_OFFSET, ARRAY_DATA_OFFSET,
     is_ptr,
     NULL,
@@ -160,6 +160,17 @@ impl Slot for SlotItem {
     #[inline(always)]
     fn load(&self) -> Option<ObjectReference> {
         let v = unsafe { ptr::read(self.0.to_ptr::<ValueRepr>()) };
+
+        #[cfg(debug_assertions)]
+        if is_ptr(v) && v != NULL {
+            unsafe {
+                let h = (v as *const crate::value::ObjHeader).as_ref().unwrap();
+                debug_assert!(
+                    matches!(h.tag, crate::value::TAG_BOXED_F64 | crate::value::TAG_STRING | crate::value::TAG_ARRAY | crate::value::TAG_OBJECT | crate::value::TAG_CLOSURE),
+                    "Unknown tag {} at {:p}", h.tag, v as *const u8
+                );
+            };
+        }
 
         // assume: lower tag bit == 0 ⇒ pointer, else immediate
         if likely(is_ptr(v)) {
@@ -307,6 +318,7 @@ impl ObjectModel<NapalmVM> for VMObjModel {
                 TAG_BOXED_F64 => core::mem::size_of::<BoxedF64>(),
                 TAG_STRING    => core::mem::size_of::<BoxedStr>(),
                 TAG_ARRAY     => core::mem::size_of::<BoxedArray>(),
+                TAG_CLOSURE   => core::mem::size_of::<BoxedClosure>(),
                 TAG_OBJECT    => core::mem::size_of::<BoxedObj>(),
                 _ => core::mem::size_of::<ObjHeader>(), // conservative fallback
             }
@@ -328,8 +340,9 @@ impl ObjectModel<NapalmVM> for VMObjModel {
                 TAG_BOXED_F64 => core::mem::align_of::<BoxedF64>(),
                 TAG_STRING    => core::mem::align_of::<BoxedStr>(),
                 TAG_ARRAY     => core::mem::align_of::<BoxedArray>(),
+                TAG_CLOSURE   => core::mem::align_of::<BoxedClosure>(),
                 TAG_OBJECT    => core::mem::align_of::<BoxedObj>(),
-                _ => core::mem::align_of::<ObjHeader>(),
+                _             => core::mem::align_of::<ObjHeader>(),
             }
         }
     }
@@ -399,11 +412,12 @@ impl ObjectModel<NapalmVM> for VMObjModel {
     // ---- Type descriptors (debug only; C-style nul-terminated) ----
     fn get_type_descriptor(reference: ObjectReference) -> &'static [i8] {
         use crate::value::*;
-        static TD_F64:    [i8; 4] = [b'f' as i8, b'6' as i8, b'4' as i8, 0];
-        static TD_STR:    [i8; 5] = [b's' as i8, b't' as i8, b'r' as i8, b'\0' as i8, 0]; // "str\0"
-        static TD_ARRAY:  [i8; 6] = [b'a' as i8, b'r' as i8, b'r' as i8, b'a' as i8, b'y' as i8, 0];
-        static TD_OBJECT: [i8; 7] = [b'o' as i8, b'b' as i8, b'j' as i8, b'e' as i8, b'c' as i8, b't' as i8, 0];
-        static TD_UNKNOWN:[i8; 8] = [b'u' as i8, b'n' as i8, b'k' as i8, b'n' as i8, b'o' as i8, b'w' as i8, b'n' as i8, 0];
+        static TD_F64:     [i8; 4] = [b'f' as i8, b'6' as i8, b'4' as i8, 0];
+        static TD_STR:     [i8; 5] = [b's' as i8, b't' as i8, b'r' as i8, b'\0' as i8, 0];
+        static TD_ARRAY:   [i8; 6] = [b'a' as i8, b'r' as i8, b'r' as i8, b'a' as i8, b'y' as i8, 0];
+        static TD_OBJECT:  [i8; 7] = [b'o' as i8, b'b' as i8, b'j' as i8, b'e' as i8, b'c' as i8, b't' as i8, 0];
+        static TD_CLOSURE: [i8; 8] = [b'c' as i8, b'l' as i8, b'o' as i8, b's' as i8, b'u' as i8, b'r' as i8, b'e' as i8, 0];
+        static TD_UNKNOWN: [i8; 8] = [b'u' as i8, b'n' as i8, b'k' as i8, b'n' as i8, b'o' as i8, b'w' as i8, b'n' as i8, 0];
 
         let hdr = Self::ref_to_object_start(reference).to_ptr::<ObjHeader>();
         unsafe {
@@ -412,6 +426,7 @@ impl ObjectModel<NapalmVM> for VMObjModel {
                 TAG_STRING    => &TD_STR,
                 TAG_ARRAY     => &TD_ARRAY,
                 TAG_OBJECT    => &TD_OBJECT,
+                TAG_CLOSURE   => &TD_CLOSURE,
                 _             => &TD_UNKNOWN,
             }
         }
@@ -460,6 +475,11 @@ impl ObjectModel<NapalmVM> for VMObjModel {
                             (*o).by_id.len(), (*o).by_str.len()
                         );
                     }
+                }
+                TAG_CLOSURE => {
+                    let c = addr.to_ptr::<BoxedClosure>();
+                    #[cfg(debug_assertions)]
+                    eprintln!("[napalm:mmtk] Closure @ {addr:?} env_len={} code_ptr=0x{:x}", (*c).env.len(), (*c).code_ptr);
                 }
                 _ => {
                     #[cfg(debug_assertions)] {
@@ -525,6 +545,19 @@ impl Scanning<NapalmVM> for VMScanning {
                         if is_ptr(val) && val != NULL {
                             let edge = SlotItem(Address::from_ptr(slot_ptr.cast::<u8>()));
                             slot_visitor.visit_slot(edge);
+                        }
+                    }
+                }
+
+                TAG_CLOSURE => {
+                    let clo = &mut *(base as *mut BoxedClosure);
+                    let len = clo.env.len();
+                    let ptr = clo.env.as_mut_ptr();
+                    for i in 0..len {
+                        let slot_ptr: *mut i64 = ptr.add(i);
+                        let val = *slot_ptr;
+                        if is_ptr(val) && val != NULL {
+                            slot_visitor.visit_slot(SlotItem(Address::from_ptr(slot_ptr.cast::<u8>())));
                         }
                     }
                 }
@@ -989,6 +1022,8 @@ impl NapalmGc {
     /// in the same way your MMTk scan does.
     #[inline(always)]
     pub fn scan_object_precise<F: FnMut(*mut ValueRepr)>(&self, obj: ObjectReference, mut f: F) {
+        pub const TAG_ARRAY_FLAT: u32 = 6;
+
         unsafe {
             let base = obj.to_raw_address().to_ptr::<u8>();
             let hdr  = &*(base as *const ObjHeader);
@@ -998,6 +1033,14 @@ impl NapalmGc {
                     let arr = &mut *(base as *mut crate::value::BoxedArray);
                     let len = arr.buf.len();
                     let ptr = arr.buf.as_mut_ptr();
+                    for i in 0..len {
+                        f(ptr.add(i));
+                    }
+                }
+                TAG_CLOSURE => {
+                    let clo = &mut *(base as *mut crate::value::BoxedClosure);
+                    let len = clo.env.len();
+                    let ptr = clo.env.as_mut_ptr();
                     for i in 0..len {
                         f(ptr.add(i));
                     }

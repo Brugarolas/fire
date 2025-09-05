@@ -68,8 +68,10 @@ fn main() {
     optimize.optimize_module(&mut module); // TODO Too Slow?
 
     // 4.1) Init GC and bind to this thread
-    let _gc = gc::NapalmGc::new();
-    _gc.bind_current_thread();
+    #[cfg(feature = "gc")] {
+        let _gc = gc::NapalmGc::new();
+        _gc.bind_current_thread();
+    }
 
     // 4.2) JIT compile ALL functions
     let mut jit = jit::JIT::default();

@@ -64,15 +64,38 @@ pub fn box_f64(x: f64) -> ValueRepr {
     unsafe {
         let size = mem::size_of::<BoxedF64>();
         let align = mem::align_of::<BoxedF64>();
-        let mut p = NAPALM_GC.alloc_raw(size, align);
-        if p.is_null() { p = NAPALM_GC.alloc_slow_path(size, align); }
-        let obj = p as *mut BoxedF64;
-        core::ptr::write(
-            obj,
-            BoxedF64 { hdr: ObjHeader { tag: TAG_BOXED_F64, aux: 0 }, val: x }
-        );
-        NAPALM_GC.post_alloc_object(p, size);
-        p as ValueRepr
+
+        #[cfg(feature = "gc")] {
+            let mut p = NAPALM_GC.alloc_raw(size, align);
+            if p.is_null() { p = NAPALM_GC.alloc_slow_path(size, align); }
+
+            let obj = p as *mut BoxedF64;
+            core::ptr::write(
+                obj,
+                BoxedF64 { hdr: ObjHeader { tag: TAG_BOXED_F64, aux: 0 }, val: x }
+            );
+
+            NAPALM_GC.post_alloc_object(p, size);
+
+            return p as ValueRepr;
+        }
+
+        #[cfg(not(feature = "gc"))] {
+            use std::alloc::{alloc, Layout};
+
+            let layout = Layout::from_size_align_unchecked(size, align);
+
+            let p = alloc(layout);
+            if p.is_null() { std::process::abort(); }
+
+            let obj = p as *mut BoxedF64;
+            core::ptr::write(
+                obj,
+                BoxedF64 { hdr: ObjHeader { tag: TAG_BOXED_F64, aux: 0 }, val: x }
+            );
+
+            return p as ValueRepr;
+        }
     }
 }
 
@@ -117,26 +140,65 @@ pub fn box_array_with_len(len: usize) -> ValueRepr {
     unsafe {
         let size  = mem::size_of::<BoxedArray>();
         let align = mem::align_of::<BoxedArray>();
-        let mut p = NAPALM_GC.alloc_raw(size, align);
-        if p.is_null() { p = NAPALM_GC.alloc_slow_path(size, align); }
-        let obj = p as *mut BoxedArray;
 
-        // Build Vec on the Rust heap (capacity=len, length=len), filled with uninitialized i64.
-        let mut buf = Vec::<i64>::with_capacity(len);
-        buf.set_len(len);
+        #[cfg(feature = "gc")] {
+            let mut p = NAPALM_GC.alloc_raw(size, align);
+            if p.is_null() { p = NAPALM_GC.alloc_slow_path(size, align); }
 
-        core::ptr::write(
-            obj,
-            BoxedArray { hdr: ObjHeader { tag: TAG_ARRAY, aux: 0 }, buf }
-        );
-        NAPALM_GC.post_alloc_object(p, size);
-        p as ValueRepr
+            let obj = p as *mut BoxedArray;
+
+            // Build Vec on the Rust heap (capacity=len, length=len), filled with uninitialized i64.
+            let mut buf = Vec::<i64>::with_capacity(len);
+            buf.set_len(len);
+
+            core::ptr::write(
+                obj,
+                BoxedArray { hdr: ObjHeader { tag: TAG_ARRAY, aux: 0 }, buf }
+            );
+
+            NAPALM_GC.post_alloc_object(p, size);
+
+            return p as ValueRepr;
+        }
+
+        #[cfg(not(feature = "gc"))] {
+            use std::alloc::{alloc, Layout};
+
+            let layout = Layout::from_size_align_unchecked(size, align);
+
+            let p = alloc(layout);
+            if p.is_null() { std::process::abort(); }
+
+            let obj = p as *mut BoxedArray;
+
+            // Build Vec on the Rust heap (capacity=len, length=len), filled with uninitialized i64.
+            let mut buf = Vec::<i64>::with_capacity(len);
+            buf.set_len(len);
+
+            core::ptr::write(
+                obj,
+                BoxedArray { hdr: ObjHeader { tag: TAG_ARRAY, aux: 0 }, buf }
+            );
+
+            return p as ValueRepr;
+        }
     }
 }
 
 #[inline(always)]
 pub unsafe fn as_boxed_array_mut(v: ValueRepr) -> *mut BoxedArray {
     v as *mut BoxedArray
+}
+
+#[inline(always)]
+pub unsafe fn array_set(arr_v: ValueRepr, idx: usize, val: ValueRepr) {
+    // Vec-backed variant shown
+    let a = &mut *as_boxed_array_mut(arr_v);
+    let slot: *mut i64 = a.buf.as_mut_ptr().add(idx);
+    *slot = val;
+
+    #[cfg(feature = "gc")]
+    NAPALM_GC.post_write_barrier(arr_v as *mut u8, slot, val);
 }
 
 // ============================================================================
@@ -155,20 +217,129 @@ pub fn box_str_borrowed(bytes: &[u8]) -> ValueRepr {
     unsafe {
         let size  = mem::size_of::<BoxedStr>();
         let align = mem::align_of::<BoxedStr>();
-        let mut p = NAPALM_GC.alloc_raw(size, align);
-        if p.is_null() { p = NAPALM_GC.alloc_slow_path(size, align); }
-        let obj = p as *mut BoxedStr;
-        core::ptr::write(
-            obj,
-            BoxedStr { hdr: ObjHeader { tag: TAG_STRING, aux: 0 }, len: bytes.len(), data: bytes.as_ptr() }
-        );
-        NAPALM_GC.post_alloc_object(p, size);
-        p as ValueRepr
+
+        #[cfg(feature = "gc")] {
+            let mut p = NAPALM_GC.alloc_raw(size, align);
+            if p.is_null() { p = NAPALM_GC.alloc_slow_path(size, align); }
+
+            let obj = p as *mut BoxedStr;
+            core::ptr::write(
+                obj,
+                BoxedStr { hdr: ObjHeader { tag: TAG_STRING, aux: 0 }, len: bytes.len(), data: bytes.as_ptr() }
+            );
+
+            NAPALM_GC.post_alloc_object(p, size);
+
+            return p as ValueRepr;
+        }
+
+        #[cfg(not(feature = "gc"))] {
+            use std::alloc::{alloc, Layout};
+
+            let layout = Layout::from_size_align_unchecked(size, align);
+
+            let p = alloc(layout);
+            if p.is_null() { std::process::abort(); }
+
+            let obj = p as *mut BoxedStr;
+            core::ptr::write(
+                obj,
+                BoxedStr { hdr: ObjHeader { tag: TAG_STRING, aux: 0 }, len: bytes.len(), data: bytes.as_ptr() }
+            );
+
+            return p as ValueRepr;
+        }
     }
 }
 
 // ============================================================================
-// Boxed object (JS-like dictionary): the bit you asked for
+// Boxed closure (placeholder wiring)
+// ============================================================================
+
+#[repr(C)]
+pub struct BoxedClosure {
+    pub hdr: ObjHeader,     // tag = TAG_CLOSURE
+    pub code_ptr: usize,    // or a function id/index if you prefer
+    pub env: Vec<i64>,      // captured values
+}
+
+#[inline(always)]
+pub fn closure_new(code_ptr: usize, env_len: usize) -> ValueRepr {
+    unsafe {
+        let size  = core::mem::size_of::<BoxedClosure>();
+        let align = core::mem::align_of::<BoxedClosure>();
+
+        #[cfg(feature = "gc")] {
+            let mut p = NAPALM_GC.alloc_raw(size, align);
+            if p.is_null() { p = NAPALM_GC.alloc_slow_path(size, align); }
+
+            let clo = p as *mut BoxedClosure;
+
+            // Build Vec on the Rust heap. Filled with uninitialized i64.
+            let mut env = Vec::<i64>::with_capacity(env_len);
+            env.set_len(env_len);
+
+            core::ptr::write(
+                clo,
+                BoxedClosure { hdr: ObjHeader { tag: TAG_CLOSURE, aux: 0 }, code_ptr, env }
+            );
+            NAPALM_GC.post_alloc_object(p, size);
+
+            return p as ValueRepr;
+        }
+
+        #[cfg(not(feature = "gc"))] {
+            use std::alloc::{alloc, Layout};
+
+            let layout = Layout::from_size_align_unchecked(size, align);
+
+            let p = alloc(layout);
+            if p.is_null() { std::process::abort(); }
+
+            let clo = p as *mut BoxedClosure;
+
+            // Build Vec on the Rust heap. Filled with uninitialized i64.
+            let mut env = Vec::<i64>::with_capacity(env_len);
+            env.set_len(env_len);
+
+            core::ptr::write(
+                clo,
+                BoxedClosure { hdr: ObjHeader { tag: TAG_CLOSURE, aux: 0 }, code_ptr, env }
+            );
+
+            return p as ValueRepr;
+        }
+    }
+}
+
+#[inline(always)]
+pub unsafe fn as_closure_mut(v: ValueRepr) -> *mut BoxedClosure {
+    v as *mut BoxedClosure
+}
+
+#[inline(always)]
+pub unsafe fn closure_get_env_slot(v: ValueRepr, idx: usize) -> ValueRepr {
+    let c = &*as_closure_mut(v);
+    *c.env.as_ptr().add(idx)
+}
+
+#[inline(always)]
+pub unsafe fn closure_set_env_slot(v: ValueRepr, idx: usize, val: ValueRepr) {
+    let c = &mut *as_closure_mut(v);
+    let slot: *mut ValueRepr = c.env.as_mut_ptr().add(idx);
+
+    // (Optional pre barrier if you enable a plan that needs it)
+    // #[cfg(feature = "gc")]
+    // NAPALM_GC.pre_write_barrier(v as *mut u8, slot);
+
+    *slot = val;
+
+    #[cfg(feature = "gc")]
+    NAPALM_GC.post_write_barrier(v as *mut u8, slot, val);
+}
+
+// ============================================================================
+// Boxed object (JS-like dictionary)
 // ============================================================================
 
 #[repr(C)]
@@ -183,19 +354,46 @@ pub fn obj_new() -> ValueRepr {
     unsafe {
         let size  = mem::size_of::<BoxedObj>();
         let align = mem::align_of::<BoxedObj>();
-        let mut p = NAPALM_GC.alloc_raw(size, align);
-        if p.is_null() { p = NAPALM_GC.alloc_slow_path(size, align); }
-        let obj = p as *mut BoxedObj;
-        core::ptr::write(
-            obj,
-            BoxedObj {
-                hdr: ObjHeader { tag: TAG_OBJECT, aux: 0 },
-                by_id:  HashMap::new(),
-                by_str: HashMap::new(),
-            }
-        );
-        NAPALM_GC.post_alloc_object(p, size);
-        p as ValueRepr
+
+        #[cfg(feature = "gc")] {
+            let mut p = NAPALM_GC.alloc_raw(size, align);
+            if p.is_null() { p = NAPALM_GC.alloc_slow_path(size, align); }
+
+            let obj = p as *mut BoxedObj;
+            core::ptr::write(
+                obj,
+                BoxedObj {
+                    hdr: ObjHeader { tag: TAG_OBJECT, aux: 0 },
+                    by_id:  HashMap::new(),
+                    by_str: HashMap::new(),
+                }
+            );
+
+            NAPALM_GC.post_alloc_object(p, size);
+
+            return p as ValueRepr;
+        }
+
+        #[cfg(not(feature = "gc"))] {
+            use std::alloc::{alloc, Layout};
+
+            let layout = Layout::from_size_align_unchecked(size, align);
+
+            let p = alloc(layout);
+            if p.is_null() { std::process::abort(); }
+
+            let obj = p as *mut BoxedObj;
+            core::ptr::write(
+                obj,
+                BoxedObj {
+                    hdr: ObjHeader { tag: TAG_OBJECT, aux: 0 },
+                    by_id:  HashMap::new(),
+                    by_str: HashMap::new(),
+                }
+            );
+
+            return p as ValueRepr;
+        }
     }
 }
 
@@ -220,7 +418,9 @@ pub unsafe fn obj_set_field(obj_v: ValueRepr, fid: u32, val: ValueRepr) -> Value
     *cell = val;
 
     // Post-write barrier
+    #[cfg(feature = "gc")]
     NAPALM_GC.post_write_barrier(obj_v as *mut u8, slot, val);
+
     val
 }
 
@@ -251,7 +451,9 @@ pub unsafe fn obj_set_str(obj_v: ValueRepr, key: &str, val: ValueRepr) -> ValueR
     let slot: *mut ValueRepr = cell as *mut ValueRepr;
     *cell = val;
 
+    #[cfg(feature = "gc")]
     NAPALM_GC.post_write_barrier(obj_v as *mut u8, slot, val);
+
     val
 }
 

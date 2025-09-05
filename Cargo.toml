@@ -84,3 +84,8 @@ target-lexicon = "0.13.2"
 
 polodb_core = "5.1.4" # Polodb embedded database
 chromadb = "2.3.0" # ChromaDB database
+
+[features]
+# Enable the real GC by default. For “no-GC” build use: --no-default-features
+default = []
+gc = []
