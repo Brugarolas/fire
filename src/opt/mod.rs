@@ -525,7 +525,7 @@ impl OptimizationPass {
                 let Some((cur_bix, mut pos)) = fs.pos_of(id) else { continue }; // deleted/moved
                 if cur_bix != bix { continue; } // moved to another block
 
-                let blen = func.blocks[bix].insts.len();
+                                let blen = func.blocks[bix].insts.len();
                 if blen == 0 || pos >= blen {
                     continue; // id deleted/moved; skip
                 }

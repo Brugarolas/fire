@@ -287,5 +287,7 @@ fn bump_uses_for_inst(uses: &mut [usize], k: &Inst) {
 
         // ---- OSR ----
         Inst::OSRPoint                             => {},
+
+        _ => { /* skip other instructions */ }
     }
 }

@@ -183,6 +183,8 @@ pub fn replace_uses_in_inst(inst: &mut Inst, from: ValueId, to: ValueId) -> usiz
 
         // ---- OSR ----
         Inst::OSRPoint => {}
+
+        _ => { /* skip other instructions */ }
     }
     n
 }

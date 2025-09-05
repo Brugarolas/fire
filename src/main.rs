@@ -3,17 +3,18 @@ mod value;
 mod wir;
 mod front;
 mod opt;
-//mod gc_new;
-//mod gc_old;
 mod gc;
 mod runtime;
 mod jit;
+mod event_loop;
+mod native_timers;
 
 use crate::opt::Optimize;
 use crate::opt::optimization::optimization_passes;
 use mimalloc::MiMalloc;
 use ahash::AHashMap as HashMap;
 use std::time::Instant;
+use crate::native_timers::invoke_and_pump;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -109,7 +110,9 @@ fn main() {
     // 6) Build argv and run (ABI: (argv_ptr, argc) -> i64)
     let argv: Vec<i64> = vec![0; entry_fun.sig.params.len()];
     let fptr = *fptrs.get(&entry_name).unwrap();
-    let ret: i64 = unsafe { fptr(argv.as_ptr(), argv.len()) };
+
+    // let ret: i64 = unsafe { fptr(argv.as_ptr(), argv.len()) };
+    let ret: i64 = invoke_and_pump(fptr, &argv);
 
     let t1 = Instant::now(); // End timing just after the function returns
     let duration = t1.duration_since(t0);

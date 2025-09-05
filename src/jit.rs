@@ -31,6 +31,11 @@ use crate::runtime::{
     wir_obj_get_str, wir_obj_set_str, wir_obj_has_str, wir_obj_del_str,
     wir_memo_get, wir_memo_put,
 };
+use crate::native_timers::{
+    wir_set_timeout, wir_set_interval, wir_clear_timeout, wir_clear_interval,
+    event_loop_yieldpoint,
+};
+
 /// ABI: `unsafe extern "C" fn(argv: *const i64, argc: usize) -> i64`
 pub type JitFnPtr = unsafe extern "C" fn(*const i64, usize) -> i64;
 
@@ -113,6 +118,14 @@ impl Default for JIT {
             fn wir_obj_set_str(obj: i64, key: i64, val: i64) -> i64;
             fn wir_obj_has_str(obj: i64, key: i64) -> i64;
             fn wir_obj_del_str(obj: i64, key: i64) -> i64;
+        }
+
+        unsafe extern "C" {
+            fn wir_set_timeout(fun: i64, delay_ms: i64) -> i64;
+            fn wir_set_interval(fun: i64, period_ms: i64) -> i64;
+            fn wir_clear_timeout(id: i64) -> i64;
+            fn wir_clear_interval(id: i64) -> i64;
+            fn event_loop_yieldpoint() -> i64;
         }
 
         unsafe {
@@ -204,15 +217,18 @@ impl Default for JIT {
 
             jb.symbol("wir_memo_get",  wir_memo_get  as *const extern "C" fn(i64, i64, *mut i64) -> i64 as *const u8);
             jb.symbol("wir_memo_put",  wir_memo_put  as *const extern "C" fn(i64, i64, i64)      -> i64 as *const u8);
-
             jb.symbol("wir_memo_get2", wir_memo_get2 as *const extern "C" fn(i64, i64, i64, *mut i64) -> i64 as *const u8);
             jb.symbol("wir_memo_put2", wir_memo_put2 as *const extern "C" fn(i64, i64, i64, i64)      -> i64 as *const u8);
-
             jb.symbol("wir_memo_get3", wir_memo_get3 as *const extern "C" fn(i64, i64, i64, i64, *mut i64) -> i64 as *const u8);
             jb.symbol("wir_memo_put3", wir_memo_put3 as *const extern "C" fn(i64, i64, i64, i64, i64)      -> i64 as *const u8);
-
             jb.symbol("wir_memo_get4", wir_memo_get4 as *const extern "C" fn(i64, i64, i64, i64, i64, *mut i64) -> i64 as *const u8);
             jb.symbol("wir_memo_put4", wir_memo_put4 as *const extern "C" fn(i64, i64, i64, i64, i64, i64)      -> i64 as *const u8);
+
+            jb.symbol("wir_set_timeout",   wir_set_timeout   as *const extern "C" fn(i64,i64)->i64 as *const u8);
+            jb.symbol("wir_set_interval",  wir_set_interval  as *const extern "C" fn(i64,i64)->i64 as *const u8);
+            jb.symbol("wir_clear_timeout", wir_clear_timeout as *const extern "C" fn(i64)->i64     as *const u8);
+            jb.symbol("wir_clear_interval",wir_clear_interval as *const extern "C" fn(i64)->i64    as *const u8);
+            jb.symbol("event_loop_yieldpoint", event_loop_yieldpoint as *const extern "C" fn()->i64           as *const u8);
         }
 
         let module = cranelift_jit::JITModule::new(jb);
@@ -1304,6 +1320,15 @@ impl JIT {
                             let _ = self.call_import(
                                 &mut fb,
                                 "napalm_yieldpoint",
+                                |s| {
+                                    // () -> i64 (ignored)
+                                    s.returns.push(AbiParam::new(types::I64));
+                                },
+                                &[],
+                            )?;
+                            let _ = self.call_import(
+                                &mut fb,
+                                "event_loop_yieldpoint",
                                 |s| {
                                     // () -> i64 (ignored)
                                     s.returns.push(AbiParam::new(types::I64));

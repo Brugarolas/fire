@@ -148,3 +148,6 @@ fn make_adder(x) {
 var add42 = make_adder(42);
 print(add42(0));  // expect 42
 print(add42(100)); // expect 142
+
+print("===== Timers =====");
+setTimeout(fn () { print("Timer"); }, 500);

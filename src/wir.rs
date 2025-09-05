@@ -348,6 +348,15 @@ pub enum Inst {
         can_throw: bool,
     },
 
+    // ---- Timers / event loop (JS-like) ----
+    SetTimeout   { fun: ValueId, delay_ms: ValueId },   // -> Int32 (timer id)
+    SetInterval  { fun: ValueId, period_ms: ValueId },  // -> Int32 (timer id)
+    ClearTimeout { id: ValueId },                        // void
+    ClearInterval{ id: ValueId },                        // void
+
+    // Optional (tiny helper to run N ready tasks; useful for strategic pumping)
+    EventLoopPump { budget: u32 },                       // -> Int32 (ran count)
+
     // ---- GC barriers (abstract) ----
     PostWriteBarrier { obj: ValueId, val: ValueId },
     ReadBarrier { obj: ValueId },

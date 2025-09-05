@@ -2283,6 +2283,75 @@ fn lower_expr_free<'m>(
                 }
             }
 
+            if let Expr::Ident(name) = &**callee {
+                if name == "setTimeout" {
+                    if args.len() != 2 { return Err(LowerError::NotLowerable("setTimeout(fn, ms)")); }
+                    let fun = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+                    let ms  = lower_expr_free(b, locals, fields, next_field, &args[1], funcs, lam_caps)?;
+                    let (_nid, res) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_set_timeout".into(),
+                            args: vec![fun, ms],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::Int32), // returns timer id (i64/SMI-ish, treat as int)
+                        1,
+                        true,
+                    );
+                    return Ok(res[0]);
+                }
+                if name == "setInterval" {
+                    if args.len() != 2 { return Err(LowerError::NotLowerable("setInterval(fn, ms)")); }
+                    let fun = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+                    let ms  = lower_expr_free(b, locals, fields, next_field, &args[1], funcs, lam_caps)?;
+                    let (_nid, res) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_set_interval".into(),
+                            args: vec![fun, ms],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::Int32),
+                        1,
+                        true,
+                    );
+                    return Ok(res[0]);
+                }
+                if name == "clearTimeout" {
+                    if args.len() != 1 { return Err(LowerError::NotLowerable("clearTimeout(id)")); }
+                    let id = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+                    let (_nid, res) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_clear_timeout".into(),
+                            args: vec![id],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::Int32),
+                        1,
+                        true,
+                    );
+                    return Ok(res[0]);
+                }
+                if name == "clearInterval" {
+                    if args.len() != 1 { return Err(LowerError::NotLowerable("clearInterval(id)")); }
+                    let id = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+                    let (_nid, res) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_clear_interval".into(),
+                            args: vec![id],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::Int32),
+                        1,
+                        true,
+                    );
+                    return Ok(res[0]);
+                }
+            }
+
             // 2) Builtin functions: list(n), print(x)
             if let Expr::Ident(name) = &**callee {
                 if name == "Array" {
@@ -2378,6 +2447,7 @@ fn lower_expr_free<'m>(
                     );
                     return Ok(res[0]);
                 }
+
                 if let Some(&fid) = funcs.get(name) {
                     let mut argv = Vec::with_capacity(args.len());
                     for a in args { argv.push(lower_expr_free(b, locals, fields, next_field, a, funcs, lam_caps)?); }
