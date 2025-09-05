@@ -1,5 +1,5 @@
 // src/jit.rs
-//! jit.rs — Cranelift JIT for WIR (Cranelift 0.121.x compatible)
+//! jit.rs — Cranelift JIT for WIR/Napalm (Cranelift 0.121.x compatible)
 
 use ahash::AHashMap as HashMap;
 
@@ -15,7 +15,7 @@ use std::cell::Cell;
 
 use crate::gc::NAPALM_GC;
 
-use crate::value::{ObjHeader, TAG_ARRAY};
+use crate::value::{ObjHeader, TAG_ARRAY, BoxedClosure, closure_new, closure_set_env_slot};
 use crate::wir::{
     Constant, Function as WirFunction, Inst, IntBinOp, Value as WirValue, ValueDef, ValueId, FuncId,
 };
@@ -1542,12 +1542,6 @@ fn trap_unsupported(fb: &mut FunctionBuilder, _what: &str) {
     fb.ins().trap(code);
 }
 
-#[repr(C)]
-struct WirClosure {
-    code: JitFnPtr, // unsafe extern "C" fn(*const i64, usize) -> i64
-    env:  i64,      // opaque environment pointer (we treat env as i64)
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_print_i64(v: i64) -> i64 {
     use crate::value::*;
@@ -1604,25 +1598,36 @@ pub extern "C" fn wir_print_str(p: *const std::os::raw::c_char) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_make_closure(code_ptr: *const u8, env: i64) -> i64 {
-    // Turn the code address into our JIT function type and box the pair.
-    let f: JitFnPtr = unsafe { std::mem::transmute(code_ptr) };
-    let b = Box::new(WirClosure { code: f, env });
-    Box::into_raw(b) as i64
+    // Allocate a BoxedClosure with env_len = 1 and set env[0] = `env`.
+    // Under `feature = "gc"` this goes through MMTk; otherwise your no-GC path.
+    let clo_val = closure_new(code_ptr as usize, 1);
+    unsafe { closure_set_env_slot(clo_val, 0, env); }
+    clo_val
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_call_closure(clo_ptr: i64, argv: *const i64, argc: i64) -> i64 {
     if clo_ptr == 0 { return 0; }
-    let clo = unsafe { &*(clo_ptr as *const WirClosure) };
 
-    // Prepend env to the provided args: callee ABI is (env, args...) -> i64
-    let mut args: Vec<i64> = Vec::with_capacity(argc as usize + 1);
-    args.push(clo.env);
+    // Borrow the BoxedClosure allocated in value.rs
+    let clo = unsafe { &*(clo_ptr as *const BoxedClosure) };
+
+    // Turn stored code_ptr back into the JIT function type:
+    let f: JitFnPtr = unsafe { std::mem::transmute(clo.code_ptr as *const u8) };
+
+    // Build (env..., args...) as the callee expects (ABI: (*const i64, usize) -> i64)
+    let env_len = clo.env.len();
+    let mut args: Vec<i64> = Vec::with_capacity(env_len + (argc as usize));
+
+    // prepend captured environment
+    args.extend_from_slice(&clo.env);
+
+    // append caller args
     for i in 0..(argc as isize) {
         unsafe { args.push(*argv.offset(i)); }
     }
 
-    unsafe { (clo.code)(args.as_ptr(), args.len()) }
+    unsafe { (f)(args.as_ptr(), args.len()) }
 }
 
 #[unsafe(no_mangle)]
