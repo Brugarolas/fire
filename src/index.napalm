@@ -179,4 +179,5 @@ e.catch(|r| { print(999 + r); });
 setTimeout(| | { e.reject(1); }, 0);
 
 print("===== Timers =====");
+print("(async)");
 setTimeout(fn () { print("Timer"); }, 500);
