@@ -62,7 +62,7 @@ impl Default for JIT {
             fn wir_make_closure(code_ptr: *const u8, env: i64) -> i64;
             fn wir_call_closure(clo_ptr: i64, argv: *const i64, argc: i64) -> i64;
             fn wir_alloc_words(n: i64) -> *mut i64;
-            fn wir_alloc_array(n: i64) -> i64;
+            fn wir_free_words(p: *mut i64, n: i64) -> i64;
 
             fn wir_add_slow(a: i64, b: i64) -> i64;
             fn wir_sub_slow(a: i64, b: i64) -> i64;
@@ -155,7 +155,7 @@ impl Default for JIT {
             jb.symbol("wir_make_closure", wir_make_closure as *const extern "C" fn(*const u8, i64) -> i64 as *const u8);
             jb.symbol("wir_call_closure", wir_call_closure as *const extern "C" fn(i64, *const i64, i64) -> i64 as *const u8);
             jb.symbol("wir_alloc_words", wir_alloc_words as *const extern "C" fn(i64) -> *mut i64 as *const u8);
-            jb.symbol("wir_alloc_array", wir_alloc_array as *const extern "C" fn(i64) -> i64 as *const u8);
+            jb.symbol("wir_free_words", wir_free_words as *const extern "C" fn(*mut i64, i64) -> i64 as *const u8);
 
             jb.symbol("wir_add_slow", wir_add_slow as *const extern "C" fn(i64,i64)->i64 as *const u8);
             jb.symbol("wir_sub_slow", wir_sub_slow as *const extern "C" fn(i64,i64)->i64 as *const u8);
@@ -963,6 +963,18 @@ impl JIT {
                                 &[clo_ptr, argv, argc],
                             )?;
 
+                            // Free argv (no-op under GC build; real free in non-GC build).
+                            let _ = self.call_import(
+                                &mut fb,
+                                "wir_free_words",
+                                |s| {
+                                    s.params.push(AbiParam::new(ptr_ty));
+                                    s.params.push(AbiParam::new(types::I64));
+                                    s.returns.push(AbiParam::new(types::I64));
+                                },
+                                &[argv, argc],
+                            )?;
+
                             if res_count >= 1 {
                                 vmap.bind(node.results[0], out);
                             }
@@ -1000,10 +1012,10 @@ impl JIT {
 
                         // ---------------- Direct calls ----------------
                         Inst::CallDirect { callee, args, .. } => {
-                            use cranelift::prelude::{AbiParam, types};
-                            use cranelift::codegen::ir::{StackSlotData, StackSlotKind};
+                            use cranelift::prelude::{AbiParam, types, MemFlags};
+                            use cranelift_module::Linkage;
 
-                            // Signature for wir_f_* must match how we define them (argv*, argc) -> i64
+                            // Callee signature: (argv_ptr, argc) -> i64  (native CC)
                             let mut sig = self.module.make_signature();
                             sig.call_conv = self.module.isa().default_call_conv();
                             sig.params.push(AbiParam::new(ptr_ty));     // argv*
@@ -1016,31 +1028,47 @@ impl JIT {
                                 .declare_function(&sym, Linkage::Import, &sig)
                                 .map_err(|e| e.to_string())?;
 
-                            // Marshal args into a stack argv buffer
-                            let n = args.len();
-                            let size_bytes: u32 = (n as u32) * 8;
-                            let slot = fb.create_sized_stack_slot(StackSlotData::new(
-                                StackSlotKind::ExplicitSlot, size_bytes, 0,
-                            ));
-                            for (i, a) in args.iter().enumerate() {
-                                let v = vmap.get_or_emit(*a, &mut fb, args_base, fun_ir);
-                                fb.ins().stack_store(v, slot, (i as i32) * 8);
-                            }
-                            let argv_ptr = fb.ins().stack_addr(ptr_ty, slot, 0);
-                            let argc     = fb.ins().iconst(types::I64, n as i64);
+                            // Allocate argv on the heap (aligned *mut i64).
+                            let argc_i64 = fb.ins().iconst(types::I64, args.len() as i64);
+                            let argv_ptr = self.call_import(
+                                &mut fb,
+                                "wir_alloc_words",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64)); // n
+                                    s.returns.push(AbiParam::new(ptr_ty));    // *mut i64
+                                },
+                                &[argc_i64],
+                            )?;
 
-                            // Indirect call through absolute address (avoids 26-bit range issue)
+                            // Store args at argv[i].
+                            for (i, a) in args.iter().enumerate() {
+                                let v    = vmap.get_or_emit(*a, &mut fb, args_base, fun_ir);
+                                let addr = fb.ins().iadd_imm(argv_ptr, (i as i64) * 8);
+                                fb.ins().store(MemFlags::trusted(), v, addr, 0);
+                            }
+
+                            // Call through absolute address (avoids range issues).
                             let outs = self.call_funcref(
                                 &mut fb,
                                 func_id,
                                 |s| {
-                                    // IMPORTANT: do not touch `self` here.
-                                    // call_funcref itself already sets `s.call_conv = default_call_conv()`.
                                     s.params.push(AbiParam::new(ptr_ty));     // argv*
                                     s.params.push(AbiParam::new(types::I64)); // argc
                                     s.returns.push(AbiParam::new(types::I64));
                                 },
-                                &[argv_ptr, argc],
+                                &[argv_ptr, argc_i64],
+                            )?;
+
+                            // Free argv (no-op under GC build; real free in non-GC build).
+                            let _ = self.call_import(
+                                &mut fb,
+                                "wir_free_words",
+                                |s| {
+                                    s.params.push(AbiParam::new(ptr_ty));     // argv*
+                                    s.params.push(AbiParam::new(types::I64)); // n (optional but handy)
+                                    s.returns.push(AbiParam::new(types::I64)); // 0
+                                },
+                                &[argv_ptr, argc_i64],
                             )?;
 
                             if res_count >= 1 {
@@ -1050,137 +1078,112 @@ impl JIT {
 
                         // Engine has the ability to memoize functions, it is implemented natively
                         Inst::CallDirectMemoized { callee, args } => {
-                            use cranelift::prelude::{AbiParam, types, IntCC};
-                            use cranelift::codegen::ir::{StackSlotData, StackSlotKind};
+                            use cranelift::prelude::{AbiParam, types, IntCC, MemFlags};
+                            use cranelift_module::Linkage;
 
                             let arity = args.len();
+                            let ptr_ty = self.ptr_ty();
 
-                            // We only memoize 1-arg calls (design choice). If not 1, just fall back to a plain call.
-                            if arity > 4 {
-                                // === same lowering as CallDirect ===
-                                let mut sig = self.module.make_signature();
-                                sig.call_conv = self.module.isa().default_call_conv();
-                                sig.params.push(AbiParam::new(ptr_ty));
-                                sig.params.push(AbiParam::new(types::I64));
-                                sig.returns.push(AbiParam::new(types::I64));
+                            // Materialize args now (as i64 CLIF vals).
+                            let mut keys = Vec::with_capacity(arity);
+                            for &a in args { keys.push(vmap.get_or_emit(a, &mut fb, args_base, fun_ir)); }
 
-                                let sym = format!("wir_f_{}", callee.0);
-                                let func_id = self.module.declare_function(&sym, Linkage::Import, &sig)
-                                    .map_err(|e| e.to_string())?;
+                            // ---- Lookup: out value lives in a 1-word HEAP buffer (aligned) ----
+                            let one  = fb.ins().iconst(types::I64, 1);
+                            let zero = fb.ins().iconst(types::I64, 0);
+                            let fid  = fb.ins().iconst(types::I64, callee.0 as i64);
 
-                                let n = args.len();
-                                let size_bytes: u32 = (n as u32) * 8;
-                                let slot = fb.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size_bytes, 0));
-                                for (i, a) in args.iter().enumerate() {
-                                    let v = vmap.get_or_emit(*a, &mut fb, args_base, fun_ir);
-                                    fb.ins().stack_store(v, slot, (i as i32) * 8);
-                                }
-                                let argv_ptr = fb.ins().stack_addr(ptr_ty, slot, 0);
-                                let argc     = fb.ins().iconst(types::I64, n as i64);
-
-                                let outs = self.call_funcref(
-                                    &mut fb,
-                                    func_id,
-                                    |s| {
-                                        s.params.push(AbiParam::new(ptr_ty));
-                                        s.params.push(AbiParam::new(types::I64));
-                                        s.returns.push(AbiParam::new(types::I64));
-                                    },
-                                    &[argv_ptr, argc],
-                                )?;
-                                if res_count >= 1 { vmap.bind(node.results[0], outs[0]); }
-                                continue;
-                            }
-
-                            let ptr_ty      = self.ptr_ty();
-                            let ptr_ty_local= ptr_ty; // avoid borrowing `self` inside closures
-
-                            // materialize args as i64 values
-                            let mut keys: Vec<Value> = Vec::with_capacity(arity);
-                            for &a in args {
-                                keys.push(vmap.get_or_emit(a, &mut fb, args_base, fun_ir));
-                            }
-
-                            // out slot for cached value
-                            let out_slot = fb.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 0));
-                            let out_ptr  = fb.ins().stack_addr(ptr_ty, out_slot, 0);
-
-                            // call wir_memo_getN
-                            let fid_i64 = fb.ins().iconst(types::I64, callee.0 as i64);
+                            let out_ptr = self.call_import(
+                                &mut fb, "wir_alloc_words",
+                                |s| { s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(ptr_ty)); },
+                                &[one],
+                            )?;
 
                             let found = match arity {
                                 1 => {
-                                    let args = [fid_i64, keys[0], out_ptr];
-                                    self.call_import(&mut fb, "wir_memo_get",  |s| {
+                                    let args = [fid, keys[0], out_ptr];
+                                    self.call_import(&mut fb, "wir_memo_get", |s| {
                                         s.params.push(AbiParam::new(types::I64));   // fid
                                         s.params.push(AbiParam::new(types::I64));   // k0
-                                        s.params.push(AbiParam::new(ptr_ty_local)); // out*
+                                        s.params.push(AbiParam::new(ptr_ty));       // out*
                                         s.returns.push(AbiParam::new(types::I64));  // 0/1
                                     }, &args)?
                                 }
                                 2 => {
-                                    let args = [fid_i64, keys[0], keys[1], out_ptr];
+                                    let args = [fid, keys[0], keys[1], out_ptr];
                                     self.call_import(&mut fb, "wir_memo_get2", |s| {
                                         s.params.push(AbiParam::new(types::I64));
                                         s.params.push(AbiParam::new(types::I64));
                                         s.params.push(AbiParam::new(types::I64));
-                                        s.params.push(AbiParam::new(ptr_ty_local));
+                                        s.params.push(AbiParam::new(ptr_ty));
                                         s.returns.push(AbiParam::new(types::I64));
                                     }, &args)?
                                 }
                                 3 => {
-                                    let args = [fid_i64, keys[0], keys[1], keys[2], out_ptr];
+                                    let args = [fid, keys[0], keys[1], keys[2], out_ptr];
                                     self.call_import(&mut fb, "wir_memo_get3", |s| {
                                         s.params.push(AbiParam::new(types::I64));
                                         s.params.push(AbiParam::new(types::I64));
                                         s.params.push(AbiParam::new(types::I64));
                                         s.params.push(AbiParam::new(types::I64));
-                                        s.params.push(AbiParam::new(ptr_ty_local));
+                                        s.params.push(AbiParam::new(ptr_ty));
                                         s.returns.push(AbiParam::new(types::I64));
                                     }, &args)?
                                 }
                                 _ => {
-                                    let args = [fid_i64, keys[0], keys[1], keys[2], keys[3], out_ptr];
+                                    let args = [fid, keys[0], keys[1], keys[2], keys[3], out_ptr];
                                     self.call_import(&mut fb, "wir_memo_get4", |s| {
                                         s.params.push(AbiParam::new(types::I64));
                                         s.params.push(AbiParam::new(types::I64));
                                         s.params.push(AbiParam::new(types::I64));
                                         s.params.push(AbiParam::new(types::I64));
                                         s.params.push(AbiParam::new(types::I64));
-                                        s.params.push(AbiParam::new(ptr_ty_local));
+                                        s.params.push(AbiParam::new(ptr_ty));
                                         s.returns.push(AbiParam::new(types::I64));
                                     }, &args)?
                                 }
                             };
 
-                            // split
-                            use cranelift::codegen::ir::instructions::BlockArg;
                             let bb_hit  = fb.create_block();
                             let bb_miss = fb.create_block();
                             let bb_join = fb.create_block();
                             let res_phi = fb.append_block_param(bb_join, types::I64);
 
-                            let zero = fb.ins().iconst(types::I64, 0);
                             let is_hit = fb.ins().icmp(IntCC::NotEqual, found, zero);
-                            fb.ins().brif(is_hit, bb_hit, &[] as &[BlockArg], bb_miss, &[] as &[BlockArg]);
+                            use cranelift::codegen::ir::instructions::BlockArg;
+                            fb.ins().brif(
+                                is_hit,
+                                bb_hit,  &[] as &[BlockArg],
+                                bb_miss, &[] as &[BlockArg],
+                            );
 
-                            // HIT: load cached, jump join
+                            // HIT: load cached, free temp buffer, jump join
                             fb.switch_to_block(bb_hit);
                             let cached = fb.ins().load(types::I64, MemFlags::trusted(), out_ptr, 0);
-                            let mut hit_args = vec![BlockArg::from(cached)];
-                            fb.ins().jump(bb_join, &hit_args[..]);
+                            let _ = self.call_import(&mut fb, "wir_free_words", |s| {
+                                s.params.push(AbiParam::new(ptr_ty));
+                                s.params.push(AbiParam::new(types::I64)); // n
+                                s.returns.push(AbiParam::new(types::I64));
+                            }, &[out_ptr, one])?;
+                            let hit_args = [BlockArg::from(cached)];
+                            fb.ins().jump(bb_join, &hit_args);
 
-                            // MISS: normal CallDirect, then wir_memo_putN, jump join
+                            // MISS: normal CallDirect via heap argv, memoize, free, jump join
                             fb.switch_to_block(bb_miss);
 
-                            // marshal argv for the callee
-                            let size_bytes: u32 = (arity as u32) * 8;
-                            let argv_slot = fb.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size_bytes, 0));
-                            for (i, &kv) in keys.iter().enumerate() { fb.ins().stack_store(kv, argv_slot, (i as i32) * 8); }
-                            let argv_ptr = fb.ins().stack_addr(ptr_ty, argv_slot, 0);
-                            let argc     = fb.ins().iconst(types::I64, arity as i64);
+                            // Marshal argv on HEAP (aligned)
+                            let argc_i64 = fb.ins().iconst(types::I64, arity as i64);
+                            let argv_ptr = self.call_import(
+                                &mut fb, "wir_alloc_words",
+                                |s| { s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(ptr_ty)); },
+                                &[argc_i64],
+                            )?;
+                            for (i, &kv) in keys.iter().enumerate() {
+                                let addr = fb.ins().iadd_imm(argv_ptr, (i as i64) * 8);
+                                fb.ins().store(MemFlags::trusted(), kv, addr, 0);
+                            }
 
-                            // import the callee symbol and call (same as your CallDirect path)
+                            // Import callee and call by absolute address
                             let mut sig = self.module.make_signature();
                             sig.call_conv = self.module.isa().default_call_conv();
                             sig.params.push(AbiParam::new(ptr_ty));
@@ -1188,70 +1191,51 @@ impl JIT {
                             sig.returns.push(AbiParam::new(types::I64));
                             let sym = format!("wir_f_{}", callee.0);
                             let func_id = self.module.declare_function(&sym, Linkage::Import, &sig).map_err(|e| e.to_string())?;
-                            let outs = self.call_funcref(
-                                &mut fb,
-                                func_id,
-                                |s| {
-                                    s.params.push(AbiParam::new(ptr_ty));
-                                    s.params.push(AbiParam::new(types::I64));
-                                    s.returns.push(AbiParam::new(types::I64));
-                                },
-                                &[argv_ptr, argc],
-                            )?;
+                            let outs = self.call_funcref(&mut fb, func_id, |s| {
+                                s.params.push(AbiParam::new(ptr_ty));
+                                s.params.push(AbiParam::new(types::I64));
+                                s.returns.push(AbiParam::new(types::I64));
+                            }, &[argv_ptr, argc_i64])?;
                             let retv = outs[0];
 
-                            // wir_memo_putN
-                            let fid_i64_put = fb.ins().iconst(types::I64, callee.0 as i64);
+                            // free argv
+                            let _ = self.call_import(&mut fb, "wir_free_words", |s| {
+                                s.params.push(AbiParam::new(ptr_ty));
+                                s.params.push(AbiParam::new(types::I64));
+                                s.returns.push(AbiParam::new(types::I64));
+                            }, &[argv_ptr, argc_i64])?;
 
+                            // memo put
+                            let fid2 = fb.ins().iconst(types::I64, callee.0 as i64);
                             match arity {
-                                1 => {
-                                    let args = [fid_i64_put, keys[0], retv];
-                                    let _ = self.call_import(&mut fb, "wir_memo_put",  |s| {
-                                        s.params.push(AbiParam::new(types::I64)); // fid
-                                        s.params.push(AbiParam::new(types::I64)); // k0
-                                        s.params.push(AbiParam::new(types::I64)); // val
+                                1 => { let args = [fid2, keys[0], retv];
+                                    let _ = self.call_import(&mut fb, "wir_memo_put", |s| {
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.params.push(AbiParam::new(types::I64));
                                         s.returns.push(AbiParam::new(types::I64));
-                                    }, &args)?;
-                                }
-                                2 => {
-                                    let args = [fid_i64_put, keys[0], keys[1], retv];
+                                    }, &args)?; }
+                                2 => { let args = [fid2, keys[0], keys[1], retv];
                                     let _ = self.call_import(&mut fb, "wir_memo_put2", |s| {
-                                        s.params.push(AbiParam::new(types::I64));
-                                        s.params.push(AbiParam::new(types::I64));
-                                        s.params.push(AbiParam::new(types::I64));
-                                        s.params.push(AbiParam::new(types::I64));
+                                        for _ in 0..4 { s.params.push(AbiParam::new(types::I64)); }
                                         s.returns.push(AbiParam::new(types::I64));
-                                    }, &args)?;
-                                }
-                                3 => {
-                                    let args = [fid_i64_put, keys[0], keys[1], keys[2], retv];
+                                    }, &args)?; }
+                                3 => { let args = [fid2, keys[0], keys[1], keys[2], retv];
                                     let _ = self.call_import(&mut fb, "wir_memo_put3", |s| {
-                                        s.params.push(AbiParam::new(types::I64));
-                                        s.params.push(AbiParam::new(types::I64));
-                                        s.params.push(AbiParam::new(types::I64));
-                                        s.params.push(AbiParam::new(types::I64));
-                                        s.params.push(AbiParam::new(types::I64));
+                                        for _ in 0..5 { s.params.push(AbiParam::new(types::I64)); }
                                         s.returns.push(AbiParam::new(types::I64));
-                                    }, &args)?;
-                                }
-                                _ => {
-                                    let args = [fid_i64_put, keys[0], keys[1], keys[2], keys[3], retv];
+                                    }, &args)?; }
+                                _ => { let args = [fid2, keys[0], keys[1], keys[2], keys[3], retv];
                                     let _ = self.call_import(&mut fb, "wir_memo_put4", |s| {
-                                        s.params.push(AbiParam::new(types::I64));
-                                        s.params.push(AbiParam::new(types::I64));
-                                        s.params.push(AbiParam::new(types::I64));
-                                        s.params.push(AbiParam::new(types::I64));
-                                        s.params.push(AbiParam::new(types::I64));
-                                        s.params.push(AbiParam::new(types::I64));
+                                        for _ in 0..6 { s.params.push(AbiParam::new(types::I64)); }
                                         s.returns.push(AbiParam::new(types::I64));
-                                    }, &args)?;
-                                }
+                                    }, &args)?; }
                             }
 
-                            let mut miss_args = vec![BlockArg::from(retv)];
-                            fb.ins().jump(bb_join, &miss_args[..]);
+                            // return path
+                            let miss_args = [BlockArg::from(retv)];
+                            fb.ins().jump(bb_join, &miss_args);
 
-                            // JOIN
                             fb.switch_to_block(bb_join);
                             if res_count >= 1 { vmap.bind(node.results[0], res_phi); }
                         }
@@ -1274,10 +1258,11 @@ impl JIT {
                             let ci64 = vmap.get_or_emit(*cond, &mut fb, args_base, fun);
                             let z    = fb.ins().iconst(types::I64, 0);
                             let cb1  = fb.ins().icmp(IntCC::NotEqual, ci64, z);
+                            use cranelift::codegen::ir::instructions::BlockArg;
                             fb.ins().brif(
                                 cb1,
-                                clif_of[then_b.0 as usize], &[] as &[_],
-                                clif_of[else_b.0 as usize], &[] as &[_],
+                                clif_of[then_b.0 as usize], &[] as &[BlockArg],
+                                clif_of[else_b.0 as usize], &[] as &[BlockArg],
                             );
                             block_terminated = true;
                         }
@@ -1672,66 +1657,61 @@ pub extern "C" fn wir_make_closure(code_ptr: *const u8, env: i64) -> i64 {
 pub extern "C" fn wir_call_closure(clo_ptr: i64, argv: *const i64, argc: i64) -> i64 {
     if clo_ptr == 0 { return 0; }
 
-    // Borrow the BoxedClosure allocated in value.rs
     let clo = unsafe { &*(clo_ptr as *const BoxedClosure) };
-
-    // Turn stored code_ptr back into the JIT function type:
     let f: JitFnPtr = unsafe { std::mem::transmute(clo.code_ptr as *const u8) };
 
-    // Build (env..., args...) as the callee expects (ABI: (*const i64, usize) -> i64)
     let env_len = clo.env.len();
-    let mut args: Vec<i64> = Vec::with_capacity(env_len + (argc as usize));
+    let total   = env_len + (argc as usize);
+    let mut args: Vec<i64> = Vec::with_capacity(total);
 
-    // prepend captured environment
+    // 1) prepend captured env
     args.extend_from_slice(&clo.env);
 
-    // append caller args
-    for i in 0..(argc as isize) {
-        unsafe { args.push(*argv.offset(i)); }
+    // 2) append caller args exactly once
+    for i in 0..(argc as usize) {
+        unsafe { args.push(*argv.add(i)); }
     }
 
+    // Call wir_f_*: ABI (*const i64, usize) -> i64
     unsafe { (f)(args.as_ptr(), args.len()) }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_alloc_words(n: i64) -> *mut i64 {
-    if n <= 0 { return std::ptr::null_mut(); }
-    let mut v = Vec::<i64>::with_capacity(n as usize);
-    v.resize(n as usize, 0);
-    let p = v.as_mut_ptr();
-    std::mem::forget(v); // leak: fine for JIT demo
-    p
+    use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
+    if n <= 0 { return core::ptr::null_mut(); }
+
+    let words = n as usize;
+    let a = core::cmp::max(core::mem::align_of::<i64>(), core::mem::align_of::<usize>());
+    let hdr = (core::mem::size_of::<usize>() + (a - 1)) & !(a - 1); // padded header
+    let total = hdr + words * core::mem::size_of::<i64>();
+
+    unsafe {
+        let layout = Layout::from_size_align(total, a).unwrap();
+        let base = alloc_zeroed(layout);
+        if base.is_null() { handle_alloc_error(layout); }
+        // store length at header
+        *(base as *mut usize) = words;
+        let ret = base.add(hdr) as *mut i64; // aligned *mut i64
+
+        return ret;
+    }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn wir_alloc_array(n: i64) -> i64 {
-    use std::ptr::{write_unaligned};
-    use crate::value::{ObjHeader, TAG_ARRAY, ARRAY_LEN_OFFSET, ARRAY_DATA_OFFSET};
-
-    if n <= 0 {
-        return 0; // null for degenerate
-    }
-
-    let total = (ARRAY_DATA_OFFSET as usize) + (n as usize) * 8;
-    // Zero-initialized backing memory; we’ll leak it (fine until GC arrives).
-    let mut buf = vec![0u8; total];
-    let p = buf.as_mut_ptr();
-    std::mem::forget(buf);
-
+pub extern "C" fn wir_free_words(p: *mut i64, _n: i64) -> i64 {
+    use std::alloc::{dealloc, Layout};
+    if p.is_null() { return 0; }
     unsafe {
-        // header
-        let hdr_ptr = p as *mut ObjHeader;
-        (*hdr_ptr).tag = TAG_ARRAY;
-        (*hdr_ptr).aux = 0;
-
-        // len
-        let len_ptr = p.add(ARRAY_LEN_OFFSET as usize) as *mut i64;
-        write_unaligned(len_ptr, n);
-
-        // data is already zeroed
+        let a = core::cmp::max(core::mem::align_of::<i64>(), core::mem::align_of::<usize>());
+        let hdr = (core::mem::size_of::<usize>() + (a - 1)) & !(a - 1);
+        let base = (p as *mut u8).sub(hdr);
+        let words = *(base as *const usize);
+        let total = hdr + words * core::mem::size_of::<i64>();
+        let layout = Layout::from_size_align(total, a).unwrap();
+        dealloc(base, layout);
     }
-
-    p as i64 // even pointer => “heap object”
+    0
 }
 
 // ----- SMI and boxed f64 handling -----
