@@ -40,10 +40,17 @@ pub extern "C" fn wir_clear_interval(id: i64) -> i64 {
 /// Drain all due timers/intervals until the event loop is quiescent.
 /// Call this **after** a top-level JIT invocation returns.
 pub fn drain_event_loop_to_quiescence() {
-    EVENT_LOOP.run_until_quiescent(|fun| unsafe {
-        // Timers here are zero-arg closures; pass null argv/argc=0.
-        let _ = wir_call_closure(fun, std::ptr::null(), 0);
-    });
+    EVENT_LOOP.run_until_quiescent(
+        // microtask: one arg
+        |f, a| unsafe {
+            let arg = [a];
+            let _ = wir_call_closure(f, arg.as_ptr(), 1);
+        },
+        // timer: zero args
+        |fun| unsafe {
+            let _ = wir_call_closure(fun, core::ptr::null(), 0);
+        },
+    );
 }
 
 /// C-ABI helper if you want to pump from the embedding.

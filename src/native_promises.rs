@@ -19,8 +19,10 @@ struct BoxedPromise {
 }
 
 // Tiny helper: allocate a BoxedStr for a *static* &str key
+// tiny helper (already present above, keep one copy)
 fn static_str_value(s: &'static str) -> i64 {
     use crate::value::{BoxedStr, TAG_STRING};
+    use crate::value::ObjHeader;
     let obj = Box::new(BoxedStr {
         hdr: ObjHeader { tag: TAG_STRING, aux: 0 },
         len: s.as_bytes().len(),
@@ -174,4 +176,94 @@ pub extern "C" fn wir_deferred_resolve(priv_ptr: i64, val: i64) -> i64 {
 pub extern "C" fn wir_deferred_reject(priv_ptr: i64, reason: i64) -> i64 {
     wir_promise_reject(priv_ptr, reason);
     priv_ptr
+}
+
+// ================= Async/Await ==================
+
+unsafe extern "C" {
+    // You already used this above for executors
+    fn wir_call_closure(clo_ptr: i64, argv: *const i64, argc: i64) -> i64;
+
+    // These exist and are used elsewhere in your lowering
+    fn wir_obj_get_str(obj: i64, key: i64) -> i64;
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_event_loop_pump_once() -> i32 {
+    unsafe extern "C" { fn wir_call_closure(clo_ptr: i64, argv: *const i64, argc: i64) -> i64; }
+    let ran = EVENT_LOOP.pump_once(
+        // microtask: one arg
+        |f, a| unsafe {
+            let arg = [a];
+            let _ = wir_call_closure(f, arg.as_ptr(), 1);
+        },
+        // timer: zero args
+        |fun| unsafe {
+            let _ = wir_call_closure(fun, core::ptr::null(), 0);
+        },
+    );
+    ran as i32
+}
+
+
+// Blocking await: returns fulfillment value; rejection returns 0 for now
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_await(val: i64) -> i64 {
+    #[repr(C)]
+    struct Cell { ready: bool, ok: bool, v: i64 }
+
+    extern "C" fn on_f(argv: *const i64, argc: usize) -> i64 {
+        unsafe {
+            let args = slice::from_raw_parts(argv, argc);
+            let cell = args.get(0).copied().unwrap_or(0) as *mut Cell;
+            let v    = args.get(1).copied().unwrap_or(0);
+            (*cell).v = v;
+            (*cell).ok = true;
+            (*cell).ready = true;
+        }
+        0
+    }
+    extern "C" fn on_r(argv: *const i64, argc: usize) -> i64 {
+        unsafe {
+            let args = slice::from_raw_parts(argv, argc);
+            let cell = args.get(0).copied().unwrap_or(0) as *mut Cell;
+            let v    = args.get(1).copied().unwrap_or(0);
+            (*cell).v = v;      // store reason; MVP: ignored by caller
+            (*cell).ok = false;
+            (*cell).ready = true;
+        }
+        0
+    }
+
+    // prepare cell + handlers
+    let cell = Box::into_raw(Box::new(Cell { ready: false, ok: true, v: 0 }));
+
+    unsafe {
+        let onf = closure_new(on_f as usize, 1);
+        closure_set_env_slot(onf, 0, cell as i64);
+        let onr = closure_new(on_r as usize, 1);
+        closure_set_env_slot(onr, 0, cell as i64);
+
+        // Try public promise object path: obj["then"](onf, onr)
+        let then_fun = wir_obj_get_str(val, static_str_value("then"));
+        if then_fun != 0 {
+            let argv = [onf, onr];
+            let _ = wir_call_closure(then_fun, argv.as_ptr(), 2);
+        } else {
+            // Fallback: treat as private promise pointer
+            let _ = wir_promise_then(val, onf, onr);
+        }
+    }
+
+    // pump loop until settled
+    loop {
+        unsafe {
+            if (*cell).ready { break; }
+        }
+        let _ = wir_event_loop_pump_once();
+    }
+
+    let out = unsafe { (*cell).v };
+    unsafe { drop(Box::from_raw(cell)); }
+    out
 }

@@ -38,6 +38,12 @@ pub enum Tok {
     #[token("in")] In,
     #[token("delete")] Delete,
 
+    // Async/await & defer/errdefer
+    #[token("async")] Async,
+    #[token("await")] Await,
+    #[token("defer")] Defer,
+    #[token("errdefer")] ErrDefer,
+
     // Simple builtins
     #[token("Array")] ListBuiltin,
     #[token("Promise")] PromiseBuiltin,
@@ -127,6 +133,7 @@ pub struct FuncDecl {
     pub name: String,
     pub params: Vec<String>,
     pub body: Block,
+    pub is_async: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +190,9 @@ pub enum Expr {
 
     // delete obj.x / delete obj["x"]
     DeleteProp { obj: SmallBox<Expr, u8>, key: PropKey },
+
+    // await <expression>
+    Await(SmallBox<Expr, u8>)
 }
 
 
@@ -304,17 +314,18 @@ impl<'src> Parser<'src> {
         let mut toplevel_stmts: Vec<Stmt> = Vec::new();
 
         while self.i < self.toks.len() {
-            // Allow stray semicolons at the top level.
-            if self.matches(&Tok::Semi) {
-                continue;
-            }
+            if self.matches(&Tok::Semi) { continue; }
 
-            if self.check(&Tok::Fn) {
-                // consume `fn` and parse a function definition
-                self.i += 1;
-                functions.push(self.fn_def()?);
+            if self.check(&Tok::Fn) || self.check(&Tok::Async) {
+                let is_async = if self.matches(&Tok::Async) {
+                    self.expect(Tok::Fn, "expected 'fn' after 'async'")?;
+                    true
+                } else {
+                    self.i += 1; // consume Fn
+                    false
+                };
+                functions.push(self.fn_def_with_async(is_async)?);
             } else {
-                // parse a regular statement at top level (e.g. `print(…) ;`)
                 let stmt = self.stmt()?;
                 toplevel_stmts.push(stmt);
             }
@@ -325,13 +336,14 @@ impl<'src> Parser<'src> {
                 name: "__toplevel__".to_string(),
                 params: Vec::new(),
                 body: Block { stmts: toplevel_stmts },
+                is_async: true, // Allows top-level async
             });
         }
 
         Ok(Program { functions })
     }
 
-    fn fn_def(&mut self) -> PResult<FuncDecl> {
+    fn fn_def_with_async(&mut self, is_async: bool) -> PResult<FuncDecl> {
         let name = match self.next().tok {
             Tok::Ident(s) => s,
             _ => return Err(self.err_here("expected function name")),
@@ -350,7 +362,7 @@ impl<'src> Parser<'src> {
             }
         }
         let body = self.block()?;
-        Ok(FuncDecl { name, params, body })
+        Ok(FuncDecl { name, params, body, is_async })
     }
 
     fn block(&mut self) -> PResult<Block> {
@@ -646,7 +658,10 @@ impl<'src> Parser<'src> {
     fn parse_factor(&mut self) -> PResult<Expr> {
         let mut e = self.parse_unary()?;
         loop {
-            if self.matches(&Tok::Star) {
+            if self.matches(&Tok::Await) {
+                let e = self.parse_unary()?;
+                return Ok(Expr::Await(SmallBox::new(e)));
+            } else if self.matches(&Tok::Star) {
                 let rhs = self.parse_unary()?;
                 e = Expr::Binary { op: BinOp::Mul, a: SmallBox::new(e), b: SmallBox::new(rhs) };
             } else if self.matches(&Tok::Slash) {
@@ -955,6 +970,8 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
             Expr::DeleteProp { obj, .. } => {
                 collect_uses_expr(obj, uses);
             }
+
+            _ => { /* other expr types have no uses */ }
         }
     }
 
@@ -1096,8 +1113,7 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
             Expr::GetProp { recv, name } =>
                 Expr::GetProp { recv: SmallBox::new(rw_expr(recv, used, counter, enclosing_locals, out_funcs, lam_caps_out)), name: name.clone() },
             Expr::Index { recv, index } =>
-                Expr::Index { recv: SmallBox::new(rw_expr(recv, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
-                              index: SmallBox::new(rw_expr(index, used, counter, enclosing_locals, out_funcs, lam_caps_out)) },
+                Expr::Index { recv: SmallBox::new(rw_expr(recv, used, counter, enclosing_locals, out_funcs, lam_caps_out)), index: SmallBox::new(rw_expr(index, used, counter, enclosing_locals, out_funcs, lam_caps_out)) },
             Expr::Group(g) => Expr::Group(SmallBox::new(rw_expr(g, used, counter, enclosing_locals, out_funcs, lam_caps_out))),
 
             // CORE: hoist to a top-level function with extra hidden `__env` param; replace with FnRef
@@ -1127,7 +1143,7 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
                 lam_params.push("__env".to_string());
                 lam_params.extend(params.iter().cloned());
 
-                out_funcs.push(FuncDecl { name: lam_name.clone(), params: lam_params, body: body.clone() });
+                out_funcs.push(FuncDecl { name: lam_name.clone(), params: lam_params, body: body.clone(), is_async: false });
 
                 // Replace literal with a named lam reference
                 Expr::FnRef { name: lam_name }
@@ -1184,6 +1200,8 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
                     key: key.clone(),
                 }
             }
+
+            Expr::Await(inner) => Expr::Await(SmallBox::new(rw_expr(inner, used, counter, enclosing_locals, out_funcs, lam_caps_out))),
         }
     }
 
@@ -1193,7 +1211,7 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
         // at top-level of a function, enclosing locals = its params (can be captured by nested lambdas)
         let enclosing: BTreeSet<String> = f.params.iter().cloned().collect();
         let rew_body = rw_block(&f.body, &mut used, &mut counter, &enclosing, &mut out_funcs, &mut lam_captures);
-        out_funcs.push(FuncDecl { name: f.name.clone(), params: f.params.clone(), body: rew_body });
+        out_funcs.push(FuncDecl { name: f.name.clone(), params: f.params.clone(), body: rew_body, is_async: f.is_async });
     }
 
     (Program { functions: out_funcs }, lam_captures)
@@ -1248,36 +1266,45 @@ impl<'m> Lowerer<'m> {
     }
 
     fn lower_fn(&mut self, fdecl: &FuncDecl) -> LResult<FuncId> {
+        use crate::wir::{Inst, Type};
+
+        // Capture list for this (hoisted) function, if any.
         let lam_caps_for_this = self
             .lam_captures
             .get(&fdecl.name)
             .cloned()
             .unwrap_or_default();
 
-        // Build param types: default i32, but "__env" (if present) is an Array (env).
+        // Param types: default i32; if the first param is "__env", treat it as an Array (env).
         let mut param_tys: Vec<Type> = fdecl.params.iter().map(|_| Type::Int32).collect();
         if matches!(fdecl.params.first().map(|s| s.as_str()), Some("__env")) {
+            // Environment is modeled as a dynamic array (of "boxes").
             param_tys[0] = Type::Array(Box::new(None));
         }
 
-        // Snapshot function table for free helpers (no &mut self borrow during build)
-        let funcs_snapshot = self.funcs.clone();
-        let func_name = fdecl.name.clone();
+        // We always return a single i32-typed value in this WIR.
         let ret_tys = vec![Type::Int32];
 
-        // Build function
+        // Snapshot the function table so we can resolve direct calls without borrowing &mut self.
+        let funcs_snapshot = self.funcs.clone();
+        let func_name = fdecl.name.clone();
+
+        // Build the function body.
         let mut func = {
             let mut b = Builder::new(self.module, &func_name, param_tys, ret_tys);
 
-            // Bind params as locals
+            // Bind parameters as locals.
             let mut locals: HashMap<String, ValueId> = Default::default();
             for (i, name) in fdecl.params.iter().enumerate() {
                 locals.insert(name.clone(), b.param(i));
             }
 
-            // Hoisted lambda: param 0 is __env (array of "boxes"). Each capture is a box.
+            // If this is a hoisted lambda, param 0 is "__env" and we must bind each captured name
+            // to its corresponding box (array slot) from the env.
             if !lam_caps_for_this.is_empty() {
-                let env_arr = *locals.get("__env").expect("__env param present");
+                let env_arr = *locals
+                    .get("__env")
+                    .expect("__env param must be present for hoisted lambdas");
                 for (i, cap) in lam_caps_for_this.iter().enumerate() {
                     let idx = b.const_i32(i as i32);
                     let (_nid, boxv) = b.push_node(
@@ -1291,16 +1318,17 @@ impl<'m> Lowerer<'m> {
                         1,
                         true,
                     );
-                    // Bind the captured name to its box, and mark it boxed.
+                    // Bind captured name to its box and mark it as "boxed" for reads/writes.
                     locals.insert(cap.clone(), boxv[0]);
                     locals.insert(boxed_key(cap), boxv[0]);
                 }
             }
 
-            // Per-function field table for object props during lowering (unchanged)
+            // Per-function table for "fast field" interning.
             let mut fields: HashMap<String, FieldId> = Default::default();
             let mut next_field: u32 = 0;
 
+            // Lower the body.
             lower_block_free(
                 &mut b,
                 &mut locals,
@@ -1311,14 +1339,14 @@ impl<'m> Lowerer<'m> {
                 &self.lam_captures,
             )?;
 
-            // Fallthrough return 0
+            // Ensure a fallthrough return (matches your current calling convention).
             let zero = b.const_i32(0);
             b.ret(&[zero]);
 
             b.finish()
         };
 
-        // publish
+        // Publish into the module with the expected ID (sequential, matching predecl order).
         let fid = FuncId(self.module.funcs.len() as u32);
         func.id = fid;
         self.module.funcs.push(func);
@@ -1561,6 +1589,224 @@ fn collect_mut_locals_in_block(b: &Block) -> Vec<String> {
     let mut set = BTreeSet::new();
     for s in &b.stmts { collect_mut_locals_in_stmt(s, &mut set); }
     set.into_iter().collect() // stable order
+}
+
+fn lower_block_free_async<'m>(
+    b: &mut Builder<'m>,
+    locals: &mut HashMap<String, ValueId>,
+    fields: &mut HashMap<String, FieldId>,
+    next_field: &mut u32,
+    blk: &Block,
+    funcs: &HashMap<String, FuncId>,
+    lam_caps: &HashMap<String, Vec<String>>,
+    in_async: bool,
+) -> LResult<()> {
+    for s in &blk.stmts {
+        lower_stmt_free_async(b, locals, fields, next_field, s, funcs, lam_caps, in_async)?;
+    }
+    Ok(())
+}
+
+fn lower_stmt_free_async<'m>(
+    b: &mut Builder<'m>,
+    locals: &mut HashMap<String, ValueId>,
+    fields: &mut HashMap<String, FieldId>,
+    next_field: &mut u32,
+    s: &Stmt,
+    funcs: &HashMap<String, FuncId>,
+    lam_caps: &HashMap<String, Vec<String>>,
+    in_async: bool,
+) -> LResult<()> {
+    match s {
+        Stmt::Return(eopt) if in_async => {
+            let d = *locals.get("__deferred").expect("__deferred present");
+            let v = if let Some(e) = eopt {
+                lower_expr_free_async(b, locals, fields, next_field, e, funcs, lam_caps, in_async)?
+            } else {
+                b.const_i32(0)
+            };
+            let (_nid, _r) = b.push_node(
+                Inst::CallNative { name: "wir_deferred_resolve".into(), args: vec![d, v], pure: false, can_throw: false },
+                None, 1, true
+            );
+            b.ret(&[d]);
+            Ok(())
+        }
+        _ => {
+            // Forward to the old lowering, but via the *_async versions
+            match s {
+                Stmt::Var { name, init } => {
+                    let val = if let Some(e) = init {
+                        lower_expr_free_async(b, locals, fields, next_field, e, funcs, lam_caps, in_async)?
+                    } else { b.const_i32(0) };
+                    locals.insert(name.clone(), val);
+                    Ok(())
+                }
+                Stmt::If { cond, then_b, else_b } => {
+                    let c = lower_expr_free_async(b, locals, fields, next_field, cond, funcs, lam_caps, in_async)?;
+                    // (rest identical to your If lowering, but using lower_block_free_async)
+                    // ...
+                    // Keep your existing structure, just swap the called helpers:
+                    let then_id  = b.block();
+                    let else_id  = b.block();
+                    let then_end = b.block();
+                    let else_end = b.block();
+                    let cont_id  = b.block();
+
+                    b.branch(c, then_id, else_id);
+
+                    let incoming = locals.clone();
+
+                    b.position_at(then_id);
+                    let mut locals_then = incoming.clone();
+                    lower_block_free_async(b, &mut locals_then, fields, next_field, then_b, funcs, lam_caps, in_async)?;
+                    if !b.current_block_terminated() { b.jump(then_end, &[]); }
+                    b.position_at(then_end);
+
+                    b.position_at(else_id);
+                    let mut locals_else = incoming.clone();
+                    if let Some(eb) = else_b {
+                        lower_block_free_async(b, &mut locals_else, fields, next_field, eb, funcs, lam_caps, in_async)?;
+                    }
+                    if !b.current_block_terminated() { b.jump(else_end, &[]); }
+                    b.position_at(else_end);
+
+                    let mut phi_vars: Vec<String> = Vec::new();
+                    for (name, &vin) in incoming.iter() {
+                        let vt = *locals_then.get(name).unwrap_or(&vin);
+                        let ve = *locals_else.get(name).unwrap_or(&vin);
+                        if vt != ve { phi_vars.push(name.clone()); }
+                    }
+                    phi_vars.sort();
+
+                    let mut phi_params = Vec::with_capacity(phi_vars.len());
+                    for _ in &phi_vars { phi_params.push(b.add_block_param(cont_id, Type::Int32)); }
+
+                    let mut args_then = Vec::with_capacity(phi_vars.len());
+                    let mut args_else = Vec::with_capacity(phi_vars.len());
+                    for name in &phi_vars {
+                        let vin = *incoming.get(name).unwrap();
+                        args_then.push(*locals_then.get(name).unwrap_or(&vin));
+                        args_else.push(*locals_else.get(name).unwrap_or(&vin));
+                    }
+
+                    b.position_at(then_end); b.jump(cont_id, &args_then);
+                    b.position_at(else_end); b.jump(cont_id, &args_else);
+
+                    b.position_at(cont_id);
+                    for (i, name) in phi_vars.iter().enumerate() {
+                        locals.insert(name.clone(), phi_params[i]);
+                    }
+
+                    Ok(())
+                }
+                // While / For / Expr … call lower_*_async respectively
+                Stmt::While { cond, body } => {
+                    // same as your While, but using lower_expr_free_async / lower_block_free_async
+                    let head = b.block();
+                    let body_b = b.block();
+                    let exit = b.block();
+
+                    let mut_names = collect_mut_locals_in_block(body)
+                        .into_iter()
+                        .filter(|n| locals.contains_key(n))
+                        .collect::<Vec<_>>();
+
+                    let init_args: Vec<ValueId> = mut_names.iter().map(|n| *locals.get(n).unwrap()).collect();
+                    let phi_vals: Vec<ValueId> = mut_names.iter().map(|_| b.add_block_param(head, Type::Int32)).collect();
+
+                    b.jump(head, &init_args);
+
+                    b.position_at(head);
+                    for (nm, p) in mut_names.iter().zip(phi_vals.iter()) {
+                        locals.insert(nm.clone(), *p);
+                    }
+                    let c = lower_expr_free_async(b, locals, fields, next_field, cond, funcs, lam_caps, in_async)?;
+                    b.branch(c, body_b, exit);
+
+                    b.position_at(body_b);
+                    lower_block_free_async(b, locals, fields, next_field, body, funcs, lam_caps, in_async)?;
+                    let back_args: Vec<ValueId> = mut_names.iter().map(|n| *locals.get(n).unwrap()).collect();
+                    b.jump(head, &back_args);
+
+                    b.position_at(exit);
+                    for (nm, p) in mut_names.into_iter().zip(phi_vals.into_iter()) {
+                        locals.insert(nm, p);
+                    }
+                    Ok(())
+                }
+                Stmt::For { init, cond, step, body } => {
+                    if let Some(i) = init { lower_stmt_free_async(b, locals, fields, next_field, i, funcs, lam_caps, in_async)?; }
+
+                    let head = b.block();
+                    let body_b = b.block();
+                    let exit = b.block();
+
+                    use BTreeSet;
+                    let mut mutated_set: BTreeSet<String> = BTreeSet::new();
+                    for st in &body.stmts { collect_mut_locals_in_stmt(st, &mut mutated_set); }
+                    if let Some(se) = step { collect_mut_locals_in_expr(se, &mut mutated_set); }
+                    let mut_names: Vec<String> = mutated_set.into_iter().filter(|n| locals.contains_key(n)).collect();
+
+                    let init_args: Vec<ValueId> = mut_names.iter().map(|n| *locals.get(n).unwrap()).collect();
+                    let phi_vals: Vec<ValueId> = mut_names.iter().map(|_| b.add_block_param(head, Type::Int32)).collect();
+
+                    b.jump(head, &init_args);
+
+                    b.position_at(head);
+                    for (nm, p) in mut_names.iter().zip(phi_vals.iter()) { locals.insert(nm.clone(), *p); }
+                    let c = if let Some(e) = cond {
+                        lower_expr_free_async(b, locals, fields, next_field, e, funcs, lam_caps, in_async)?
+                    } else {
+                        let (_nid, res) = b.push_node(Inst::Const(Constant::Bool(true)), Some(Type::Bool), 1, false);
+                        res[0]
+                    };
+                    b.branch(c, body_b, exit);
+
+                    b.position_at(body_b);
+                    lower_block_free_async(b, locals, fields, next_field, body, funcs, lam_caps, in_async)?;
+                    if let Some(se) = step { let _ = lower_expr_free_async(b, locals, fields, next_field, se, funcs, lam_caps, in_async)?; }
+                    let back_args: Vec<ValueId> = mut_names.iter().map(|n| *locals.get(n).unwrap()).collect();
+                    b.jump(head, &back_args);
+
+                    b.position_at(exit);
+                    for (nm, p) in mut_names.into_iter().zip(phi_vals.into_iter()) { locals.insert(nm, p); }
+                    Ok(())
+                }
+                Stmt::Expr(e) => { let _ = lower_expr_free_async(b, locals, fields, next_field, e, funcs, lam_caps, in_async)?; Ok(()) }
+                Stmt::Return(_) => unreachable!(), // handled above when in_async
+            }
+        }
+    }
+}
+
+fn lower_expr_free_async<'m>(
+    b: &mut Builder<'m>,
+    locals: &mut HashMap<String, ValueId>,
+    fields: &mut HashMap<String, FieldId>,
+    next_field: &mut u32,
+    e: &Expr,
+    funcs: &HashMap<String, FuncId>,
+    lam_caps: &HashMap<String, Vec<String>>,
+    in_async: bool,
+) -> LResult<ValueId> {
+    match e {
+        Expr::Await(inner) => {
+            if !in_async {
+                return Err(LowerError::NotLowerable("await outside async function"));
+            }
+            let pv = lower_expr_free_async(b, locals, fields, next_field, inner, funcs, lam_caps, in_async)?;
+            let (_nid, res) = b.push_node(
+                Inst::CallNative { name: "wir_await".into(), args: vec![pv], pure: false, can_throw: false },
+                None, 1, true
+            );
+            Ok(res[0])
+        }
+        _ => {
+            // fall back to your original lowerer
+            lower_expr_free(b, locals, fields, next_field, e, funcs, lam_caps)
+        }
+    }
 }
 
 fn lower_array_method_call<'m>(

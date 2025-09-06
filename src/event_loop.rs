@@ -175,45 +175,76 @@ impl EventLoop {
         ran
     }
 
-    // Block and drive the loop until no pending timers exist.
-    pub fn run_until_quiescent(&self, mut call_closure: impl FnMut(i64)) {
-        loop {
-            // 1) Always drain microtasks to completion first
-            let _ = self.run_microtasks(usize::MAX, |f, a| {
-                // zero/one-arg closures — here we pass exactly one arg
-                unsafe {
-                    unsafe extern "C" { fn wir_call_closure(clo_ptr: i64, argv: *const i64, argc: i64) -> i64; }
-                    let arg = [a];
-                    let _ = wir_call_closure(f, arg.as_ptr(), 1);
-                }
-            });
+    /// Drive the loop once:
+    /// 1) drain some microtasks,
+    /// 2) move due timers to the ready queue,
+    /// 3) run at most one ready timer callback,
+    /// 4) if nothing ran, wait until the next timer (or briefly if none).
+    ///
+    /// Returns `true` if any work (microtask or timer) was executed.
+    pub fn pump_once(
+        &self,
+        mut call_micro: impl FnMut(i64, i64),  // (fun, arg)
+        mut call_timer: impl FnMut(i64),       // (fun)
+    ) -> bool {
+        // 1) Drain some microtasks first
+        let ran_micro = self.run_microtasks(1024, |f, a| call_micro(f, a));
+        if ran_micro > 0 { return true; }
 
-            // 2) Move due timers to ready and run what’s ready
+        // 2) Promote due timers
+        self.poll_due_and_enqueue();
+
+        // 3) Run at most one ready timer
+        let ran_timers = self.run_ready(1, &mut call_timer);
+        if ran_timers > 0 { return true; }
+
+        // 4) Nothing ran; wait until next timer or a short timeout
+        let mut g = self.m.lock().unwrap();
+
+        // If something arrived concurrently, loop again immediately (no wait)
+        if !g.micro.is_empty() || !g.ready.is_empty() {
+            return false;
+        }
+
+        if let Some(std::cmp::Reverse(next)) = g.heap.peek().cloned() {
+            let now = Instant::now();
+            let dur = if next.when > now { next.when - now } else { Duration::from_millis(0) };
+            let (_g2, _) = self.cv.wait_timeout(g, dur).unwrap();
+        } else {
+            let (_g2, _) = self.cv.wait_timeout(g, Duration::from_millis(1)).unwrap();
+        }
+
+        false
+    }
+
+    // Block and drive the loop until no pending timers exist.
+    pub fn run_until_quiescent(
+        &self,
+        mut call_micro: impl FnMut(i64, i64),  // (fun, arg)
+        mut call_timer: impl FnMut(i64),       // (fun)
+    ) {
+        loop {
+            // 1) Drain all microtasks
+            let _ = self.run_microtasks(usize::MAX, |f, a| call_micro(f, a));
+
+            // 2) Timers
             self.poll_due_and_enqueue();
-            let ran = self.run_ready(usize::MAX, &mut call_closure);
+            let _ran = self.run_ready(usize::MAX, &mut call_timer);
 
             // 3) Quiescence / wait
             let mut g = self.m.lock().unwrap();
-            // If NOTHING left anywhere (no timers, no ready, no micro), we’re done
             if g.active == 0 && g.ready.is_empty() && g.micro.is_empty() { break; }
-
-            // If there are microtasks queued, loop immediately (no wait)
             if !g.micro.is_empty() { continue; }
 
-            if let Some(Reverse(next)) = g.heap.peek().cloned() {
+            if let Some(std::cmp::Reverse(next)) = g.heap.peek().cloned() {
                 let now = Instant::now();
-                if next.when <= now {
-                    continue;
-                }
+                if next.when <= now { continue; }
                 let dur = next.when - now;
                 let (g2, _) = self.cv.wait_timeout(g, dur).unwrap();
                 g = g2;
-            } else {
-                // No heap timers; if nothing ready, wait briefly for microtasks/timers
-                if g.ready.is_empty() {
-                    let (g2, _) = self.cv.wait_timeout(g, Duration::from_millis(1)).unwrap();
-                    g = g2;
-                }
+            } else if g.ready.is_empty() {
+                let (g2, _) = self.cv.wait_timeout(g, Duration::from_millis(1)).unwrap();
+                g = g2;
             }
         }
     }
