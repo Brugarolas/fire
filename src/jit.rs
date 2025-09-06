@@ -39,6 +39,7 @@ use crate::native_promises::{
     wir_promise_new, wir_promise_then, wir_promise_catch,
     wir_promise_resolve, wir_promise_reject,
     wir_deferred_new, wir_deferred_resolve, wir_deferred_reject,
+    wir_event_loop_pump_once, wir_await
 };
 
 /// ABI: `unsafe extern "C" fn(argv: *const i64, argc: usize) -> i64`
@@ -143,6 +144,9 @@ impl Default for JIT {
             fn wir_deferred_new() -> i64;
             fn wir_deferred_resolve(priv_ptr: i64, val: i64) -> i64;
             fn wir_deferred_reject(priv_ptr: i64, reason: i64) -> i64;
+
+            fn wir_event_loop_pump_once() -> u32;
+            fn wir_await(val: i64) -> i64;
         }
 
         unsafe {
@@ -255,6 +259,8 @@ impl Default for JIT {
             jb.symbol("wir_deferred_new",        wir_deferred_new        as *const extern "C" fn()->i64 as *const u8);
             jb.symbol("wir_deferred_resolve",    wir_deferred_resolve    as *const extern "C" fn(i64,i64)->i64 as *const u8);
             jb.symbol("wir_deferred_reject",     wir_deferred_reject     as *const extern "C" fn(i64,i64)->i64 as *const u8);
+            jb.symbol("wir_event_loop_pump_once", wir_event_loop_pump_once as *const extern "C" fn()->u32 as *const u8);
+            jb.symbol("wir_await", wir_await as *const extern "C" fn(i64)->i64 as *const u8);
         }
 
         let module = cranelift_jit::JITModule::new(jb);

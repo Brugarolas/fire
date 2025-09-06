@@ -1,4 +1,4 @@
-// front.rs
+// src/front.rs
 use logos::Logos;
 use std::{collections::BTreeSet, ops::Deref};
 use ahash::AHashMap as HashMap;
@@ -658,10 +658,7 @@ impl<'src> Parser<'src> {
     fn parse_factor(&mut self) -> PResult<Expr> {
         let mut e = self.parse_unary()?;
         loop {
-            if self.matches(&Tok::Await) {
-                let e = self.parse_unary()?;
-                return Ok(Expr::Await(SmallBox::new(e)));
-            } else if self.matches(&Tok::Star) {
+            if self.matches(&Tok::Star) {
                 let rhs = self.parse_unary()?;
                 e = Expr::Binary { op: BinOp::Mul, a: SmallBox::new(e), b: SmallBox::new(rhs) };
             } else if self.matches(&Tok::Slash) {
@@ -675,7 +672,11 @@ impl<'src> Parser<'src> {
         Ok(e)
     }
     fn parse_unary(&mut self) -> PResult<Expr> {
-        if self.matches(&Tok::Bang) {
+        if self.matches(&Tok::Await) {
+            // await <unary>
+            let e = self.parse_unary()?;
+            return Ok(Expr::Await(SmallBox::new(e)));
+        } if self.matches(&Tok::Bang) {
             let e = self.parse_unary()?;
             Ok(Expr::Unary { op: UnOp::Not, e: SmallBox::new(e) })
         } else if self.matches(&Tok::Minus) {
@@ -1116,7 +1117,7 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
                 Expr::Index { recv: SmallBox::new(rw_expr(recv, used, counter, enclosing_locals, out_funcs, lam_caps_out)), index: SmallBox::new(rw_expr(index, used, counter, enclosing_locals, out_funcs, lam_caps_out)) },
             Expr::Group(g) => Expr::Group(SmallBox::new(rw_expr(g, used, counter, enclosing_locals, out_funcs, lam_caps_out))),
 
-            // CORE: hoist to a top-level function with extra hidden `__env` param; replace with FnRef
+            // Core: hoist to a top-level function with extra hidden `__env` param; replace with FnRef
             Expr::FnLit { params, body } => {
                 // names defined inside the lambda
                 let mut inner_defs: BTreeSet<String> = params.iter().cloned().collect();
@@ -1143,7 +1144,25 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
                 lam_params.push("__env".to_string());
                 lam_params.extend(params.iter().cloned());
 
-                out_funcs.push(FuncDecl { name: lam_name.clone(), params: lam_params, body: body.clone(), is_async: false });
+                // IMPORTANT: recursively hoist inside the lambda body.
+                // Enclosing scope for nested lambdas = lambda params ∪ captured names.
+                let mut lam_enclosing: BTreeSet<String> = params.iter().cloned().collect();
+                for c in &caps { lam_enclosing.insert(c.clone()); }
+                let body_rewritten = rw_block(
+                    body,
+                    used,
+                    counter,
+                    &lam_enclosing,
+                    out_funcs,
+                    lam_caps_out,
+                );
+
+                out_funcs.push(FuncDecl {
+                    name: lam_name.clone(),
+                    params: lam_params,
+                    body: body_rewritten,
+                    is_async: false,
+                });
 
                 // Replace literal with a named lam reference
                 Expr::FnRef { name: lam_name }
@@ -1278,16 +1297,16 @@ impl<'m> Lowerer<'m> {
         // Param types: default i32; if the first param is "__env", treat it as an Array (env).
         let mut param_tys: Vec<Type> = fdecl.params.iter().map(|_| Type::Int32).collect();
         if matches!(fdecl.params.first().map(|s| s.as_str()), Some("__env")) {
-            // Environment is modeled as a dynamic array (of "boxes").
             param_tys[0] = Type::Array(Box::new(None));
         }
 
-        // We always return a single i32-typed value in this WIR.
+        // We model returns uniformly as a single Int32 slot (your dynamic value).
         let ret_tys = vec![Type::Int32];
 
         // Snapshot the function table so we can resolve direct calls without borrowing &mut self.
         let funcs_snapshot = self.funcs.clone();
         let func_name = fdecl.name.clone();
+        let is_async = fdecl.is_async;
 
         // Build the function body.
         let mut func = {
@@ -1318,7 +1337,6 @@ impl<'m> Lowerer<'m> {
                         1,
                         true,
                     );
-                    // Bind captured name to its box and mark it as "boxed" for reads/writes.
                     locals.insert(cap.clone(), boxv[0]);
                     locals.insert(boxed_key(cap), boxv[0]);
                 }
@@ -1328,20 +1346,64 @@ impl<'m> Lowerer<'m> {
             let mut fields: HashMap<String, FieldId> = Default::default();
             let mut next_field: u32 = 0;
 
-            // Lower the body.
-            lower_block_free(
-                &mut b,
-                &mut locals,
-                &mut fields,
-                &mut next_field,
-                &fdecl.body,
-                &funcs_snapshot,
-                &self.lam_captures,
-            )?;
+            if is_async {
+                // --- Async prologue: d = Deferred()
+                let (_nid, d_res) = b.push_node(
+                    Inst::CallNative { name: "wir_deferred_new".into(), args: vec![], pure: false, can_throw: false },
+                    None,
+                    1,
+                    true,
+                );
+                let d = d_res[0];
+                locals.insert("__deferred".to_string(), d);
 
-            // Ensure a fallthrough return (matches your current calling convention).
-            let zero = b.const_i32(0);
-            b.ret(&[zero]);
+                // Lower body with async-aware lowering.
+                lower_block_free_async(
+                    &mut b,
+                    &mut locals,
+                    &mut fields,
+                    &mut next_field,
+                    &fdecl.body,
+                    &funcs_snapshot,
+                    &self.lam_captures,
+                    true, // in_async
+                )?;
+
+                // Fallthrough: if the body didn’t explicitly return, resolve with 0 and return d.
+                if !b.current_block_terminated() {
+                    let zero = b.const_i32(0);
+                    let dloc = *locals.get("__deferred").expect("__deferred present");
+                    let (_nid, _) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_deferred_resolve".into(),
+                            args: vec![dloc, zero],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        None,
+                        1,
+                        true,
+                    );
+                    b.ret(&[dloc]);
+                }
+            } else {
+                // --- Sync function: old path
+                lower_block_free(
+                    &mut b,
+                    &mut locals,
+                    &mut fields,
+                    &mut next_field,
+                    &fdecl.body,
+                    &funcs_snapshot,
+                    &self.lam_captures,
+                )?;
+
+                // Fallthrough return 0 (matches previous convention).
+                if !b.current_block_terminated() {
+                    let zero = b.const_i32(0);
+                    b.ret(&[zero]);
+                }
+            }
 
             b.finish()
         };
@@ -2270,6 +2332,15 @@ fn lower_expr_free<'m>(
             Ok(res[0])
         }
 
+        // If 'await' ever reaches the sync lowerer, give a precise error.
+        Expr::Await(_) => {
+            return Err(LowerError::NotLowerable("await outside async function"));
+        }
+        // Unhoisted function literal shouldn't reach the lowerer
+        Expr::FnLit { .. } => {
+            return Err(LowerError::NotLowerable("unhoisted function literal reached lowerer"));
+        }
+
         // locals first, else known function -> a closure with null env
         Expr::Ident(name) => {
             // If this local is "boxed" (captured), read box[0].
@@ -2520,6 +2591,72 @@ fn lower_expr_free<'m>(
 
                 _ => Err(LowerError::NotLowerable("invalid lvalue"))
             }
+        }
+
+        // obj.<propKey>  where propKey is an identifier or string
+        Expr::GetPropObj { obj, key } => {
+            let o = lower_expr_free(b, locals, fields, next_field, obj, funcs, lam_caps)?;
+            let (field_name, is_ident) = match key {
+                PropKey::Ident(s) => (s.clone(), true),
+                PropKey::Str(s)   => (s.clone(), false),
+            };
+
+            // Fast field first, then string table fallback
+            let field   = intern_field_local(fields, next_field, &field_name);
+            let fid_smi = b.const_i32(field.0 as i32);
+
+            let (_nid_h, hasf) = b.push_node(
+                Inst::CallNative { name: "wir_obj_has_field".into(), args: vec![o, fid_smi], pure: false, can_throw: false },
+                Some(Type::Bool), 1, true,
+            );
+
+            let then_b = b.block();
+            let else_b = b.block();
+            let cont   = b.block();
+            let out    = b.add_block_param(cont, Type::Int32);
+
+            b.branch(hasf[0], then_b, else_b);
+
+            b.position_at(then_b);
+            let (_nid_f, fv) = b.push_node(Inst::LoadField { obj: o, field, expected: None }, None, 1, false);
+            b.jump(cont, &[fv[0]]);
+
+            b.position_at(else_b);
+            let (_nid_sc, ks) = b.push_node(Inst::Const(Constant::Str(field_name)), Some(Type::Str), 1, false);
+            let (_nid_s, sv)  = b.push_node(
+                Inst::CallNative { name: "wir_obj_get_str".into(), args: vec![o, ks[0]], pure: false, can_throw: false },
+                None, 1, true,
+            );
+            b.jump(cont, &[sv[0]]);
+
+            b.position_at(cont);
+            Ok(out)
+        }
+
+        // obj.<propKey> = value   (identifier or string propKey)
+        Expr::SetPropObj { obj, key, value } => {
+            let o  = lower_expr_free(b, locals, fields, next_field, obj, funcs, lam_caps)?;
+            let v  = lower_expr_free(b, locals, fields, next_field, value, funcs, lam_caps)?;
+            let field_name = match key {
+                PropKey::Ident(s) => s.clone(),
+                PropKey::Str(s)   => s.clone(),
+            };
+
+            // 1) fast field store
+            let field = intern_field_local(fields, next_field, &field_name);
+            let _ = b.push_node(
+                Inst::StoreField { obj: o, field, val: v, expected: None },
+                Some(Type::Top), 1, true,
+            );
+
+            // 2) mirror in string table
+            let (_nid_sc, ks) = b.push_node(Inst::Const(Constant::Str(field_name)), Some(Type::Str), 1, false);
+            let _ = b.push_node(
+                Inst::CallNative { name: "wir_obj_set_str".into(), args: vec![o, ks[0], v], pure: false, can_throw: false },
+                Some(Type::Int32), 1, true,
+            );
+
+            Ok(v)
         }
 
         // Calls / builtins

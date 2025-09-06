@@ -181,3 +181,26 @@ setTimeout(| | { e.reject(1); }, 0);
 print("===== Timers =====");
 print("(async)");
 setTimeout(fn () { print("Timer"); }, 500);
+
+print("===== Async/Await =====");
+print("(async)");
+async fn delay(ms, v) {
+    var d = Deferred();
+    setTimeout(| | { d.resolve(v); }, ms);
+    return await d;
+}
+
+// await inside top-level (top-level is async)
+var aa = await delay(0, 21);
+print(aa + 21);                // expect 42
+
+// await a plain Promise
+var bb = await Promise(|resolve, reject| {
+    setTimeout(| | { resolve(7); }, 0);
+});
+print(bb);                     // expect 7
+
+// multiple awaits in sequence
+var a1 = await delay(0, 10);
+var a2 = await delay(0, 32);
+print(a1 + a2);                // expect 42
