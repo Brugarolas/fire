@@ -113,7 +113,10 @@ pub extern "C" fn wir_obj_set_str(obj: i64, key_ptr: i64, val: i64) -> i64 {
     let cell = o.by_str.entry(k).or_insert(0);
     let slot: *mut i64 = cell as *mut i64;
     *cell = val;
+
+    #[cfg(feature = "gc")]
     unsafe { NAPALM_GC.post_write_barrier(obj as *mut u8, slot, val) };
+
     0
 }
 

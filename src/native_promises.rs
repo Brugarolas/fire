@@ -212,9 +212,14 @@ pub extern "C" fn wir_await(val: i64) -> i64 {
     #[repr(C)]
     struct Cell { ready: bool, ok: bool, v: i64 }
 
+    // Immediates (SMIs/booleans) and null resolve synchronously.
+    if val == 0 || (val & 1) == 1 {
+        return val;
+    }
+
     extern "C" fn on_f(argv: *const i64, argc: usize) -> i64 {
         unsafe {
-            let args = slice::from_raw_parts(argv, argc);
+            let args = std::slice::from_raw_parts(argv, argc);
             let cell = args.get(0).copied().unwrap_or(0) as *mut Cell;
             let v    = args.get(1).copied().unwrap_or(0);
             (*cell).v = v;
@@ -225,17 +230,16 @@ pub extern "C" fn wir_await(val: i64) -> i64 {
     }
     extern "C" fn on_r(argv: *const i64, argc: usize) -> i64 {
         unsafe {
-            let args = slice::from_raw_parts(argv, argc);
+            let args = std::slice::from_raw_parts(argv, argc);
             let cell = args.get(0).copied().unwrap_or(0) as *mut Cell;
             let v    = args.get(1).copied().unwrap_or(0);
-            (*cell).v = v;      // store reason; MVP: ignored by caller
+            (*cell).v = v;
             (*cell).ok = false;
             (*cell).ready = true;
         }
         0
     }
 
-    // prepare cell + handlers
     let cell = Box::into_raw(Box::new(Cell { ready: false, ok: true, v: 0 }));
 
     unsafe {
@@ -244,22 +248,14 @@ pub extern "C" fn wir_await(val: i64) -> i64 {
         let onr = closure_new(on_r as usize, 1);
         closure_set_env_slot(onr, 0, cell as i64);
 
-        // Try public promise object path: obj["then"](onf, onr)
-        let then_fun = wir_obj_get_str(val, static_str_value("then"));
-        if then_fun != 0 {
-            let argv = [onf, onr];
-            let _ = wir_call_closure(then_fun, argv.as_ptr(), 2);
-        } else {
-            // Fallback: treat as private promise pointer
-            let _ = wir_promise_then(val, onf, onr);
-        }
+        // IMPORTANT: do NOT call wir_obj_get_str here.
+        // This is a private promise pointer, wire via the native API.
+        let _ = wir_promise_then(val, onf, onr);
     }
 
-    // pump loop until settled
+    // Pump until settled.
     loop {
-        unsafe {
-            if (*cell).ready { break; }
-        }
+        unsafe { if (*cell).ready { break; } }
         let _ = wir_event_loop_pump_once();
     }
 
