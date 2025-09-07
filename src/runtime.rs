@@ -1,4 +1,5 @@
 #![allow(unsafe_op_in_unsafe_fn)]
+#![allow(unused_imports)]
 
 use crate::value::{TAG_STRING, BoxedStr, ObjHeader};
 use crate::gc::NAPALM_GC;

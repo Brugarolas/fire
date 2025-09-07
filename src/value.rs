@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 #![allow(unsafe_op_in_unsafe_fn)]
+#![allow(unused_imports)]
 
 use core::mem;
 use ahash::AHashMap as HashMap;

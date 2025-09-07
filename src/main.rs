@@ -1,4 +1,6 @@
 // src/main.rs
+#![allow(unused_imports)]
+
 mod value;
 mod wir;
 mod front;
@@ -9,6 +11,7 @@ mod jit;
 mod event_loop;
 mod native_timers;
 mod native_promises;
+mod http;
 
 use crate::opt::Optimize;
 use crate::opt::optimization::optimization_passes;
@@ -30,7 +33,7 @@ fn default_script() -> &'static str {
             }
             return fibonacci(n - 1) + fibonacci(n - 2);
         }
-        print(fibonacci(45));
+        print(fibonacci(50));
     "#
 }
 

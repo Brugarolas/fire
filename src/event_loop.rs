@@ -1,4 +1,5 @@
 // runtime/event_loop.rs (new)
+#![allow(unused_imports)]
 
 use std::{
     cmp::Reverse,

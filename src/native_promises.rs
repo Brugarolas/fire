@@ -1,4 +1,5 @@
 // src/native_promises.rs
+#![allow(unused_imports)]
 
 use crate::event_loop::EVENT_LOOP;
 use crate::value::{ObjHeader, BoxedClosure, closure_new, closure_set_env_slot, TAG_STRING};

@@ -1,4 +1,6 @@
 // src/front.rs
+#![allow(unused_imports)]
+
 use logos::Logos;
 use std::{collections::BTreeSet, ops::Deref};
 use ahash::AHashMap as HashMap;

@@ -1,5 +1,6 @@
 // src/jit.rs
 //! jit.rs — Cranelift JIT for WIR/Napalm (Cranelift 0.121.x compatible)
+#![allow(unused_imports)]
 
 use ahash::AHashMap as HashMap;
 
@@ -13,8 +14,14 @@ use cranelift::prelude::{types, InstBuilder};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::cell::Cell;
 
+#[allow(unused_imports)]
 use crate::gc::NAPALM_GC;
 
+use crate::wir::{
+    Constant, Function as WirFunction, Inst, IntBinOp, Value as WirValue, ValueDef, ValueId, FuncId,
+};
+
+#[allow(unused_imports)]
 use crate::value::{
     ObjHeader, TAG_ARRAY, BoxedClosure, BoxedArray, closure_new, closure_set_env_slot,
     wir_array_new, wir_array_len, wir_array_get, wir_array_set, wir_array_set_len,
@@ -22,19 +29,19 @@ use crate::value::{
     wir_array_slice, wir_array_map, wir_array_for_each, wir_array_find, wir_array_find_index,
     wir_array_filter, wir_array_reduce, wir_array_fill, wir_array_copy,
 };
-use crate::wir::{
-    Constant, Function as WirFunction, Inst, IntBinOp, Value as WirValue, ValueDef, ValueId, FuncId,
-};
+#[allow(unused_imports)]
 use crate::runtime::{
     wir_obj_new, wir_is_str, napalm_yieldpoint,
     wir_obj_get_field, wir_obj_set_field, wir_obj_has_field, wir_obj_del_field,
     wir_obj_get_str, wir_obj_set_str, wir_obj_has_str, wir_obj_del_str,
     wir_memo_get, wir_memo_put,
 };
+#[allow(unused_imports)]
 use crate::native_timers::{
     wir_set_timeout, wir_set_interval, wir_clear_timeout, wir_clear_interval,
     event_loop_yieldpoint,
 };
+#[allow(unused_imports)]
 use crate::native_promises::{
     wir_promise_new, wir_promise_then, wir_promise_catch,
     wir_promise_resolve, wir_promise_reject,
