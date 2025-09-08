@@ -1,4 +1,5 @@
 #![allow(unused_imports)]
+#![allow(unused_variables)]
 
 use once_cell::sync::Lazy;
 use once_cell::sync::OnceCell;

@@ -1,3 +1,6 @@
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+
 use std::mem;
 use crate::opt::{OptimizationWIR, WirEditQueue};
 use crate::opt::helpers::{value_is_const_bool, value_as_i32, value_as_f64};

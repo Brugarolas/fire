@@ -1,5 +1,6 @@
 // src/front.rs
 #![allow(unused_imports)]
+#![allow(unused_variables)]
 
 use logos::Logos;
 use std::{collections::BTreeSet, ops::Deref};
@@ -28,6 +29,7 @@ pub enum Tok {
     // Keywords
     #[token("fn")] Fn,
     #[token("var")] Var,
+    #[token("let")] Let,
     #[token("if")] If,
     #[token("unless")] Unless,
     #[token("else")] Else,
@@ -151,6 +153,7 @@ pub enum Stmt {
     For { init: Option<SmallBox<Stmt, u8>>, cond: Option<Expr>, step: Option<Expr>, body: Block },
     Return(Option<Expr>),
     Expr(Expr),
+    Listen(ListenDecl),
 }
 
 #[derive(Debug, Clone)]
@@ -215,6 +218,19 @@ pub enum BinOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnOp {
     Neg, Pos, Not,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListenDecl {
+    pub addr: String,
+    pub routes: Vec<RouteDecl>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RouteDecl {
+    pub method: String,  // e.g. "GET"
+    pub pattern: Expr,   // we store it as an Expr (usually ArrayLit of strings)
+    pub handler: Expr,   // a FnLit / hoisted FnRef
 }
 
 /// -------------------------
@@ -311,6 +327,16 @@ impl<'src> Parser<'src> {
         self.i >= self.toks.len()
     }
 
+    #[inline(always)]
+    fn check_ident(&self, s: &str) -> bool {
+        matches!(&self.peek().tok, Tok::Ident(name) if name == s)
+    }
+
+    #[inline(always)]
+    fn matches_ident(&mut self, s: &str) -> bool {
+        if self.check_ident(s) { self.i += 1; true } else { false }
+    }
+
     pub fn program(&mut self) -> PResult<Program> {
         let mut functions = Vec::new();
         let mut toplevel_stmts: Vec<Stmt> = Vec::new();
@@ -400,7 +426,11 @@ impl<'src> Parser<'src> {
             return Ok(Stmt::Expr(Expr::LitInt(0)));
         }
 
-        if self.matches(&Tok::Var) {
+        if self.check_ident("listen") {
+            return self.parse_listen_stmt();
+        }
+
+        if self.matches(&Tok::Var) || self.matches(&Tok::Let){
             let name = match self.next().tok {
                 Tok::Ident(s) => s,
                 _ => return Err(self.err_here("expected identifier after 'var'")),
@@ -564,9 +594,16 @@ impl<'src> Parser<'src> {
         if let Some((kind, bop)) = op {
             // Turn `left` into an LValue
             let lv = match left {
-                Expr::Ident(s)                      => LValue::Ident(s),
-                Expr::GetProp { recv, name }        => LValue::GetProp { recv: recv.into_inner().clone(), name },
-                Expr::Index   { recv, index }       => LValue::Index   { recv: recv.into_inner().clone(), index: index.into_inner().clone() },
+                Expr::Ident(s) => LValue::Ident(s),
+                Expr::GetProp { recv, name } => {
+                    let recv_expr = (*recv).clone();         // or: recv.as_ref().clone()
+                    LValue::GetProp { recv: recv_expr, name }
+                }
+                Expr::Index { recv, index } => {
+                    let recv_expr  = (*recv).clone();
+                    let index_expr = (*index).clone();
+                    LValue::Index { recv: recv_expr, index: index_expr }
+                }
                 _ => return Err(self.err_here("invalid assignment target")),
             };
 
@@ -791,6 +828,73 @@ impl<'src> Parser<'src> {
         }
     }
 
+    fn parse_listen_stmt(&mut self) -> PResult<Stmt> {
+        // consume 'listen'
+        let _ = self.next(); // Ident("listen")
+        // "addr"
+        let addr = match self.next().tok {
+            Tok::Str(s) => s,
+            _ => return Err(self.err_here("expected string address after 'listen'")),
+        };
+        // body
+        self.expect(Tok::LBrace, "expected '{' after listen address")?;
+        let mut routes = Vec::new();
+        while !self.matches(&Tok::RBrace) {
+            routes.push(self.parse_route_decl()?);
+        }
+        Ok(Stmt::Listen(ListenDecl { addr, routes }))
+    }
+
+    fn parse_route_decl(&mut self) -> PResult<RouteDecl> {
+        // route "METHOD" [pattern] (params) => { body } ;
+        if !self.matches_ident("route") {
+            return Err(self.err_here("expected 'route'"));
+        }
+
+        // "METHOD" (accept also bare Ident for convenience)
+        let method = match self.next().tok {
+            Tok::Str(s) => s,
+            Tok::Ident(s) => s, // allow: route GET [...]
+            _ => return Err(self.err_here("expected HTTP method (string or identifier)")),
+        };
+
+        // [ pattern parts ]  -- we parse a general array expression to keep it flexible
+        self.expect(Tok::LBracket, "expected '[' after method")?;
+        let mut elems = Vec::new();
+        if !self.matches(&Tok::RBracket) {
+            loop {
+                // keep it general: any expression (usually "literal" strings like "/","users",":id")
+                elems.push(self.expr()?);
+                if self.matches(&Tok::RBracket) { break; }
+                self.expect(Tok::Comma, "expected ',' in route pattern")?;
+            }
+        }
+        let pattern_expr = Expr::ArrayLit(elems);
+
+        // ( params )
+        self.expect(Tok::LParen, "expected '(' before route handler params")?;
+        let params = self.parse_param_list()?;
+
+        // =>
+        self.expect(Tok::Eq, "expected '=>' after params (first '=')")?;
+        self.expect(Tok::Gt, "expected '=>' after params (second '>')")?;
+
+        // body: block or single expression (we'll allow both; single expr becomes 'return expr;')
+        let handler_body = if self.check(&Tok::LBrace) {
+            self.block()?
+        } else {
+            // expression-body → implicit return
+            let e = self.expr()?;
+            Block { stmts: vec![Stmt::Return(Some(e))] }
+        };
+
+        // optional ';' after a block is allowed by your grammar, require it for consistency
+        self.expect(Tok::Semi, "expected ';' after route")?;
+
+        let handler = Expr::FnLit { params, body: handler_body };
+        Ok(RouteDecl { method, pattern: pattern_expr, handler })
+    }
+
     // Parse an object literal: { a: 1, "b": 2, c: x+y }
     fn parse_object_literal(&mut self) -> PResult<Expr> {
         // self.expect(Tok::LBrace, "expected '{'")?; // already consumed
@@ -829,24 +933,19 @@ impl<'src> Parser<'src> {
 
     // delete obj.x   |   delete obj["x"]
     fn parse_delete(&mut self) -> PResult<Expr> {
-        // self.expect(Tok::Delete, "expected 'delete'")?; // already consumed
-        // Parse a member expression after delete. We reuse your existing call/postfix chain.
-        // Start from a primary and then allow . / [ ] as your parse_call() does.
-        // Easiest minimum-change approach: parse like parse_call() but only accept a GetProp/Index.
+        // receiver
+        let recv = self.parse_primary()?;
 
-        // Parse receiver first
-        let mut recv = self.parse_primary()?;
-        // Then allow just one layer of .name or [expr] (that mirrors how 'delete' is used)
-        let key = if self.matches(&Tok::Dot) {
+        if self.matches(&Tok::Dot) {
             // delete obj.ident
             let name = match self.next().tok {
                 Tok::Ident(s) => s,
                 _ => return Err(self.err_here("expected identifier after '.' in delete")),
             };
             return Ok(Expr::DeleteProp { obj: SmallBox::new(recv), key: PropKey::Ident(name) });
-        } else if self.matches(&Tok::LBracket) {
-            // delete obj["x"]  or delete obj[expr]
-            // For MVP, support string and identifier statically; fall back to Index for general expr.
+        }
+
+        if self.matches(&Tok::LBracket) {
             match &self.peek().tok {
                 Tok::Str(_) => {
                     let s = if let Tok::Str(s) = self.next().tok { s } else { unreachable!() };
@@ -859,24 +958,22 @@ impl<'src> Parser<'src> {
                     return Ok(Expr::DeleteProp { obj: SmallBox::new(recv), key: PropKey::Ident(name) });
                 }
                 _ => {
-                    // general index: delete obj[expr]
+                    // general: delete obj[expr]  (keep MVP behavior per your comment)
                     let idx = self.expr()?;
                     self.expect(Tok::RBracket, "expected ']'")?;
-                    // Keep an Index-flavored delete as "delete index". If you prefer a distinct node,
-                    // add Expr::DeleteIndex and return that instead.
-                    return Ok(Expr::Unary { op: UnOp::Pos, e: SmallBox::new(Expr::Index { recv: SmallBox::new(recv), index: SmallBox::new(idx) }) });
+                    return Ok(Expr::Unary {
+                        op: UnOp::Pos,
+                        e: SmallBox::new(Expr::Index { recv: SmallBox::new(recv), index: SmallBox::new(idx) }),
+                    });
                 }
             }
-        } else {
-            return Err(self.err_here("delete expects a property access (obj.x or obj[...])"));
-        };
-    }
+        }
 
+        Err(self.err_here("delete expects a property access (obj.x or obj[...])"))
+}
 }
 
 fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String>>) {
-    use BTreeSet;
-
     // name -> sorted capture list (stable order)
     let mut lam_captures: HashMap<String, Vec<String>> = HashMap::new();
 
@@ -918,6 +1015,12 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
             }
             Stmt::Return(e) => { if let Some(e) = e { collect_uses_expr(e, uses); } }
             Stmt::Expr(e) => collect_uses_expr(e, uses),
+            Stmt::Listen(ld) => {
+                for r in &ld.routes {
+                    collect_uses_expr(&r.pattern, uses);
+                    collect_uses_expr(&r.handler, uses);
+                }
+            }
         }
     }
 
@@ -1069,6 +1172,20 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
             Stmt::Return(e) =>
                 Stmt::Return(e.as_ref().map(|x| rw_expr(x, used, counter, enclosing_locals, out_funcs, lam_caps_out))),
             Stmt::Expr(e) => Stmt::Expr(rw_expr(e, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+
+            Stmt::Listen(ld) => {
+                let mut routes = Vec::with_capacity(ld.routes.len());
+                for r in &ld.routes {
+                    let pattern_rw = rw_expr(&r.pattern, used, counter, enclosing_locals, out_funcs, lam_caps_out);
+                    let handler_rw = rw_expr(&r.handler, used, counter, enclosing_locals, out_funcs, lam_caps_out);
+                    routes.push(RouteDecl {
+                        method: r.method.clone(),
+                        pattern: pattern_rw,
+                        handler: handler_rw,
+                    });
+                }
+                Stmt::Listen(ListenDecl { addr: ld.addr.clone(), routes })
+            }
         }
     }
 
@@ -1543,7 +1660,6 @@ fn lower_stmt_free<'m>(
             let body_b = b.block();
             let exit = b.block();
 
-            use BTreeSet;
             let mut mutated_set: BTreeSet<String> = BTreeSet::new();
             for st in &body.stmts { collect_mut_locals_in_stmt(st, &mut mutated_set); }
             if let Some(se) = step { collect_mut_locals_in_expr(se, &mut mutated_set); }
@@ -1582,8 +1698,68 @@ fn lower_stmt_free<'m>(
                 b.ret(&[z]);
             }
         }
+        Stmt::Listen(ld) => {
+            // server id = wir_server_create(addr)
+            let (_nid_addr, addr_r) = b.push_node(
+                Inst::Const(Constant::Str(ld.addr.clone())),
+                Some(Type::Str), 1, false
+            );
+            let addr_v = addr_r[0];
+            let (_nid_sid, sid_r) = b.push_node(
+                Inst::CallNative {
+                    name: "wir_server_create".into(),
+                    args: vec![addr_v],
+                    pure: false,
+                    can_throw: false,
+                },
+                Some(Type::Int32), // server id
+                1,
+                true,
+            );
+            let sid = sid_r[0];
+
+            // add routes
+            for rt in &ld.routes {
+                let pat_v = lower_expr_free(b, locals, fields, next_field, &rt.pattern, funcs, lam_caps)?;
+                let hnd_v = lower_expr_free(b, locals, fields, next_field, &rt.handler, funcs, lam_caps)?;
+                let (_mid, mr) = b.push_node(
+                    Inst::Const(Constant::Str(rt.method.clone())),
+                    Some(Type::Str),
+                    1,
+                    false,
+                );
+                let m_str = mr[0];
+
+                let _ = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_server_add_route".into(),
+                        args: vec![sid, m_str, pat_v, hnd_v],  // <-- pass the string pointer
+                        pure: false,
+                        can_throw: false,
+                    },
+                    Some(Type::Int32),
+                    1,
+                    true,
+                );
+            }
+
+            // listen
+            let _ = b.push_node(
+                Inst::CallNative {
+                    name: "wir_server_listen".into(),
+                    args: vec![sid],
+                    pure: false,
+                    can_throw: false,
+                },
+                Some(Type::Int32),
+                1,
+                true,
+            );
+        }
+
         Stmt::Expr(e) => { let _ = lower_expr_free(b, locals, fields, next_field, e, funcs, lam_caps)?; } // <-- pass
     }
+
     Ok(())
 }
 
@@ -1646,6 +1822,13 @@ fn collect_mut_locals_in_stmt(s: &Stmt, out: &mut BTreeSet<String>) {
             for st in &body.stmts { collect_mut_locals_in_stmt(st, out); }
         }
         Stmt::Return(e) => { if let Some(e) = e { collect_mut_locals_in_expr(e, out); } }
+
+        Stmt::Listen(ld) => {
+            for r in &ld.routes {
+                collect_mut_locals_in_expr(&r.pattern, out);
+                collect_mut_locals_in_expr(&r.handler, out);
+            }
+        }
     }
 }
 
@@ -1694,6 +1877,66 @@ fn lower_stmt_free_async<'m>(
                 None, 1, true
             );
             b.ret(&[d]);
+            Ok(())
+        }
+        Stmt::Listen(ld) => {
+            // server id = wir_server_create(addr)
+            let (_nid_addr, addr_r) = b.push_node(
+                Inst::Const(Constant::Str(ld.addr.clone())),
+                Some(Type::Str), 1, false
+            );
+            let addr_v = addr_r[0];
+            let (_nid_sid, sid_r) = b.push_node(
+                Inst::CallNative {
+                    name: "wir_server_create".into(),
+                    args: vec![addr_v],
+                    pure: false,
+                    can_throw: false,
+                },
+                Some(Type::Int32), // server id
+                1,
+                true,
+            );
+            let sid = sid_r[0];
+
+            // add routes
+            for rt in &ld.routes {
+                let pat_v = lower_expr_free(b, locals, fields, next_field, &rt.pattern, funcs, lam_caps)?;
+                let hnd_v = lower_expr_free(b, locals, fields, next_field, &rt.handler, funcs, lam_caps)?;
+                let (_mid, mr) = b.push_node(
+                    Inst::Const(Constant::Str(rt.method.clone())),
+                    Some(Type::Str),
+                    1,
+                    false,
+                );
+                let m_str = mr[0];
+
+                let _ = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_server_add_route".into(),
+                        args: vec![sid, m_str, pat_v, hnd_v],  // <-- pass the string pointer
+                        pure: false,
+                        can_throw: false,
+                    },
+                    Some(Type::Int32),
+                    1,
+                    true,
+                );
+            }
+
+            // listen
+            let _ = b.push_node(
+                Inst::CallNative {
+                    name: "wir_server_listen".into(),
+                    args: vec![sid],
+                    pure: false,
+                    can_throw: false,
+                },
+                Some(Type::Int32),
+                1,
+                true,
+            );
+
             Ok(())
         }
         _ => {
@@ -1806,7 +2049,6 @@ fn lower_stmt_free_async<'m>(
                     let body_b = b.block();
                     let exit = b.block();
 
-                    use BTreeSet;
                     let mut mutated_set: BTreeSet<String> = BTreeSet::new();
                     for st in &body.stmts { collect_mut_locals_in_stmt(st, &mut mutated_set); }
                     if let Some(se) = step { collect_mut_locals_in_expr(se, &mut mutated_set); }
@@ -1838,6 +2080,8 @@ fn lower_stmt_free_async<'m>(
                     Ok(())
                 }
                 Stmt::Expr(e) => { let _ = lower_expr_free_async(b, locals, fields, next_field, e, funcs, lam_caps, in_async)?; Ok(()) }
+
+                Stmt::Listen(_) => unreachable!(), // handled in the outer match arm
                 Stmt::Return(_) => unreachable!(), // handled above when in_async
             }
         }
@@ -2729,9 +2973,118 @@ fn lower_expr_free<'m>(
                     return Ok(res[0]);
                 }
 
+                            // --- http.* helpers ---
+            if let Expr::GetProp { recv, name } = &**callee {
+                // --- http.* helpers ---
+                if let Expr::Ident(obj) = &**recv {
+                    if obj == "http" {
+                        match name.as_str() {
+                            "startStream" => {
+                                if args.len() != 3 {
+                                    return Err(LowerError::NotLowerable("http.startStream(req, status, headers)"));
+                                }
+                                let req    = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+                                let status = lower_expr_free(b, locals, fields, next_field, &args[1], funcs, lam_caps)?;
+                                let hdrs   = lower_expr_free(b, locals, fields, next_field, &args[2], funcs, lam_caps)?;
+                                let (_nid, res) = b.push_node(
+                                    Inst::CallNative {
+                                        name: "wir_http_start_stream_from_req".into(),
+                                        args: vec![req, status, hdrs],
+                                        pure: false,
+                                        can_throw: false,
+                                    },
+                                    Some(Type::Int32), 1, true
+                                );
+                                return Ok(res[0]);
+                            }
+                            "streamWrite" => {
+                                if args.len() != 3 {
+                                    return Err(LowerError::NotLowerable("http.streamWrite(serverId, reqId, chunk)"));
+                                }
+                                let sid   = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+                                let rid   = lower_expr_free(b, locals, fields, next_field, &args[1], funcs, lam_caps)?;
+                                let chunk = lower_expr_free(b, locals, fields, next_field, &args[2], funcs, lam_caps)?;
+                                let (_nid, res) = b.push_node(
+                                    Inst::CallNative {
+                                        name: "wir_http_stream_write".into(),
+                                        args: vec![sid, rid, chunk],
+                                        pure: false,
+                                        can_throw: false,
+                                    },
+                                    Some(Type::Int32), 1, true
+                                );
+                                return Ok(res[0]);
+                            }
+                            "streamEnd" => {
+                                if args.len() != 2 {
+                                    return Err(LowerError::NotLowerable("http.streamEnd(serverId, reqId)"));
+                                }
+                                let sid = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+                                let rid = lower_expr_free(b, locals, fields, next_field, &args[1], funcs, lam_caps)?;
+                                let (_nid, res) = b.push_node(
+                                    Inst::CallNative {
+                                        name: "wir_http_stream_end".into(),
+                                        args: vec![sid, rid],
+                                        pure: false,
+                                        can_throw: false,
+                                    },
+                                    Some(Type::Int32), 1, true
+                                );
+                                return Ok(res[0]);
+                            }
+                            _ => {}
+                        }
+                    }
 
-                // 1) Array methods (existing)
-                if let Some(v) = lower_array_method_call(
+                    if obj == "json" {
+                        // Allow json(body) or json(status, body[, headers])
+                        let (_nid_null, nul) = b.push_node(
+                            Inst::Const(Constant::Null),
+                            Some(Type::Null),
+                            1,
+                            false
+                        );
+
+                        let (status_v, body_v, headers_v) = match args.len() {
+                            1 => {
+                                let body = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+                                let status = b.const_i32(200);    // default 200
+                                (status, body, nul[0])
+                            }
+                            2 => {
+                                let status = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+                                let body   = lower_expr_free(b, locals, fields, next_field, &args[1], funcs, lam_caps)?;
+                                (status, body, nul[0])
+                            }
+                            3 => {
+                                let status  = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+                                let body    = lower_expr_free(b, locals, fields, next_field, &args[1], funcs, lam_caps)?;
+                                let headers = lower_expr_free(b, locals, fields, next_field, &args[2], funcs, lam_caps)?;
+                                (status, body, headers)
+                            }
+                            _ => return Err(LowerError::NotLowerable("json expects (body) or (status, body[, headers])")),
+                        };
+
+                        // Call a native that formats/sends a JSON response.
+                        // Name it to match your runtime; adjust if you use a different symbol.
+                        let (_nid, res) = b.push_node(
+                            Inst::CallNative {
+                                name: "wir_http_send_json".into(),
+                                args: vec![status_v, body_v, headers_v],
+                                pure: false,
+                                can_throw: false,
+                            },
+                            None,
+                            1,
+                            true,
+                        );
+                        return Ok(res[0]);
+                    }
+                }
+            }
+
+            // 1) Array methods (existing)
+            if let Some(v) = lower_array_method_call(
                     b, locals, fields, next_field, recv, name, args, funcs, lam_caps
                 )? {
                     return Ok(v);
@@ -2854,6 +3207,23 @@ fn lower_expr_free<'m>(
                     return Ok(res[0]);
                 }
 
+                if name == "get" {
+                    if args.len() != 1 { return Err(LowerError::NotLowerable("get(url) expects 1 arg")); }
+                    let url = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+                    let (_nid, res) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_http_get".into(),
+                            args: vec![url],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        None,
+                        1,
+                        true,
+                    );
+                    return Ok(res[0]); // resolves to a promise; `await` will use wir_await
+                }
+
                 if name == "print" {
                     if args.len() != 1 { return Err(LowerError::NotLowerable("print() expects 1 arg")); }
 
@@ -2926,6 +3296,50 @@ fn lower_expr_free<'m>(
                             can_throw: false,
                         },
                         Some(Type::Int32),
+                        1,
+                        true,
+                    );
+                    return Ok(res[0]);
+                }
+
+                if name == "getJSON" {
+                    if args.len() != 1 { return Err(LowerError::NotLowerable("getJSON(url) expects 1 arg")); }
+                    let url = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+                    let (_nid, res) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_http_get_json".into(),
+                            args: vec![url],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        None,
+                        1,
+                        true,
+                    );
+                    return Ok(res[0]);
+                }
+
+                if name == "postJSON" {
+                    if !(args.len() == 2 || args.len() == 3) {
+                        return Err(LowerError::NotLowerable("postJSON(url, body, headers?)"));
+                    }
+                    let url  = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+                    let body = lower_expr_free(b, locals, fields, next_field, &args[1], funcs, lam_caps)?;
+                    // headers is optional → default null
+                    let (_nid_null, nul) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
+                    let headers = if args.len() == 3 {
+                        lower_expr_free(b, locals, fields, next_field, &args[2], funcs, lam_caps)?
+                    } else {
+                        nul[0]
+                    };
+                    let (_nid, res) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_http_post_json".into(),
+                            args: vec![url, body, headers],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        None,
                         1,
                         true,
                     );
@@ -3451,6 +3865,20 @@ fn build_bool_or(b: &mut Builder, lhs: ValueId, rhs: ValueId) -> ValueId {
 
     b.position_at(cont);
     out
+}
+
+fn http_method_smi(method: &str) -> i32 {
+    match method {
+        "GET" | "get" => 1,
+        "POST" | "post" => 2,
+        "PUT" | "put" => 3,
+        "DELETE" | "delete" => 4,
+        "PATCH" | "patch" => 5,
+        "OPTIONS" | "options" => 6,
+        "HEAD" | "head" => 7,
+        "*" | "ANY" | "any" => 0,
+        _ => 0, // default ANY
+    }
 }
 
 fn boxed_key(name: &str) -> String {

@@ -10,6 +10,9 @@
 //! Soundness: we only substitute within the same block *after* the Mov,
 //! which is dominated by the Mov’s operand in SSA, so dominance holds.
 
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+
 use crate::opt::{OptimizationWIR, WirEditQueue};
 use crate::opt::helpers::replace_uses_in_inst;
 use crate::wir::{Function, Inst, ValueDef, ValueId, Constant, InstId};

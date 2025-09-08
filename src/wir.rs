@@ -17,6 +17,7 @@
 //! - Type lattice with unions, for type inference/speculation.
 
 #![allow(unused_imports)]
+#![allow(unused_variables)]
 #![allow(dead_code)]
 #![allow(clippy::large_enum_variant)]
 #![allow(clippy::too_many_arguments)]

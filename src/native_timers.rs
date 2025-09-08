@@ -1,5 +1,6 @@
 // runtime/natives_timers.rs (new)
 #![allow(unused_imports)]
+#![allow(unused_variables)]
 
 use crate::event_loop::{EVENT_LOOP, TimerKind};
 use crate::jit::JitFnPtr;

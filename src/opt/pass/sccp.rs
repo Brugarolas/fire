@@ -1,4 +1,7 @@
 // src/opt/pass/sccp.rs
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+
 use std::collections::{VecDeque};
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use crate::opt::{InstCursor, OptimizationWIR, WirEditQueue};

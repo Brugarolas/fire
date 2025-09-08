@@ -1,7 +1,9 @@
 // src/opts/mega_dce.rs
 #![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
 
-use std::collections::{HashMap, HashSet};
+use ahash::{AHashSet as HashSet, AHashMap as HashMap};
 
 use crate::opt::{OptimizationWIR, WirEditQueue};
 use crate::wir::{Function, Inst, BlockId, ValueId, ValueDef};

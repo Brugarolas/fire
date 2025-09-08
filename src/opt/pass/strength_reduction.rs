@@ -1,5 +1,7 @@
 // src/opts/strength_reduction.rs
 #![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
 
 use crate::opt::{InstCursor, OptimizationWIR, WirEditQueue};
 use crate::wir::{Function, Inst, IntBinOp, ValueDef, ValueId, Constant, Type};

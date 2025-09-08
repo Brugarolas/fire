@@ -1,3 +1,6 @@
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+
 use crate::opt::Optimize;
 use crate::opt::OptimizationPass;
 use crate::opt::pass::peephole_simplify::PeepholeSimplify;

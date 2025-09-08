@@ -1,6 +1,7 @@
 // src/jit.rs
 //! jit.rs — Cranelift JIT for WIR/Napalm (Cranelift 0.121.x compatible)
 #![allow(unused_imports)]
+#![allow(unused_variables)]
 
 use ahash::AHashMap as HashMap;
 
@@ -47,6 +48,9 @@ use crate::native_promises::{
     wir_promise_resolve, wir_promise_reject,
     wir_deferred_new, wir_deferred_resolve, wir_deferred_reject,
     wir_event_loop_pump_once, wir_await
+};
+use crate::http::{
+    wir_server_create, wir_server_add_route, wir_server_listen,
 };
 
 /// ABI: `unsafe extern "C" fn(argv: *const i64, argc: usize) -> i64`
@@ -154,6 +158,23 @@ impl Default for JIT {
 
             fn wir_event_loop_pump_once() -> u32;
             fn wir_await(val: i64) -> i64;
+        }
+
+        unsafe extern "C" {
+            fn wir_server_create(addr_ptr: i64) -> i64;
+            fn wir_server_add_route(server_id: i64, method_ptr: i64, pattern_arr: i64, handler: i64) -> i64;
+            fn wir_server_listen(server_id: i64) -> i64;
+            fn wir_http_get(url_ptr: i64) -> i64;
+            fn wir_http_get_json(url_ptr: i64) -> i64;
+            fn wir_http_post(url_ptr: i64, body_ptr: i64, headers_arr: i64) -> i64;
+            fn wir_http_request(method_ptr: i64, url_ptr: i64, body_ptr: i64, headers_arr: i64, as_json: i64) -> i64;
+            fn wir_http_post_json(url_ptr: i64, json_str_ptr: i64, headers_arr: i64) -> i64;
+            fn wir_http_start_stream(server_id_smi: i64, req_id_smi: i64, status_smi: i64, headers_arr: i64) -> i64;
+            fn wir_http_stream_write(server_id_smi: i64, req_id_smi: i64, chunk_ptr: i64) -> i64;
+            fn wir_http_stream_end(server_id_smi: i64, req_id_smi: i64) -> i64;
+            fn wir_http_start_stream_from_req(req_obj: i64, status_smi: i64, headers_arr: i64) -> i64;
+            fn wir_json_parse(str_ptr: i64) -> i64;
+            fn wir_http_send_json(status_smi: i64, body_val: i64, headers_arr: i64) -> i64;
         }
 
         unsafe {
@@ -268,6 +289,21 @@ impl Default for JIT {
             jb.symbol("wir_deferred_reject",     wir_deferred_reject     as *const extern "C" fn(i64,i64)->i64 as *const u8);
             jb.symbol("wir_event_loop_pump_once", wir_event_loop_pump_once as *const extern "C" fn()->u32 as *const u8);
             jb.symbol("wir_await", wir_await as *const extern "C" fn(i64)->i64 as *const u8);
+
+            jb.symbol("wir_server_create",     wir_server_create     as *const extern "C" fn(i64)->i64 as *const u8);
+            jb.symbol("wir_server_add_route",   wir_server_add_route  as *const extern "C" fn(i64,i64,i64,i64)->i64 as *const u8);
+            jb.symbol("wir_server_listen",      wir_server_listen     as *const extern "C" fn(i64)->i64 as *const u8);
+            jb.symbol("wir_http_get",           wir_http_get          as *const extern "C" fn(i64)->i64 as *const u8);
+            jb.symbol("wir_http_get_json",      wir_http_get_json     as *const extern "C" fn(i64)->i64 as *const u8);
+            jb.symbol("wir_http_post",          wir_http_post         as *const extern "C" fn(i64,i64,i64)->i64 as *const u8);
+            jb.symbol("wir_http_request",       wir_http_request      as *const extern "C" fn(i64,i64,i64,i64,i64)->i64 as *const u8);
+            jb.symbol("wir_http_post_json",     wir_http_post_json    as *const extern "C" fn(i64,i64,i64)->i64 as *const u8);
+            jb.symbol("wir_http_start_stream",    wir_http_start_stream    as *const extern "C" fn(i64,i64,i64,i64)->i64 as *const u8);
+            jb.symbol("wir_http_stream_write",     wir_http_stream_write     as *const extern "C" fn(i64,i64,i64)->i64 as *const u8);
+            jb.symbol("wir_http_stream_end",       wir_http_stream_end       as *const extern "C" fn(i64,i64)->i64 as *const u8);
+            jb.symbol("wir_http_start_stream_from_req", wir_http_start_stream_from_req as *const extern "C" fn(i64,i64,i64)->i64 as *const u8);
+            jb.symbol("wir_json_parse",          wir_json_parse       as *const extern "C" fn(i64)->i64 as *const u8);
+            jb.symbol("wir_http_send_json",      wir_http_send_json   as *const extern "C" fn(i64,i64,i64)->i64 as *const u8);
         }
 
         let module = cranelift_jit::JITModule::new(jb);

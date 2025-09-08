@@ -1,3 +1,6 @@
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+
 pub mod peephole_simplify;
 pub mod const_fold;
 pub mod copy_propagation;

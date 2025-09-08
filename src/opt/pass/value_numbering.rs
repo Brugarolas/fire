@@ -1,4 +1,7 @@
 // src/opts/gvn.rs
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use crate::wir::{Function, ValueId, Constant};
 use crate::opt::{OptimizationWIR, WirEditQueue};

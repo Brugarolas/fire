@@ -1,5 +1,6 @@
 // src/main.rs
 #![allow(unused_imports)]
+#![allow(unused_variables)]
 
 mod value;
 mod wir;

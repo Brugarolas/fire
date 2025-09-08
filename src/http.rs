@@ -1,5 +1,6 @@
 // src/http.rs
 #![allow(unused_imports)]
+#![allow(unused_variables)]
 
 #![allow(unsafe_op_in_unsafe_fn)]
 use axum::{
@@ -23,6 +24,7 @@ use parking_lot::Mutex;
 use rclite::Arc;
 
 use crate::event_loop::EVENT_LOOP;
+use crate::gc::NAPALM_GC;
 use crate::value::{
     ObjHeader, TAG_STRING, BoxedStr, make_smi, is_imm, smi_to_i64, fmt_value,
 };
@@ -288,9 +290,13 @@ fn attach_then_catch(promise: i64, sid: u64, rid: u64) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_server_create(addr_ptr: i64) -> i64 {
+    // Ensure HTTP_RESOLVE_CLO is created while the VM/GC mutator is attached
+    // let _ = http_resolve_closure();
+
     extern "C" fn dispatch_tramp(argv: *const i64, argc: usize) -> i64 {
         crate::http::vm_dispatch(argv, argc)
     }
+
     let addr = unsafe { boxedstr_to_string(addr_ptr) };
     let server_id = rand_id();
 
@@ -346,8 +352,11 @@ pub extern "C" fn wir_server_listen(server_id: i64) -> i64 {
     let dispatch_closure = entry.dispatch_closure;
 
     TOKIO_RT.spawn(async move {
+        #[cfg(feature = "gc")]
+        unsafe { NAPALM_GC.bind_current_thread(); }
+
         let app = Router::new().route(
-            "/*path",
+            "/{*path}",
             any(move |method: Method, uri: axum::http::Uri, headers: HeaderMap, body: Bytes| {
                 let entry = entry.clone();
                 async move {
@@ -589,6 +598,9 @@ fn collect_headers_from_arr(arr: i64) -> Vec<(String,String)> {
 fn spawn_request(method: String, url: String, body: Option<Vec<u8>>, headers: Vec<(String,String)>, as_json: bool) -> i64 {
     let d = wir_deferred_new();
     TOKIO_RT.spawn(async move {
+        #[cfg(feature = "gc")]
+        unsafe { NAPALM_GC.bind_current_thread(); }
+
         let client = reqwest::Client::new();
         let mut req = client.request(method.parse().unwrap_or(reqwest::Method::GET), &url);
         if let Some(b) = body.clone() { req = req.body(b); }
@@ -782,6 +794,66 @@ pub extern "C" fn wir_json_parse(str_ptr: i64) -> i64 {
             Ok(v) => json_to_vm(&v),
             Err(_) => 0,
         }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_http_send_json(status_smi: i64, body_val: i64, headers_arr: i64) -> i64 {
+    use crate::value::{make_smi};
+
+    // 1) Normalize status
+    let mut status = smi_to_i64(status_smi);
+    if !(100..=599).contains(&status) {
+        status = 200;
+    }
+
+    // 2) Collect headers (array of [k, v]) and ensure content-type
+    let mut headers = collect_headers_from_arr(headers_arr);
+    if !headers.iter().any(|(k,_)| k.eq_ignore_ascii_case("content-type")) {
+        headers.push(("content-type".into(), "application/json".into()));
+    }
+
+    // 3) Encode body: if it's already a VM string, reuse it; otherwise fall back
+    //    to fmt_value(..) (best-effort; upgrade to a real JSON serializer later).
+    let body_str_val = unsafe {
+        if wir_is_str(body_val) != 0 {
+            // Already a string → use as-is
+            body_val
+        } else {
+            // Fallback: stringify the value and send that as the body
+            box_str_keepalive(fmt_value(body_val).into_bytes())
+        }
+    };
+
+    // 4) Build `{ status, body, headers }` object on the VM heap
+    unsafe {
+        unsafe extern "C" {
+            fn wir_array_new(len: i64) -> i64;
+            fn wir_array_push(arr: i64, val: i64) -> i64;
+        }
+
+        let obj = wir_obj_new();
+
+        // status
+        wir_obj_set_str(obj, static_str_value("status"), make_smi(status));
+
+        // body (string)
+        wir_obj_set_str(obj, static_str_value("body"), body_str_val);
+
+        // headers: array of [key, value] pairs
+        let hdrs_arr_vm = wir_array_new(make_smi(0));
+        for (k, v) in headers {
+            let pair = wir_array_new(make_smi(0));
+            let k_vm = box_str_keepalive(k.into_bytes());
+            let v_vm = box_str_keepalive(v.into_bytes());
+            let _ = wir_array_push(pair, k_vm);
+            let _ = wir_array_push(pair, v_vm);
+            let _ = wir_array_push(hdrs_arr_vm, pair);
+        }
+        wir_obj_set_str(obj, static_str_value("headers"), hdrs_arr_vm);
+
+        // Return the response object; vm_dispatch will map it to an HTTP response.
+        obj
     }
 }
 

@@ -1,5 +1,7 @@
 // src/opts/cse.rs
 #![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
 
 use std::collections::{HashMap, HashSet};
 

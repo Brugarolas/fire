@@ -1,4 +1,7 @@
 // src/opt/pass/licm.rs
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use ahash::AHashMap as HashMap;
 use crate::opt::InstCursor;

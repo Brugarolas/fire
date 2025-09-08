@@ -1,4 +1,6 @@
 #![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
 
 use crate::opt::{OptimizationWIR, WirEditQueue};
 use crate::wir::{Function, Inst, InstId, ValueDef, ValueId, BlockId};

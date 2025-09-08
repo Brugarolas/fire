@@ -1,5 +1,7 @@
 // src/opt/helpers.rs
 #![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
 
 use crate::wir::{Constant, Function, Inst, ValueDef, ValueId};
 

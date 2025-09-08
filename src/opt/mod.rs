@@ -16,6 +16,8 @@
 //!   let mut opt = Optimize::new().with_pass(your_pass());
 //!   opt.optimize_module(&mut module);
 
+#![allow(unused_imports)]
+#![allow(unused_variables)]
 #![allow(dead_code)]
 #![allow(clippy::needless_return)]
 
