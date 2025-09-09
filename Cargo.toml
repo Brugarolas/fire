@@ -94,7 +94,7 @@ chromadb = "2.3.0" # ChromaDB database
 
 [features]
 # Enable the real GC by default. For “no-GC” build use: --no-default-features
-default = ["gc"]
+default = []
 gc = []
 
 [target.aarch64-apple-darwin]

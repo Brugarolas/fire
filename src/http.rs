@@ -17,6 +17,7 @@ use tokio::net::TcpListener;
 use serde_json;
 use reqwest;
 
+use core::ptr::read_unaligned;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::{runtime::Runtime, sync::{oneshot, mpsc}};
 use ahash::AHashMap as HashMap;
@@ -32,6 +33,17 @@ use crate::runtime::{wir_obj_get_str, wir_obj_set_str, wir_obj_new, wir_is_str};
 use crate::native_promises::{wir_deferred_new, wir_deferred_resolve, wir_deferred_reject};
 
 /// -------- Tokio runtime on a dedicated thread (net/io) --------
+#[cfg(feature = "gc")]
+static TOKIO_RT: Lazy<Runtime> = Lazy::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("napalm-net")
+        .on_thread_start(|| unsafe { NAPALM_GC.bind_current_thread(); })
+        .build()
+        .expect("tokio runtime")
+});
+
+#[cfg(not(feature = "gc"))]
 static TOKIO_RT: Lazy<Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -109,6 +121,12 @@ struct HttpResult {
 
 /// ---- tiny utils ----
 #[inline(always)]
+unsafe fn argv_read(argv: *const i64, idx: usize) -> i64 {
+    // Use an unaligned 64-bit load to avoid SIGBUS on aarch64 when argv isn’t 8-byte aligned.
+    read_unaligned(argv.add(idx))
+}
+
+#[inline(always)]
 unsafe fn boxedstr_to_string(p: i64) -> String {
     let s = &*(p as *const BoxedStr);
     let bytes = std::slice::from_raw_parts(s.data, s.len);
@@ -117,12 +135,8 @@ unsafe fn boxedstr_to_string(p: i64) -> String {
 
 #[inline(always)]
 fn static_str_value(s: &'static str) -> i64 {
-    let obj = Box::new(BoxedStr {
-        hdr: ObjHeader { tag: TAG_STRING, aux: 0 },
-        len: s.as_bytes().len(),
-        data: s.as_ptr(),
-    });
-    Box::into_raw(obj) as i64
+    use crate::value::box_str_borrowed;
+    box_str_borrowed(s.as_bytes())
 }
 
 fn box_str_keepalive(bytes: Vec<u8>) -> i64 {
@@ -245,10 +259,9 @@ fn attach_then_catch(promise: i64, sid: u64, rid: u64) {
     unsafe extern "C" { fn wir_call_closure(clo: i64, argv: *const i64, argc: i64) -> i64; }
     extern "C" fn on_f(argv: *const i64, argc: usize) -> i64 {
         unsafe {
-            let a = std::slice::from_raw_parts(argv, argc);
-            let sid = a.get(0).copied().unwrap_or(0) as u64;
-            let rid = a.get(1).copied().unwrap_or(0) as u64;
-            let val = a.get(2).copied().unwrap_or(0);
+            let sid = argv_read(argv, 0) as u64;
+            let rid = argv_read(argv, 1) as u64;
+            let val = argv_read(argv, 2);
             let (st, body, headers) = value_to_response(val);
             send_response(sid, rid, st, body, headers);
         }
@@ -256,10 +269,9 @@ fn attach_then_catch(promise: i64, sid: u64, rid: u64) {
     }
     extern "C" fn on_r(argv: *const i64, argc: usize) -> i64 {
         unsafe {
-            let a = std::slice::from_raw_parts(argv, argc);
-            let sid = a.get(0).copied().unwrap_or(0) as u64;
-            let rid = a.get(1).copied().unwrap_or(0) as u64;
-            let val = a.get(2).copied().unwrap_or(0);
+            let sid = argv_read(argv, 0) as u64;
+            let rid = argv_read(argv, 1) as u64;
+            let val = argv_read(argv, 2);
             let mut body = format!("rejected: {}", fmt_value(val)).into_bytes();
             send_response(sid, rid, 500, std::mem::take(&mut body), vec![]);
         }
@@ -290,9 +302,6 @@ fn attach_then_catch(promise: i64, sid: u64, rid: u64) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_server_create(addr_ptr: i64) -> i64 {
-    // Ensure HTTP_RESOLVE_CLO is created while the VM/GC mutator is attached
-    // let _ = http_resolve_closure();
-
     extern "C" fn dispatch_tramp(argv: *const i64, argc: usize) -> i64 {
         crate::http::vm_dispatch(argv, argc)
     }
@@ -303,7 +312,6 @@ pub extern "C" fn wir_server_create(addr_ptr: i64) -> i64 {
     let dispatch_closure = crate::value::closure_new(dispatch_tramp as usize, 0);
     let entry = Arc::new(ServerEntry { addr, dispatch_closure, routes: Vec::new() });
     SERVERS.lock().insert(server_id, entry);
-
     server_id as i64
 }
 
@@ -352,9 +360,6 @@ pub extern "C" fn wir_server_listen(server_id: i64) -> i64 {
     let dispatch_closure = entry.dispatch_closure;
 
     TOKIO_RT.spawn(async move {
-        #[cfg(feature = "gc")]
-        unsafe { NAPALM_GC.bind_current_thread(); }
-
         let app = Router::new().route(
             "/{*path}",
             any(move |method: Method, uri: axum::http::Uri, headers: HeaderMap, body: Bytes| {
@@ -451,7 +456,7 @@ fn match_route<'a>(routes: &'a [Route], method: &str, path: &str) -> Option<(&'a
 pub extern "C" fn vm_dispatch(argv: *const i64, _argc: usize) -> i64 {
     use crate::value::*;
     unsafe {
-        let arg = *argv; // req_ptr
+        let arg = argv_read(argv, 0);
         let mut req: Box<ReqMsg> = Box::from_raw(arg as *mut ReqMsg); // take ownership
 
         // 1) Build VM Request object
@@ -522,7 +527,7 @@ fn value_to_str(v: i64) -> String { method_to_str(v) }
 static HTTP_RESOLVE_CLO: Lazy<i64> = Lazy::new(|| {
     extern "C" fn http_resolve_tramp(argv: *const i64, _argc: usize) -> i64 {
         unsafe {
-            let arg = *argv;
+            let arg = argv_read(argv, 0);
             let hr: Box<HttpResult> = Box::from_raw(arg as *mut HttpResult);
 
             if hr.is_err {
@@ -598,9 +603,6 @@ fn collect_headers_from_arr(arr: i64) -> Vec<(String,String)> {
 fn spawn_request(method: String, url: String, body: Option<Vec<u8>>, headers: Vec<(String,String)>, as_json: bool) -> i64 {
     let d = wir_deferred_new();
     TOKIO_RT.spawn(async move {
-        #[cfg(feature = "gc")]
-        unsafe { NAPALM_GC.bind_current_thread(); }
-
         let client = reqwest::Client::new();
         let mut req = client.request(method.parse().unwrap_or(reqwest::Method::GET), &url);
         if let Some(b) = body.clone() { req = req.body(b); }
@@ -875,3 +877,4 @@ pub fn http_with_root_slots<F: FnMut(*mut i64)>(mut f: F) {
         }
     }
 }
+
