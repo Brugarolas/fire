@@ -860,3 +860,16 @@ pub fn fmt_value(v: i64) -> String {
     // Unknown object
     format!("{:#x}", v as u64)
 }
+
+#[inline(always)]
+pub fn dbg_classify(v: i64) -> &'static str {
+    // We only say what we can know without dereferencing:
+    // - "null"      => 0
+    // - "smi"       => (v & 1) == 1
+    // - "ptr"       => even, nonzero
+    if v == 0 { "null" } else if (v & 1) == 1 { "smi" } else { "ptr" }
+}
+
+pub fn dbg_addr(v: i64) -> String {
+    if (v & 1) == 1 || v == 0 { format!("{}", v) } else { format!("0x{:x}", v as u64) }
+}

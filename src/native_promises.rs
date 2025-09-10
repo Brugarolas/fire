@@ -7,6 +7,39 @@ use crate::value::{ObjHeader, BoxedClosure, closure_new, closure_set_env_slot, T
 use crate::runtime::{wir_obj_new, wir_obj_set_str};
 use std::slice;
 
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+
+// Store promise pointers as integer handles so T: Send holds for the Mutex.
+type PromiseHandle = usize;
+
+static PROMISES: Lazy<Mutex<Vec<PromiseHandle>>> =Lazy::new(|| Mutex::new(Vec::new()));
+
+fn register_promise(p: *mut BoxedPromise) {
+    PROMISES.lock().push(p as usize);
+}
+
+fn unregister_promise(p: *mut BoxedPromise) {
+    let h = p as usize;
+    let mut v = PROMISES.lock();
+    if let Some(i) = v.iter().position(|&q| q == h) {
+        v.swap_remove(i);
+    }
+}
+
+/// Let the GC visit the i64 slots stored inside BoxedPromise (callbacks & value).
+pub fn promises_with_root_slots<F: FnMut(*mut i64)>(mut f: F) {
+    let v = PROMISES.lock();
+    for &h in v.iter() {
+        unsafe {
+            let p = &mut *(h as *mut BoxedPromise);
+            for fun in p.on_fulfilled.iter_mut() { f(fun as *mut i64); }
+            for fun in p.on_rejected.iter_mut()  { f(fun as *mut i64); }
+            f(&mut p.value as *mut i64);
+        }
+    }
+}
+
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum PState { Pending=0, Fulfilled=1, Rejected=2 }
 
@@ -40,6 +73,9 @@ unsafe fn as_promise(p: i64) -> *mut BoxedPromise {
 }
 
 fn schedule_fulfill(fun: i64, arg: i64) {
+    #[cfg(debug_assertions)]
+    eprintln!("[promise] schedule_fulfill(fun={}, arg={})", crate::value::dbg_addr(fun), crate::value::dbg_addr(arg));
+
     EVENT_LOOP.enqueue_microtask(fun, arg);
 }
 
@@ -55,6 +91,8 @@ pub extern "C" fn wir_promise_resolve(priv_ptr: i64, val: i64) -> i64 {
         // schedule queued on_fulfilled
         let pending = std::mem::take(&mut (*p).on_fulfilled);
         for f in pending { schedule_fulfill(f, val); }
+
+        unregister_promise(p);
     }
     0
 }
@@ -69,6 +107,8 @@ pub extern "C" fn wir_promise_reject(priv_ptr: i64, reason: i64) -> i64 {
 
         let pending = std::mem::take(&mut (*p).on_rejected);
         for f in pending { schedule_fulfill(f, reason); } // same microtask path
+
+        unregister_promise(p);
     }
     0
 }
@@ -147,6 +187,8 @@ pub extern "C" fn wir_promise_new(executor: i64) -> i64 {
         let argv = [res, rej];
         let _ = wir_call_closure(executor, argv.as_ptr(), 2);
 
+        register_promise(priv_p as *mut BoxedPromise);
+
         // Public value is the private pointer; .then/.catch are lowered directly (see front.rs).
         priv_p
     }
@@ -164,7 +206,10 @@ pub extern "C" fn wir_deferred_new() -> i64 {
         on_fulfilled: Vec::new(),
         on_rejected: Vec::new(),
     };
-    Box::into_raw(Box::new(p)) as i64
+
+    let p_raw = Box::into_raw(Box::new(p)) as i64;
+    register_promise(p_raw as *mut BoxedPromise);
+    p_raw
 }
 
 // Return-the-same-pointer wrappers so you can chain: d.resolve(v).then(...)
@@ -211,6 +256,9 @@ pub extern "C" fn wir_event_loop_pump_once() -> i32 {
 // Blocking await: returns fulfillment value; rejection returns 0 for now
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_await(val: i64) -> i64 {
+    #[cfg(debug_assertions)]
+    eprintln!("[await] wir_await(val={} {})", crate::value::dbg_addr(val), crate::value::dbg_classify(val));
+
     #[repr(C)]
     struct Cell { ready: bool, ok: bool, v: i64 }
 
@@ -253,6 +301,9 @@ pub extern "C" fn wir_await(val: i64) -> i64 {
         // IMPORTANT: do NOT call wir_obj_get_str here.
         // This is a private promise pointer, wire via the native API.
         let _ = wir_promise_then(val, onf, onr);
+
+        #[cfg(debug_assertions)]
+        eprintln!("[await] then attached to {}", crate::value::dbg_addr(val));
     }
 
     // Pump until settled.

@@ -10,6 +10,7 @@ use smallbox::SmallBox;
 // Bring in the WIR types from your other file/module.
 use crate::wir::{
     Builder, Constant, FieldId, FuncId, Inst, IntBinOp, Module, Type, ValueId,
+    MethodInfo, AccessorInfo, ClassInfo
 };
 
 /// -------------------------

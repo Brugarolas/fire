@@ -342,6 +342,17 @@ pub enum Inst {
     MakeClosure { callee: FuncId, env: ValueId },
     CallClosure { conv: CallConv, fun: ValueId, args: Vec<ValueId> },
 
+    RegisterClass {
+        name: String,
+        base: Option<String>,
+        // runtime receives these maps; we serialize into arrays of tuples at lowering
+        fields: Vec<String>,                     // stored property names (instance)
+        statics: Vec<String>,                    // static stored property names
+        methods: Vec<(String, FuncId, bool)>,    // (name, func, is_static)
+        accessors: Vec<(String, Option<FuncId>, Option<FuncId>, bool)>, // name, get, set, is_static
+    },
+    AllocInstance { class: String }, // or ShapeId if you pre-shape
+
     // ---- Natives / intrinsics ----
     CallNative {
         name: String,
@@ -365,6 +376,29 @@ pub enum Inst {
 
     // ---- OSR points ----
     OSRPoint, // mark loop header for on-stack replacement
+}
+
+#[derive(Debug, Clone)]
+pub struct MethodInfo {
+    name: String,
+    func: FuncId,
+    is_static: bool,
+}
+#[derive(Debug, Clone)]
+pub struct AccessorInfo {
+    name: String,
+    getter: Option<FuncId>,
+    setter: Option<FuncId>,
+    is_static: bool,
+}
+#[derive(Debug, Clone)]
+pub struct ClassInfo {
+    name: String,
+    base: Option<String>,
+    fields: Vec<String>,     // instance stored properties
+    statics: Vec<String>,    // static stored properties
+    methods: Vec<MethodInfo>,
+    accessors: Vec<AccessorInfo>,
 }
 
 impl Inst {

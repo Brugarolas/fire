@@ -161,32 +161,26 @@ impl From<Address> for SlotItem { fn from(a: Address) -> Self { SlotItem(a) } }
 impl Slot for SlotItem {
     #[inline(always)]
     fn load(&self) -> Option<ObjectReference> {
-        let v = unsafe { ptr::read(self.0.to_ptr::<ValueRepr>()) };
+        use crate::value::{ObjHeader, TAG_BOXED_F64, TAG_STRING, TAG_ARRAY, TAG_OBJECT, TAG_CLOSURE, ValueRepr, NULL, is_ptr};
+        let v: ValueRepr = unsafe { ptr::read(self.0.to_ptr::<ValueRepr>()) };
 
-        #[cfg(debug_assertions)]
-        if is_ptr(v) && v != NULL {
+        if likely(is_ptr(v)) && v != NULL {
+            // Validate that this is a *Napalm GC object*, not some foreign/native handle.
             unsafe {
-                let h = (v as *const crate::value::ObjHeader).as_ref().unwrap();
-                debug_assert!(
-                    matches!(h.tag, crate::value::TAG_BOXED_F64 | crate::value::TAG_STRING | crate::value::TAG_ARRAY | crate::value::TAG_OBJECT | crate::value::TAG_CLOSURE),
-                    "Unknown tag {} at {:p}", h.tag, v as *const u8
-                );
-            };
-        }
-
-        // assume: lower tag bit == 0 ⇒ pointer, else immediate
-        if likely(is_ptr(v)) {
-            // NULL check can be folded into is_ptr if you reserve a nonzero null-tag, otherwise keep
-            if v != NULL {
-                return ObjectReference::from_raw_address(Address::from_ptr(v as *mut u8));
+                let h = (v as *const ObjHeader).as_ref()?;
+                match h.tag {
+                    TAG_BOXED_F64 | TAG_STRING | TAG_ARRAY | TAG_OBJECT | TAG_CLOSURE => {
+                        return ObjectReference::from_raw_address(Address::from_ptr(v as *mut u8));
+                    }
+                    _ => return None, // NOT a GC-managed object (e.g., native Promise handle)
+                }
             }
         }
         None
-}
+    }
 
     #[inline(always)]
     fn store(&self, obj: ObjectReference) {
-        // MMTk only calls this for actual reference slots.
         let p = self.0.to_mut_ptr::<ValueRepr>();
         let val: ValueRepr = obj.to_raw_address().to_ptr::<u8>() as i64;
         unsafe { ptr::write(p, val) };
@@ -577,7 +571,48 @@ impl Scanning<NapalmVM> for VMScanning {
         _tls: VMWorkerThread,
         mut factory: impl RootsWorkFactory<SlotItem>,
     ) {
+        // 1) Shadow stack
         emit_shadow_roots_to_factory(&mut factory);
+
+        // 2) Event loop roots (microtasks, ready timers)
+        {
+            let mut edges: SmallVec<[SlotItem; 64]> = SmallVec::new();
+            crate::event_loop::EVENT_LOOP.with_root_slots(|slot| {
+                edges.push(SlotItem(Address::from_ptr(slot.cast::<u8>())));
+                if edges.len() == 64 {
+                    factory.create_process_roots_work(edges.to_vec());
+                    edges.clear();
+                }
+            });
+            if !edges.is_empty() {
+                factory.create_process_roots_work(edges.to_vec());
+            }
+        }
+
+        // 3) HTTP module roots (server dispatch closures, route handlers, and Deferred slots)
+        {
+            let mut edges: SmallVec<[SlotItem; 64]> = SmallVec::new();
+            crate::http::http_with_root_slots(|slot| {
+                edges.push(SlotItem(Address::from_ptr(slot.cast::<u8>())));
+                if edges.len() == 64 {
+                    factory.create_process_roots_work(edges.to_vec());
+                    edges.clear();
+                }
+            });
+            if !edges.is_empty() {
+                factory.create_process_roots_work(edges.to_vec());
+            }
+        }
+
+        // Promises – closures stored off-heap
+        {
+            let mut edges: SmallVec<[SlotItem; 64]> = SmallVec::new();
+            crate::native_promises::promises_with_root_slots(|slot| {
+                edges.push(SlotItem(Address::from_ptr(slot.cast::<u8>())));
+                if edges.len() == 64 { factory.create_process_roots_work(edges.to_vec()); edges.clear(); }
+            });
+            if !edges.is_empty() { factory.create_process_roots_work(edges.to_vec()); }
+        }
     }
 
     // ===== extra items your MMTk requires =====

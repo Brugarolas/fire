@@ -16,7 +16,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio::net::TcpListener;
 use serde_json;
 use reqwest;
-
 use core::ptr::read_unaligned;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::{runtime::Runtime, sync::{oneshot, mpsc}};
@@ -27,7 +26,7 @@ use rclite::Arc;
 use crate::event_loop::EVENT_LOOP;
 use crate::gc::NAPALM_GC;
 use crate::value::{
-    ObjHeader, TAG_STRING, BoxedStr, make_smi, is_imm, smi_to_i64, fmt_value,
+    ObjHeader, TAG_STRING, TAG_OBJECT, BoxedStr, make_smi, is_imm, smi_to_i64, fmt_value, dbg_addr, dbg_classify,
 };
 use crate::runtime::{wir_obj_get_str, wir_obj_set_str, wir_obj_new, wir_is_str};
 use crate::native_promises::{wir_deferred_new, wir_deferred_resolve, wir_deferred_reject};
@@ -108,15 +107,38 @@ pub struct ResponseMsg {
     pub headers: Vec<(String,String)>,
 }
 
+// --- GC roots for in-flight HTTP deferreds (store as usize to be Send/Sync) ---
+type RootSlot = i64; // holds a Box<i64> pointer
+
 /// Small helper used by HTTP client to deliver results on the VM thread.
 #[repr(C)]
 struct HttpResult {
-    deferred: i64,    // private promise pointer
+    deferred: RootSlot,
     status:   i64,    // SMI
     body:     Vec<u8>,
     headers:  Vec<(String,String)>,
     is_err:   bool,
     as_json:  bool,
+}
+
+static DEFERRED_ROOTS: Lazy<Mutex<Vec<RootSlot>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+fn root_deferred(d: i64) -> RootSlot {
+    let slot_ptr: *mut i64 = Box::into_raw(Box::new(d)); // slot the GC can rewrite
+    let u = slot_ptr as i64;
+    DEFERRED_ROOTS.lock().push(u);
+    u
+}
+
+fn unroot_deferred(slot: RootSlot) {
+    // remove from the list
+    let mut v = DEFERRED_ROOTS.lock();
+    if let Some(i) = v.iter().position(|&p| p == slot) {
+        v.swap_remove(i);
+    }
+    drop(v);
+    // free the slot
+    unsafe { drop(Box::from_raw(slot as *mut i64)); }
 }
 
 /// ---- tiny utils ----
@@ -156,12 +178,24 @@ fn box_str_keepalive(bytes: Vec<u8>) -> i64 {
 ///  - object {status?, body?, headers?} where:
 ///      status = SMI, body = string; headers = array of [key, value] pairs (strings)
 fn value_to_response(v: i64) -> (u16, Vec<u8>, Vec<(String,String)>) {
+    #[cfg(debug_assertions)]
+    eprintln!("[http] value_to_response: v={} ({})", dbg_addr(v), dbg_classify(v));
+
     // string?
     unsafe {
+        if v == 0 {
+            // treat as empty body (or 204 if you prefer)
+            return (200, Vec::new(), vec![]);
+        }
         if wir_is_str(v) != 0 {
             let s = &*(v as *const BoxedStr);
             let bytes = std::slice::from_raw_parts(s.data, s.len);
             return (200, bytes.to_vec(), vec![]);
+        }
+        let hdr = &*(v as *const ObjHeader);
+        if hdr.tag != TAG_OBJECT {
+            // not an object → just stringify
+            return (200, fmt_value(v).into_bytes(), vec![]);
         }
     }
 
@@ -244,13 +278,32 @@ fn send_immediate_response(server_id: u64, req_id: u64, v: i64) {
 
 /// Promise-like detection: check obj["then"] first; else treat as private promise pointer.
 fn is_promise_like(v: i64) -> bool {
+    #[cfg(debug_assertions)]
+    eprintln!("[http] is_promise_like? v={} ({})", dbg_addr(v), dbg_classify(v));
+
+    // null or immediate → not a promise
+    if v == 0 || (v & 1) == 1 { return false; }
+
     unsafe {
-        let then = wir_obj_get_str(v, static_str_value("then"));
-        if then != 0 { return true; }
-    }
-    v != 0 && (v & 1) == 0 && unsafe {
         let hdr = &*(v as *const ObjHeader);
-        hdr.tag != TAG_STRING
+
+        #[cfg(debug_assertions)]
+        eprintln!("[http]   tag={}", hdr.tag);
+
+        // strings are not promises
+        if hdr.tag == TAG_STRING { return false; }
+        // your native/private Promise uses tag 0
+        if hdr.tag == 0 { return true; }
+        // Only objects may be "thenables"
+        if hdr.tag == TAG_OBJECT {
+            let then = wir_obj_get_str(v, static_str_value("then"));
+
+            #[cfg(debug_assertions)]
+            eprintln!("[http]   .then present? {}", then != 0);
+
+            return then != 0;
+        }
+        false
     }
 }
 
@@ -388,7 +441,7 @@ pub extern "C" fn wir_server_listen(server_id: i64) -> i64 {
                     let arg = (&*msg as *const ReqMsg as usize) as i64;
                     std::mem::forget(msg);
 
-                    EVENT_LOOP.enqueue_microtask(dispatch_closure, arg);
+                    EVENT_LOOP.enqueue_microtask(entry.dispatch_closure, arg);
 
                     match rx.await {
                         Ok(r) => {
@@ -501,6 +554,9 @@ pub extern "C" fn vm_dispatch(argv: *const i64, _argc: usize) -> i64 {
         let argv = [req_obj];
         let ret = wir_call_closure(route.handler_closure, argv.as_ptr(), 1);
 
+        #[cfg(debug_assertions)]
+        eprintln!("[http] route returned v={} ({})", dbg_addr(ret), dbg_classify(ret));
+
         // 4) Return mapping
         if is_promise_like(ret) {
             attach_then_catch(ret, req.server_id, req.req_id);
@@ -530,16 +586,30 @@ static HTTP_RESOLVE_CLO: Lazy<i64> = Lazy::new(|| {
             let arg = argv_read(argv, 0);
             let hr: Box<HttpResult> = Box::from_raw(arg as *mut HttpResult);
 
+            // Read the up-to-date promise pointer from the slot (GC will have updated this).
+            let slot: *mut i64 = hr.deferred as *mut i64;
+            let deferred: i64 = *slot;
+
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[http] resolve_tramp slot={:?} -> {} ({}) is_err={} as_json={}",
+                slot,
+                crate::value::dbg_addr(deferred),
+                crate::value::dbg_classify(deferred),
+                hr.is_err,
+                hr.as_json
+            );
+
             if hr.is_err {
-                let _ = wir_deferred_reject(hr.deferred, 0);
+                let _ = wir_deferred_reject(deferred, 0);
+                unroot_deferred(hr.deferred);   // free the slot now that we're done
                 return 0;
             }
 
-            // Build {status, body?, json?, headers}
             let obj = wir_obj_new();
             wir_obj_set_str(obj, static_str_value("status"), make_smi(hr.status));
 
-            // headers object
+            // headers
             let hdrs_obj = wir_obj_new();
             for (k, v) in hr.headers.iter() {
                 wir_obj_set_str(
@@ -550,6 +620,7 @@ static HTTP_RESOLVE_CLO: Lazy<i64> = Lazy::new(|| {
             }
             wir_obj_set_str(obj, static_str_value("headers"), hdrs_obj);
 
+            // body / json
             if hr.as_json {
                 if let Some(jv) = json_bytes_to_vm(&hr.body) {
                     wir_obj_set_str(obj, static_str_value("json"), jv);
@@ -562,7 +633,10 @@ static HTTP_RESOLVE_CLO: Lazy<i64> = Lazy::new(|| {
                 wir_obj_set_str(obj, static_str_value("body"), body_v);
             }
 
-            let _ = wir_deferred_resolve(hr.deferred, obj);
+            let _ = wir_deferred_resolve(deferred, obj);
+
+            // Done with this request — stop rooting the promise
+            unroot_deferred(hr.deferred);
         }
         0
     }
@@ -602,6 +676,8 @@ fn collect_headers_from_arr(arr: i64) -> Vec<(String,String)> {
 
 fn spawn_request(method: String, url: String, body: Option<Vec<u8>>, headers: Vec<(String,String)>, as_json: bool) -> i64 {
     let d = wir_deferred_new();
+    let dslot = root_deferred(d);               // <-- KEEP A ROOT SLOT
+
     TOKIO_RT.spawn(async move {
         let client = reqwest::Client::new();
         let mut req = client.request(method.parse().unwrap_or(reqwest::Method::GET), &url);
@@ -616,18 +692,27 @@ fn spawn_request(method: String, url: String, body: Option<Vec<u8>>, headers: Ve
                 for (k, v) in r.headers().iter() {
                     hdrs.push((k.as_str().to_string(), v.to_str().unwrap_or_default().to_string()));
                 }
-                let body   = r.bytes().await.unwrap_or_default().to_vec();
-                let msg = Box::new(HttpResult { deferred: d, status, body, headers: hdrs, is_err: false, as_json });
+                let body = r.bytes().await.unwrap_or_default().to_vec();
+                let msg = Box::new(HttpResult {
+                    deferred: dslot,
+                    status, body, headers: hdrs,
+                    is_err: false, as_json
+                });
                 let arg = Box::into_raw(msg) as i64;
                 EVENT_LOOP.enqueue_microtask(http_resolve_closure(), arg);
             }
-            Err(_e) => {
-                let msg = Box::new(HttpResult { deferred: d, status: 0, body: Vec::new(), headers: vec![], is_err: true, as_json });
+            Err(_) => {
+                let msg = Box::new(HttpResult {
+                    deferred: dslot,
+                    status: 0, body: Vec::new(), headers: vec![],
+                    is_err: true, as_json
+                });
                 let arg = Box::into_raw(msg) as i64;
                 EVENT_LOOP.enqueue_microtask(http_resolve_closure(), arg);
             }
         }
     });
+
     d
 }
 
@@ -862,11 +947,16 @@ pub extern "C" fn wir_http_send_json(status_smi: i64, body_val: i64, headers_arr
 /// --------- GC integration: expose root slots to the collector ---------
 /// Call this from your GC's root scanning hook, similar to EVENT_LOOP.with_root_slots.
 pub fn http_with_root_slots<F: FnMut(*mut i64)>(mut f: F) {
-    // HTTP client resolve trampoline
     let p = &*HTTP_RESOLVE_CLO as *const i64 as *mut i64;
+
+    #[cfg(debug_assertions)]
+    {
+        let cur = unsafe { *p };
+        eprintln!("[http] root deferred slot {:?} -> {}", p, crate::value::dbg_addr(cur));
+    }
+
     f(p);
 
-    // Servers: dispatch + route handlers
     let g = SERVERS.lock();
     for entry in g.values() {
         let p = &entry.dispatch_closure as *const i64 as *mut i64;
@@ -877,4 +967,3 @@ pub fn http_with_root_slots<F: FnMut(*mut i64)>(mut f: F) {
         }
     }
 }
-
