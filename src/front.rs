@@ -43,6 +43,18 @@ pub enum Tok {
     #[token("in")] In,
     #[token("delete")] Delete,
 
+    // Class support
+    #[token("class")] Class,
+    #[token("extends")] Extends,
+    #[token("static")] Static,
+    #[token("constructor")] Constructor,
+    #[token("destructor")] Destructor,
+    #[token("get")] Get,
+    #[token("set")] Set,
+    #[token("new")] New,
+    #[token("this")] This,
+    #[token("super")] Super,
+
     // Async/await & defer/errdefer
     #[token("async")] Async,
     #[token("await")] Await,
@@ -131,6 +143,55 @@ fn unescape_string(raw: &str) -> String {
 #[derive(Debug, Clone)]
 pub struct Program {
     pub functions: Vec<FuncDecl>,
+    pub classes:   Vec<ClassDecl>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClassDecl {
+    pub name: String,
+    pub base: Option<String>,        // name after `extends`
+    pub members: Vec<ClassMember>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ClassMember {
+    // `var name [ : Type ] [= init]? ;`   (instance or static)
+    Stored {
+        is_static: bool,
+        name: String,
+        type_ann: Option<String>,    // parsed after ':', kept as raw for now
+        init: Option<Expr>,          // optional initializer
+    },
+
+    // `var name { get(){...} set(x){...} }` (either/both accessors; instance or static)
+    Accessor {
+        is_static: bool,
+        name: String,
+        getter: Option<Block>,       // body of `get()`
+        setter_param: Option<String>,
+        setter_body: Option<Block>,  // body of `set(param)`
+    },
+
+    // `fn name(params) { ... }`     (instance)   or  `static fn name(...) { ... }`
+    Method {
+        is_static: bool,
+        name: String,
+        params: Vec<String>,
+        body: Block,
+        is_async: bool,
+    },
+
+    // `constructor(params) { ... }`
+    Constructor {
+        params: Vec<String>,
+        body: Block,
+        is_async: bool,              // allow `async constructor` now or later
+    },
+
+    // `destructor() { ... }`
+    Destructor {
+        body: Block,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -181,6 +242,10 @@ pub enum Expr {
     FnLit { params: Vec<String>, body: Block },
     FnRef { name: String },
     ArrayLit(Vec<Expr>),
+
+    This,                            // `this`
+    Super,                           // `super` (used with member access or super(...) in ctor)
+    New { class: String, args: Vec<Expr> }, // `new ClassName(args...)`
 
     // { a: 1, "b": 2, c: x+y }
     ObjLit(Vec<(PropKey, Expr)>),
@@ -340,12 +405,15 @@ impl<'src> Parser<'src> {
 
     pub fn program(&mut self) -> PResult<Program> {
         let mut functions = Vec::new();
+        let mut classes   = Vec::new();
         let mut toplevel_stmts: Vec<Stmt> = Vec::new();
 
         while self.i < self.toks.len() {
             if self.matches(&Tok::Semi) { continue; }
 
-            if self.check(&Tok::Fn) || self.check(&Tok::Async) {
+            if self.check(&Tok::Class) {
+                classes.push(self.class_decl()?);
+            } else if self.check(&Tok::Fn) || self.check(&Tok::Async) {
                 let is_async = if self.matches(&Tok::Async) {
                     self.expect(Tok::Fn, "expected 'fn' after 'async'")?;
                     true
@@ -369,7 +437,133 @@ impl<'src> Parser<'src> {
             });
         }
 
-        Ok(Program { functions })
+        Ok(Program { functions, classes })
+    }
+
+    fn class_decl(&mut self) -> PResult<ClassDecl> {
+    self.expect(Tok::Class, "expected 'class'")?;
+    let name = match self.next().tok {
+        Tok::Ident(s) => s,
+        _ => return Err(self.err_here("expected class name")),
+    };
+
+    let base = if self.matches(&Tok::Extends) {
+        match self.next().tok {
+            Tok::Ident(s) => Some(s),
+            _ => return Err(self.err_here("expected base class name after 'extends'")),
+        }
+    } else { None };
+
+    self.expect(Tok::LBrace, "expected '{' after class header")?;
+    let mut members = Vec::new();
+    while !self.matches(&Tok::RBrace) {
+        members.push(self.class_member()?);
+    }
+
+    Ok(ClassDecl { name, base, members })
+}
+
+    fn class_member(&mut self) -> PResult<ClassMember> {
+        // optional 'static'
+        let is_static = self.matches(&Tok::Static);
+
+        // constructor / destructor
+        if self.matches(&Tok::Constructor) {
+            self.expect(Tok::LParen, "expected '(' after 'constructor'")?;
+            let params = self.parse_param_list()?;
+            let body = self.block()?;
+            return Ok(ClassMember::Constructor { params, body, is_async: false });
+        }
+        if self.matches(&Tok::Destructor) {
+            self.expect(Tok::LParen, "expected '(' after 'destructor'")?;
+            self.expect(Tok::RParen, "expected ')' after 'destructor('")?;
+            let body = self.block()?;
+            return Ok(ClassMember::Destructor { body });
+        }
+
+        // async fn (method)
+        let mut is_async = false;
+        if self.matches(&Tok::Async) {
+            self.expect(Tok::Fn, "expected 'fn' after 'async' in class")?;
+            is_async = true;
+            let (name, params, body) = self.parse_method_tail()?;
+            return Ok(ClassMember::Method { is_static, name, params, body, is_async });
+        }
+
+        // fn (method)
+        if self.matches(&Tok::Fn) {
+            let (name, params, body) = self.parse_method_tail()?;
+            return Ok(ClassMember::Method { is_static, name, params, body, is_async: false });
+        }
+
+        // var ...  (stored or accessor)
+        if self.matches(&Tok::Var) {
+            // name
+            let name = match self.next().tok {
+                Tok::Ident(s) => s,
+                _ => return Err(self.err_here("expected identifier after 'var' in class")),
+            };
+
+            // Accessor form:  var name { get() { ... } set(x){...} }
+            if self.matches(&Tok::LBrace) {
+                let mut getter: Option<Block> = None;
+                let mut setter_param: Option<String> = None;
+                let mut setter_body: Option<Block> = None;
+
+                while !self.matches(&Tok::RBrace) {
+                    if self.matches(&Tok::Get) {
+                        self.expect(Tok::LParen, "expected '(' after 'get'")?;
+                        self.expect(Tok::RParen, "get() takes no params")?;
+                        let body = self.block()?;
+                        getter = Some(body);
+                    } else if self.matches(&Tok::Set) {
+                        self.expect(Tok::LParen, "expected '(' after 'set'")?;
+                        let param = match self.next().tok {
+                            Tok::Ident(s) => s,
+                            _ => return Err(self.err_here("expected setter parameter name")),
+                        };
+                        self.expect(Tok::RParen, "expected ')' after setter parameter")?;
+                        let body = self.block()?;
+                        setter_param = Some(param);
+                        setter_body  = Some(body);
+                    } else {
+                        return Err(self.err_here("expected 'get' or 'set' in accessor block"));
+                    }
+                }
+
+                return Ok(ClassMember::Accessor { is_static, name, getter, setter_param, setter_body });
+            }
+
+            // Stored form:  var name [: Type] [= init]? ;
+            let mut type_ann: Option<String> = None;
+            if self.matches(&Tok::Colon) {
+                // parse a simple type name (Identifier) for now
+                match self.next().tok {
+                    Tok::Ident(s) => type_ann = Some(s),
+                    _ => return Err(self.err_here("expected type name after ':'")),
+                }
+            }
+
+            let init = if self.matches(&Tok::Eq) {
+                Some(self.expr()?)
+            } else { None };
+
+            self.expect(Tok::Semi, "expected ';' after class var")?;
+            return Ok(ClassMember::Stored { is_static, name, type_ann, init });
+        }
+
+        Err(self.err_here("expected class member (var/fn/constructor/destructor)"))
+    }
+
+    fn parse_method_tail(&mut self) -> PResult<(String, Vec<String>, Block)> {
+        let name = match self.next().tok {
+            Tok::Ident(s) => s,
+            _ => return Err(self.err_here("expected method name")),
+        };
+        self.expect(Tok::LParen, "expected '(' after method name")?;
+        let params = self.parse_param_list()?;
+        let body = self.block()?;
+        Ok((name, params, body))
     }
 
     fn fn_def_with_async(&mut self, is_async: bool) -> PResult<FuncDecl> {
@@ -761,6 +955,27 @@ impl<'src> Parser<'src> {
     fn parse_primary(&mut self) -> PResult<Expr> {
         let t = self.next();
         match t.tok {
+            Tok::This  => Ok(Expr::This),
+            Tok::Super => Ok(Expr::Super),
+
+            Tok::New => {
+                // new <Ident>(args...)
+                let class = match self.next().tok {
+                    Tok::Ident(s) => s,
+                    _ => return Err(self.err_here("expected class name after 'new'")),
+                };
+                self.expect(Tok::LParen, "expected '(' after class name")?;
+                let mut args = Vec::new();
+                if !self.matches(&Tok::RParen) {
+                    loop {
+                        args.push(self.expr()?);
+                        if self.matches(&Tok::RParen) { break; }
+                        self.expect(Tok::Comma, "expected ',' in argument list")?;
+                    }
+                }
+                Ok(Expr::New { class, args })
+            }
+
             Tok::Int(x) => Ok(Expr::LitInt(x)),
             Tok::Float(x) => Ok(Expr::LitF64(x)),
             Tok::True => Ok(Expr::LitBool(true)),
