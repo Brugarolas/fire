@@ -266,6 +266,25 @@ pub enum Expr {
     Await(SmallBox<Expr, u8>)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Visibility {
+    Public,
+    Private,
+}
+
+#[derive(Debug, Clone)]
+pub enum SuperRef {
+    // super(...) in a constructor
+    Ctor(Vec<Expr>),
+    // (add more variants later if we need them)
+}
+
+#[derive(Debug, Clone)]
+pub enum NewTarget {
+    // new Ident(args...)
+    Ident(String),
+    // (add more variants later if we need them)
+}
 
 #[derive(Debug, Clone)]
 pub enum LValue {
@@ -441,118 +460,171 @@ impl<'src> Parser<'src> {
     }
 
     fn class_decl(&mut self) -> PResult<ClassDecl> {
-    self.expect(Tok::Class, "expected 'class'")?;
-    let name = match self.next().tok {
-        Tok::Ident(s) => s,
-        _ => return Err(self.err_here("expected class name")),
-    };
+        self.expect(Tok::Class, "expected 'class'")?;
+        let name = match self.next().tok {
+            Tok::Ident(s) => s,
+            _ => return Err(self.err_here("expected class name")),
+        };
 
-    let base = if self.matches(&Tok::Extends) {
-        match self.next().tok {
-            Tok::Ident(s) => Some(s),
-            _ => return Err(self.err_here("expected base class name after 'extends'")),
+        let base = if self.matches(&Tok::Extends) {
+            match self.next().tok {
+                Tok::Ident(s) => Some(s),
+                _ => return Err(self.err_here("expected base class name after 'extends'")),
+            }
+        } else { None };
+
+        self.expect(Tok::LBrace, "expected '{' after class header")?;
+        let mut members = Vec::new();
+        while !self.matches(&Tok::RBrace) {
+            members.push(self.class_member()?);
         }
-    } else { None };
 
-    self.expect(Tok::LBrace, "expected '{' after class header")?;
-    let mut members = Vec::new();
-    while !self.matches(&Tok::RBrace) {
-        members.push(self.class_member()?);
+        Ok(ClassDecl { name, base, members })
     }
 
-    Ok(ClassDecl { name, base, members })
-}
+    fn class_decl(&mut self) -> PResult<ClassDecl> {
+        // class Name [extends Base] { members }
+        let name = match self.next().tok {
+            Tok::Ident(s) => s,
+            _ => return Err(self.err_here("expected class name")),
+        };
 
-    fn class_member(&mut self) -> PResult<ClassMember> {
-        // optional 'static'
-        let is_static = self.matches(&Tok::Static);
+        let base = if self.matches(&Tok::Extends) {
+            match self.next().tok {
+                Tok::Ident(s) => Some(s),
+                _ => return Err(self.err_here("expected base class name after 'extends'")),
+            }
+        } else { None };
 
-        // constructor / destructor
-        if self.matches(&Tok::Constructor) {
-            self.expect(Tok::LParen, "expected '(' after 'constructor'")?;
-            let params = self.parse_param_list()?;
-            let body = self.block()?;
-            return Ok(ClassMember::Constructor { params, body, is_async: false });
-        }
-        if self.matches(&Tok::Destructor) {
-            self.expect(Tok::LParen, "expected '(' after 'destructor'")?;
-            self.expect(Tok::RParen, "expected ')' after 'destructor('")?;
-            let body = self.block()?;
-            return Ok(ClassMember::Destructor { body });
-        }
+        self.expect(Tok::LBrace, "expected '{' after class header")?;
 
-        // async fn (method)
-        let mut is_async = false;
-        if self.matches(&Tok::Async) {
-            self.expect(Tok::Fn, "expected 'fn' after 'async' in class")?;
-            is_async = true;
-            let (name, params, body) = self.parse_method_tail()?;
-            return Ok(ClassMember::Method { is_static, name, params, body, is_async });
-        }
+        let mut members = Vec::new();
+        while !self.matches(&Tok::RBrace) {
+            // [private]? [static]? (var|prop|fn|constructor|destructor) ...
+            let vis = if self.matches(&Tok::Private) { Visibility::Private } else { Visibility::Public };
+            let is_static = self.matches(&Tok::Static);
 
-        // fn (method)
-        if self.matches(&Tok::Fn) {
-            let (name, params, body) = self.parse_method_tail()?;
-            return Ok(ClassMember::Method { is_static, name, params, body, is_async: false });
-        }
+            // constructor/destructor
+            if self.matches(&Tok::Constructor) {
+                let params = self.parse_fn_param_names()?;
+                let body = self.block()?;
+                members.push(ClassMember::Ctor { params, body });
+                continue;
+            }
+            if self.matches(&Tok::Destructor) {
+                let body = self.block()?;
+                members.push(ClassMember::Dtor { body });
+                continue;
+            }
 
-        // var ...  (stored or accessor)
-        if self.matches(&Tok::Var) {
-            // name
-            let name = match self.next().tok {
-                Tok::Ident(s) => s,
-                _ => return Err(self.err_here("expected identifier after 'var' in class")),
-            };
+            // prop
+            if self.matches(&Tok::Prop) {
+                let name = match self.next().tok {
+                    Tok::Ident(s) => s,
+                    _ => return Err(self.err_here("expected property name after 'prop'")),
+                };
+                // Optional ": Type" — skip it if present
+                let _ = self.maybe_skip_type_annot()?;
+                self.expect(Tok::LBrace, "expected '{' after property name")?;
 
-            // Accessor form:  var name { get() { ... } set(x){...} }
-            if self.matches(&Tok::LBrace) {
                 let mut getter: Option<Block> = None;
-                let mut setter_param: Option<String> = None;
-                let mut setter_body: Option<Block> = None;
+                let mut setter: Option<(String, Block)> = None;
 
                 while !self.matches(&Tok::RBrace) {
-                    if self.matches(&Tok::Get) {
-                        self.expect(Tok::LParen, "expected '(' after 'get'")?;
-                        self.expect(Tok::RParen, "get() takes no params")?;
-                        let body = self.block()?;
-                        getter = Some(body);
-                    } else if self.matches(&Tok::Set) {
-                        self.expect(Tok::LParen, "expected '(' after 'set'")?;
+                    // get => expr;    OR   get { ... }
+                    if self.matches_ident("get") {
+                        if self.matches(&Tok::Eq) && self.matches(&Tok::Gt) {
+                            // 'get =>' expression ';'
+                            let e = self.expr()?;
+                            self.expect(Tok::Semi, "expected ';' after get => expr")?;
+                            getter = Some(Block { stmts: vec![Stmt::Return(Some(e))] });
+                        } else {
+                            // 'get' { block }
+                            let b = self.block()?;
+                            getter = Some(b);
+                        }
+                        continue;
+                    }
+                    // set(v) { ... }
+                    if self.matches_ident("set") {
+                        self.expect(Tok::LParen, "expected '(' after set")?;
                         let param = match self.next().tok {
                             Tok::Ident(s) => s,
-                            _ => return Err(self.err_here("expected setter parameter name")),
+                            _ => return Err(self.err_here("expected parameter name in set(...)")),
                         };
-                        self.expect(Tok::RParen, "expected ')' after setter parameter")?;
+                        self.expect(Tok::RParen, "expected ')' after set parameter")?;
                         let body = self.block()?;
-                        setter_param = Some(param);
-                        setter_body  = Some(body);
-                    } else {
-                        return Err(self.err_here("expected 'get' or 'set' in accessor block"));
+                        setter = Some((param, body));
+                        continue;
                     }
+
+                    return Err(self.err_here("expected 'get' or 'set' in property"));
                 }
 
-                return Ok(ClassMember::Accessor { is_static, name, getter, setter_param, setter_body });
+                members.push(ClassMember::Prop { vis, name, getter, setter, is_static });
+                continue;
             }
 
-            // Stored form:  var name [: Type] [= init]? ;
-            let mut type_ann: Option<String> = None;
-            if self.matches(&Tok::Colon) {
-                // parse a simple type name (Identifier) for now
-                match self.next().tok {
-                    Tok::Ident(s) => type_ann = Some(s),
-                    _ => return Err(self.err_here("expected type name after ':'")),
-                }
+            // var
+            if self.matches(&Tok::Var) {
+                let name = match self.next().tok {
+                    Tok::Ident(s) => s,
+                    _ => return Err(self.err_here("expected identifier after 'var'")),
+                };
+                let _ = self.maybe_skip_type_annot()?;
+                let init = if self.matches(&Tok::Eq) { Some(self.expr()?) } else { None };
+                self.expect(Tok::Semi, "expected ';' after field")?;
+                members.push(ClassMember::Field { vis, name, init, is_static });
+                continue;
             }
 
-            let init = if self.matches(&Tok::Eq) {
-                Some(self.expr()?)
-            } else { None };
+            // fn (instance or static)
+            if self.matches(&Tok::Fn) {
+                let name = match self.next().tok {
+                    Tok::Ident(s) => s,
+                    _ => return Err(self.err_here("expected method name after 'fn'")),
+                };
+                self.expect(Tok::LParen, "expected '('")?;
+                let params = self.parse_param_list()?;
+                // Block or => expr
+                let body = if self.check(&Tok::LBrace) {
+                    self.block()?
+                } else {
+                    self.expect(Tok::Eq, "expected '=>' or '{' after params (first '=')")?;
+                    self.expect(Tok::Gt, "expected '=>' after params (second '>')")?;
+                    let e = self.expr()?;
+                    Block { stmts: vec![Stmt::Return(Some(e))] }
+                };
+                members.push(ClassMember::Method { is_static, name, params, body, is_async: false });
+                continue;
+            }
 
-            self.expect(Tok::Semi, "expected ';' after class var")?;
-            return Ok(ClassMember::Stored { is_static, name, type_ann, init });
+            return Err(self.err_here("expected a class member"));
         }
 
-        Err(self.err_here("expected class member (var/fn/constructor/destructor)"))
+        Ok(ClassDecl { name, base, members })
+    }
+
+    fn maybe_skip_type_annot(&mut self) -> PResult<()> {
+        // Allow and ignore: : Ident [.<Ident>]*  (super minimal)
+        if self.matches(&Tok::Colon) {
+            // eat at least one token of the type
+            match &self.peek().tok {
+                Tok::Ident(_) => { self.i += 1; }
+                _ => {}
+            }
+            // consume any dotted qualifiers (rough)
+            while self.matches(&Tok::Dot) {
+                if matches!(&self.peek().tok, Tok::Ident(_)) { self.i += 1; }
+                else { break; }
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_fn_param_names(&mut self) -> PResult<Vec<String>> {
+        self.expect(Tok::LParen, "expected '('")?;
+        self.parse_param_list()
     }
 
     fn parse_method_tail(&mut self) -> PResult<(String, Vec<String>, Block)> {
@@ -1555,6 +1627,19 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
                 }
             }
 
+            Expr::This => Expr::This,
+
+            Expr::Super => Expr::Super,
+
+            Expr::New { class, args } => {
+                Expr::New {
+                    class: class.clone(),
+                    args: args.iter()
+                            .map(|a| rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out))
+                            .collect(),
+                }
+            },
+
             Expr::Await(inner) => Expr::Await(SmallBox::new(rw_expr(inner, used, counter, enclosing_locals, out_funcs, lam_caps_out))),
         }
     }
@@ -1575,6 +1660,21 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
 /// LOWERING (AST → WIR)
 /// -------------------------
 
+#[derive(Debug, Clone)]
+struct ClassInfo {
+    name: String,
+    base: Option<String>,
+    priv_mangled: HashMap<String, String>,   // "_x" -> hidden key string
+    has_ctor: bool,
+    has_dtor: bool,
+    instance_fields: Vec<(Visibility, String, Option<Expr>)>,
+    props: Vec<(Visibility, String, Option<Block>, Option<(String, Block)>)>, // get/set
+    methods: Vec<(String, Vec<String>, Block /*body*/, bool /*is_async*/ )>,
+    static_vars: Vec<(String, Option<Expr>)>,                 // name, init
+    static_methods: Vec<(String, Vec<String>, Block, bool)>,  // name, params, body, is_async
+}
+
+
 #[derive(Debug)]
 pub enum LowerError {
     UnknownVar(String),
@@ -1588,6 +1688,7 @@ pub struct Lowerer<'m> {
     module: &'m mut Module,
     funcs: HashMap<String, FuncId>,
     lam_captures: HashMap<String, Vec<String>>,
+    classes: HashMap<String, ClassInfo>,
 }
 
 impl<'m> Lowerer<'m> {
@@ -1596,10 +1697,140 @@ impl<'m> Lowerer<'m> {
             module,
             funcs: Default::default(),
             lam_captures: Default::default(),
+            classes: Default::default(),
         }
     }
 
     pub fn lower_program(&mut self, prog: &Program) -> LResult<Vec<FuncId>> {
+        // --- collect classes & predeclare their functions ---
+        self.classes.clear();
+        for c in &prog.classes {
+            // Build ClassInfo + mangle private keys
+            let mut privs = HashMap::new();
+            for m in &c.members {
+                if let ClassMember::Field { vis: Visibility::Private, name, .. } = m {
+                    let mangled = format!("\u{1F512}{}::{}::<hidden>", c.name, name); // hard-to-guess key
+                    privs.insert(name.clone(), mangled);
+                }
+            }
+
+            let mut ci = ClassInfo {
+                name: c.name.clone(),
+                base: c.base.clone(),
+                priv_mangled: privs,
+                has_ctor: false,
+                has_dtor: false,
+                instance_fields: Vec::new(),
+                props: Vec::new(),
+                methods: Vec::new(),
+                static_vars: Vec::new(),
+                static_methods: Vec::new(),
+            };
+
+            for m in &c.members {
+                match m {
+                    ClassMember::Field { vis, name, init, is_static } => {
+                        if *is_static {
+                            ci.static_vars.push((name.clone(), init.clone()));
+                        } else {
+                            ci.instance_fields.push((*vis, name.clone(), init.clone()));
+                        }
+                    }
+                    ClassMember::Prop { vis, name, getter, setter, is_static } => {
+                        if *is_static {
+                            // (parsed, but MVP ignores static props)
+                        } else {
+                            ci.props.push((*vis, name.clone(), getter.clone(), setter.clone()));
+                        }
+                    }
+                    ClassMember::Method { is_static, name, params, body, is_async } => {
+                        if *is_static {
+                            ci.static_methods.push((name.clone(), params.clone(), body.clone(), *is_async));
+                        } else {
+                            ci.methods.push((name.clone(), params.clone(), body.clone(), *is_async));
+                        }
+                    }
+                    ClassMember::Ctor { params, body } => {
+                        ci.has_ctor = true;
+                        // predeclare ctor body function name
+                        let ctor_name = format!("__ctor_{}", c.name);
+                        self.funcs.insert(ctor_name, FuncId(0)); // placeholder id; set real ids later
+                        // stash as method zero-arg hidden function via table below; we lower later
+                        ci.methods.insert(0, (String::from("__<ctor-body>"), params.clone(), body.clone(), false));
+                    }
+                    ClassMember::Dtor { body } => {
+                        ci.has_dtor = true;
+                        let dtor_name = format!("__dtor_{}", c.name);
+                        self.funcs.insert(dtor_name, FuncId(0));
+                        // store as method with no params; lowered later
+                        ci.methods.push((String::from("__<dtor-body>"), Vec::new(), body.clone(), false));
+                    }
+                }
+            }
+
+            // Predeclare instance method functions    __method_<Class>_<name>(this, ...)
+            for (name, params, _body, _is_async) in &ci.methods {
+                if name == "__<ctor-body>" || name == "__<dtor-body>" { continue; }
+                let mname = format!("__method_{}_{}", c.name, name);
+                self.funcs.insert(mname, FuncId(0));
+            }
+            // Predeclare prop accessors
+            for (_vis, pname, get, set) in &ci.props {
+                if get.is_some() {
+                    self.funcs.insert(format!("__get_{}_{}", c.name, pname), FuncId(0));
+                }
+                if set.is_some() {
+                    self.funcs.insert(format!("__set_{}_{}", c.name, pname), FuncId(0));
+                }
+            }
+            // Predeclare static methods
+            for (name, _params, _body, _is_async) in &ci.static_methods {
+                self.funcs.insert(format!("__static_{}_{}", c.name, name), FuncId(0));
+            }
+            // Predeclare the allocator  __class_new_<Class>(...)
+            self.funcs.insert(format!("__class_new_{}", c.name), FuncId(0));
+
+            self.classes.insert(c.name.clone(), ci);
+        }
+
+        // Now rebuild the funcs table with proper, **stable** indices:
+        self.funcs.clear();
+        // 1) normal functions in given order
+        for (i, f) in prog.functions.iter().enumerate() {
+            self.funcs.insert(f.name.clone(), FuncId(i as u32));
+        }
+        // 2) class-generated functions in a fixed order (deterministic)
+        let mut extra_names: Vec<String> = Vec::new();
+        for c in &prog.classes {
+            let cname = &c.name;
+            extra_names.push(format!("__class_new_{}", cname));
+            extra_names.push(format!("__ctor_{}", cname));
+            if let Some(_) = c.members.iter().find(|m| matches!(m, ClassMember::Dtor{..})) {
+                extra_names.push(format!("__dtor_{}", cname));
+            }
+            // accessors then methods then static
+            for m in &c.members {
+                if let ClassMember::Prop { name, getter, setter, .. } = m {
+                    if getter.is_some() { extra_names.push(format!("__get_{}_{}", cname, name)); }
+                    if setter.is_some() { extra_names.push(format!("__set_{}_{}", cname, name)); }
+                }
+            }
+            for m in &c.members {
+                if let ClassMember::Method { is_static: false, name, .. } = m {
+                    extra_names.push(format!("__method_{}_{}", cname, name));
+                }
+            }
+            for m in &c.members {
+                if let ClassMember::Method { is_static: true, name, .. } = m {
+                    extra_names.push(format!("__static_{}_{}", cname, name));
+                }
+            }
+        }
+        let base = prog.functions.len() as u32;
+        for (k, nm) in extra_names.iter().enumerate() {
+            self.funcs.insert(nm.clone(), FuncId(base + k as u32));
+        }
+
         // Stage 3 hoist: produce lam functions with __env + capture table, and FnRef at sites
         let (prog, lam_caps) = hoist_fn_lits_program(prog);
         self.lam_captures = lam_caps;
@@ -3056,47 +3287,152 @@ fn lower_expr_free<'m>(
         }
 
         // obj.<propKey>  where propKey is an identifier or string
-        Expr::GetPropObj { obj, key } => {
-            let o = lower_expr_free(b, locals, fields, next_field, obj, funcs, lam_caps)?;
-            let (field_name, is_ident) = match key {
-                PropKey::Ident(s) => (s.clone(), true),
-                PropKey::Str(s)   => (s.clone(), false),
-            };
+        Expr::GetProp { recv, name } => {
+            // Special-case: arr.length
+            if name == "length" {
+                let arr = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
+                let (_nid, res) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_array_len".into(),
+                        args: vec![arr],
+                        pure: false,
+                        can_throw: false,
+                    },
+                    Some(Type::Int32),
+                    1,
+                    true,
+                );
+                return Ok(res[0]);
+            }
 
-            // Fast field first, then string table fallback
-            let field   = intern_field_local(fields, next_field, &field_name);
+            // General object property read with fallback chain:
+            // 1) fast field → return
+            // 2) string table lookup → if present return
+            // 3) getter method "__get__<name>" → if present call it as fn(obj) and return
+            // 4) else return 0/null
+            let obj     = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
+            let field   = intern_field_local(fields, next_field, name);
             let fid_smi = b.const_i32(field.0 as i32);
 
             let (_nid_h, hasf) = b.push_node(
-                Inst::CallNative { name: "wir_obj_has_field".into(), args: vec![o, fid_smi], pure: false, can_throw: false },
-                Some(Type::Bool), 1, true,
+                Inst::CallNative {
+                    name: "wir_obj_has_field".into(),
+                    args: vec![obj, fid_smi],
+                    pure: false,
+                    can_throw: false,
+                },
+                Some(Type::Bool),
+                1,
+                true,
             );
 
-            let then_b = b.block();
-            let else_b = b.block();
-            let cont   = b.block();
-            let out    = b.add_block_param(cont, Type::Int32);
+            let fast_b   = b.block();
+            let slow_b   = b.block();
+            let cont     = b.block();
+            let out_val  = b.add_block_param(cont, Type::Int32);
 
-            b.branch(hasf[0], then_b, else_b);
+            b.branch(hasf[0], fast_b, slow_b);
 
-            b.position_at(then_b);
-            let (_nid_f, fv) = b.push_node(Inst::LoadField { obj: o, field, expected: None }, None, 1, false);
+            // --- Fast field path
+            b.position_at(fast_b);
+            let (_nid_f, fv) = b.push_node(
+                Inst::LoadField { obj, field, expected: None },
+                None,
+                1,
+                false,
+            );
             b.jump(cont, &[fv[0]]);
 
-            b.position_at(else_b);
-            let (_nid_sc, ks) = b.push_node(Inst::Const(Constant::Str(field_name)), Some(Type::Str), 1, false);
-            let (_nid_s, sv)  = b.push_node(
-                Inst::CallNative { name: "wir_obj_get_str".into(), args: vec![o, ks[0]], pure: false, can_throw: false },
-                None, 1, true,
+            // --- Slow path: string-table, then "__get__<name>" getter
+            b.position_at(slow_b);
+
+            // string lookup
+            let (_nid_sc, ks) = b.push_node(
+                Inst::Const(Constant::Str(name.clone())),
+                Some(Type::Str),
+                1,
+                false,
             );
+            let (_nid_s, sv)  = b.push_node(
+                Inst::CallNative {
+                    name: "wir_obj_get_str".into(),
+                    args: vec![obj, ks[0]],
+                    pure: false,
+                    can_throw: false,
+                },
+                None,
+                1,
+                true,
+            );
+
+            // if (sv != 0) goto cont(sv) else try getter
+            let z = b.const_i32(0);
+            let (_nid_has_str, has_str) = b.push_node(
+                Inst::CmpInt { kind: crate::wir::CmpKind::Ne, a: sv[0], b: z },
+                Some(Type::Bool),
+                1,
+                false,
+            );
+
+            let got_str_b   = b.block();
+            let try_getter  = b.block();
+            b.branch(has_str[0], got_str_b, try_getter);
+
+            b.position_at(got_str_b);
             b.jump(cont, &[sv[0]]);
 
+            // "__get__<name>" lookup and call
+            b.position_at(try_getter);
+            let getter_key = format!("__get__{}", name);
+            let (_nid_gk, gk) = b.push_node(
+                Inst::Const(Constant::Str(getter_key)),
+                Some(Type::Str),
+                1,
+                false,
+            );
+            let (_nid_g, gv) = b.push_node(
+                Inst::CallNative {
+                    name: "wir_obj_get_str".into(),
+                    args: vec![obj, gk[0]],
+                    pure: false,
+                    can_throw: false,
+                },
+                None,
+                1,
+                true,
+            );
+
+            let (_nid_has_g, has_g) = b.push_node(
+                Inst::CmpInt { kind: crate::wir::CmpKind::Ne, a: gv[0], b: z },
+                Some(Type::Bool),
+                1,
+                false,
+            );
+
+            let call_g_b = b.block();
+            let miss_b   = b.block();
+            b.branch(has_g[0], call_g_b, miss_b);
+
+            b.position_at(call_g_b);
+            let (_nid_call, gres) = b.push_node(
+                Inst::CallClosure { conv: crate::wir::CallConv::Fast, fun: gv[0], args: vec![obj] },
+                Some(Type::Int32),
+                1,
+                true,
+            );
+            b.jump(cont, &[gres[0]]);
+
+            b.position_at(miss_b);
+            b.jump(cont, &[z]);
+
+            // merge
             b.position_at(cont);
-            Ok(out)
+            Ok(out_val)
         }
 
         // obj.<propKey> = value   (identifier or string propKey)
         Expr::SetPropObj { obj, key, value } => {
+            // Normalize inputs
             let o  = lower_expr_free(b, locals, fields, next_field, obj, funcs, lam_caps)?;
             let v  = lower_expr_free(b, locals, fields, next_field, value, funcs, lam_caps)?;
             let field_name = match key {
@@ -3104,27 +3440,90 @@ fn lower_expr_free<'m>(
                 PropKey::Str(s)   => s.clone(),
             };
 
-            // 1) fast field store
+            // If a setter "__set__<name>" exists on the object, call it as setter(obj, value)
+            // and return the assigned value. Otherwise, perform default store (fast+string mirror).
+            let setter_key = format!("__set__{}", field_name);
+            let (_nid_sk, sk) = b.push_node(
+                Inst::Const(Constant::Str(setter_key)),
+                Some(Type::Str),
+                1,
+                false,
+            );
+            let (_nid_sv, sv) = b.push_node(
+                Inst::CallNative {
+                    name: "wir_obj_get_str".into(),
+                    args: vec![o, sk[0]],
+                    pure: false,
+                    can_throw: false,
+                },
+                None,
+                1,
+                true,
+            );
+
+            let z = b.const_i32(0);
+            let (_nid_has_set, has_set) = b.push_node(
+                Inst::CmpInt { kind: crate::wir::CmpKind::Ne, a: sv[0], b: z },
+                Some(Type::Bool),
+                1,
+                false,
+            );
+
+            let call_set_b = b.block();
+            let store_b    = b.block();
+            let cont       = b.block();
+
+            b.branch(has_set[0], call_set_b, store_b);
+
+            // Use custom setter
+            b.position_at(call_set_b);
+            let (_nid_call, _r) = b.push_node(
+                Inst::CallClosure { conv: crate::wir::CallConv::Fast, fun: sv[0], args: vec![o, v] },
+                Some(Type::Int32),
+                1,
+                true,
+            );
+            b.jump(cont, &[]);
+
+            // Default storage path (fast field + mirror into string table)
+            b.position_at(store_b);
             let field = intern_field_local(fields, next_field, &field_name);
             let _ = b.push_node(
                 Inst::StoreField { obj: o, field, val: v, expected: None },
-                Some(Type::Top), 1, true,
+                Some(Type::Top),
+                1,
+                true,
             );
 
-            // 2) mirror in string table
-            let (_nid_sc, ks) = b.push_node(Inst::Const(Constant::Str(field_name)), Some(Type::Str), 1, false);
+            let (_nid_sc, ks) = b.push_node(
+                Inst::Const(Constant::Str(field_name)),
+                Some(Type::Str),
+                1,
+                false,
+            );
             let _ = b.push_node(
-                Inst::CallNative { name: "wir_obj_set_str".into(), args: vec![o, ks[0], v], pure: false, can_throw: false },
-                Some(Type::Int32), 1, true,
+                Inst::CallNative {
+                    name: "wir_obj_set_str".into(),
+                    args: vec![o, ks[0], v],
+                    pure: false,
+                    can_throw: false,
+                },
+                Some(Type::Int32),
+                1,
+                true,
             );
+            b.jump(cont, &[]);
 
+            b.position_at(cont);
+            // The expression value of an assignment is the assigned value.
             Ok(v)
         }
 
         // Calls / builtins
         Expr::Call { callee, args } => {
-            // 0) Promise methods: p.then(...) / p.catch(...)
+            // --- 0) Property-call fast paths ---
             if let Expr::GetProp { recv, name } = &**callee {
+                // 0a) Promise-style instance methods
                 if name == "then" {
                     // p.then(onFulfilled?, onRejected?)
                     let p   = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
@@ -3162,10 +3561,9 @@ fn lower_expr_free<'m>(
                     );
                     return Ok(res[0]);
                 }
-
                 if name == "resolve" {
+                    // deferred.resolve(value?)
                     let p = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
-                    // default to null if no value was given
                     let (_nid, nul) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
                     let val = if args.len() >= 1 {
                         lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?
@@ -3174,9 +3572,10 @@ fn lower_expr_free<'m>(
                         Inst::CallNative { name: "wir_deferred_resolve".into(), args: vec![p, val], pure: false, can_throw: false },
                         None, 1, true,
                     );
-                    return Ok(res[0]); // returns the same deferred for optional chaining
+                    return Ok(res[0]);
                 }
                 if name == "reject" {
+                    // deferred.reject(reason?)
                     let p = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
                     let (_nid, nul) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
                     let reason = if args.len() >= 1 {
@@ -3189,9 +3588,7 @@ fn lower_expr_free<'m>(
                     return Ok(res[0]);
                 }
 
-                            // --- http.* helpers ---
-            if let Expr::GetProp { recv, name } = &**callee {
-                // --- http.* helpers ---
+                // 0b) http.* helpers
                 if let Expr::Ident(obj) = &**recv {
                     if obj == "http" {
                         match name.as_str() {
@@ -3206,8 +3603,7 @@ fn lower_expr_free<'m>(
                                     Inst::CallNative {
                                         name: "wir_http_start_stream_from_req".into(),
                                         args: vec![req, status, hdrs],
-                                        pure: false,
-                                        can_throw: false,
+                                        pure: false, can_throw: false,
                                     },
                                     Some(Type::Int32), 1, true
                                 );
@@ -3224,8 +3620,7 @@ fn lower_expr_free<'m>(
                                     Inst::CallNative {
                                         name: "wir_http_stream_write".into(),
                                         args: vec![sid, rid, chunk],
-                                        pure: false,
-                                        can_throw: false,
+                                        pure: false, can_throw: false,
                                     },
                                     Some(Type::Int32), 1, true
                                 );
@@ -3241,8 +3636,7 @@ fn lower_expr_free<'m>(
                                     Inst::CallNative {
                                         name: "wir_http_stream_end".into(),
                                         args: vec![sid, rid],
-                                        pure: false,
-                                        can_throw: false,
+                                        pure: false, can_throw: false,
                                     },
                                     Some(Type::Int32), 1, true
                                 );
@@ -3251,86 +3645,57 @@ fn lower_expr_free<'m>(
                             _ => {}
                         }
                     }
-
-                    if obj == "json" {
-                        // Allow json(body) or json(status, body[, headers])
-                        let (_nid_null, nul) = b.push_node(
-                            Inst::Const(Constant::Null),
-                            Some(Type::Null),
-                            1,
-                            false
-                        );
-
-                        let (status_v, body_v, headers_v) = match args.len() {
-                            1 => {
-                                let body = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
-                                let status = b.const_i32(200);    // default 200
-                                (status, body, nul[0])
-                            }
-                            2 => {
-                                let status = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
-                                let body   = lower_expr_free(b, locals, fields, next_field, &args[1], funcs, lam_caps)?;
-                                (status, body, nul[0])
-                            }
-                            3 => {
-                                let status  = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
-                                let body    = lower_expr_free(b, locals, fields, next_field, &args[1], funcs, lam_caps)?;
-                                let headers = lower_expr_free(b, locals, fields, next_field, &args[2], funcs, lam_caps)?;
-                                (status, body, headers)
-                            }
-                            _ => return Err(LowerError::NotLowerable("json expects (body) or (status, body[, headers])")),
-                        };
-
-                        // Call a native that formats/sends a JSON response.
-                        // Name it to match your runtime; adjust if you use a different symbol.
-                        let (_nid, res) = b.push_node(
-                            Inst::CallNative {
-                                name: "wir_http_send_json".into(),
-                                args: vec![status_v, body_v, headers_v],
-                                pure: false,
-                                can_throw: false,
-                            },
-                            None,
-                            1,
-                            true,
-                        );
-                        return Ok(res[0]);
-                    }
                 }
-            }
 
-            // 1) Array methods (existing)
-            if let Some(v) = lower_array_method_call(
-                    b, locals, fields, next_field, recv, name, args, funcs, lam_caps
-                )? {
-                    return Ok(v);
-                }
-            }
-
-            // 1) Array methods: a.push(x), a.map(f), ...
-            if let Expr::GetProp { recv, name } = &**callee {
+                // 0c) Array instance methods (map/filter/etc.)
                 if let Some(v) = lower_array_method_call(
                     b, locals, fields, next_field, recv, name, args, funcs, lam_caps
                 )? {
                     return Ok(v);
                 }
+
+                // 0d) Class static methods: ClassName.m(...)
+                if let Expr::Ident(cn) = &**recv {
+                    if self.classes.contains_key(cn) {
+                        if let Some(&fid) = funcs.get(&format!("__static_{}_{}", cn, name)) {
+                            let mut argv = Vec::with_capacity(args.len());
+                            for a in args {
+                                argv.push(lower_expr_free(b, locals, fields, next_field, a, funcs, lam_caps)?);
+                            }
+                            let (_nid, res) = b.push_node(
+                                Inst::CallDirect { conv: crate::wir::CallConv::Fast, callee: fid, args: argv },
+                                Some(Type::Int32), 1, true
+                            );
+                            return Ok(res[0]);
+                        }
+                    }
+                }
+
+                // 0e) Generic property call: inject receiver as implicit first arg
+                let this_v = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
+                let fun_v  = lower_expr_free(b, locals, fields, next_field, callee, funcs, lam_caps)?;
+                let mut argv = Vec::with_capacity(args.len() + 1);
+                argv.push(this_v);
+                for a in args {
+                    argv.push(lower_expr_free(b, locals, fields, next_field, a, funcs, lam_caps)?);
+                }
+                let (_nid, res) = b.push_node(
+                    Inst::CallClosure { conv: crate::wir::CallConv::Fast, fun: fun_v, args: argv },
+                    Some(Type::Int32), 1, true
+                );
+                return Ok(res[0]);
             }
 
+            // --- 1) Callee is a bare identifier: builtins & direct calls ---
             if let Expr::Ident(name) = &**callee {
+                // Timers
                 if name == "setTimeout" {
                     if args.len() != 2 { return Err(LowerError::NotLowerable("setTimeout(fn, ms)")); }
                     let fun = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
                     let ms  = lower_expr_free(b, locals, fields, next_field, &args[1], funcs, lam_caps)?;
                     let (_nid, res) = b.push_node(
-                        Inst::CallNative {
-                            name: "wir_set_timeout".into(),
-                            args: vec![fun, ms],
-                            pure: false,
-                            can_throw: false,
-                        },
-                        Some(Type::Int32), // returns timer id (i64/SMI-ish, treat as int)
-                        1,
-                        true,
+                        Inst::CallNative { name: "wir_set_timeout".into(), args: vec![fun, ms], pure: false, can_throw: false },
+                        Some(Type::Int32), 1, true
                     );
                     return Ok(res[0]);
                 }
@@ -3339,15 +3704,8 @@ fn lower_expr_free<'m>(
                     let fun = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
                     let ms  = lower_expr_free(b, locals, fields, next_field, &args[1], funcs, lam_caps)?;
                     let (_nid, res) = b.push_node(
-                        Inst::CallNative {
-                            name: "wir_set_interval".into(),
-                            args: vec![fun, ms],
-                            pure: false,
-                            can_throw: false,
-                        },
-                        Some(Type::Int32),
-                        1,
-                        true,
+                        Inst::CallNative { name: "wir_set_interval".into(), args: vec![fun, ms], pure: false, can_throw: false },
+                        Some(Type::Int32), 1, true
                     );
                     return Ok(res[0]);
                 }
@@ -3355,15 +3713,8 @@ fn lower_expr_free<'m>(
                     if args.len() != 1 { return Err(LowerError::NotLowerable("clearTimeout(id)")); }
                     let id = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
                     let (_nid, res) = b.push_node(
-                        Inst::CallNative {
-                            name: "wir_clear_timeout".into(),
-                            args: vec![id],
-                            pure: false,
-                            can_throw: false,
-                        },
-                        Some(Type::Int32),
-                        1,
-                        true,
+                        Inst::CallNative { name: "wir_clear_timeout".into(), args: vec![id], pure: false, can_throw: false },
+                        Some(Type::Int32), 1, true
                     );
                     return Ok(res[0]);
                 }
@@ -3371,46 +3722,28 @@ fn lower_expr_free<'m>(
                     if args.len() != 1 { return Err(LowerError::NotLowerable("clearInterval(id)")); }
                     let id = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
                     let (_nid, res) = b.push_node(
-                        Inst::CallNative {
-                            name: "wir_clear_interval".into(),
-                            args: vec![id],
-                            pure: false,
-                            can_throw: false,
-                        },
-                        Some(Type::Int32),
-                        1,
-                        true,
+                        Inst::CallNative { name: "wir_clear_interval".into(), args: vec![id], pure: false, can_throw: false },
+                        Some(Type::Int32), 1, true
                     );
                     return Ok(res[0]);
                 }
-            }
 
-            // 2) Builtin functions: list(n), print(x)
-            if let Expr::Ident(name) = &**callee {
+                // Builtins: Array/Promise/Deferred
                 if name == "Array" {
                     if args.len() != 1 { return Err(LowerError::NotLowerable("list() expects 1 arg")); }
                     let len = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
                     let (_nid, res) = b.push_node(
-                        Inst::CallNative {
-                            name: "wir_array_new".into(),
-                            args: vec![len],
-                            pure: false,
-                            can_throw: false,
-                        },
-                        Some(Type::Array(Box::new(None))),
-                        1,
-                        true,
+                        Inst::CallNative { name: "wir_array_new".into(), args: vec![len], pure: false, can_throw: false },
+                        Some(Type::Array(Box::new(None))), 1, true
                     );
                     return Ok(res[0]);
                 }
-
                 if name == "Promise" {
                     if args.len() != 1 { return Err(LowerError::NotLowerable("Promise() expects 1 arg")); }
-
                     let exec = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
                     let (_nid, res) = b.push_node(
                         Inst::CallNative { name: "wir_promise_new".into(), args: vec![exec], pure: false, can_throw: false },
-                        None, 1, true,
+                        None, 1, true
                     );
                     return Ok(res[0]);
                 }
@@ -3418,172 +3751,98 @@ fn lower_expr_free<'m>(
                     if !args.is_empty() { return Err(LowerError::NotLowerable("Deferred() expects 0 args")); }
                     let (_nid, res) = b.push_node(
                         Inst::CallNative { name: "wir_deferred_new".into(), args: vec![], pure: false, can_throw: false },
-                        None, 1, true,
+                        None, 1, true
                     );
                     return Ok(res[0]);
                 }
 
+                // HTTP helpers (global)
                 if name == "get" {
                     if args.len() != 1 { return Err(LowerError::NotLowerable("get(url) expects 1 arg")); }
                     let url = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
                     let (_nid, res) = b.push_node(
-                        Inst::CallNative {
-                            name: "wir_http_get".into(),
-                            args: vec![url],
-                            pure: false,
-                            can_throw: false,
-                        },
-                        None,
-                        1,
-                        true,
-                    );
-                    return Ok(res[0]); // resolves to a promise; `await` will use wir_await
-                }
-
-                if name == "print" {
-                    if args.len() != 1 { return Err(LowerError::NotLowerable("print() expects 1 arg")); }
-
-                    // 1) If it’s a string literal, use the string printer directly.
-                    if matches!(args[0], Expr::Str(_)) {
-                        let v = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
-                        let (_nid, res) = b.push_node(
-                            Inst::CallNative {
-                                name: "wir_print_str".into(),
-                                args: vec![v],
-                                pure: false,
-                                can_throw: false,
-                            },
-                            Some(Type::Int32),
-                            1,
-                            true,
-                        );
-                        return Ok(res[0]);
-                    }
-
-                    // 2) If it’s “bool-ish”, coerce Bool → i32 {false:0, true:1} then print as i64.
-                    let is_boolish = matches!(
-                        args[0],
-                        // comparisons / equality
-                        Expr::Binary { op: BinOp::Eq  , .. }
-                        | Expr::Binary { op: BinOp::Ne , .. }
-                        | Expr::Binary { op: BinOp::Lt , .. }
-                        | Expr::Binary { op: BinOp::Le , .. }
-                        | Expr::Binary { op: BinOp::Gt , .. }
-                        | Expr::Binary { op: BinOp::Ge , .. }
-                        // logical operators (already return Bool)
-                        | Expr::Binary { op: BinOp::And, .. }
-                        | Expr::Binary { op: BinOp::Or , .. }
-                        // unary not
-                        | Expr::Unary  { op: UnOp::Not, .. }
-                        // the `in` operator
-                        | Expr::In { .. }
-                    );
-
-                    let v0 = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
-
-                    // If bool-ish, branch to synthesize 0/1; else, pass the value directly.
-                    let v_to_print = if is_boolish {
-                        let then_b = b.block();
-                        let else_b = b.block();
-                        let cont   = b.block();
-                        let out_i  = b.add_block_param(cont, Type::Int32);
-
-                        b.branch(v0, then_b, else_b);
-
-                        b.position_at(then_b);
-                        let one = b.const_i32(1);
-                        b.jump(cont, &[one]);
-
-                        b.position_at(else_b);
-                        let zero = b.const_i32(0);
-                        b.jump(cont, &[zero]);
-
-                        b.position_at(cont);
-                        out_i
-                    } else {
-                        v0
-                    };
-
-                    let (_nid, res) = b.push_node(
-                        Inst::CallNative {
-                            name: "wir_print_i64".into(),
-                            args: vec![v_to_print],
-                            pure: false,
-                            can_throw: false,
-                        },
-                        Some(Type::Int32),
-                        1,
-                        true,
+                        Inst::CallNative { name: "wir_http_get".into(), args: vec![url], pure: false, can_throw: false },
+                        None, 1, true
                     );
                     return Ok(res[0]);
                 }
-
                 if name == "getJSON" {
                     if args.len() != 1 { return Err(LowerError::NotLowerable("getJSON(url) expects 1 arg")); }
                     let url = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
                     let (_nid, res) = b.push_node(
-                        Inst::CallNative {
-                            name: "wir_http_get_json".into(),
-                            args: vec![url],
-                            pure: false,
-                            can_throw: false,
-                        },
-                        None,
-                        1,
-                        true,
+                        Inst::CallNative { name: "wir_http_get_json".into(), args: vec![url], pure: false, can_throw: false },
+                        None, 1, true
                     );
                     return Ok(res[0]);
                 }
-
                 if name == "postJSON" {
                     if !(args.len() == 2 || args.len() == 3) {
                         return Err(LowerError::NotLowerable("postJSON(url, body, headers?)"));
                     }
                     let url  = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
                     let body = lower_expr_free(b, locals, fields, next_field, &args[1], funcs, lam_caps)?;
-                    // headers is optional → default null
                     let (_nid_null, nul) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
                     let headers = if args.len() == 3 {
                         lower_expr_free(b, locals, fields, next_field, &args[2], funcs, lam_caps)?
-                    } else {
-                        nul[0]
+                    } else { nul[0] };
+                    let (_nid, res) = b.push_node(
+                        Inst::CallNative { name: "wir_http_post_json".into(), args: vec![url, body, headers], pure: false, can_throw: false },
+                        None, 1, true
+                    );
+                    return Ok(res[0]);
+                }
+                if name == "json" {
+                    // json(body) OR json(status, body[, headers])
+                    let (_nid_null, nul) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
+                    let (status_v, body_v, headers_v) = match args.len() {
+                        1 => {
+                            let body = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+                            let status = b.const_i32(200);
+                            (status, body, nul[0])
+                        }
+                        2 => {
+                            let status = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+                            let body   = lower_expr_free(b, locals, fields, next_field, &args[1], funcs, lam_caps)?;
+                            (status, body, nul[0])
+                        }
+                        3 => {
+                            let status  = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+                            let body    = lower_expr_free(b, locals, fields, next_field, &args[1], funcs, lam_caps)?;
+                            let headers = lower_expr_free(b, locals, fields, next_field, &args[2], funcs, lam_caps)?;
+                            (status, body, headers)
+                        }
+                        _ => return Err(LowerError::NotLowerable("json expects (body) or (status, body[, headers])")),
                     };
                     let (_nid, res) = b.push_node(
-                        Inst::CallNative {
-                            name: "wir_http_post_json".into(),
-                            args: vec![url, body, headers],
-                            pure: false,
-                            can_throw: false,
-                        },
-                        None,
-                        1,
-                        true,
+                        Inst::CallNative { name: "wir_http_send_json".into(), args: vec![status_v, body_v, headers_v], pure: false, can_throw: false },
+                        None, 1, true
                     );
                     return Ok(res[0]);
                 }
 
+                // Direct call to a known (hoisted/declared) function
                 if let Some(&fid) = funcs.get(name) {
                     let mut argv = Vec::with_capacity(args.len());
-                    for a in args { argv.push(lower_expr_free(b, locals, fields, next_field, a, funcs, lam_caps)?); }
+                    for a in args {
+                        argv.push(lower_expr_free(b, locals, fields, next_field, a, funcs, lam_caps)?);
+                    }
                     let (_nid, res) = b.push_node(
                         Inst::CallDirect { conv: crate::wir::CallConv::Fast, callee: fid, args: argv },
-                        Some(Type::Int32),
-                        1,
-                        true,
+                        Some(Type::Int32), 1, true
                     );
                     return Ok(res[0]);
                 }
             }
 
-            // generic: fun value + CallClosure
+            // --- 2) Fallback: general function value + CallClosure ---
             let funv = lower_expr_free(b, locals, fields, next_field, callee, funcs, lam_caps)?;
             let mut argv = Vec::with_capacity(args.len());
-            for a in args { argv.push(lower_expr_free(b, locals, fields, next_field, a, funcs, lam_caps)?); }
+            for a in args {
+                argv.push(lower_expr_free(b, locals, fields, next_field, a, funcs, lam_caps)?);
+            }
             let (_nid, res) = b.push_node(
                 Inst::CallClosure { conv: crate::wir::CallConv::Fast, fun: funv, args: argv },
-                Some(Type::Int32),
-                1,
-                true,
+                Some(Type::Int32), 1, true
             );
             Ok(res[0])
         }
@@ -3662,6 +3921,61 @@ fn lower_expr_free<'m>(
 
             b.position_at(cont);
             Ok(out)
+        }
+
+        Expr::This => {
+            if let Some(&v) = locals.get("this") { Ok(v) } else { Err(LowerError::UnknownVar("this".into())) }
+        }
+
+        Expr::Super(SuperRef::Ctor(args)) => {
+            // super(...) → call base ctor: __ctor_Base(this, args…)
+            // We expect a special lowerer context to have set "__super_ctor" string with base name.
+            let base_name = locals.get("__super_ctor_name__")
+                .ok_or_else(|| LowerError::NotLowerable("super() used outside constructor"))?;
+            let (_nid, base_str) = b.push_node(Inst::Const(Constant::Str("__dummy__".into())), Some(Type::Str), 1, false);
+            // Hack: we stored actual base funcid in a local slot __super_ctor_fid__
+            let fid_val = *locals.get("__super_ctor_fid__").ok_or_else(|| LowerError::NotLowerable("internal: missing base ctor id"))?;
+            // Materialize call: CallDirect to that FuncId (encoded as i32)
+            // Simpler: we stashed the real fid in locals under "__super_ctor_fid__" as a ValueId;
+            // We can just CallDirect using it is not supported; instead, we’ll look it up again:
+            let base_class = if let Some(v) = locals.get("__super_ctor_class__name") { v } else { base_str }; // unused
+            let this_v = *locals.get("this").ok_or_else(|| LowerError::UnknownVar("this".into()))?;
+            let mut argv = vec![this_v];
+            for a in args {
+                argv.push(lower_expr_free(b, locals, fields, next_field, a, funcs, lam_caps)?);
+            }
+            // Re-lookup the fid by name:
+            let cname = locals.get("__super_ctor_name_str__")
+                .and_then(|_| None); // see note below
+            // We’ll actually set a fixed mapping when lowering ctor (see below):
+            let base = locals.get("__super_ctor_fid_value__").copied()
+                .ok_or_else(|| LowerError::NotLowerable("internal: missing base ctor fid value"))?;
+            // We can’t CallDirect with a ValueId; instead we emit a closure for the ctor and CallClosure.
+            let (_nid_mk, clos) = b.push_node(
+                Inst::MakeClosure { callee: *funcs.get("__super_ctor::<will-be-set>").unwrap(), env: b.const_i32(0) },
+                Some(Type::Closure(None)), 1, false
+            );
+            let (_nid_call, res) = b.push_node(
+                Inst::CallClosure { conv: crate::wir::CallConv::Fast, fun: clos[0], args: argv },
+                Some(Type::Int32), 1, true
+            );
+            return Ok(res[0]);
+        }
+
+        Expr::New { target, args } => {
+            if let NewTarget::Ident(cn) = target {
+                let fname = format!("__class_new_{}", cn);
+                if let Some(&fid) = funcs.get(&fname) {
+                    let mut argv = Vec::with_capacity(args.len());
+                    for a in args { argv.push(lower_expr_free(b, locals, fields, next_field, a, funcs, lam_caps)?); }
+                    let (_nid, res) = b.push_node(
+                        Inst::CallDirect { conv: crate::wir::CallConv::Fast, callee: fid, args: argv },
+                        Some(Type::Int32), 1, true);
+                    return Ok(res[0]);
+                }
+                return Err(LowerError::UnknownFunc(fname));
+            }
+            return Err(LowerError::NotLowerable("new target not supported"));
         }
 
         Expr::Index { recv, index } => {
@@ -4046,6 +4360,138 @@ fn lower_expr_free<'m>(
         }
 
         _ => Err(LowerError::NotLowerable("expression type not supported"))
+    }
+}
+
+impl<'m> Lowerer<'m> {
+    fn lower_all_classes(&mut self, prog: &Program) -> LResult<()> {
+        // Emit in the same order we predeclared
+        for c in &prog.classes {
+            self.lower_one_class(c)?;
+        }
+        Ok(())
+    }
+
+    fn lower_one_class(&mut self, c: &ClassDecl) -> LResult<()> {
+        let cname = &c.name;
+        let ci = self.classes.get(cname).expect("class collected");
+
+        // --- 1) Accessors
+        for (_vis, pname, get, set) in &ci.props {
+            if let Some(gb) = get {
+                let fname = format!("__get_{}_{}", cname, pname);
+                self.lower_instance_fun(cname, &fname, &["this"], gb, false)?;
+            }
+            if let Some((p, sb)) = set {
+                let fname = format!("__set_{}_{}", cname, pname);
+                let mut params = vec!["this".to_string(), p.clone()];
+                self.lower_instance_fun(cname, &fname, &params, sb, false)?;
+            }
+        }
+
+        // --- 2) Methods (skip ctor/dtor pseudo entries)
+        for (mname, params, body, is_async) in &ci.methods {
+            if mname == "__<ctor-body>" || mname == "__<dtor-body>" { continue; }
+            let fname = format!("__method_{}_{}", cname, mname);
+            let mut p = Vec::with_capacity(params.len() + 1);
+            p.push("this".to_string());
+            p.extend(params.iter().cloned());
+            self.lower_instance_fun(cname, &fname, &p, body, *is_async)?;
+        }
+
+        // --- 3) Static methods
+        for (mname, params, body, is_async) in &ci.static_methods {
+            let fname = format!("__static_{}_{}", cname, mname);
+            self.lower_free_like_fun(&fname, params, body, *is_async)?;
+        }
+
+        // --- 4) Ctor body (optional)
+        if let Some((_, ctor_params, ctor_body, _)) = ci.methods.iter().find(|(n,_,_,_)| n == "__<ctor-body>") {
+            let fname = format!("__ctor_{}", cname);
+            let mut p = Vec::with_capacity(ctor_params.len() + 1);
+            p.push("this".to_string());
+            p.extend(ctor_params.iter().cloned());
+            self.lower_instance_fun(cname, &fname, &p, ctor_body, false)?;
+        }
+
+        // --- 5) Dtor (optional)
+        if ci.has_dtor {
+            if let Some((_, _, dtor_body, _)) = ci.methods.iter().find(|(n,_,_,_)| n == "__<dtor-body>") {
+                let fname = format!("__dtor_{}", cname);
+                self.lower_instance_fun(cname, &fname, &["this"], dtor_body, false)?;
+            }
+        }
+
+        // --- 6) Allocator: __class_new_<C>(...args)
+        self.lower_allocator(ci)?;
+
+        Ok(())
+    }
+
+    fn lower_instance_fun(&mut self, class_name: &str, fname: &str, params: &[String], body: &Block, is_async: bool) -> LResult<()> {
+        let mut b = Builder::new(self.module, fname, vec![Type::Int32; params.len()], vec![Type::Int32]);
+
+        // Bind params as locals (including "this")
+        let mut locals: HashMap<String, ValueId> = Default::default();
+        for (i, name) in params.iter().enumerate() {
+            locals.insert(name.clone(), b.param(i));
+        }
+        // Make shorthand "this" available
+        if !locals.contains_key("this") { locals.insert("this".into(), b.param(0)); }
+
+        // Rewrite private identifiers in body: _name → this["<mangled>"]
+        let body_rw = self.rewrite_privates_in_block(class_name, body);
+
+        // Lower the body
+        let mut fields: HashMap<String, FieldId> = Default::default();
+        let mut next_field: u32 = 0;
+
+        if is_async {
+            // (async methods can be added later; MVP keeps them sync)
+            return Err(LowerError::NotLowerable("async methods in classes not yet supported"));
+        } else {
+            lower_block_free(&mut b, &mut locals, &mut fields, &mut next_field, &body_rw, &self.funcs, &self.lam_captures)?;
+            if !b.current_block_terminated() {
+                let zero = b.const_i32(0);
+                b.ret(&[zero]);
+            }
+        }
+
+        let fid = FuncId(self.module.funcs.len() as u32);
+        let mut f = b.finish();
+        f.id = fid;
+        self.module.funcs.push(f);
+        Ok(())
+    }
+
+    fn lower_free_like_fun<'m>(
+        b: &mut Builder<'m>,
+        locals: &mut HashMap<String, ValueId>,
+        fields: &mut HashMap<String, FieldId>,
+        next_field: &mut u32,
+        e: &Expr,
+        funcs: &HashMap<String, FuncId>,
+        lam_caps: &HashMap<String, Vec<String>>,
+    ) -> LResult<ValueId> {
+        match e {
+            // Turn a bare function name into a closure with null env,
+            // so call sites can uniformly do CallClosure.
+            Expr::Ident(name) => {
+                if let Some(&fid) = funcs.get(name) {
+                    let (_nid, env_null) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
+                    let (_nid, clos) = b.push_node(
+                        Inst::MakeClosure { callee: fid, env: env_null[0] },
+                        Some(Type::Closure(None)),
+                        1,
+                        false,
+                    );
+                    Ok(clos[0])
+                } else {
+                    lower_expr_free(b, locals, fields, next_field, e, funcs, lam_caps)
+                }
+            }
+            _ => lower_expr_free(b, locals, fields, next_field, e, funcs, lam_caps),
+        }
     }
 }
 
