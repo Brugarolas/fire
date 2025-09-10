@@ -10,7 +10,7 @@ use smallbox::SmallBox;
 // Bring in the WIR types from your other file/module.
 use crate::wir::{
     Builder, Constant, FieldId, FuncId, Inst, IntBinOp, Module, Type, ValueId,
-    MethodInfo, AccessorInfo, ClassInfo
+    MethodInfo, AccessorInfo,
 };
 
 /// -------------------------
@@ -482,127 +482,100 @@ impl<'src> Parser<'src> {
         Ok(ClassDecl { name, base, members })
     }
 
-    fn class_decl(&mut self) -> PResult<ClassDecl> {
-        // class Name [extends Base] { members }
-        let name = match self.next().tok {
-            Tok::Ident(s) => s,
-            _ => return Err(self.err_here("expected class name")),
-        };
+    fn class_member(&mut self) -> PResult<ClassMember> {
+        // optional "static"
+        let is_static = self.matches(&Tok::Static);
 
-        let base = if self.matches(&Tok::Extends) {
-            match self.next().tok {
-                Tok::Ident(s) => Some(s),
-                _ => return Err(self.err_here("expected base class name after 'extends'")),
-            }
-        } else { None };
-
-        self.expect(Tok::LBrace, "expected '{' after class header")?;
-
-        let mut members = Vec::new();
-        while !self.matches(&Tok::RBrace) {
-            // [private]? [static]? (var|prop|fn|constructor|destructor) ...
-            let vis = if self.matches(&Tok::Private) { Visibility::Private } else { Visibility::Public };
-            let is_static = self.matches(&Tok::Static);
-
-            // constructor/destructor
-            if self.matches(&Tok::Constructor) {
-                let params = self.parse_fn_param_names()?;
-                let body = self.block()?;
-                members.push(ClassMember::Ctor { params, body });
-                continue;
-            }
-            if self.matches(&Tok::Destructor) {
-                let body = self.block()?;
-                members.push(ClassMember::Dtor { body });
-                continue;
-            }
-
-            // prop
-            if self.matches(&Tok::Prop) {
-                let name = match self.next().tok {
-                    Tok::Ident(s) => s,
-                    _ => return Err(self.err_here("expected property name after 'prop'")),
-                };
-                // Optional ": Type" — skip it if present
-                let _ = self.maybe_skip_type_annot()?;
-                self.expect(Tok::LBrace, "expected '{' after property name")?;
-
-                let mut getter: Option<Block> = None;
-                let mut setter: Option<(String, Block)> = None;
-
-                while !self.matches(&Tok::RBrace) {
-                    // get => expr;    OR   get { ... }
-                    if self.matches_ident("get") {
-                        if self.matches(&Tok::Eq) && self.matches(&Tok::Gt) {
-                            // 'get =>' expression ';'
-                            let e = self.expr()?;
-                            self.expect(Tok::Semi, "expected ';' after get => expr")?;
-                            getter = Some(Block { stmts: vec![Stmt::Return(Some(e))] });
-                        } else {
-                            // 'get' { block }
-                            let b = self.block()?;
-                            getter = Some(b);
-                        }
-                        continue;
-                    }
-                    // set(v) { ... }
-                    if self.matches_ident("set") {
-                        self.expect(Tok::LParen, "expected '(' after set")?;
-                        let param = match self.next().tok {
-                            Tok::Ident(s) => s,
-                            _ => return Err(self.err_here("expected parameter name in set(...)")),
-                        };
-                        self.expect(Tok::RParen, "expected ')' after set parameter")?;
-                        let body = self.block()?;
-                        setter = Some((param, body));
-                        continue;
-                    }
-
-                    return Err(self.err_here("expected 'get' or 'set' in property"));
-                }
-
-                members.push(ClassMember::Prop { vis, name, getter, setter, is_static });
-                continue;
-            }
-
-            // var
-            if self.matches(&Tok::Var) {
-                let name = match self.next().tok {
-                    Tok::Ident(s) => s,
-                    _ => return Err(self.err_here("expected identifier after 'var'")),
-                };
-                let _ = self.maybe_skip_type_annot()?;
-                let init = if self.matches(&Tok::Eq) { Some(self.expr()?) } else { None };
-                self.expect(Tok::Semi, "expected ';' after field")?;
-                members.push(ClassMember::Field { vis, name, init, is_static });
-                continue;
-            }
-
-            // fn (instance or static)
-            if self.matches(&Tok::Fn) {
-                let name = match self.next().tok {
-                    Tok::Ident(s) => s,
-                    _ => return Err(self.err_here("expected method name after 'fn'")),
-                };
-                self.expect(Tok::LParen, "expected '('")?;
-                let params = self.parse_param_list()?;
-                // Block or => expr
-                let body = if self.check(&Tok::LBrace) {
-                    self.block()?
-                } else {
-                    self.expect(Tok::Eq, "expected '=>' or '{' after params (first '=')")?;
-                    self.expect(Tok::Gt, "expected '=>' after params (second '>')")?;
-                    let e = self.expr()?;
-                    Block { stmts: vec![Stmt::Return(Some(e))] }
-                };
-                members.push(ClassMember::Method { is_static, name, params, body, is_async: false });
-                continue;
-            }
-
-            return Err(self.err_here("expected a class member"));
+        // constructor
+        if self.matches(&Tok::Constructor) {
+            let params = self.parse_fn_param_names()?;
+            let body   = self.block()?;
+            return Ok(ClassMember::Constructor { params, body, is_async: false });
         }
 
-        Ok(ClassDecl { name, base, members })
+        // destructor
+        if self.matches(&Tok::Destructor) {
+            let body = self.block()?;
+            return Ok(ClassMember::Destructor { body });
+        }
+
+        // stored field: var name [: Type]? (= expr)? ;
+        if self.matches(&Tok::Var) {
+            let name = match self.next().tok {
+                Tok::Ident(s) => s,
+                _ => return Err(self.err_here("expected field name after 'var'")),
+            };
+
+            // (optional) type annotation — we just skip it for now
+            let _ = self.maybe_skip_type_annot()?;
+
+            let init = if self.matches(&Tok::Eq) { Some(self.expr()?) } else { None };
+            self.expect(Tok::Semi, "expected ';' after field")?;
+            return Ok(ClassMember::Stored {
+                is_static,
+                name,
+                type_ann: None,
+                init,
+            });
+        }
+
+        // accessor: get name() { ... }  |  set name(param) { ... }
+        if self.matches(&Tok::Get) {
+            let name = match self.next().tok {
+                Tok::Ident(s) => s,
+                _ => return Err(self.err_here("expected property name after 'get'")),
+            };
+            self.expect(Tok::LParen, "expected '(' after getter name")?;
+            self.expect(Tok::RParen, "expected ')' after getter params")?;
+            let getter = self.block()?;
+            return Ok(ClassMember::Accessor {
+                is_static,
+                name,
+                getter: Some(getter),
+                setter_param: None,
+                setter_body: None,
+            });
+        }
+        if self.matches(&Tok::Set) {
+            let name = match self.next().tok {
+                Tok::Ident(s) => s,
+                _ => return Err(self.err_here("expected property name after 'set'")),
+            };
+            self.expect(Tok::LParen, "expected '(' after setter name")?;
+            let param = match self.next().tok {
+                Tok::Ident(s) => s,
+                _ => return Err(self.err_here("expected setter parameter name")),
+            };
+            self.expect(Tok::RParen, "expected ')' after setter parameter")?;
+            let body = self.block()?;
+            return Ok(ClassMember::Accessor {
+                is_static,
+                name,
+                getter: None,
+                setter_param: Some(param),
+                setter_body: Some(body),
+            });
+        }
+
+        // methods: [async] fn name(params) block
+        let is_async = if self.matches(&Tok::Async) {
+            self.expect(Tok::Fn, "expected 'fn' after 'async'")?;
+            true
+        } else if self.matches(&Tok::Fn) {
+            false
+        } else {
+            return Err(self.err_here("expected class member"));
+        };
+
+        let name = match self.next().tok {
+            Tok::Ident(s) => s,
+            _ => return Err(self.err_here("expected method name")),
+        };
+        self.expect(Tok::LParen, "expected '(' after method name")?;
+        let params = self.parse_param_list()?;
+        let body = self.block()?;
+
+        Ok(ClassMember::Method { is_static, name, params, body, is_async })
     }
 
     fn maybe_skip_type_annot(&mut self) -> PResult<()> {
@@ -1653,7 +1626,7 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
         out_funcs.push(FuncDecl { name: f.name.clone(), params: f.params.clone(), body: rew_body, is_async: f.is_async });
     }
 
-    (Program { functions: out_funcs }, lam_captures)
+    (Program { functions: out_funcs, classes: prog.classes.clone() }, lam_captures)
 }
 
 // -------------------------
@@ -1664,16 +1637,14 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
 struct ClassInfo {
     name: String,
     base: Option<String>,
-    priv_mangled: HashMap<String, String>,   // "_x" -> hidden key string
     has_ctor: bool,
     has_dtor: bool,
-    instance_fields: Vec<(Visibility, String, Option<Expr>)>,
-    props: Vec<(Visibility, String, Option<Block>, Option<(String, Block)>)>, // get/set
-    methods: Vec<(String, Vec<String>, Block /*body*/, bool /*is_async*/ )>,
-    static_vars: Vec<(String, Option<Expr>)>,                 // name, init
-    static_methods: Vec<(String, Vec<String>, Block, bool)>,  // name, params, body, is_async
+    instance_fields: Vec<(String, Option<Expr>)>,
+    props: Vec<(String, Option<Block>, Option<(String, Block)>)>, // name, getter, setter
+    methods: Vec<(String, Vec<String>, Block, bool)>,             // instance methods
+    static_vars: Vec<(String, Option<Expr>)>,
+    static_methods: Vec<(String, Vec<String>, Block, bool)>,
 }
-
 
 #[derive(Debug)]
 pub enum LowerError {
@@ -1704,20 +1675,14 @@ impl<'m> Lowerer<'m> {
     pub fn lower_program(&mut self, prog: &Program) -> LResult<Vec<FuncId>> {
         // --- collect classes & predeclare their functions ---
         self.classes.clear();
+
         for c in &prog.classes {
-            // Build ClassInfo + mangle private keys
-            let mut privs = HashMap::new();
-            for m in &c.members {
-                if let ClassMember::Field { vis: Visibility::Private, name, .. } = m {
-                    let mangled = format!("\u{1F512}{}::{}::<hidden>", c.name, name); // hard-to-guess key
-                    privs.insert(name.clone(), mangled);
-                }
-            }
+            // gather accessors by name so we can form (getter,setter)
+            let mut prop_map: HashMap<String, (Option<Block>, Option<(String, Block)>)> = HashMap::new();
 
             let mut ci = ClassInfo {
                 name: c.name.clone(),
                 base: c.base.clone(),
-                priv_mangled: privs,
                 has_ctor: false,
                 has_dtor: false,
                 instance_fields: Vec::new(),
@@ -1729,18 +1694,24 @@ impl<'m> Lowerer<'m> {
 
             for m in &c.members {
                 match m {
-                    ClassMember::Field { vis, name, init, is_static } => {
+                    ClassMember::Stored { is_static, name, init, .. } => {
                         if *is_static {
                             ci.static_vars.push((name.clone(), init.clone()));
                         } else {
-                            ci.instance_fields.push((*vis, name.clone(), init.clone()));
+                            ci.instance_fields.push((name.clone(), init.clone()));
                         }
                     }
-                    ClassMember::Prop { vis, name, getter, setter, is_static } => {
+                    ClassMember::Accessor { is_static, name, getter, setter_param, setter_body } => {
                         if *is_static {
-                            // (parsed, but MVP ignores static props)
-                        } else {
-                            ci.props.push((*vis, name.clone(), getter.clone(), setter.clone()));
+                            // static accessors ignored in MVP
+                            continue;
+                        }
+                        let entry = prop_map.entry(name.clone()).or_insert((None, None));
+                        if let Some(gb) = getter.clone() {
+                            entry.0 = Some(gb);
+                        }
+                        if let (Some(p), Some(sb)) = (setter_param.clone(), setter_body.clone()) {
+                            entry.1 = Some((p, sb));
                         }
                     }
                     ClassMember::Method { is_static, name, params, body, is_async } => {
@@ -1750,80 +1721,51 @@ impl<'m> Lowerer<'m> {
                             ci.methods.push((name.clone(), params.clone(), body.clone(), *is_async));
                         }
                     }
-                    ClassMember::Ctor { params, body } => {
+                    ClassMember::Constructor { params, body, .. } => {
                         ci.has_ctor = true;
-                        // predeclare ctor body function name
-                        let ctor_name = format!("__ctor_{}", c.name);
-                        self.funcs.insert(ctor_name, FuncId(0)); // placeholder id; set real ids later
-                        // stash as method zero-arg hidden function via table below; we lower later
+                        // stash ctor body like a pseudo-method
                         ci.methods.insert(0, (String::from("__<ctor-body>"), params.clone(), body.clone(), false));
                     }
-                    ClassMember::Dtor { body } => {
+                    ClassMember::Destructor { body } => {
                         ci.has_dtor = true;
-                        let dtor_name = format!("__dtor_{}", c.name);
-                        self.funcs.insert(dtor_name, FuncId(0));
-                        // store as method with no params; lowered later
                         ci.methods.push((String::from("__<dtor-body>"), Vec::new(), body.clone(), false));
                     }
                 }
             }
 
-            // Predeclare instance method functions    __method_<Class>_<name>(this, ...)
-            for (name, params, _body, _is_async) in &ci.methods {
-                if name == "__<ctor-body>" || name == "__<dtor-body>" { continue; }
-                let mname = format!("__method_{}_{}", c.name, name);
-                self.funcs.insert(mname, FuncId(0));
-            }
-            // Predeclare prop accessors
-            for (_vis, pname, get, set) in &ci.props {
-                if get.is_some() {
-                    self.funcs.insert(format!("__get_{}_{}", c.name, pname), FuncId(0));
-                }
-                if set.is_some() {
-                    self.funcs.insert(format!("__set_{}_{}", c.name, pname), FuncId(0));
-                }
-            }
-            // Predeclare static methods
-            for (name, _params, _body, _is_async) in &ci.static_methods {
-                self.funcs.insert(format!("__static_{}_{}", c.name, name), FuncId(0));
-            }
-            // Predeclare the allocator  __class_new_<Class>(...)
-            self.funcs.insert(format!("__class_new_{}", c.name), FuncId(0));
+            ci.props = prop_map.into_iter().map(|(n, (g, s))| (n, g, s)).collect();
 
+            // record
             self.classes.insert(c.name.clone(), ci);
         }
 
-        // Now rebuild the funcs table with proper, **stable** indices:
+        // Now build a stable function table
         self.funcs.clear();
-        // 1) normal functions in given order
+        // 1) normal functions in order
         for (i, f) in prog.functions.iter().enumerate() {
             self.funcs.insert(f.name.clone(), FuncId(i as u32));
         }
-        // 2) class-generated functions in a fixed order (deterministic)
+        // 2) deterministic class-generated names
         let mut extra_names: Vec<String> = Vec::new();
         for c in &prog.classes {
             let cname = &c.name;
             extra_names.push(format!("__class_new_{}", cname));
-            extra_names.push(format!("__ctor_{}", cname));
-            if let Some(_) = c.members.iter().find(|m| matches!(m, ClassMember::Dtor{..})) {
-                extra_names.push(format!("__dtor_{}", cname));
+
+            let ci = self.classes.get(cname).unwrap();
+            if ci.has_ctor { extra_names.push(format!("__ctor_{}", cname)); }
+            if ci.has_dtor { extra_names.push(format!("__dtor_{}", cname)); }
+
+            for (pname, get, set) in &ci.props {
+                if get.is_some() { extra_names.push(format!("__get_{}_{}", cname, pname)); }
+                if set.is_some() { extra_names.push(format!("__set_{}_{}", cname, pname)); }
             }
-            // accessors then methods then static
-            for m in &c.members {
-                if let ClassMember::Prop { name, getter, setter, .. } = m {
-                    if getter.is_some() { extra_names.push(format!("__get_{}_{}", cname, name)); }
-                    if setter.is_some() { extra_names.push(format!("__set_{}_{}", cname, name)); }
+            for (mname, _, _, _) in &ci.methods {
+                if mname != "__<ctor-body>" && mname != "__<dtor-body>" {
+                    extra_names.push(format!("__method_{}_{}", cname, mname));
                 }
             }
-            for m in &c.members {
-                if let ClassMember::Method { is_static: false, name, .. } = m {
-                    extra_names.push(format!("__method_{}_{}", cname, name));
-                }
-            }
-            for m in &c.members {
-                if let ClassMember::Method { is_static: true, name, .. } = m {
-                    extra_names.push(format!("__static_{}_{}", cname, name));
-                }
+            for (mname, _, _, _) in &ci.static_methods {
+                extra_names.push(format!("__static_{}_{}", cname, mname));
             }
         }
         let base = prog.functions.len() as u32;
@@ -3656,18 +3598,16 @@ fn lower_expr_free<'m>(
 
                 // 0d) Class static methods: ClassName.m(...)
                 if let Expr::Ident(cn) = &**recv {
-                    if self.classes.contains_key(cn) {
-                        if let Some(&fid) = funcs.get(&format!("__static_{}_{}", cn, name)) {
-                            let mut argv = Vec::with_capacity(args.len());
-                            for a in args {
-                                argv.push(lower_expr_free(b, locals, fields, next_field, a, funcs, lam_caps)?);
-                            }
-                            let (_nid, res) = b.push_node(
-                                Inst::CallDirect { conv: crate::wir::CallConv::Fast, callee: fid, args: argv },
-                                Some(Type::Int32), 1, true
-                            );
-                            return Ok(res[0]);
+                    if let Some(&fid) = funcs.get(&format!("__static_{}_{}", cn, name)) {
+                        let mut argv = Vec::with_capacity(args.len());
+                        for a in args {
+                            argv.push(lower_expr_free(b, locals, fields, next_field, a, funcs, lam_caps)?);
                         }
+                        let (_nid, res) = b.push_node(
+                            Inst::CallDirect { conv: crate::wir::CallConv::Fast, callee: fid, args: argv },
+                            Some(Type::Int32), 1, true
+                        );
+                        return Ok(res[0]);
                     }
                 }
 
@@ -3820,6 +3760,85 @@ fn lower_expr_free<'m>(
                     return Ok(res[0]);
                 }
 
+                // print(value)
+                                if name == "print" {
+                    if args.len() != 1 { return Err(LowerError::NotLowerable("print() expects 1 arg")); }
+
+                    // 1) If it’s a string literal, use the string printer directly.
+                    if matches!(args[0], Expr::Str(_)) {
+                        let v = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+                        let (_nid, res) = b.push_node(
+                            Inst::CallNative {
+                                name: "wir_print_str".into(),
+                                args: vec![v],
+                                pure: false,
+                                can_throw: false,
+                            },
+                            Some(Type::Int32),
+                            1,
+                            true,
+                        );
+                        return Ok(res[0]);
+                    }
+
+                    // 2) If it’s “bool-ish”, coerce Bool → i32 {false:0, true:1} then print as i64.
+                    let is_boolish = matches!(
+                        args[0],
+                        // comparisons / equality
+                        Expr::Binary { op: BinOp::Eq  , .. }
+                        | Expr::Binary { op: BinOp::Ne , .. }
+                        | Expr::Binary { op: BinOp::Lt , .. }
+                        | Expr::Binary { op: BinOp::Le , .. }
+                        | Expr::Binary { op: BinOp::Gt , .. }
+                        | Expr::Binary { op: BinOp::Ge , .. }
+                        // logical operators (already return Bool)
+                        | Expr::Binary { op: BinOp::And, .. }
+                        | Expr::Binary { op: BinOp::Or , .. }
+                        // unary not
+                        | Expr::Unary  { op: UnOp::Not, .. }
+                        // the `in` operator
+                        | Expr::In { .. }
+                    );
+
+                    let v0 = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+
+                    // If bool-ish, branch to synthesize 0/1; else, pass the value directly.
+                    let v_to_print = if is_boolish {
+                        let then_b = b.block();
+                        let else_b = b.block();
+                        let cont   = b.block();
+                        let out_i  = b.add_block_param(cont, Type::Int32);
+
+                        b.branch(v0, then_b, else_b);
+
+                        b.position_at(then_b);
+                        let one = b.const_i32(1);
+                        b.jump(cont, &[one]);
+
+                        b.position_at(else_b);
+                        let zero = b.const_i32(0);
+                        b.jump(cont, &[zero]);
+
+                        b.position_at(cont);
+                        out_i
+                    } else {
+                        v0
+                    };
+
+                    let (_nid, res) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_print_i64".into(),
+                            args: vec![v_to_print],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::Int32),
+                        1,
+                        true,
+                    );
+                    return Ok(res[0]);
+                }
+
                 // Direct call to a known (hoisted/declared) function
                 if let Some(&fid) = funcs.get(name) {
                     let mut argv = Vec::with_capacity(args.len());
@@ -3927,55 +3946,24 @@ fn lower_expr_free<'m>(
             if let Some(&v) = locals.get("this") { Ok(v) } else { Err(LowerError::UnknownVar("this".into())) }
         }
 
-        Expr::Super(SuperRef::Ctor(args)) => {
-            // super(...) → call base ctor: __ctor_Base(this, args…)
-            // We expect a special lowerer context to have set "__super_ctor" string with base name.
-            let base_name = locals.get("__super_ctor_name__")
-                .ok_or_else(|| LowerError::NotLowerable("super() used outside constructor"))?;
-            let (_nid, base_str) = b.push_node(Inst::Const(Constant::Str("__dummy__".into())), Some(Type::Str), 1, false);
-            // Hack: we stored actual base funcid in a local slot __super_ctor_fid__
-            let fid_val = *locals.get("__super_ctor_fid__").ok_or_else(|| LowerError::NotLowerable("internal: missing base ctor id"))?;
-            // Materialize call: CallDirect to that FuncId (encoded as i32)
-            // Simpler: we stashed the real fid in locals under "__super_ctor_fid__" as a ValueId;
-            // We can just CallDirect using it is not supported; instead, we’ll look it up again:
-            let base_class = if let Some(v) = locals.get("__super_ctor_class__name") { v } else { base_str }; // unused
-            let this_v = *locals.get("this").ok_or_else(|| LowerError::UnknownVar("this".into()))?;
-            let mut argv = vec![this_v];
-            for a in args {
-                argv.push(lower_expr_free(b, locals, fields, next_field, a, funcs, lam_caps)?);
-            }
-            // Re-lookup the fid by name:
-            let cname = locals.get("__super_ctor_name_str__")
-                .and_then(|_| None); // see note below
-            // We’ll actually set a fixed mapping when lowering ctor (see below):
-            let base = locals.get("__super_ctor_fid_value__").copied()
-                .ok_or_else(|| LowerError::NotLowerable("internal: missing base ctor fid value"))?;
-            // We can’t CallDirect with a ValueId; instead we emit a closure for the ctor and CallClosure.
-            let (_nid_mk, clos) = b.push_node(
-                Inst::MakeClosure { callee: *funcs.get("__super_ctor::<will-be-set>").unwrap(), env: b.const_i32(0) },
-                Some(Type::Closure(None)), 1, false
-            );
-            let (_nid_call, res) = b.push_node(
-                Inst::CallClosure { conv: crate::wir::CallConv::Fast, fun: clos[0], args: argv },
-                Some(Type::Int32), 1, true
-            );
-            return Ok(res[0]);
+        Expr::Super => {
+            return Err(LowerError::NotLowerable("bare 'super' only valid as callee (e.g. super(...))"));
         }
 
-        Expr::New { target, args } => {
-            if let NewTarget::Ident(cn) = target {
-                let fname = format!("__class_new_{}", cn);
-                if let Some(&fid) = funcs.get(&fname) {
-                    let mut argv = Vec::with_capacity(args.len());
-                    for a in args { argv.push(lower_expr_free(b, locals, fields, next_field, a, funcs, lam_caps)?); }
-                    let (_nid, res) = b.push_node(
-                        Inst::CallDirect { conv: crate::wir::CallConv::Fast, callee: fid, args: argv },
-                        Some(Type::Int32), 1, true);
-                    return Ok(res[0]);
+        Expr::New { class, args } => {
+            let fname = format!("__class_new_{}", class);
+            if let Some(&fid) = funcs.get(&fname) {
+                let mut argv = Vec::with_capacity(args.len());
+                for a in args {
+                    argv.push(lower_expr_free(b, locals, fields, next_field, a, funcs, lam_caps)?);
                 }
-                return Err(LowerError::UnknownFunc(fname));
+                let (_nid, res) = b.push_node(
+                    Inst::CallDirect { conv: crate::wir::CallConv::Fast, callee: fid, args: argv },
+                    Some(Type::Int32), 1, true
+                );
+                return Ok(res[0]);
             }
-            return Err(LowerError::NotLowerable("new target not supported"));
+            return Err(LowerError::UnknownFunc(fname));
         }
 
         Expr::Index { recv, index } => {
@@ -4374,17 +4362,25 @@ impl<'m> Lowerer<'m> {
 
     fn lower_one_class(&mut self, c: &ClassDecl) -> LResult<()> {
         let cname = &c.name;
-        let ci = self.classes.get(cname).expect("class collected");
+
+        // OWN the class info so we don't hold an immutable borrow of `self`
+        let ci = self.classes.get(cname).expect("class collected").clone();
 
         // --- 1) Accessors
-        for (_vis, pname, get, set) in &ci.props {
+        for (pname, get, set) in &ci.props {
             if let Some(gb) = get {
                 let fname = format!("__get_{}_{}", cname, pname);
-                self.lower_instance_fun(cname, &fname, &["this"], gb, false)?;
+                self.lower_instance_fun(
+                    cname,
+                    &fname,
+                    &vec!["this".to_string()],
+                    gb,
+                    false
+                )?;
             }
             if let Some((p, sb)) = set {
                 let fname = format!("__set_{}_{}", cname, pname);
-                let mut params = vec!["this".to_string(), p.clone()];
+                let mut params: Vec<String> = vec!["this".to_string(), p.clone()];
                 self.lower_instance_fun(cname, &fname, &params, sb, false)?;
             }
         }
@@ -4418,53 +4414,109 @@ impl<'m> Lowerer<'m> {
         if ci.has_dtor {
             if let Some((_, _, dtor_body, _)) = ci.methods.iter().find(|(n,_,_,_)| n == "__<dtor-body>") {
                 let fname = format!("__dtor_{}", cname);
-                self.lower_instance_fun(cname, &fname, &["this"], dtor_body, false)?;
+                self.lower_instance_fun(cname, &fname, &vec!["this".to_string()], dtor_body, false)?;
             }
         }
 
-        // --- 6) Allocator: __class_new_<C>(...args)
-        self.lower_allocator(ci)?;
-
+        // --- 6) Allocator
+        self.lower_allocator(&ci)?;
         Ok(())
     }
 
     fn lower_instance_fun(&mut self, class_name: &str, fname: &str, params: &[String], body: &Block, is_async: bool) -> LResult<()> {
-        let mut b = Builder::new(self.module, fname, vec![Type::Int32; params.len()], vec![Type::Int32]);
+        use crate::wir::Type;
 
-        // Bind params as locals (including "this")
-        let mut locals: HashMap<String, ValueId> = Default::default();
-        for (i, name) in params.iter().enumerate() {
-            locals.insert(name.clone(), b.param(i));
-        }
-        // Make shorthand "this" available
-        if !locals.contains_key("this") { locals.insert("this".into(), b.param(0)); }
-
-        // Rewrite private identifiers in body: _name → this["<mangled>"]
+        // Do read-only work BEFORE constructing Builder (which borrows self.module mutably)
         let body_rw = self.rewrite_privates_in_block(class_name, body);
 
-        // Lower the body
-        let mut fields: HashMap<String, FieldId> = Default::default();
-        let mut next_field: u32 = 0;
+        // Build function inside a short scope so the &mut borrow ends before we touch self.module again
+        let mut f = {
+            let mut b = Builder::new(self.module, fname, vec![Type::Int32; params.len()], vec![Type::Int32]);
 
-        if is_async {
-            // (async methods can be added later; MVP keeps them sync)
-            return Err(LowerError::NotLowerable("async methods in classes not yet supported"));
-        } else {
-            lower_block_free(&mut b, &mut locals, &mut fields, &mut next_field, &body_rw, &self.funcs, &self.lam_captures)?;
-            if !b.current_block_terminated() {
-                let zero = b.const_i32(0);
-                b.ret(&[zero]);
+            // Bind params as locals (including "this")
+            let mut locals: HashMap<String, ValueId> = Default::default();
+            for (i, name) in params.iter().enumerate() {
+                locals.insert(name.clone(), b.param(i));
             }
-        }
+            if !locals.contains_key("this") { locals.insert("this".into(), b.param(0)); }
 
+            let mut fields: HashMap<String, FieldId> = Default::default();
+            let mut next_field: u32 = 0;
+
+            if is_async {
+                return Err(LowerError::NotLowerable("async methods in classes not yet supported"));
+            } else {
+                lower_block_free(&mut b, &mut locals, &mut fields, &mut next_field, &body_rw, &self.funcs, &self.lam_captures)?;
+                if !b.current_block_terminated() {
+                    let zero = b.const_i32(0);
+                    b.ret(&[zero]);
+                }
+            }
+
+            b.finish()
+        };
+
+        // Now the builder is dropped; we may read & push on self.module
         let fid = FuncId(self.module.funcs.len() as u32);
-        let mut f = b.finish();
         f.id = fid;
         self.module.funcs.push(f);
         Ok(())
     }
 
-    fn lower_free_like_fun<'m>(
+    fn rewrite_privates_in_block(&self, _class_name: &str, body: &Block) -> Block {
+        body.clone()
+    }
+
+    fn lower_allocator(&mut self, ci: &ClassInfo) -> LResult<()> {
+        use crate::wir::{Inst, Type};
+
+        let fname = format!("__class_new_{}", ci.name);
+
+        let ctor_params: Vec<String> = ci.methods
+            .iter()
+            .find(|(n, _, _, _)| n == "__<ctor-body>")
+            .map(|(_, ps, _, _)| ps.clone())
+            .unwrap_or_default();
+
+        let mut f = {
+            let mut b = Builder::new(
+                self.module,
+                &fname,
+                vec![Type::Int32; ctor_params.len()],
+                vec![Type::Int32],
+            );
+
+            // obj = wir_obj_new()
+            let (_nid, obj_r) = b.push_node(
+                Inst::CallNative { name: "wir_obj_new".into(), args: vec![], pure: false, can_throw: false },
+                None, 1, true
+            );
+            let obj = obj_r[0];
+
+            // call ctor if present
+            if ci.has_ctor {
+                if let Some(&fid) = self.funcs.get(&format!("__ctor_{}", ci.name)) {
+                    let mut argv = Vec::with_capacity(1 + ctor_params.len());
+                    argv.push(obj);
+                    for i in 0..ctor_params.len() { argv.push(b.param(i)); }
+                    let (_nid, _res) = b.push_node(
+                        Inst::CallDirect { conv: crate::wir::CallConv::Fast, callee: fid, args: argv },
+                        Some(Type::Int32), 1, true
+                    );
+                }
+            }
+
+            b.ret(&[obj]);
+            b.finish()
+        };
+
+        let fid = FuncId(self.module.funcs.len() as u32);
+        f.id = fid;
+        self.module.funcs.push(f);
+        Ok(())
+    }
+
+    fn lower_expr_maybe_ident_to_closure(
         b: &mut Builder<'m>,
         locals: &mut HashMap<String, ValueId>,
         fields: &mut HashMap<String, FieldId>,
@@ -4492,6 +4544,74 @@ impl<'m> Lowerer<'m> {
             }
             _ => lower_expr_free(b, locals, fields, next_field, e, funcs, lam_caps),
         }
+    }
+
+    fn lower_free_like_fun(
+        &mut self,
+        fname: &str,
+        params: &[String],
+        body: &Block,
+        is_async: bool,
+    ) -> LResult<()> {
+        use crate::wir::{Inst, Type};
+
+        let mut f = {
+            let mut b = Builder::new(
+                self.module,
+                fname,
+                vec![Type::Int32; params.len()],
+                vec![Type::Int32],
+            );
+
+            // Bind params
+            let mut locals: HashMap<String, ValueId> = Default::default();
+            for (i, p) in params.iter().enumerate() {
+                locals.insert(p.clone(), b.param(i));
+            }
+
+            let mut fields: HashMap<String, FieldId> = Default::default();
+            let mut next_field: u32 = 0;
+
+            if is_async {
+                // Deferred prologue
+                let (_nid, d_res) = b.push_node(
+                    Inst::CallNative { name: "wir_deferred_new".into(), args: vec![], pure: false, can_throw: false },
+                    None, 1, true
+                );
+                let d = d_res[0];
+                locals.insert("__deferred".to_string(), d);
+
+                lower_block_free_async(
+                    &mut b, &mut locals, &mut fields, &mut next_field,
+                    body, &self.funcs, &self.lam_captures, true
+                )?;
+
+                if !b.current_block_terminated() {
+                    let zero = b.const_i32(0);
+                    let (_nid, _) = b.push_node(
+                        Inst::CallNative { name: "wir_deferred_resolve".into(), args: vec![d, zero], pure: false, can_throw: false },
+                        None, 1, true
+                    );
+                    b.ret(&[d]);
+                }
+            } else {
+                lower_block_free(
+                    &mut b, &mut locals, &mut fields, &mut next_field,
+                    body, &self.funcs, &self.lam_captures
+                )?;
+                if !b.current_block_terminated() {
+                    let zero = b.const_i32(0);
+                    b.ret(&[zero]);
+                }
+            }
+
+            b.finish()
+        };
+
+        let fid = FuncId(self.module.funcs.len() as u32);
+        f.id = fid;
+        self.module.funcs.push(f);
+        Ok(())
     }
 }
 

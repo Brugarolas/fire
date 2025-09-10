@@ -44,12 +44,12 @@ pub extern "C" fn wir_clear_interval(id: i64) -> i64 {
 pub fn drain_event_loop_to_quiescence() {
     EVENT_LOOP.run_until_quiescent(
         // microtask: one arg
-        |f, a| unsafe {
+        |f, a| {
             let arg = [a];
             let _ = wir_call_closure(f, arg.as_ptr(), 1);
         },
         // timer: zero args
-        |fun| unsafe {
+        |fun| {
             let _ = wir_call_closure(fun, core::ptr::null(), 0);
         },
     );

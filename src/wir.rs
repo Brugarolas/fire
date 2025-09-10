@@ -391,15 +391,6 @@ pub struct AccessorInfo {
     setter: Option<FuncId>,
     is_static: bool,
 }
-#[derive(Debug, Clone)]
-pub struct ClassInfo {
-    name: String,
-    base: Option<String>,
-    fields: Vec<String>,     // instance stored properties
-    statics: Vec<String>,    // static stored properties
-    methods: Vec<MethodInfo>,
-    accessors: Vec<AccessorInfo>,
-}
 
 impl Inst {
     /// Whether the instruction *requires* an incoming effect token.
