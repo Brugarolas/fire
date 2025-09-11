@@ -3,8 +3,6 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
-use ahash::AHashMap as HashMap;
-
 use cranelift::prelude::*;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITModule};
@@ -14,6 +12,9 @@ use cranelift::prelude::{types, InstBuilder};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::cell::Cell;
+use std::sync::OnceLock;
+use ahash::AHashMap as HashMap;
+use parking_lot::Mutex;
 
 #[allow(unused_imports)]
 use crate::gc::NAPALM_GC;
@@ -56,6 +57,24 @@ use crate::http::{
 /// ABI: `unsafe extern "C" fn(argv: *const i64, argc: usize) -> i64`
 pub type JitFnPtr = unsafe extern "C" fn(*const i64, usize) -> i64;
 
+static WIR_FUNPTRS: OnceLock<Mutex<HashMap<u32, usize>>> = OnceLock::new();
+
+fn funptrs() -> &'static Mutex<HashMap<u32, usize>> {
+    WIR_FUNPTRS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_resolve_funptr(fid: i64) -> *const u8 {
+    let m = funptrs().lock();
+    let addr = m.get(&(fid as u32)).copied().unwrap_or(0usize);
+    addr as *const u8
+}
+
+fn register_funptr(fid: u32, ptr: *const u8) {
+    let mut m = funptrs().lock();
+    m.insert(fid, ptr as usize);
+}
+
 pub struct JIT {
     module: JITModule,
     fctx: FunctionBuilderContext,
@@ -68,6 +87,8 @@ impl Default for JIT {
         let mut jb = cranelift_jit::JITBuilder::new(cranelift_module::default_libcall_names()).expect("JITBuilder::new");
 
         unsafe extern "C" {
+            fn wir_resolve_funptr(fid: i64) -> *const u8;
+
             fn wir_print_i64(x: i64) -> i64;
             fn wir_print_str(p: *const std::os::raw::c_char) -> i64;
             fn wir_make_closure(code_ptr: *const u8, env: i64) -> i64;
@@ -111,12 +132,15 @@ impl Default for JIT {
 
             fn wir_memo_get(fid: i64, key: i64, out_ptr: *mut i64) -> i64;
             fn wir_memo_put(fid: i64, key: i64, val: i64) -> i64;
-            fn wir_memo_get2(fid: i64, key: i64, out_ptr: *mut i64) -> i64;
-            fn wir_memo_put2(fid: i64, key: i64, val: i64) -> i64;
-            fn wir_memo_get3(fid: i64, key: i64, out_ptr: *mut i64) -> i64;
-            fn wir_memo_put3(fid: i64, key: i64, val: i64) -> i64;
-            fn wir_memo_get4(fid: i64, key: i64, out_ptr: *mut i64) -> i64;
-            fn wir_memo_put4(fid: i64, key: i64, val: i64) -> i64;
+
+            fn wir_memo_get2(fid: i64, k0: i64, k1: i64, out_ptr: *mut i64) -> i64;
+            fn wir_memo_put2(fid: i64, k0: i64, k1: i64, val: i64) -> i64;
+
+            fn wir_memo_get3(fid: i64, k0: i64, k1: i64, k2: i64, out_ptr: *mut i64) -> i64;
+            fn wir_memo_put3(fid: i64, k0: i64, k1: i64, k2: i64, val: i64) -> i64;
+
+            fn wir_memo_get4(fid: i64, k0: i64, k1: i64, k2: i64, k3: i64, out_ptr: *mut i64) -> i64;
+            fn wir_memo_put4(fid: i64, k0: i64, k1: i64, k2: i64, k3: i64, val: i64) -> i64;
         }
 
         // --- declare the object natives so we can take typed fn pointers ---
@@ -178,6 +202,11 @@ impl Default for JIT {
         }
 
         unsafe {
+            jb.symbol(
+                "wir_resolve_funptr",
+                wir_resolve_funptr as *const extern "C" fn(i64) -> *const u8 as *const u8
+            );
+
             jb.symbol("wir_print_i64", wir_print_i64 as *const extern "C" fn(i64) -> i64 as *const u8);
             jb.symbol("wir_print_str", wir_print_str as *const extern "C" fn(*const std::os::raw::c_char) -> i64 as *const u8);
             jb.symbol("wir_make_closure", wir_make_closure as *const extern "C" fn(*const u8, i64) -> i64 as *const u8);
@@ -318,33 +347,45 @@ impl Default for JIT {
 
 impl JIT {
     /// Get an i64-typed code pointer for a compiled WIR function (`wir_f_<id>`).
-    fn funptr_i64(&mut self, fb: &mut FunctionBuilder, fid: FuncId) -> cranelift::prelude::Value {
-        use cranelift::prelude::*;
-
+    fn funptr_i64(&mut self, fb: &mut FunctionBuilder, fid: FuncId) -> Value {
         let ptr_ty = self.module.target_config().pointer_type();
-
-        // JIT-internal callee signature: (argv_ptr, argc) -> i64
         let mut sig = self.module.make_signature();
-        sig.call_conv = self.module.isa().default_call_conv(); // IMPORTANT: native ABI
-        sig.params.push(AbiParam::new(ptr_ty));
-        sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I64));
+        sig.call_conv = self.module.isa().default_call_conv();
 
-        let sym = format!("wir_f_{}", fid.0);
-        let func_id = self
-            .module
-            .declare_function(&sym, Linkage::Import, &sig)
-            .expect("declare wir_f_*");
-        let func_ref = self.module.declare_func_in_func(func_id, &mut fb.func);
+        // resolve at runtime: wir_resolve_funptr(fid) -> code_ptr
+        let fid_v = fb.ins().iconst(types::I64, fid.0 as i64);
+        let code_ptr = self.call_import(
+            fb,
+            "wir_resolve_funptr",
+            |s| {
+                s.params.push(AbiParam::new(types::I64));
+                s.returns.push(AbiParam::new(ptr_ty));
+            },
+            &[fid_v],
+        ).expect("resolve funptr");
 
-        let addr = fb.ins().func_addr(ptr_ty, func_ref);
-
-        // Normalize to i64 for our FFI.
+        // Keep returning I64 for callers that expect it.
         match ptr_ty {
-            types::I64 => addr,
-            types::I32 => fb.ins().uextend(types::I64, addr),
-            _ => fb.ins().uextend(types::I64, addr),
+            types::I64 => code_ptr,
+            types::I32 => fb.ins().uextend(types::I64, code_ptr),
+            _          => fb.ins().uextend(types::I64, code_ptr),
         }
+    }
+
+    fn funptr_ptr(&mut self, fb: &mut FunctionBuilder, fid: FuncId) -> Value {
+        use cranelift::prelude::*;
+        let ptr_ty = self.ptr_ty();
+        let fid_val = fb.ins().iconst(types::I64, fid.0 as i64);
+        // call resolver: (i64 fid) -> ptr
+        self.call_import(
+            fb,
+            "wir_resolve_funptr",
+            |s| {
+                s.params.push(AbiParam::new(types::I64));
+                s.returns.push(AbiParam::new(ptr_ty));
+            },
+            &[fid_val],
+        ).expect("resolve funptr")
     }
 }
 
@@ -769,7 +810,7 @@ impl JIT {
                         Inst::ArrayMap { func, arr } => {
                             use cranelift::prelude::{AbiParam, types};
                             let ptr_ty   = self.ptr_ty();
-                            let code_ptr = self.funptr_i64(&mut fb, *func);      // wir_f_<id> address (i64)
+                            let code_ptr = self.funptr_ptr(&mut fb, *func);      // wir_f_<id> address (i64)
                             let zero     = fb.ins().iconst(types::I64, 0);       // empty env
                             let clo      = self.call_import(&mut fb, "wir_make_closure", |s| {
                                 s.params.push(AbiParam::new(ptr_ty));            // code_ptr
@@ -789,7 +830,7 @@ impl JIT {
                         Inst::ArrayForEach { func, arr } => {
                             use cranelift::prelude::{AbiParam, types};
                             let ptr_ty   = self.ptr_ty();
-                            let code_ptr = self.funptr_i64(&mut fb, *func);
+                            let code_ptr = self.funptr_ptr(&mut fb, *func);
                             let zero     = fb.ins().iconst(types::I64, 0);
                             let clo      = self.call_import(&mut fb, "wir_make_closure", |s| {
                                 s.params.push(AbiParam::new(ptr_ty));
@@ -809,7 +850,7 @@ impl JIT {
                         Inst::ArrayFind { func, arr } => {
                             use cranelift::prelude::{AbiParam, types};
                             let ptr_ty   = self.ptr_ty();
-                            let code_ptr = self.funptr_i64(&mut fb, *func);
+                            let code_ptr = self.funptr_ptr(&mut fb, *func);
                             let zero     = fb.ins().iconst(types::I64, 0);
                             let clo      = self.call_import(&mut fb, "wir_make_closure", |s| {
                                 s.params.push(AbiParam::new(ptr_ty));
@@ -829,7 +870,7 @@ impl JIT {
                         Inst::ArrayFindIndex { func, arr } => {
                             use cranelift::prelude::{AbiParam, types};
                             let ptr_ty   = self.ptr_ty();
-                            let code_ptr = self.funptr_i64(&mut fb, *func);
+                            let code_ptr = self.funptr_ptr(&mut fb, *func);
                             let zero     = fb.ins().iconst(types::I64, 0);
                             let clo      = self.call_import(&mut fb, "wir_make_closure", |s| {
                                 s.params.push(AbiParam::new(ptr_ty));
@@ -849,7 +890,7 @@ impl JIT {
                         Inst::ArrayFilter { func, arr } => {
                             use cranelift::prelude::{AbiParam, types};
                             let ptr_ty   = self.ptr_ty();
-                            let code_ptr = self.funptr_i64(&mut fb, *func);
+                            let code_ptr = self.funptr_ptr(&mut fb, *func);
                             let zero     = fb.ins().iconst(types::I64, 0);
                             let clo      = self.call_import(&mut fb, "wir_make_closure", |s| {
                                 s.params.push(AbiParam::new(ptr_ty));
@@ -869,7 +910,7 @@ impl JIT {
                         Inst::ArrayReduce { func, init, arr } => {
                             use cranelift::prelude::{AbiParam, types, IntCC};
                             let ptr_ty   = self.ptr_ty();
-                            let code_ptr = self.funptr_i64(&mut fb, *func);
+                            let code_ptr = self.funptr_ptr(&mut fb, *func);
                             let zero     = fb.ins().iconst(types::I64, 0);
                             let clo      = self.call_import(&mut fb, "wir_make_closure", |s| {
                                 s.params.push(AbiParam::new(ptr_ty));
@@ -937,17 +978,18 @@ impl JIT {
                             use cranelift::prelude::{AbiParam, types};
 
                             // JIT function code ptr for wir_f_<id> (direct within code heap).
-                            let ptr_ty   = self.module.target_config().pointer_type();
+                            let ptr_ty   =      self.module.target_config().pointer_type();
                             let mut jsig = self.module.make_signature();
-                            jsig.call_conv = self.module.isa().default_call_conv();
-                            jsig.params.push(AbiParam::new(ptr_ty));
-                            jsig.params.push(AbiParam::new(types::I64));
+                            jsig.call_conv =          self.module.isa().default_call_conv();
+                            jsig.params.push (AbiParam::new(ptr_ty));
+                            jsig.params.push (AbiParam::new(types::I64));
                             jsig.returns.push(AbiParam::new(types::I64));
-                            let sym      = format!("wir_f_{}", callee.0);
-                            let fid      = self.module.declare_function(&sym, cranelift_module::Linkage::Import, &jsig)
-                                .map_err(|e| e.to_string())?;
-                            let fref     = self.module.declare_func_in_func(fid, &mut fb.func);
-                            let code_ptr = fb.ins().func_addr(ptr_ty, fref);
+
+                            let sym   = format!("wir_f_{}", callee.0);
+                            let fid   = self.module.declare_function(&sym, cranelift_module::Linkage::Local, &jsig).map_err(|e| e.to_string())?;
+                            let fref = self.module.declare_func_in_func(fid, &mut fb.func);
+
+                            let code_ptr = self.funptr_ptr(&mut fb, *callee);
 
                             // env value
                             let env_v = vmap.get_or_emit(*env, &mut fb, args_base, fun_ir);
@@ -957,8 +999,8 @@ impl JIT {
                                 &mut fb,
                                 "wir_make_closure",
                                 |s| {
-                                    s.params.push(AbiParam::new(ptr_ty));     // code_ptr
-                                    s.params.push(AbiParam::new(types::I64)); // env
+                                    s.params.push (AbiParam::new(ptr_ty));     // code_ptr
+                                    s.params.push (AbiParam::new(types::I64)); // env
                                     s.returns.push(AbiParam::new(types::I64)); // closure ptr
                                 },
                                 &[code_ptr, env_v],
@@ -977,7 +1019,7 @@ impl JIT {
                                 &mut fb,
                                 "wir_alloc_words",
                                 |s| {
-                                    s.params.push(AbiParam::new(types::I64));   // n
+                                    s.params.push (AbiParam::new(types::I64));   // n
                                     s.returns.push(AbiParam::new(ptr_ty));      // *mut i64
                                 },
                                 &[n_i64],
@@ -998,9 +1040,9 @@ impl JIT {
                                 &mut fb,
                                 "wir_call_closure",
                                 |s| {
-                                    s.params.push(AbiParam::new(types::I64));   // closure pointer (i64)
-                                    s.params.push(AbiParam::new(ptr_ty));       // argv*
-                                    s.params.push(AbiParam::new(types::I64));   // argc
+                                    s.params.push (AbiParam::new(types::I64));   // closure pointer (i64)
+                                    s.params.push (AbiParam::new(ptr_ty));       // argv*
+                                    s.params.push (AbiParam::new(types::I64));   // argc
                                     s.returns.push(AbiParam::new(types::I64));  // result
                                 },
                                 &[clo_ptr, argv, argc],
@@ -1011,8 +1053,8 @@ impl JIT {
                                 &mut fb,
                                 "wir_free_words",
                                 |s| {
-                                    s.params.push(AbiParam::new(ptr_ty));
-                                    s.params.push(AbiParam::new(types::I64));
+                                    s.params.push (AbiParam::new(ptr_ty));
+                                    s.params.push (AbiParam::new(types::I64));
                                     s.returns.push(AbiParam::new(types::I64));
                                 },
                                 &[argv, argc],
@@ -1056,67 +1098,45 @@ impl JIT {
                         // ---------------- Direct calls ----------------
                         Inst::CallDirect { callee, args, .. } => {
                             use cranelift::prelude::{AbiParam, types, MemFlags};
-                            use cranelift_module::Linkage;
 
-                            // Callee signature: (argv_ptr, argc) -> i64  (native CC)
+                            let ptr_ty = self.ptr_ty();
+
+                            // Build (argv*, argc) -> i64 signature
                             let mut sig = self.module.make_signature();
                             sig.call_conv = self.module.isa().default_call_conv();
-                            sig.params.push(AbiParam::new(ptr_ty));     // argv*
-                            sig.params.push(AbiParam::new(types::I64)); // argc
+                            sig.params.push(AbiParam::new(ptr_ty));
+                            sig.params.push(AbiParam::new(types::I64));
                             sig.returns.push(AbiParam::new(types::I64));
+                            let sigref = fb.import_signature(sig);
 
-                            let sym = format!("wir_f_{}", callee.0);
-                            let func_id = self
-                                .module
-                                .declare_function(&sym, Linkage::Import, &sig)
-                                .map_err(|e| e.to_string())?;
-
-                            // Allocate argv on the heap (aligned *mut i64).
+                            // argv on heap
                             let argc_i64 = fb.ins().iconst(types::I64, args.len() as i64);
-                            let argv_ptr = self.call_import(
-                                &mut fb,
-                                "wir_alloc_words",
-                                |s| {
-                                    s.params.push(AbiParam::new(types::I64)); // n
-                                    s.returns.push(AbiParam::new(ptr_ty));    // *mut i64
-                                },
+                            let argv_ptr = self.call_import(&mut fb, "wir_alloc_words",
+                                |s| { s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(ptr_ty)); },
                                 &[argc_i64],
                             )?;
-
-                            // Store args at argv[i].
                             for (i, a) in args.iter().enumerate() {
                                 let v    = vmap.get_or_emit(*a, &mut fb, args_base, fun_ir);
                                 let addr = fb.ins().iadd_imm(argv_ptr, (i as i64) * 8);
                                 fb.ins().store(MemFlags::trusted(), v, addr, 0);
                             }
 
-                            // Call through absolute address (avoids range issues).
-                            let outs = self.call_funcref(
-                                &mut fb,
-                                func_id,
-                                |s| {
-                                    s.params.push(AbiParam::new(ptr_ty));     // argv*
-                                    s.params.push(AbiParam::new(types::I64)); // argc
-                                    s.returns.push(AbiParam::new(types::I64));
-                                },
+                            // resolve -> call_indirect
+                            let fid_v  = fb.ins().iconst(types::I64, callee.0 as i64);
+                            let fptr   = self.call_import(&mut fb, "wir_resolve_funptr",
+                                |s| { s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(ptr_ty)); },
+                                &[fid_v],
+                            )?;
+                            let call   = fb.ins().call_indirect(sigref, fptr, &[argv_ptr, argc_i64]);
+                            let outs   = fb.inst_results(call).to_vec();
+
+                            // free argv
+                            let _ = self.call_import(&mut fb, "wir_free_words",
+                                |s| { s.params.push(AbiParam::new(ptr_ty)); s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(types::I64)); },
                                 &[argv_ptr, argc_i64],
                             )?;
 
-                            // Free argv (no-op under GC build; real free in non-GC build).
-                            let _ = self.call_import(
-                                &mut fb,
-                                "wir_free_words",
-                                |s| {
-                                    s.params.push(AbiParam::new(ptr_ty));     // argv*
-                                    s.params.push(AbiParam::new(types::I64)); // n (optional but handy)
-                                    s.returns.push(AbiParam::new(types::I64)); // 0
-                                },
-                                &[argv_ptr, argc_i64],
-                            )?;
-
-                            if res_count >= 1 {
-                                vmap.bind(node.results[0], outs[0]);
-                            }
+                            if res_count >= 1 { vmap.bind(node.results[0], outs[0]); }
                         }
 
                         // Engine has the ability to memoize functions, it is implemented natively
@@ -1464,6 +1484,7 @@ impl JIT {
             self.module.finalize_definitions().map_err(|e| e.to_string())?;
 
             let code = self.module.get_finalized_function(func_id);
+            register_funptr(fun.id.0 as u32, code as *const u8);
             let fptr: JitFnPtr = unsafe { std::mem::transmute(code) };
             Ok(fptr)
         })();
@@ -1698,25 +1719,53 @@ pub extern "C" fn wir_make_closure(code_ptr: *const u8, env: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_call_closure(clo_ptr: i64, argv: *const i64, argc: i64) -> i64 {
-    if clo_ptr == 0 { return 0; }
+    use crate::value::{is_imm, NULL, ObjHeader, TAG_CLOSURE};
+    use core::ptr;
 
-    let clo = unsafe { &*(clo_ptr as *const BoxedClosure) };
-    let f: JitFnPtr = unsafe { std::mem::transmute(clo.code_ptr as *const u8) };
-
-    let env_len = clo.env.len();
-    let total   = env_len + (argc as usize);
-    let mut args: Vec<i64> = Vec::with_capacity(total);
-
-    // 1) prepend captured env
-    args.extend_from_slice(&clo.env);
-
-    // 2) append caller args exactly once
-    for i in 0..(argc as usize) {
-        unsafe { args.push(*argv.add(i)); }
+    // Basic checks (helpful messages instead of UB)
+    if clo_ptr == NULL {
+        panic!("CallClosure: null callee");
+    }
+    if ((argv as usize) & 7) != 0 {
+        panic!("CallClosure: argv not 8-byte aligned: {:p}", argv);
     }
 
-    // Call wir_f_*: ABI (*const i64, usize) -> i64
-    unsafe { (f)(args.as_ptr(), args.len()) }
+    // Path 1: callee is a SMI(FuncId). Call wir_f_<id>(argv, argc) directly.
+    if is_imm(clo_ptr) {
+        // SMI decode: raw id = v >> 1
+        let fid = clo_ptr >> 1;
+        let code = unsafe { wir_resolve_funptr(fid) };
+        if code.is_null() {
+            panic!("CallClosure: unresolved function id {}", fid);
+        }
+        let f: JitFnPtr = unsafe { core::mem::transmute(code) };
+        return unsafe { (f)(argv, argc as usize) };
+    }
+
+    // Path 2: callee must be a real closure object
+    unsafe {
+        let hdr = &*(clo_ptr as *const ObjHeader);
+        if hdr.tag != TAG_CLOSURE {
+            panic!("CallClosure: value is not a closure (tag={})", hdr.tag);
+        }
+
+        let clo = &*(clo_ptr as *const BoxedClosure);
+        let f: JitFnPtr = core::mem::transmute(clo.code_ptr as *const u8);
+
+        // Build argv' = [env..., argv...]
+        let env_len = clo.env.len();
+        let arg_len = argc as usize;
+        let total   = env_len + arg_len;
+
+        // Allocate a temporary vector to stitch env + args. (Aligned, safe.)
+        let mut args: Vec<i64> = Vec::with_capacity(total);
+        args.extend_from_slice(&clo.env);
+        for i in 0..arg_len {
+            args.push(*argv.add(i));
+        }
+
+        (f)(args.as_ptr(), args.len())
+    }
 }
 
 #[unsafe(no_mangle)]
