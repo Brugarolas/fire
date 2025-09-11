@@ -4470,7 +4470,41 @@ impl<'m> Lowerer<'m> {
             );
             let obj = obj_r[0];
 
-            // call ctor if present
+            // --- NEW: expose instance methods as properties on the instance
+            // p.sum -> smi(FuncId(__method_Class_sum))
+            for (mname, _params, _body, _is_async) in &ci.methods {
+                if mname == "constructor" || mname == "destructor" { continue; }
+
+                let meth_sym = format!("__method_{}_{}", ci.name, mname);
+                if let Some(&fid) = self.funcs.get(&meth_sym) {
+                    // key = "sum"
+                    let (_nid_k, key_res) = b.push_node(
+                        Inst::Const(Constant::Str(mname.clone())),
+                        Some(Type::Str),
+                        1,
+                        false
+                    );
+                    let key = key_res[0];
+
+                    // value = smi(fid)
+                    let fid_smi = b.const_i32(fid.0 as i32);
+
+                    // obj["sum"] = smi(fid)
+                    let _ = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_obj_set_str".into(),
+                            args: vec![obj, key, fid_smi],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::Int32),
+                        1,
+                        true
+                    );
+                }
+            }
+
+            // call ctor if present (kept as-is)
             if ci.has_ctor {
                 if let Some(&fid) = self.funcs.get(&format!("__ctor_{}", ci.name)) {
                     let mut argv = Vec::with_capacity(1 + ctor_params.len());

@@ -91,6 +91,8 @@ impl Default for JIT {
 
             fn wir_print_i64(x: i64) -> i64;
             fn wir_print_str(p: *const std::os::raw::c_char) -> i64;
+            fn wir_method_trampoline(argv: *const i64, argc: usize) -> i64;
+            fn wir_make_method_closure(fid_smi: i64) -> i64;
             fn wir_make_closure(code_ptr: *const u8, env: i64) -> i64;
             fn wir_call_closure(clo_ptr: i64, argv: *const i64, argc: i64) -> i64;
             fn wir_alloc_words(n: i64) -> *mut i64;
@@ -209,6 +211,8 @@ impl Default for JIT {
 
             jb.symbol("wir_print_i64", wir_print_i64 as *const extern "C" fn(i64) -> i64 as *const u8);
             jb.symbol("wir_print_str", wir_print_str as *const extern "C" fn(*const std::os::raw::c_char) -> i64 as *const u8);
+            jb.symbol("wir_method_trampoline", wir_method_trampoline as *const extern "C" fn(*const i64, usize) -> i64 as *const u8);
+            jb.symbol("wir_make_method_closure", wir_make_method_closure as *const extern "C" fn(i64) -> i64 as *const u8);
             jb.symbol("wir_make_closure", wir_make_closure as *const extern "C" fn(*const u8, i64) -> i64 as *const u8);
             jb.symbol("wir_call_closure", wir_call_closure as *const extern "C" fn(i64, *const i64, i64) -> i64 as *const u8);
             jb.symbol("wir_alloc_words", wir_alloc_words as *const extern "C" fn(i64) -> *mut i64 as *const u8);
@@ -1709,63 +1713,104 @@ pub extern "C" fn wir_print_str(p: *const std::os::raw::c_char) -> i64 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn wir_method_trampoline(argv: *const i64, argc: usize) -> i64 {
+    // argv layout when called via wir_call_closure with env_len=1:
+    //   argv[0] = env[0] = SMI(fid)
+    //   argv[1] = this
+    //   argv[2...] = user args
+    if argv.is_null() || argc == 0 {
+        panic!("method trampoline: empty argv");
+    }
+
+    unsafe {
+        let fid_smi = *argv;
+        // SMI decode: (x >> 1)
+        let fid_raw = (fid_smi >> 1) as i64;
+        let fptr = wir_resolve_funptr(fid_raw);
+        if fptr.is_null() {
+            panic!("method trampoline: unresolved fid={}", fid_raw);
+        }
+        let f: JitFnPtr = std::mem::transmute(fptr);
+        // forward *without* the env word
+        (f)(argv.add(1), argc - 1)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_make_method_closure(fid_smi: i64) -> i64 {
+    // Sentinel: code_ptr == 0 means “method closure”; env[0] = SMI(fid).
+    let clo_val = closure_new(0usize, 1);
+    unsafe { closure_set_env_slot(clo_val, 0, fid_smi); }
+    clo_val
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn wir_make_closure(code_ptr: *const u8, env: i64) -> i64 {
-    // Allocate a BoxedClosure with env_len = 1 and set env[0] = `env`.
-    // Under `feature = "gc"` this goes through MMTk; otherwise your no-GC path.
-    let clo_val = closure_new(code_ptr as usize, 1);
-    unsafe { closure_set_env_slot(clo_val, 0, env); }
+    // If env == 0 (NULL), build a closure with no env slots,
+    // so calls won't prepend an extra argument before `this`.
+    let env_len = if env == 0 { 0 } else { 1 };
+    let clo_val = closure_new(code_ptr as usize, env_len);
+    if env_len == 1 {
+        unsafe { closure_set_env_slot(clo_val, 0, env); }
+    }
     clo_val
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_call_closure(clo_ptr: i64, argv: *const i64, argc: i64) -> i64 {
     use crate::value::{is_imm, NULL, ObjHeader, TAG_CLOSURE};
-    use core::ptr;
 
-    // Basic checks (helpful messages instead of UB)
-    if clo_ptr == NULL {
-        panic!("CallClosure: null callee");
+    if clo_ptr == NULL || is_imm(clo_ptr) {
+        panic!("CallClosure: not a closure (got {}): smi/null where closure* expected", clo_ptr);
     }
     if ((argv as usize) & 7) != 0 {
         panic!("CallClosure: argv not 8-byte aligned: {:p}", argv);
     }
-
-    // Path 1: callee is a SMI(FuncId). Call wir_f_<id>(argv, argc) directly.
-    if is_imm(clo_ptr) {
-        // SMI decode: raw id = v >> 1
-        let fid = clo_ptr >> 1;
-        let code = unsafe { wir_resolve_funptr(fid) };
-        if code.is_null() {
-            panic!("CallClosure: unresolved function id {}", fid);
-        }
-        let f: JitFnPtr = unsafe { core::mem::transmute(code) };
-        return unsafe { (f)(argv, argc as usize) };
-    }
-
-    // Path 2: callee must be a real closure object
     unsafe {
         let hdr = &*(clo_ptr as *const ObjHeader);
         if hdr.tag != TAG_CLOSURE {
             panic!("CallClosure: value is not a closure (tag={})", hdr.tag);
         }
-
-        let clo = &*(clo_ptr as *const BoxedClosure);
-        let f: JitFnPtr = core::mem::transmute(clo.code_ptr as *const u8);
-
-        // Build argv' = [env..., argv...]
-        let env_len = clo.env.len();
-        let arg_len = argc as usize;
-        let total   = env_len + arg_len;
-
-        // Allocate a temporary vector to stitch env + args. (Aligned, safe.)
-        let mut args: Vec<i64> = Vec::with_capacity(total);
-        args.extend_from_slice(&clo.env);
-        for i in 0..arg_len {
-            args.push(*argv.add(i));
-        }
-
-        (f)(args.as_ptr(), args.len())
     }
+
+    let clo = unsafe { &*(clo_ptr as *const BoxedClosure) };
+
+    // ---- SPECIAL: method-closure sentinel ----
+    // We encode method closures with `code_ptr == 0` and env[0] = SMI(fid).
+    if clo.code_ptr == 0 {
+        if clo.env.len() < 1 {
+            panic!("method-closure: missing fid in env");
+        }
+        let fid_smi = clo.env[0];
+        let fid_raw = fid_smi >> 1; // SMI decode
+
+        extern "C" { fn wir_resolve_funptr(fid: i64) -> *const u8; }
+        let fptr = unsafe { wir_resolve_funptr(fid_raw) };
+        if fptr.is_null() {
+            panic!("method-closure: unresolved fid={}", fid_raw);
+        }
+        let f: JitFnPtr = unsafe { std::mem::transmute(fptr) };
+
+        // For methods we DO NOT prepend env — argv[0] is already `this`.
+        return unsafe { f(argv, argc as usize) };
+    }
+
+    // ---- Normal closure path: prepend env then call code_ptr ----
+    let f: JitFnPtr = unsafe { std::mem::transmute(clo.code_ptr as *const u8) };
+
+    let env_len = clo.env.len();
+    let total   = env_len + (argc as usize);
+    let mut args: Vec<i64> = Vec::with_capacity(total);
+
+    // 1) prepend captured env
+    args.extend_from_slice(&clo.env);
+
+    // 2) append caller args
+    for i in 0..(argc as usize) {
+        unsafe { args.push(*argv.add(i)); }
+    }
+
+    unsafe { (f)(args.as_ptr(), args.len()) }
 }
 
 #[unsafe(no_mangle)]
