@@ -1673,7 +1673,7 @@ impl<'m> Lowerer<'m> {
     }
 
     pub fn lower_program(&mut self, prog: &Program) -> LResult<Vec<FuncId>> {
-        // --- collect classes & predeclare their functions ---
+        // -------- Stage 1: collect classes & their metadata --------
         self.classes.clear();
 
         for c in &prog.classes {
@@ -1703,7 +1703,7 @@ impl<'m> Lowerer<'m> {
                     }
                     ClassMember::Accessor { is_static, name, getter, setter_param, setter_body } => {
                         if *is_static {
-                            // static accessors ignored in MVP
+                            // (static accessors ignored in MVP)
                             continue;
                         }
                         let entry = prop_map.entry(name.clone()).or_insert((None, None));
@@ -1724,71 +1724,80 @@ impl<'m> Lowerer<'m> {
                     ClassMember::Constructor { params, body, .. } => {
                         ci.has_ctor = true;
                         // stash ctor body like a pseudo-method
-                        ci.methods.insert(0, (String::from("__<ctor-body>"), params.clone(), body.clone(), false));
+                        ci.methods.insert(0, (String::from("constructor"), params.clone(), body.clone(), false));
                     }
                     ClassMember::Destructor { body } => {
                         ci.has_dtor = true;
-                        ci.methods.push((String::from("__<dtor-body>"), Vec::new(), body.clone(), false));
+                        ci.methods.push((String::from("destructor"), Vec::new(), body.clone(), false));
                     }
                 }
             }
 
             ci.props = prop_map.into_iter().map(|(n, (g, s))| (n, g, s)).collect();
-
-            // record
             self.classes.insert(c.name.clone(), ci);
         }
 
-        // Now build a stable function table
-        self.funcs.clear();
-        // 1) normal functions in order
-        for (i, f) in prog.functions.iter().enumerate() {
-            self.funcs.insert(f.name.clone(), FuncId(i as u32));
-        }
-        // 2) deterministic class-generated names
-        let mut extra_names: Vec<String> = Vec::new();
-        for c in &prog.classes {
-            let cname = &c.name;
-            extra_names.push(format!("__class_new_{}", cname));
-
-            let ci = self.classes.get(cname).unwrap();
-            if ci.has_ctor { extra_names.push(format!("__ctor_{}", cname)); }
-            if ci.has_dtor { extra_names.push(format!("__dtor_{}", cname)); }
-
-            for (pname, get, set) in &ci.props {
-                if get.is_some() { extra_names.push(format!("__get_{}_{}", cname, pname)); }
-                if set.is_some() { extra_names.push(format!("__set_{}_{}", cname, pname)); }
-            }
-            for (mname, _, _, _) in &ci.methods {
-                if mname != "__<ctor-body>" && mname != "__<dtor-body>" {
-                    extra_names.push(format!("__method_{}_{}", cname, mname));
-                }
-            }
-            for (mname, _, _, _) in &ci.static_methods {
-                extra_names.push(format!("__static_{}_{}", cname, mname));
-            }
-        }
-        let base = prog.functions.len() as u32;
-        for (k, nm) in extra_names.iter().enumerate() {
-            self.funcs.insert(nm.clone(), FuncId(base + k as u32));
-        }
-
-        // Stage 3 hoist: produce lam functions with __env + capture table, and FnRef at sites
+        // -------- Stage 2: hoist lambdas (produces __lam_* functions) --------
         let (prog, lam_caps) = hoist_fn_lits_program(prog);
         self.lam_captures = lam_caps;
 
-        // Predeclare all functions, including hoisted lambdas (so direct calls resolve)
+        // -------- Stage 3: build function table ONCE, post-hoist --------
         self.funcs.clear();
+
+        // 3.1 Free/hoisted functions first (includes __lam_*)
         for (i, f) in prog.functions.iter().enumerate() {
             self.funcs.insert(f.name.clone(), FuncId(i as u32));
         }
 
-        // Lower each function
+        // 3.2 Class-generated functions in the SAME order lower_one_class emits them:
+        //     Accessors → instance methods (skip ctor/dtor) → static methods → ctor → dtor → allocator
+        let mut extra_names: Vec<String> = Vec::new();
+        for c in &prog.classes {
+            let cname = &c.name;
+            let ci = self.classes.get(cname).expect("class collected");
+
+            // Accessors
+            for (pname, get, set) in &ci.props {
+                if get.is_some() { extra_names.push(format!("__get_{}_{}",  cname, pname)); }
+                if set.is_some() { extra_names.push(format!("__set_{}_{}",  cname, pname)); }
+            }
+
+            // Instance methods (skip ctor/dtor)
+            for (mname, _, _, _) in &ci.methods {
+                if mname != "constructor" && mname != "destructor" {
+                    extra_names.push(format!("__method_{}_{}", cname, mname));
+                }
+            }
+
+            // Statics
+            for (mname, _, _, _) in &ci.static_methods {
+                extra_names.push(format!("__static_{}_{}", cname, mname));
+            }
+
+            // Ctor / Dtor
+            if ci.has_ctor { extra_names.push(format!("__ctor_{}", cname)); }
+            if ci.has_dtor { extra_names.push(format!("__dtor_{}", cname)); }
+
+            // Allocator
+            extra_names.push(format!("__class_new_{}", cname));
+        }
+
+        let base = prog.functions.len() as u32;
+        for (k, nm) in extra_names.into_iter().enumerate() {
+            self.funcs.insert(nm, FuncId(base + k as u32));
+        }
+
+        // -------- Stage 4: lower everything in the same order --------
+        // Free/hoisted functions first (so outer funcs can reference __lam_* by FuncId)
         let mut out = Vec::new();
         for f in &prog.functions {
             let id = self.lower_fn(f)?;
             out.push(id);
         }
+
+        // Then all class-generated functions in exactly the order matched above
+        self.lower_all_classes(&prog)?;
+
         Ok(out)
     }
 
@@ -3463,11 +3472,10 @@ fn lower_expr_free<'m>(
 
         // Calls / builtins
         Expr::Call { callee, args } => {
-            // --- 0) Property-call fast paths ---
+            // --- Property-call fast paths ---
             if let Expr::GetProp { recv, name } = &**callee {
                 // 0a) Promise-style instance methods
                 if name == "then" {
-                    // p.then(onFulfilled?, onRejected?)
                     let p   = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
                     let z   = b.const_i32(0); // sentinel "no callback"
                     let onf = if args.len() >= 1 {
@@ -3487,7 +3495,6 @@ fn lower_expr_free<'m>(
                     return Ok(res[0]);
                 }
                 if name == "catch" {
-                    // p.catch(onRejected?)
                     let p   = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
                     let z   = b.const_i32(0);
                     let onr = if args.len() >= 1 {
@@ -3530,7 +3537,7 @@ fn lower_expr_free<'m>(
                     return Ok(res[0]);
                 }
 
-                // 0b) http.* helpers
+                // 0b) http.* helpers — IMPORTANT: this branch does NOT lower `recv`
                 if let Expr::Ident(obj) = &**recv {
                     if obj == "http" {
                         match name.as_str() {
@@ -3589,14 +3596,7 @@ fn lower_expr_free<'m>(
                     }
                 }
 
-                // 0c) Array instance methods (map/filter/etc.)
-                if let Some(v) = lower_array_method_call(
-                    b, locals, fields, next_field, recv, name, args, funcs, lam_caps
-                )? {
-                    return Ok(v);
-                }
-
-                // 0d) Class static methods: ClassName.m(...)
+                // 0c) STATIC CLASS METHODS — check BEFORE anything that would lower `recv`
                 if let Expr::Ident(cn) = &**recv {
                     if let Some(&fid) = funcs.get(&format!("__static_{}_{}", cn, name)) {
                         let mut argv = Vec::with_capacity(args.len());
@@ -3611,7 +3611,14 @@ fn lower_expr_free<'m>(
                     }
                 }
 
-                // 0e) Generic property call: inject receiver as implicit first arg
+                // 0d) Array instance methods (map/filter/etc.) — AFTER static check (this lowers `recv`)
+                if let Some(v) = lower_array_method_call(
+                    b, locals, fields, next_field, recv, name, args, funcs, lam_caps
+                )? {
+                    return Ok(v);
+                }
+
+                // 0e) Generic property call: inject receiver as implicit first arg ("this")
                 let this_v = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
                 let fun_v  = lower_expr_free(b, locals, fields, next_field, callee, funcs, lam_caps)?;
                 let mut argv = Vec::with_capacity(args.len() + 1);
@@ -3626,7 +3633,7 @@ fn lower_expr_free<'m>(
                 return Ok(res[0]);
             }
 
-            // --- 1) Callee is a bare identifier: builtins & direct calls ---
+            // --- Bare identifier callee & other cases ---
             if let Expr::Ident(name) = &**callee {
                 // Timers
                 if name == "setTimeout" {
@@ -3670,7 +3677,7 @@ fn lower_expr_free<'m>(
 
                 // Builtins: Array/Promise/Deferred
                 if name == "Array" {
-                    if args.len() != 1 { return Err(LowerError::NotLowerable("list() expects 1 arg")); }
+                    if args.len() != 1 { return Err(LowerError::NotLowerable("Array(len) expects 1 arg")); }
                     let len = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
                     let (_nid, res) = b.push_node(
                         Inst::CallNative { name: "wir_array_new".into(), args: vec![len], pure: false, can_throw: false },
@@ -3679,7 +3686,7 @@ fn lower_expr_free<'m>(
                     return Ok(res[0]);
                 }
                 if name == "Promise" {
-                    if args.len() != 1 { return Err(LowerError::NotLowerable("Promise() expects 1 arg")); }
+                    if args.len() != 1 { return Err(LowerError::NotLowerable("Promise(executor) expects 1 arg")); }
                     let exec = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
                     let (_nid, res) = b.push_node(
                         Inst::CallNative { name: "wir_promise_new".into(), args: vec![exec], pure: false, can_throw: false },
@@ -3761,48 +3768,35 @@ fn lower_expr_free<'m>(
                 }
 
                 // print(value)
-                                if name == "print" {
-                    if args.len() != 1 { return Err(LowerError::NotLowerable("print() expects 1 arg")); }
+                if name == "print" {
+                    if args.len() != 1 { return Err(LowerError::NotLowerable("print(value) expects 1 arg")); }
 
-                    // 1) If it’s a string literal, use the string printer directly.
+                    // Fast string-literal path
                     if matches!(args[0], Expr::Str(_)) {
                         let v = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
                         let (_nid, res) = b.push_node(
-                            Inst::CallNative {
-                                name: "wir_print_str".into(),
-                                args: vec![v],
-                                pure: false,
-                                can_throw: false,
-                            },
-                            Some(Type::Int32),
-                            1,
-                            true,
+                            Inst::CallNative { name: "wir_print_str".into(), args: vec![v], pure: false, can_throw: false },
+                            Some(Type::Int32), 1, true
                         );
                         return Ok(res[0]);
                     }
 
-                    // 2) If it’s “bool-ish”, coerce Bool → i32 {false:0, true:1} then print as i64.
+                    // Bool-ish detection: normalize to 0/1 for integer printer
                     let is_boolish = matches!(
                         args[0],
-                        // comparisons / equality
                         Expr::Binary { op: BinOp::Eq  , .. }
                         | Expr::Binary { op: BinOp::Ne , .. }
                         | Expr::Binary { op: BinOp::Lt , .. }
                         | Expr::Binary { op: BinOp::Le , .. }
                         | Expr::Binary { op: BinOp::Gt , .. }
                         | Expr::Binary { op: BinOp::Ge , .. }
-                        // logical operators (already return Bool)
                         | Expr::Binary { op: BinOp::And, .. }
                         | Expr::Binary { op: BinOp::Or , .. }
-                        // unary not
                         | Expr::Unary  { op: UnOp::Not, .. }
-                        // the `in` operator
                         | Expr::In { .. }
                     );
 
                     let v0 = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
-
-                    // If bool-ish, branch to synthesize 0/1; else, pass the value directly.
                     let v_to_print = if is_boolish {
                         let then_b = b.block();
                         let else_b = b.block();
@@ -3826,15 +3820,8 @@ fn lower_expr_free<'m>(
                     };
 
                     let (_nid, res) = b.push_node(
-                        Inst::CallNative {
-                            name: "wir_print_i64".into(),
-                            args: vec![v_to_print],
-                            pure: false,
-                            can_throw: false,
-                        },
-                        Some(Type::Int32),
-                        1,
-                        true,
+                        Inst::CallNative { name: "wir_print_i64".into(), args: vec![v_to_print], pure: false, can_throw: false },
+                        Some(Type::Int32), 1, true
                     );
                     return Ok(res[0]);
                 }
@@ -4370,29 +4357,20 @@ impl<'m> Lowerer<'m> {
         for (pname, get, set) in &ci.props {
             if let Some(gb) = get {
                 let fname = format!("__get_{}_{}", cname, pname);
-                self.lower_instance_fun(
-                    cname,
-                    &fname,
-                    &vec!["this".to_string()],
-                    gb,
-                    false
-                )?;
+                self.lower_instance_fun(cname, &fname, &[], gb, false)?;
             }
             if let Some((p, sb)) = set {
                 let fname = format!("__set_{}_{}", cname, pname);
-                let mut params: Vec<String> = vec!["this".to_string(), p.clone()];
+                let params: Vec<String> = vec![p.clone()];
                 self.lower_instance_fun(cname, &fname, &params, sb, false)?;
             }
         }
 
         // --- 2) Methods (skip ctor/dtor pseudo entries)
         for (mname, params, body, is_async) in &ci.methods {
-            if mname == "__<ctor-body>" || mname == "__<dtor-body>" { continue; }
+            if mname == "constructor" || mname == "destructor" { continue; }
             let fname = format!("__method_{}_{}", cname, mname);
-            let mut p = Vec::with_capacity(params.len() + 1);
-            p.push("this".to_string());
-            p.extend(params.iter().cloned());
-            self.lower_instance_fun(cname, &fname, &p, body, *is_async)?;
+            self.lower_instance_fun(cname, &fname, params, body, *is_async)?;
         }
 
         // --- 3) Static methods
@@ -4402,19 +4380,16 @@ impl<'m> Lowerer<'m> {
         }
 
         // --- 4) Ctor body (optional)
-        if let Some((_, ctor_params, ctor_body, _)) = ci.methods.iter().find(|(n,_,_,_)| n == "__<ctor-body>") {
+        if let Some((_, ctor_params, ctor_body, _)) = ci.methods.iter().find(|(n,_,_,_)| n == "constructor") {
             let fname = format!("__ctor_{}", cname);
-            let mut p = Vec::with_capacity(ctor_params.len() + 1);
-            p.push("this".to_string());
-            p.extend(ctor_params.iter().cloned());
-            self.lower_instance_fun(cname, &fname, &p, ctor_body, false)?;
+            self.lower_instance_fun(cname, &fname, ctor_params, ctor_body, false)?;
         }
 
         // --- 5) Dtor (optional)
         if ci.has_dtor {
-            if let Some((_, _, dtor_body, _)) = ci.methods.iter().find(|(n,_,_,_)| n == "__<dtor-body>") {
+            if let Some((_, _, dtor_body, _)) = ci.methods.iter().find(|(n,_,_,_)| n == "destructor") {
                 let fname = format!("__dtor_{}", cname);
-                self.lower_instance_fun(cname, &fname, &vec!["this".to_string()], dtor_body, false)?;
+                self.lower_instance_fun(cname, &fname, &[], dtor_body, false)?;
             }
         }
 
@@ -4431,14 +4406,16 @@ impl<'m> Lowerer<'m> {
 
         // Build function inside a short scope so the &mut borrow ends before we touch self.module again
         let mut f = {
-            let mut b = Builder::new(self.module, fname, vec![Type::Int32; params.len()], vec![Type::Int32]);
+            // +1 for the hidden `this`
+            let argc = params.len() + 1;
+            let mut b = Builder::new(self.module, fname, vec![Type::Int32; argc], vec![Type::Int32]);
 
-            // Bind params as locals (including "this")
+            // Bind hidden `this` first, then user-visible params
             let mut locals: HashMap<String, ValueId> = Default::default();
+            locals.insert("this".to_string(), b.param(0));
             for (i, name) in params.iter().enumerate() {
-                locals.insert(name.clone(), b.param(i));
+                locals.insert(name.clone(), b.param(i + 1));
             }
-            if !locals.contains_key("this") { locals.insert("this".into(), b.param(0)); }
 
             let mut fields: HashMap<String, FieldId> = Default::default();
             let mut next_field: u32 = 0;
@@ -4474,7 +4451,7 @@ impl<'m> Lowerer<'m> {
 
         let ctor_params: Vec<String> = ci.methods
             .iter()
-            .find(|(n, _, _, _)| n == "__<ctor-body>")
+            .find(|(n, _, _, _)| n == "constructor")
             .map(|(_, ps, _, _)| ps.clone())
             .unwrap_or_default();
 
