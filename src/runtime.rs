@@ -66,6 +66,10 @@ pub extern "C" fn wir_obj_get_field(obj: i64, field_id_smi: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_obj_set_field(obj: i64, field_id_smi: i64, val: i64) -> i64 {
+    #[cfg(debug_assertions)] {
+        eprintln!("[dbg] wir_obj_set_field called");
+    }
+
     if obj == 0 { return 0; }
     let id = decode_field_smi(field_id_smi);
     let o = unsafe { &mut *(obj as *mut WirObj) };
@@ -108,6 +112,10 @@ pub extern "C" fn wir_obj_get_str(obj: i64, key_ptr: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_obj_set_str(obj: i64, key_ptr: i64, val: i64) -> i64 {
+    #[cfg(debug_assertions)] {
+        eprintln!("[dbg] wir_obj_set_str called");
+    }
+
     if obj == 0 { return 0; }
     let Some(k) = (unsafe { boxedstr_to_string(key_ptr) }) else { return 0; };
     let o = unsafe { &mut *(obj as *mut WirObj) };
