@@ -2,7 +2,7 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
-use crate::value::{TAG_STRING, BoxedStr, ObjHeader};
+use crate::value::{TAG_STRING, BoxedStr, ObjHeader, is_imm, NULL};
 use crate::gc::NAPALM_GC;
 
 use ahash::AHashMap as HashMap;
@@ -102,48 +102,96 @@ pub extern "C" fn wir_obj_del_field(obj: i64, field_id_smi: i64) -> i64 {
 
 // -------- string-key path (key is a BoxedStr pointer) --------
 
-#[unsafe(no_mangle)]
-pub extern "C" fn wir_obj_get_str(obj: i64, key_ptr: i64) -> i64 {
-    if obj == 0 { return 0; }
-    let Some(k) = (unsafe { boxedstr_to_string(key_ptr) }) else { return 0; };
-    let o = unsafe { &*(obj as *const WirObj) };
-    o.by_str.get(&k).copied().unwrap_or(0)
+type StrKey = Vec<u8>; // own the bytes; alignment no longer matters
+
+static STR_PROPS: OnceLock<Mutex<HashMap<usize, HashMap<StrKey, i64>>>> = OnceLock::new();
+fn str_props() -> &'static Mutex<HashMap<usize, HashMap<StrKey, i64>>> {
+    STR_PROPS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn wir_obj_set_str(obj: i64, key_ptr: i64, val: i64) -> i64 {
-    #[cfg(debug_assertions)] {
-        eprintln!("[dbg] wir_obj_set_str called");
+pub extern "C" fn wir_obj_get_str(obj: i64, key: i64) -> i64 {
+    if obj == NULL || is_imm(obj) || key == NULL || is_imm(key) {
+        return 0;
     }
+    unsafe {
+        let hdr = &*(key as *const ObjHeader);
+        if hdr.tag != TAG_STRING { return 0; }
+        let bs = &*(key as *const BoxedStr);
+        let bytes = std::slice::from_raw_parts(bs.data, bs.len);
 
-    if obj == 0 { return 0; }
-    let Some(k) = (unsafe { boxedstr_to_string(key_ptr) }) else { return 0; };
-    let o = unsafe { &mut *(obj as *mut WirObj) };
-
-    let cell = o.by_str.entry(k).or_insert(0);
-    let slot: *mut i64 = cell as *mut i64;
-    *cell = val;
-
-    #[cfg(feature = "gc")]
-    unsafe { NAPALM_GC.post_write_barrier(obj as *mut u8, slot, val) };
-
+        let top = str_props().lock();
+        if let Some(map) = top.get(&(obj as usize)) {
+            if let Some(&v) = map.get(bytes) {
+                return v;
+            }
+        }
+    }
     0
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn wir_obj_has_str(obj: i64, key_ptr: i64) -> i64 {
-    if obj == 0 { return 0; }
-    let Some(k) = (unsafe { boxedstr_to_string(key_ptr) }) else { return 0; };
-    let o = unsafe { &*(obj as *const WirObj) };
-    if o.by_str.contains_key(&k) { 1 } else { 0 }
+pub extern "C" fn wir_obj_set_str(obj: i64, key: i64, val: i64) -> i64 {
+    // Defensive checks
+    if obj == NULL || is_imm(obj) || key == NULL || is_imm(key) {
+        // Not a heap object or not a boxed string → treat as no-op
+        return 0;
+    }
+    unsafe {
+        // Decode boxed string
+        let hdr = &*(key as *const ObjHeader);
+        if hdr.tag != TAG_STRING {
+            return 0; // not a string key
+        }
+        let bs = &*(key as *const BoxedStr);
+        let bytes = std::slice::from_raw_parts(bs.data, bs.len);
+
+        let mut top = str_props().lock();
+        let map = top.entry(obj as usize).or_insert_with(HashMap::new);
+        map.insert(bytes.to_vec(), val);
+    }
+    0
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn wir_obj_del_str(obj: i64, key_ptr: i64) -> i64 {
-    if obj == 0 { return 0; }
-    let Some(k) = (unsafe { boxedstr_to_string(key_ptr) }) else { return 0; };
-    let o = unsafe { &mut *(obj as *mut WirObj) };
-    if o.by_str.remove(&k).is_some() { 1 } else { 0 }
+pub extern "C" fn wir_obj_has_str(obj: i64, key: i64) -> i64 {
+    if obj == NULL || is_imm(obj) || key == NULL || is_imm(key) {
+        return 0;
+    }
+    unsafe {
+        let hdr = &*(key as *const ObjHeader);
+        if hdr.tag != TAG_STRING { return 0; }
+        let bs = &*(key as *const BoxedStr);
+        let bytes = std::slice::from_raw_parts(bs.data, bs.len);
+
+        let top = str_props().lock();
+        let has = top
+            .get(&(obj as usize))
+            .map(|m| m.contains_key(bytes))
+            .unwrap_or(false);
+        if has { 1 } else { 0 } // raw 0/1 (not SMI) is what your WIR Bool expects
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_obj_del_str(obj: i64, key: i64) -> i64 {
+    if obj == NULL || is_imm(obj) || key == NULL || is_imm(key) {
+        return 0;
+    }
+    unsafe {
+        let hdr = &*(key as *const ObjHeader);
+        if hdr.tag != TAG_STRING { return 0; }
+        let bs = &*(key as *const BoxedStr);
+        let bytes = std::slice::from_raw_parts(bs.data, bs.len);
+
+        let mut top = str_props().lock();
+        if let Some(map) = top.get_mut(&(obj as usize)) {
+            if map.remove(bytes).is_some() {
+                return 1;
+            }
+        }
+    }
+    0
 }
 
 // Global: func_id -> (key -> value)

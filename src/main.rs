@@ -14,8 +14,8 @@ mod native_timers;
 mod native_promises;
 mod http;
 
-use crate::opt::Optimize;
-use crate::opt::optimization::optimization_passes;
+//use crate::opt::Optimize;
+//use crate::opt::optimization::optimization_passes;
 use mimalloc::MiMalloc;
 use ahash::AHashMap as HashMap;
 use std::time::Instant;
@@ -70,8 +70,8 @@ fn main() {
     }
 
     // 3.5) Optimize WIR
-    let optimize = optimization_passes();
-    optimize.optimize_module(&mut module); // TODO Too Slow?
+    //let optimize = optimization_passes();
+    //optimize.optimize_module(&mut module); // TODO Too Slow?
 
     // 4.1) Init GC and bind to this thread
     #[cfg(feature = "gc")] {

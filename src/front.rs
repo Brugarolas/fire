@@ -4271,83 +4271,107 @@ impl<'m> Lowerer<'m> {
         Ok(())
     }
 
-    fn lower_one_class(&mut self, c: &ClassDecl) -> LResult<()> {
+    fn lower_one_class(&mut self, c: & ClassDecl) -> LResult<()> {
         let cname = &c.name;
 
-        // OWN the class info so we don't hold an immutable borrow of `self`
+        // Own the collected class info (props/method lists, flags)
         let ci = self.classes.get(cname).expect("class collected").clone();
 
-        // --- 1) Accessors
+        // ---- IMPORTANT: one shared field-id table per class ----
+        let mut cls_fields: HashMap<String, FieldId> = HashMap::new();
+        let mut cls_next_field: u32 = 0;
+
+        // 1) Accessors
         for (pname, get, set) in &ci.props {
             if let Some(gb) = get {
                 let fname = format!("__get_{}_{}", cname, pname);
-                self.lower_instance_fun(cname, &fname, &[], gb, false)?;
+                self.lower_instance_fun(cname, &fname, &[], gb, false, &mut cls_fields, &mut cls_next_field)?;
             }
             if let Some((p, sb)) = set {
                 let fname = format!("__set_{}_{}", cname, pname);
                 let params: Vec<String> = vec![p.clone()];
-                self.lower_instance_fun(cname, &fname, &params, sb, false)?;
+                self.lower_instance_fun(cname, &fname, &params, sb, false, &mut cls_fields, &mut cls_next_field)?;
             }
         }
 
-        // --- 2) Methods (skip ctor/dtor pseudo entries)
+        // 2) Instance methods (skip ctor/dtor pseudo entries)
         for (mname, params, body, is_async) in &ci.methods {
             if mname == "constructor" || mname == "destructor" { continue; }
             let fname = format!("__method_{}_{}", cname, mname);
-            self.lower_instance_fun(cname, &fname, params, body, *is_async)?;
+            self.lower_instance_fun(cname, &fname, params, body, *is_async, &mut cls_fields, &mut cls_next_field)?;
         }
 
-        // --- 3) Static methods
+        // 3) Static methods (unchanged)
         for (mname, params, body, is_async) in &ci.static_methods {
             let fname = format!("__static_{}_{}", cname, mname);
             self.lower_free_like_fun(&fname, params, body, *is_async)?;
         }
 
-        // --- 4) Ctor body (optional)
-        if let Some((_, ctor_params, ctor_body, _)) = ci.methods.iter().find(|(n,_,_,_)| n == "constructor") {
+        // 4) Ctor (optional) — must share the same field-id map
+        if let Some((_, ctor_params, ctor_body, _)) =
+            ci.methods.iter().find(|(n,_,_,_)| n == "constructor")
+        {
             let fname = format!("__ctor_{}", cname);
-            self.lower_instance_fun(cname, &fname, ctor_params, ctor_body, false)?;
+            self.lower_instance_fun(cname, &fname, ctor_params, ctor_body, false, &mut cls_fields, &mut cls_next_field)?;
         }
 
-        // --- 5) Dtor (optional)
+        // 5) Dtor (optional)
         if ci.has_dtor {
-            if let Some((_, _, dtor_body, _)) = ci.methods.iter().find(|(n,_,_,_)| n == "destructor") {
+            if let Some((_, _, dtor_body, _)) =
+                ci.methods.iter().find(|(n,_,_,_)| n == "destructor")
+            {
                 let fname = format!("__dtor_{}", cname);
-                self.lower_instance_fun(cname, &fname, &[], dtor_body, false)?;
+                self.lower_instance_fun(cname, &fname, &[], dtor_body, false, &mut cls_fields, &mut cls_next_field)?;
             }
         }
 
-        // --- 6) Allocator
-        self.lower_allocator(&ci)?;
+        // 6) Allocator — also installs method closures onto the instance
+        self.lower_allocator(&ci, &mut cls_fields, &mut cls_next_field)?;
         Ok(())
     }
 
-    fn lower_instance_fun(&mut self, class_name: &str, fname: &str, params: &[String], body: &Block, is_async: bool) -> LResult<()> {
+    fn lower_instance_fun(
+        &mut self,
+        class_name: &str,
+        fname: &str,
+        params: &[String],
+        body: &Block,
+        is_async: bool,
+        // NEW: class-shared field-id table
+        fields: &mut HashMap<String, FieldId>,
+        next_field: &mut u32,
+    ) -> LResult<()> {
         use crate::wir::Type;
 
-        // Do read-only work BEFORE constructing Builder (which borrows self.module mutably)
+        // Optional rewrite stage you already have
         let body_rw = self.rewrite_privates_in_block(class_name, body);
 
-        // Build function inside a short scope so the &mut borrow ends before we touch self.module again
+        // Build the function
         let mut f = {
-            // +1 for the hidden `this`
+            // +1 for hidden `this`
             let argc = params.len() + 1;
             let mut b = Builder::new(self.module, fname, vec![Type::Int32; argc], vec![Type::Int32]);
 
-            // Bind hidden `this` first, then user-visible params
+            // Bind hidden `this`, then user params
             let mut locals: HashMap<String, ValueId> = Default::default();
             locals.insert("this".to_string(), b.param(0));
             for (i, name) in params.iter().enumerate() {
                 locals.insert(name.clone(), b.param(i + 1));
             }
 
-            let mut fields: HashMap<String, FieldId> = Default::default();
-            let mut next_field: u32 = 0;
-
             if is_async {
                 return Err(LowerError::NotLowerable("async methods in classes not yet supported"));
             } else {
-                lower_block_free(&mut b, &mut locals, &mut fields, &mut next_field, &body_rw, &self.funcs, &self.lam_captures)?;
+                // IMPORTANT: pass the class-shared fields/next_field
+                lower_block_free(
+                    &mut b,
+                    &mut locals,
+                    fields,
+                    next_field,
+                    &body_rw,
+                    &self.funcs,
+                    &self.lam_captures,
+                )?;
                 if !b.current_block_terminated() {
                     let zero = b.const_i32(0);
                     b.ret(&[zero]);
@@ -4357,7 +4381,6 @@ impl<'m> Lowerer<'m> {
             b.finish()
         };
 
-        // Now the builder is dropped; we may read & push on self.module
         let fid = FuncId(self.module.funcs.len() as u32);
         f.id = fid;
         self.module.funcs.push(f);
@@ -4368,11 +4391,19 @@ impl<'m> Lowerer<'m> {
         body.clone()
     }
 
-    fn lower_allocator(&mut self, ci: &ClassInfo) -> LResult<()> {
+    fn lower_allocator(
+        &mut self,
+        ci: &ClassInfo,
+        // Keep signature parallel to instance lowering (fields are not used here,
+        // but we accept them so the call site can be uniform).
+        _fields: &mut HashMap<String, FieldId>,
+        _next_field: &mut u32,
+    ) -> LResult<()> {
         use crate::wir::{Inst, Type};
 
         let fname = format!("__class_new_{}", ci.name);
 
+        // Discover ctor param list (for arity)
         let ctor_params: Vec<String> = ci.methods
             .iter()
             .find(|(n, _, _, _)| n == "constructor")
@@ -4394,41 +4425,7 @@ impl<'m> Lowerer<'m> {
             );
             let obj = obj_r[0];
 
-            // --- NEW: expose instance methods as properties on the instance
-            // p.sum -> smi(FuncId(__method_Class_sum))
-            for (mname, _params, _body, _is_async) in &ci.methods {
-                if mname == "constructor" || mname == "destructor" { continue; }
-
-                let meth_sym = format!("__method_{}_{}", ci.name, mname);
-                if let Some(&fid) = self.funcs.get(&meth_sym) {
-                    // key = "sum"
-                    let (_nid_k, key_res) = b.push_node(
-                        Inst::Const(Constant::Str(mname.clone())),
-                        Some(Type::Str),
-                        1,
-                        false
-                    );
-                    let key = key_res[0];
-
-                    // value = smi(fid)
-                    let fid_smi = b.const_i32(fid.0 as i32);
-
-                    // obj["sum"] = smi(fid)
-                    let _ = b.push_node(
-                        Inst::CallNative {
-                            name: "wir_obj_set_str".into(),
-                            args: vec![obj, key, fid_smi],
-                            pure: false,
-                            can_throw: false,
-                        },
-                        Some(Type::Int32),
-                        1,
-                        true
-                    );
-                }
-            }
-
-            // call ctor if present (kept as-is)
+            // call ctor if present — uses shared field IDs via how ctor was lowered
             if ci.has_ctor {
                 if let Some(&fid) = self.funcs.get(&format!("__ctor_{}", ci.name)) {
                     let mut argv = Vec::with_capacity(1 + ctor_params.len());
@@ -4437,6 +4434,41 @@ impl<'m> Lowerer<'m> {
                     let (_nid, _res) = b.push_node(
                         Inst::CallDirect { conv: crate::wir::CallConv::Fast, callee: fid, args: argv },
                         Some(Type::Int32), 1, true
+                    );
+                }
+            }
+
+            // ---- Install instance methods as closures on the object ----
+            // So that `p.sum` resolves to a callable closure.
+            let (_nid_null, nul) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
+            for (mname, _params, _body, _is_async) in &ci.methods {
+                if mname == "constructor" || mname == "destructor" { continue; }
+                let mfun = format!("__method_{}_{}", ci.name, mname);
+                if let Some(&mfid) = self.funcs.get(&mfun) {
+                    // closure = MakeClosure(mfid, env = null)
+                    let (_nid_clo, clos) = b.push_node(
+                        Inst::MakeClosure { callee: mfid, env: nul[0] },
+                        Some(Type::Closure(None)),
+                        1,
+                        false,
+                    );
+                    // obj["<name>"] = closure
+                    let (_nid_k, ks) = b.push_node(
+                        Inst::Const(Constant::Str(mname.clone())),
+                        Some(Type::Str),
+                        1,
+                        false,
+                    );
+                    let _ = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_obj_set_str".into(),
+                            args: vec![obj, ks[0], clos[0]],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::Int32),
+                        1,
+                        true,
                     );
                 }
             }

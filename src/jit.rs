@@ -1537,28 +1537,35 @@ impl JIT {
     }
 
     fn alloc_boxed_str(&mut self, s: &str) -> i64 {
+        use std::alloc::{alloc, handle_alloc_error, Layout};
+        use std::ptr::copy_nonoverlapping;
         use crate::value::{BoxedStr, ObjHeader, TAG_STRING};
 
-        // Keep UTF-8 bytes alive using CString (or you can keep raw Vec<u8>).
-        let c = std::ffi::CString::new(s).unwrap();
-        let data = c.as_ptr() as *const u8;
-        let len  = s.as_bytes().len();
+        let len = s.as_bytes().len();
+        // At least 1 byte, but force 8-byte alignment for ARM64 safety.
+        let layout = Layout::from_size_align(len.max(1), 8).unwrap();
 
-        // Store the CString so its memory isn't freed.
-        self.keep_alive.push(c);
+        unsafe {
+            // Allocate an 8-byte aligned raw buffer and copy the bytes.
+            let buf = alloc(layout);
+            if buf.is_null() { handle_alloc_error(layout); }
+            if len > 0 {
+                copy_nonoverlapping(s.as_ptr(), buf, len);
+            }
+            // Keep the raw buffer alive (we leak like other boxed heap objs — until GC arrives).
+            self.heap_keep_alive.push(buf);
 
-        // Box the string object itself
-        let obj = Box::new(BoxedStr {
-            hdr: ObjHeader { tag: TAG_STRING, aux: 0 },
-            len,
-            data,
-        });
-        let ptr = Box::into_raw(obj) as *mut u8;
+            // Now box the metadata object that points to the aligned buffer.
+            let obj = Box::new(BoxedStr {
+                hdr: ObjHeader { tag: TAG_STRING, aux: 0 },
+                len,
+                data: buf as *const u8,   // 8-byte aligned
+            });
+            let ptr = Box::into_raw(obj) as *mut u8;
+            self.heap_keep_alive.push(ptr);
 
-        // Keep the object alive (until GC arrives)
-        self.heap_keep_alive.push(ptr);
-
-        ptr as i64  // even pointer => “heap object”
+            ptr as i64  // even pointer => heap object
+        }
     }
 }
 /// Value binder: maps WIR ValueIds to CLIF Values, and lazily loads argv[idx] only for params.
@@ -1738,10 +1745,10 @@ pub extern "C" fn wir_method_trampoline(argv: *const i64, argc: usize) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_make_method_closure(fid_smi: i64) -> i64 {
-    // Capture fid in env[0], point code_ptr to the trampoline.
-    let code_ptr = wir_method_trampoline as *const extern "C" fn(*const i64, usize) -> i64 as *const u8;
-    // env != 0 -> env_len = 1 inside wir_make_closure (see replacement below)
-    wir_make_closure(code_ptr, fid_smi)
+    // Sentinel: code_ptr == 0 means “method closure”; env[0] = SMI(fid).
+    let clo_val = closure_new(0usize, 1);
+    unsafe { closure_set_env_slot(clo_val, 0, fid_smi); }
+    clo_val
 }
 
 #[unsafe(no_mangle)]

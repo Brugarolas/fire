@@ -47,30 +47,45 @@ pub struct InstCursor<'f> {
 impl<'f> InstCursor<'f> {
     #[inline]
     pub fn new(func: &'f mut Function, block: BlockId, pos: usize) -> Self {
-        let block_ix = unsafe {
-            (*(&*func as *const Function as *mut Function))
-                .blocks
-                .iter()
-                .position(|bb| bb.id == block)
+        // We have &mut Function here, so we can safely search blocks directly.
+        let block_ix = func
+            .blocks
+            .iter()
+            .position(|bb| bb.id == block)
+            .expect("invalid BlockId");
+        // Store the raw pointer for later cursor use.
+        Self {
+            func: func as *mut Function,
+            block_ix,
+            pos,
+            _marker: std::marker::PhantomData,
         }
-        .expect("invalid BlockId");
-        Self { func, block_ix, pos, _marker: std::marker::PhantomData }
     }
 
     #[inline]
     pub fn new_ix(func: &'f mut Function, block_ix: usize, pos: usize) -> Self {
-        Self { func: (func as *mut Function), block_ix, pos, _marker: std::marker::PhantomData }
+        Self { func: func as *mut Function, block_ix, pos, _marker: std::marker::PhantomData }
     }
 
-    #[inline] pub fn block_id(&self) -> BlockId { unsafe { (*self.func).blocks[self.block_ix].id } }
+    // ----- explicit materialization helpers (avoid implicit autoref) -----
+    #[inline(always)]
+    unsafe fn func_ref(&self) -> &Function { &*self.func }
+    #[inline(always)]
+    unsafe fn func_mut(&mut self) -> &mut Function { &mut *self.func }
+
+    #[inline] pub fn block_id(&self) -> BlockId {
+        unsafe { self.func_ref().blocks[self.block_ix].id }
+    }
     #[inline] pub fn block_index(&self) -> usize { self.block_ix }
     #[inline] pub fn pos(&self) -> usize { self.pos }
-    #[inline] pub fn len(&self) -> usize { unsafe { (*self.func).blocks[self.block_ix].insts.len() } }
+    #[inline] pub fn len(&self) -> usize {
+        unsafe { self.func_ref().blocks[self.block_ix].insts.len() }
+    }
 
     #[inline]
     pub fn cur_id(&self) -> InstId {
         unsafe {
-            let insts = &(*self.func).blocks[self.block_ix].insts;
+            let insts = &self.func_ref().blocks[self.block_ix].insts;
             *insts
                 .get(self.pos)
                 .expect("InstCursor::cur_id OOB (stale pos); guard before constructing cursor")
@@ -78,44 +93,45 @@ impl<'f> InstCursor<'f> {
     }
 
     /// Cheap tag for dispatch.
-    #[inline] pub fn cur_tag(&self) -> Discriminant<Inst> {
+    #[inline] pub fn cur_tag(&self) -> std::mem::Discriminant<Inst> {
         let id = self.cur_id();
-        unsafe { discriminant(&(*self.func).nodes[id.0 as usize].kind) }
+        unsafe { std::mem::discriminant(&self.func_ref().nodes[id.0 as usize].kind) }
     }
 
     /// Back-compat: clone of current kind (avoid in hot paths if possible).
     #[inline] pub fn cur_kind(&self) -> Inst {
         let id = self.cur_id();
-        unsafe { (*self.func).nodes[id.0 as usize].kind.clone() }
+        unsafe { self.func_ref().nodes[id.0 as usize].kind.clone() }
     }
 
     #[inline] pub fn peek_cur<R>(&self, f: impl FnOnce(&Inst) -> R) -> R {
         let id = self.cur_id();
-        unsafe { f(&(*self.func).nodes[id.0 as usize].kind) }
+        unsafe { f(&self.func_ref().nodes[id.0 as usize].kind) }
     }
 
     #[inline] pub fn with_cur<R>(&mut self, f: impl FnOnce(&mut crate::wir::Node) -> R) -> R {
         let id = self.cur_id();
-        unsafe { f(&mut (*self.func).nodes[id.0 as usize]) }
+        unsafe { f(&mut self.func_mut().nodes[id.0 as usize]) }
     }
 
     #[inline] pub fn with_prev<R>(&mut self, f: impl FnOnce(&mut crate::wir::Node) -> R) -> Option<R> {
         if self.pos == 0 { return None; }
-        let prev_id = unsafe { (*self.func).blocks[self.block_ix].insts[self.pos - 1] };
-        Some(unsafe { f(&mut (*self.func).nodes[prev_id.0 as usize]) })
+        let prev_id = unsafe { self.func_ref().blocks[self.block_ix].insts[self.pos - 1] };
+        Some(unsafe { f(&mut self.func_mut().nodes[prev_id.0 as usize]) })
     }
 
     #[inline] pub fn with_next<R>(&mut self, f: impl FnOnce(&mut crate::wir::Node) -> R) -> Option<R> {
         let len = self.len();
         if self.pos + 1 >= len { return None; }
-        let next_id = unsafe { (*self.func).blocks[self.block_ix].insts[self.pos + 1] };
-        Some(unsafe { f(&mut (*self.func).nodes[next_id.0 as usize]) })
+        let next_id = unsafe { self.func_ref().blocks[self.block_ix].insts[self.pos + 1] };
+        Some(unsafe { f(&mut self.func_mut().nodes[next_id.0 as usize]) })
     }
 
     #[inline] pub fn with_func<R>(&mut self, f: impl FnOnce(&mut Function) -> R) -> R {
-        unsafe { f(&mut *self.func) }
+        unsafe { f(self.func_mut()) }
     }
 }
+
 
 /// =======================================
 /// Peephole window (prev2..next2)
@@ -130,16 +146,17 @@ pub struct Window {
 }
 
 impl<'f> InstCursor<'f> {
+    /// Peephole window (prev2..next2)
     #[inline]
     pub fn window5(&self) -> Window {
         let len = self.len();
         let p = self.pos;
-        let block = unsafe { &(*self.func).blocks[self.block_ix] };
+        let block = unsafe { &self.func_ref().blocks[self.block_ix] };
         let at = |i: usize| block.insts.get(i).copied();
         Window {
             prev2: if p >= 2 { at(p - 2) } else { None },
             prev1: if p >= 1 { at(p - 1) } else { None },
-            cur: at(p).unwrap(),
+            cur:   at(p).unwrap(),
             next1: if p + 1 < len { at(p + 1) } else { None },
             next2: if p + 2 < len { at(p + 2) } else { None },
         }
