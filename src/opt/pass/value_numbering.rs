@@ -3,16 +3,23 @@
 #![allow(unused_variables)]
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
-use crate::wir::{Function, ValueId, Constant};
-use crate::opt::{OptimizationWIR, WirEditQueue};
+use smallvec::SmallVec;
+use std::mem::{discriminant, Discriminant};
+
+use crate::opt::{InstCursor, OptimizationWIR, WirEditQueue};
 use crate::wir::{
-    BlockId, Inst, InstId, IntBinOp, F64BinOp, CmpKind, ValueDef,
+    BlockId, Constant, Function, Inst, InstId, ValueDef, ValueId,
+    IntBinOp, F64BinOp, CmpKind,
 };
 
-pub struct GlobalValueNumbering {}
+/// GVN runs lazily once per Function (per pass round).
+/// We detect “first time for this function” via the function’s address.
+pub struct GlobalValueNumbering {
+    last_func_ptr: Option<usize>,
+}
 
 impl Default for GlobalValueNumbering {
-    fn default() -> Self { Self { } }
+    fn default() -> Self { Self { last_func_ptr: None } }
 }
 
 #[derive(Default)]
@@ -65,167 +72,71 @@ impl VnCtx {
 impl GlobalValueNumbering {
     pub fn new() -> Self { Self::default() }
 
-    pub fn run(&mut self, func: &mut Function) {
+    /// Run once over the whole function, emitting ReplaceKind edits into `q`.
+    fn run_on_function(&mut self, func: &Function, q: &mut WirEditQueue) {
         let (preds, succs) = build_cfg(func);
         let rpo = rpo_order(func.entry, &succs);
         let idom = compute_idom(func.entry, &preds, &rpo);
         let dom_children = build_dom_tree(&idom);
 
-        let mut q = WirEditQueue::new();
+        // BlockId -> index (O(1) lookups; avoid linear scans).
+        let mut ix_of: HashMap<BlockId, usize> = HashMap::with_capacity(func.blocks.len());
+        for (i, b) in func.blocks.iter().enumerate() { ix_of.insert(b.id, i); }
+
         let mut expr2leader: HashMap<ExprKey, ValueId> = HashMap::new();
-        let mut expr_stack: Vec<ExprKey> = Vec::new();
+        let mut expr_stack: SmallVec<[ExprKey; 32]> = SmallVec::new(); // per-scope keys
         let mut ctx = VnCtx::new(func);
 
-        GlobalValueNumbering::visit_block(func, func.entry, &dom_children, &mut expr2leader, &mut expr_stack, &mut ctx, &mut q);
-        q.apply(func);
-    }
-
-    fn visit_block(
-        func: &Function,
-        bb: BlockId,
-        dom_children: &HashMap<BlockId, Vec<BlockId>>,
-        expr2leader: &mut HashMap<ExprKey, ValueId>,
-        expr_stack: &mut Vec<ExprKey>,
-        ctx: &mut VnCtx,
-        q: &mut WirEditQueue,
-    ) {
-        let scope_mark = expr_stack.len();
-        let block = func.blocks.iter().find(|b| b.id == bb).unwrap();
-
-        for &param in &block.params {
-            let _ = ctx.get_vn(func, param);
-        }
-
-        for &nid in &block.insts {
-            let node = &func.nodes[nid.0 as usize];
-
-            match &node.kind {
-                Inst::Mov(src) => {
-                    if let Some(&dst) = node.results.get(0) {
-                        let vn = ctx.get_vn(func, *src);
-                        ctx.set_vn(dst, vn);
-                    }
-                }
-                Inst::Const(c) => {
-                    if let Some(&dst) = node.results.get(0) {
-                        let ck = ConstKey::from_const(c);
-                        let vn = ctx.get_vn_of_const(ck.clone());
-                        let key = ExprKey::Const(ck);
-                        if let Some(&leader) = expr2leader.get(&key) {
-                            q.replace_kind(nid, Inst::Mov(leader));
-                            let lvn = ctx.get_vn(func, leader);
-                            ctx.set_vn(dst, lvn);
-                        } else {
-                            expr2leader.insert(key.clone(), dst);
-                            expr_stack.push(key);
-                            ctx.set_vn(dst, vn);
-                        }
-                    }
-                }
-
-                Inst::IntBin { op, a, b } => {
-                    if let Some(dst) = node.results.get(0).copied() {
-                        let va = ctx.get_vn(func, *a);
-                        let vb = ctx.get_vn(func, *b);
-                        let key = ExprKey::IntBin { op: *op, a: va, b: vb }.canonicalized();
-                        gvn_lookup_or_insert(key, dst, expr2leader, expr_stack, q, nid, func, ctx);
-                    }
-                }
-
-                Inst::F64Bin { op, a, b } => {
-                    if let Some(dst) = node.results.get(0).copied() {
-                        let va = ctx.get_vn(func, *a);
-                        let vb = ctx.get_vn(func, *b);
-                        let key = ExprKey::F64Bin { op: *op, a: va, b: vb }.canonicalized();
-                        gvn_lookup_or_insert(key, dst, expr2leader, expr_stack, q, nid, func, ctx);
-                    }
-                }
-
-                Inst::NumAdd(a,b) | Inst::NumSub(a,b) | Inst::NumMul(a,b) | Inst::NumDiv(a,b) | Inst::NumRem(a,b) => {
-                    if let Some(dst) = node.results.get(0).copied() {
-                        let va = ctx.get_vn(func, *a);
-                        let vb = ctx.get_vn(func, *b);
-                        let key = ExprKey::NumOp { kind: num_op_of(&node.kind).unwrap(), a: va, b: vb }.canonicalized();
-                        gvn_lookup_or_insert(key, dst, expr2leader, expr_stack, q, nid, func, ctx);
-                    }
-                }
-
-                Inst::CmpInt { kind, a, b } => {
-                    if let Some(dst) = node.results.get(0).copied() {
-                        let va = ctx.get_vn(func, *a);
-                        let vb = ctx.get_vn(func, *b);
-                        let key = ExprKey::CmpInt { kind: *kind, a: va, b: vb }.canonicalized();
-                        gvn_lookup_or_insert(key, dst, expr2leader, expr_stack, q, nid, func, ctx);
-                    }
-                }
-                Inst::CmpF64 { kind, a, b } => {
-                    if let Some(dst) = node.results.get(0).copied() {
-                        let va = ctx.get_vn(func, *a);
-                        let vb = ctx.get_vn(func, *b);
-                        let key = ExprKey::CmpF64 { kind: *kind, a: va, b: vb }.canonicalized();
-                        gvn_lookup_or_insert(key, dst, expr2leader, expr_stack, q, nid, func, ctx);
-                    }
-                }
-                Inst::CmpRefEq { a, b } => {
-                    if let Some(dst) = node.results.get(0).copied() {
-                        let va = ctx.get_vn(func, *a);
-                        let vb = ctx.get_vn(func, *b);
-                        let key = ExprKey::CmpRefEq { a: va, b: vb }.canonicalized();
-                        gvn_lookup_or_insert(key, dst, expr2leader, expr_stack, q, nid, func, ctx);
-                    }
-                }
-
-                Inst::ArrayLen(arr) => {
-                    if let Some(dst) = node.results.get(0).copied() {
-                        let va = ctx.get_vn(func, *arr);
-                        let key = ExprKey::ArrayLen { a: va };
-                        gvn_lookup_or_insert(key, dst, expr2leader, expr_stack, q, nid, func, ctx);
-                    }
-                }
-                Inst::StrLen(s) => {
-                    if let Some(dst) = node.results.get(0).copied() {
-                        let vs = ctx.get_vn(func, *s);
-                        let key = ExprKey::StrLen { a: vs };
-                        gvn_lookup_or_insert(key, dst, expr2leader, expr_stack, q, nid, func, ctx);
-                    }
-                }
-                Inst::StrCompare { a, b } => {
-                    if let Some(dst) = node.results.get(0).copied() {
-                        let va = ctx.get_vn(func, *a);
-                        let vb = ctx.get_vn(func, *b);
-                        let key = ExprKey::StrCompare { a: va, b: vb }.canonicalized();
-                        gvn_lookup_or_insert(key, dst, expr2leader, expr_stack, q, nid, func, ctx);
-                    }
-                }
-
-                _ => {
-                    for &dst in &node.results {
-                        if ctx.get_vn(func, dst) == 0 {
-                            let vn = ctx.next_vn; ctx.next_vn += 1;
-                            ctx.set_vn(dst, vn);
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(children) = dom_children.get(&bb) {
-            for &c in children {
-                GlobalValueNumbering::visit_block(func, c, dom_children, expr2leader, expr_stack, ctx, q);
-            }
-        }
-
-        while expr_stack.len() > scope_mark {
-            if let Some(k) = expr_stack.pop() {
-                expr2leader.remove(&k);
-            }
-        }
+        // Dominator tree preorder
+        visit_block_ix(
+            func,
+            *ix_of.get(&func.entry).expect("missing entry block"),
+            &dom_children,
+            &ix_of,
+            &mut expr2leader,
+            &mut expr_stack,
+            &mut ctx,
+            q,
+        );
     }
 }
 
 impl OptimizationWIR for GlobalValueNumbering {
-    fn optimize_node(&mut self, cur: &mut crate::opt::InstCursor, _q: &mut WirEditQueue) -> bool {
-        cur.with_func(|f| self.run(f));
+    /// Only wake up on opcodes GVN can fold; helps the pass-level tag bucketing.
+    fn maybe_interesting(&self, tag: Discriminant<Inst>) -> bool {
+        use Inst::*;
+        let v0 = ValueId(0);
+        let tags = [
+            discriminant(&Const(Constant::Null)),
+            discriminant(&IntBin { op: IntBinOp::Add, a: v0, b: v0 }),
+            discriminant(&F64Bin { op: F64BinOp::Add, a: v0, b: v0 }),
+            discriminant(&NumAdd(v0, v0)),
+            discriminant(&NumSub(v0, v0)),
+            discriminant(&NumMul(v0, v0)),
+            discriminant(&NumDiv(v0, v0)),
+            discriminant(&NumRem(v0, v0)),
+            discriminant(&CmpInt { kind: CmpKind::Eq, a: v0, b: v0 }),
+            discriminant(&CmpF64 { kind: CmpKind::Eq, a: v0, b: v0 }),
+            discriminant(&CmpRefEq { a: v0, b: v0 }),
+            discriminant(&ArrayLen(v0)),
+            discriminant(&StrLen(v0)),
+            discriminant(&StrCompare { a: v0, b: v0 }),
+        ];
+        tags.contains(&tag)
+    }
+
+    /// Lazily run once per function; emit edits into `q` and let the framework apply them.
+    fn optimize_node(&mut self, cur: &mut InstCursor, q: &mut WirEditQueue) -> bool {
+        // Get a stable identity for the current Function (address)
+        cur.with_func(|f| {
+            let ptr = f as *mut Function as usize;
+            if self.last_func_ptr != Some(ptr) {
+                self.last_func_ptr = Some(ptr);
+                // Run GVN *now* and queue edits; framework will apply incrementally.
+                self.run_on_function(f, q);
+            }
+        });
+        // Return false so other opts can still run on this instruction in this visit.
         false
     }
 }
@@ -290,16 +201,16 @@ enum ExprKey {
     // Pure numeric ops
     IntBin { op: IntBinOp, a: u32, b: u32 },
     F64Bin { op: F64BinOp, a: u32, b: u32 },
-    NumOp  { kind: NumOp,     a: u32, b: u32 },
+    NumOp  { kind: NumOp,   a: u32, b: u32 },
 
     // Comparisons
-    CmpInt  { kind: CmpKind, a: u32, b: u32 },
-    CmpF64  { kind: CmpKind, a: u32, b: u32 },
-    CmpRefEq{              a: u32, b: u32 },
+    CmpInt   { kind: CmpKind, a: u32, b: u32 },
+    CmpF64   { kind: CmpKind, a: u32, b: u32 },
+    CmpRefEq {               a: u32, b: u32 },
 
     // Simple queries
-    ArrayLen { a: u32 },
-    StrLen   { a: u32 },
+    ArrayLen   { a: u32 },
+    StrLen     { a: u32 },
     StrCompare { a: u32, b: u32 },
 }
 
@@ -326,7 +237,6 @@ impl ExprKey {
                 if matches!(kind, Eq | Ne) {
                     if *a > *b { std::mem::swap(a, b); }
                 } else if *a > *b {
-                    // flip predicate to keep (a<=b) with a<=b form
                     *kind = flip_cmp(*kind);
                     std::mem::swap(a, b);
                 }
@@ -362,13 +272,14 @@ fn gvn_lookup_or_insert(
     key: ExprKey,
     dst: ValueId,
     expr2leader: &mut HashMap<ExprKey, ValueId>,
-    expr_stack: &mut Vec<ExprKey>,
+    expr_stack: &mut SmallVec<[ExprKey; 32]>,
     q: &mut WirEditQueue,
     nid: InstId,
     func: &Function,
     ctx: &mut VnCtx,
 ) {
     if let Some(&leader) = expr2leader.get(&key) {
+        // Emit a global ReplaceKind (anchorless). Framework will apply/drain.
         q.replace_kind(nid, Inst::Mov(leader));
         let vn = ctx.get_vn(func, leader);
         ctx.set_vn(dst, vn);
@@ -377,6 +288,154 @@ fn gvn_lookup_or_insert(
         expr_stack.push(key);
         let vn = ctx.get_vn(func, dst);
         ctx.set_vn(dst, vn);
+    }
+}
+
+fn visit_block_ix(
+    func: &Function,
+    bix: usize,
+    dom_children: &HashMap<BlockId, Vec<BlockId>>,
+    ix_of: &HashMap<BlockId, usize>,
+    expr2leader: &mut HashMap<ExprKey, ValueId>,
+    expr_stack: &mut SmallVec<[ExprKey; 32]>,
+    ctx: &mut VnCtx,
+    q: &mut WirEditQueue,
+) {
+    let scope_mark = expr_stack.len();
+    let block = &func.blocks[bix];
+
+    for &param in &block.params {
+        let _ = ctx.get_vn(func, param);
+    }
+
+    for &nid in &block.insts {
+        let node = &func.nodes[nid.0 as usize];
+
+        match &node.kind {
+            Inst::Mov(src) => {
+                if let Some(&dst) = node.results.get(0) {
+                    let vn = ctx.get_vn(func, *src);
+                    ctx.set_vn(dst, vn);
+                }
+            }
+            Inst::Const(c) => {
+                if let Some(&dst) = node.results.get(0) {
+                    let ck = ConstKey::from_const(c);
+                    let vn = ctx.get_vn_of_const(ck.clone());
+                    let key = ExprKey::Const(ck);
+                    if let Some(&leader) = expr2leader.get(&key) {
+                        q.replace_kind(nid, Inst::Mov(leader));
+                        let lvn = ctx.get_vn(func, leader);
+                        ctx.set_vn(dst, lvn);
+                    } else {
+                        expr2leader.insert(key.clone(), dst);
+                        expr_stack.push(key);
+                        ctx.set_vn(dst, vn);
+                    }
+                }
+            }
+
+            Inst::IntBin { op, a, b } => {
+                if let Some(dst) = node.results.get(0).copied() {
+                    let va = ctx.get_vn(func, *a);
+                    let vb = ctx.get_vn(func, *b);
+                    let key = ExprKey::IntBin { op: *op, a: va, b: vb }.canonicalized();
+                    gvn_lookup_or_insert(key, dst, expr2leader, expr_stack, q, nid, func, ctx);
+                }
+            }
+
+            Inst::F64Bin { op, a, b } => {
+                if let Some(dst) = node.results.get(0).copied() {
+                    let va = ctx.get_vn(func, *a);
+                    let vb = ctx.get_vn(func, *b);
+                    let key = ExprKey::F64Bin { op: *op, a: va, b: vb }.canonicalized();
+                    gvn_lookup_or_insert(key, dst, expr2leader, expr_stack, q, nid, func, ctx);
+                }
+            }
+
+            Inst::NumAdd(a,b) | Inst::NumSub(a,b) | Inst::NumMul(a,b) | Inst::NumDiv(a,b) | Inst::NumRem(a,b) => {
+                if let Some(dst) = node.results.get(0).copied() {
+                    let va = ctx.get_vn(func, *a);
+                    let vb = ctx.get_vn(func, *b);
+                    let key = ExprKey::NumOp { kind: num_op_of(&node.kind).unwrap(), a: va, b: vb }.canonicalized();
+                    gvn_lookup_or_insert(key, dst, expr2leader, expr_stack, q, nid, func, ctx);
+                }
+            }
+
+            Inst::CmpInt { kind, a, b } => {
+                if let Some(dst) = node.results.get(0).copied() {
+                    let va = ctx.get_vn(func, *a);
+                    let vb = ctx.get_vn(func, *b);
+                    let key = ExprKey::CmpInt { kind: *kind, a: va, b: vb }.canonicalized();
+                    gvn_lookup_or_insert(key, dst, expr2leader, expr_stack, q, nid, func, ctx);
+                }
+            }
+            Inst::CmpF64 { kind, a, b } => {
+                if let Some(dst) = node.results.get(0).copied() {
+                    let va = ctx.get_vn(func, *a);
+                    let vb = ctx.get_vn(func, *b);
+                    let key = ExprKey::CmpF64 { kind: *kind, a: va, b: vb }.canonicalized();
+                    gvn_lookup_or_insert(key, dst, expr2leader, expr_stack, q, nid, func, ctx);
+                }
+            }
+            Inst::CmpRefEq { a, b } => {
+                if let Some(dst) = node.results.get(0).copied() {
+                    let va = ctx.get_vn(func, *a);
+                    let vb = ctx.get_vn(func, *b);
+                    let key = ExprKey::CmpRefEq { a: va, b: vb }.canonicalized();
+                    gvn_lookup_or_insert(key, dst, expr2leader, expr_stack, q, nid, func, ctx);
+                }
+            }
+
+            Inst::ArrayLen(arr) => {
+                if let Some(dst) = node.results.get(0).copied() {
+                    let va = ctx.get_vn(func, *arr);
+                    let key = ExprKey::ArrayLen { a: va };
+                    gvn_lookup_or_insert(key, dst, expr2leader, expr_stack, q, nid, func, ctx);
+                }
+            }
+            Inst::StrLen(s) => {
+                if let Some(dst) = node.results.get(0).copied() {
+                    let vs = ctx.get_vn(func, *s);
+                    let key = ExprKey::StrLen { a: vs };
+                    gvn_lookup_or_insert(key, dst, expr2leader, expr_stack, q, nid, func, ctx);
+                }
+            }
+            Inst::StrCompare { a, b } => {
+                if let Some(dst) = node.results.get(0).copied() {
+                    let va = ctx.get_vn(func, *a);
+                    let vb = ctx.get_vn(func, *b);
+                    let key = ExprKey::StrCompare { a: va, b: vb }.canonicalized();
+                    gvn_lookup_or_insert(key, dst, expr2leader, expr_stack, q, nid, func, ctx);
+                }
+            }
+
+            _ => {
+                // Assign fresh VNs to any results we haven't seen.
+                for &dst in &node.results {
+                    if ctx.get_vn(func, dst) == 0 {
+                        let vn = ctx.next_vn; ctx.next_vn += 1;
+                        ctx.set_vn(dst, vn);
+                    }
+                }
+            }
+        }
+    }
+
+    // Recurse into dominated children (by BlockId -> index)
+    if let Some(children) = dom_children.get(&block.id) {
+        for &c in children {
+            if let Some(&cbix) = ix_of.get(&c) {
+                visit_block_ix(func, cbix, dom_children, ix_of, expr2leader, expr_stack, ctx, q);
+            }
+        }
+    }
+
+    // Pop expressions defined in this block’s scope.
+    while expr_stack.len() > scope_mark {
+        if let Some(k) = expr_stack.pop() {
+            expr2leader.remove(&k);
+        }
     }
 }
 
@@ -478,16 +537,4 @@ fn build_dom_tree(idom: &HashMap<BlockId, BlockId>) -> HashMap<BlockId, Vec<Bloc
         tree.entry(*b).or_default(); // ensure key present
     }
     tree
-}
-
-fn dom_preorder(entry: BlockId, domc: &HashMap<BlockId, Vec<BlockId>>) -> Vec<BlockId> {
-    let mut out = Vec::new();
-    fn dfs(u: BlockId, domc: &HashMap<BlockId, Vec<BlockId>>, out: &mut Vec<BlockId>) {
-        out.push(u);
-        if let Some(vs) = domc.get(&u) {
-            for &v in vs { dfs(v, domc, out); }
-        }
-    }
-    dfs(entry, domc, &mut out);
-    out
 }

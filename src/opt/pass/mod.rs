@@ -13,6 +13,6 @@ pub mod tail_call;
 
 //pub mod licm;
 //pub mod sccp;
-//pub mod value_numbering;
+pub mod value_numbering;
 
 pub mod recur_memo;
