@@ -1,9 +1,11 @@
-// src/opt/pass/sccp.rs
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
-use std::collections::{VecDeque};
+use std::collections::VecDeque;
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use smallvec::SmallVec;
+use std::mem::{discriminant, Discriminant};
+
 use crate::opt::{InstCursor, OptimizationWIR, WirEditQueue};
 use crate::wir::{
     BlockId, Function, Inst, InstId, ValueDef, ValueId, Constant, Type,
@@ -27,20 +29,54 @@ impl PartialEq for Lat {
     }
 }
 
-pub struct Sccp { ran: bool }
-impl Default for Sccp { fn default() -> Self { Self { ran: false } } }
+pub struct Sccp {
+    last_func_ptr: Option<usize>,
+}
+impl Default for Sccp { fn default() -> Self { Self { last_func_ptr: None } } }
 impl Sccp { pub fn new() -> Self { Self::default() } }
 
 impl OptimizationWIR for Sccp {
-    fn optimize_node(&mut self, cur: &mut InstCursor, _q: &mut WirEditQueue) -> bool {
-        if self.ran { return false; }
-        cur.with_func(|f| { let _ = run_on_function(f); });
-        self.ran = true;
+    /// Wake up on control-flow (so we discover CFG) and on common foldable ops.
+    fn maybe_interesting(&self, tag: Discriminant<Inst>) -> bool {
+        use Inst::*;
+        let v0 = ValueId(0);
+        let tags = [
+            // Control
+            discriminant(&Branch { cond: v0, then_b: BlockId(0), else_b: BlockId(0) }),
+            discriminant(&Jump(BlockId(0), Vec::<ValueId>::new())),
+            // (Skip Switch discriminant construction to avoid field-shape coupling)
+
+            // Things we often fold/propagate
+            discriminant(&Const(Constant::Null)),
+            discriminant(&Mov(v0)),
+            discriminant(&IntBin { op: IntBinOp::Add, a: v0, b: v0 }),
+            discriminant(&F64Bin { op: F64BinOp::Add, a: v0, b: v0 }),
+            discriminant(&NumAdd(v0, v0)),
+            discriminant(&NumSub(v0, v0)),
+            discriminant(&NumMul(v0, v0)),
+            discriminant(&NumDiv(v0, v0)),
+            discriminant(&NumRem(v0, v0)),
+            discriminant(&CmpInt { kind: CmpKind::Eq, a: v0, b: v0 }),
+            discriminant(&CmpF64 { kind: CmpKind::Eq, a: v0, b: v0 }),
+            discriminant(&StrLen(v0)),
+            discriminant(&StrCompare { a: v0, b: v0 }),
+        ];
+        tags.contains(&tag)
+    }
+
+    fn optimize_node(&mut self, cur: &mut InstCursor, q: &mut WirEditQueue) -> bool {
+        cur.with_func(|f| {
+            let ptr = f as *mut Function as usize;
+            if self.last_func_ptr != Some(ptr) {
+                self.last_func_ptr = Some(ptr);
+                let _ = run_on_function(f, q);
+            }
+        });
         false
     }
 }
 
-pub fn run_on_function(func: &mut Function) -> bool {
+pub fn run_on_function(func: &Function, q: &mut WirEditQueue) -> bool {
     let n_blocks = func.blocks.len();
     let n_values = func.values.len();
 
@@ -53,6 +89,18 @@ pub fn run_on_function(func: &mut Function) -> bool {
 
     // Precompute per-block terminator ids (Jump/Branch/Switch)
     let terms = collect_terminators(func);
+
+    // InstId -> (block_ix,pos) map for O(1) block-of lookup
+    let mut pos_of_inst: Vec<Option<(usize, usize)>> = vec![None; func.nodes.len()];
+    for (bi, bb) in func.blocks.iter().enumerate() {
+        for (i, &iid) in bb.insts.iter().enumerate() {
+            pos_of_inst[iid.0 as usize] = Some((bi, i));
+        }
+    }
+    let entry_idx = bid_to_idx[&func.entry];
+    let block_of_inst = |iid: InstId| -> usize {
+        pos_of_inst[iid.0 as usize].map(|(bi, _)| bi).unwrap_or(entry_idx)
+    };
 
     // --------- Lattice & dataflow state ---------
     fn meet(a: &Lat, b: &Lat) -> Lat {
@@ -109,7 +157,7 @@ pub fn run_on_function(func: &mut Function) -> bool {
 
         // Process pending insts
         while let Some(nid) = inst_wl.pop_front() {
-            let bidx = block_of_inst(func, nid, &bid_to_idx);
+            let bidx = block_of_inst(nid);
             if !exec_block[bidx] { continue; }
             let node = &func.nodes[nid.0 as usize];
 
@@ -214,7 +262,8 @@ pub fn run_on_function(func: &mut Function) -> bool {
         }
     }
 
-    // --------- Rewrite IR based on final lattice ---------
+    // --------- Rewrite IR based on final lattice (emit edits) ---------
+
     let mut changed = false;
 
     // 1) Branch/Switch -> Jump
@@ -226,7 +275,7 @@ pub fn run_on_function(func: &mut Function) -> bool {
                 Inst::Branch { cond, then_b, else_b } => {
                     if let Lat::Const(Constant::Bool(c)) = &val_lat[cond.0 as usize] {
                         let to = if *c { *then_b } else { *else_b };
-                        func.nodes[last.0 as usize].kind = Inst::Jump(to, Vec::new());
+                        q.replace_kind(last, Inst::Jump(to, Vec::new()));
                         changed = true;
                     }
                 }
@@ -236,7 +285,7 @@ pub fn run_on_function(func: &mut Function) -> bool {
                         for &(key, bb) in table {
                             if key as i32 == *tval { target = bb; break; }
                         }
-                        func.nodes[last.0 as usize].kind = Inst::Jump(target, Vec::new());
+                        q.replace_kind(last, Inst::Jump(target, Vec::new()));
                         changed = true;
                     }
                 }
@@ -246,12 +295,11 @@ pub fn run_on_function(func: &mut Function) -> bool {
     }
 
     // 2) Replace pure, non-effectful single-result with constants
-    for n in &mut func.nodes {
-        if n.results.len() == 1 && !n.kind.needs_effect_in() && is_pure_non_effectful(&n.kind) {
+    for (i, n) in func.nodes.iter().enumerate() {
+        if n.results.len() == 1 && is_pure_non_effectful(&n.kind) {
             let res = n.results[0];
             if let Lat::Const(c) = &val_lat[res.0 as usize] {
-                n.kind = Inst::Const(c.clone());
-                n.ty = Some(const_type_hint(&n.kind));
+                q.replace_kind(InstId(i as u32), Inst::Const(c.clone()));
                 changed = true;
             }
         }
@@ -330,13 +378,6 @@ fn build_cfg(
     }
 
     (succs, preds)
-}
-
-fn block_of_inst(func: &Function, nid: InstId, bid_to_idx: &HashMap<BlockId, usize>) -> usize {
-    for (i, b) in func.blocks.iter().enumerate() {
-        if b.insts.iter().any(|&x| x == nid) { return i; }
-    }
-    bid_to_idx[&func.entry]
 }
 
 fn mark_block_executable(
@@ -488,6 +529,7 @@ fn is_pure_non_effectful(k: &Inst) -> bool {
     }
 }
 
+#[allow(dead_code)]
 fn const_type_hint(kind: &Inst) -> Type {
     match kind {
         Inst::Const(Constant::Int32(_)) => Type::Int32,
