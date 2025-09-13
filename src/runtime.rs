@@ -2,7 +2,7 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
-use crate::value::{TAG_STRING, BoxedStr, ObjHeader, is_imm, NULL};
+use crate::value::{TAG_STRING, BoxedStr, ObjHeader, TAG_OBJECT, is_imm, NULL};
 use crate::gc::NAPALM_GC;
 
 use ahash::AHashMap as HashMap;
@@ -58,21 +58,17 @@ pub extern "C" fn napalm_yieldpoint() -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_obj_get_field(obj: i64, field_id_smi: i64) -> i64 {
-    if obj == 0 { return 0; }
+    let Some(p) = (unsafe { as_wirobj_const(obj) }) else { return 0; };
     let id = decode_field_smi(field_id_smi);
-    let o = unsafe { &*(obj as *const WirObj) };
+    let o = unsafe { &*p };
     o.by_id.get(&id).copied().unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_obj_set_field(obj: i64, field_id_smi: i64, val: i64) -> i64 {
-    #[cfg(debug_assertions)] {
-        eprintln!("[dbg] wir_obj_set_field called");
-    }
-
-    if obj == 0 { return 0; }
+    let Some(p) = (unsafe { as_wirobj_mut(obj) }) else { return 0; };
     let id = decode_field_smi(field_id_smi);
-    let o = unsafe { &mut *(obj as *mut WirObj) };
+    let o = unsafe { &mut *p };
 
     let cell = o.by_id.entry(id).or_insert(0);
     let slot: *mut i64 = cell as *mut i64;
@@ -86,17 +82,17 @@ pub extern "C" fn wir_obj_set_field(obj: i64, field_id_smi: i64, val: i64) -> i6
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_obj_has_field(obj: i64, field_id_smi: i64) -> i64 {
-    if obj == 0 { return 0; }
+    let Some(p) = (unsafe { as_wirobj_const(obj) }) else { return 0; };
     let id = decode_field_smi(field_id_smi);
-    let o = unsafe { &*(obj as *const WirObj) };
+    let o = unsafe { &*p };
     if o.by_id.contains_key(&id) { 1 } else { 0 }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_obj_del_field(obj: i64, field_id_smi: i64) -> i64 {
-    if obj == 0 { return 0; }
+    let Some(p) = (unsafe { as_wirobj_mut(obj) }) else { return 0; };
     let id = decode_field_smi(field_id_smi);
-    let o = unsafe { &mut *(obj as *mut WirObj) };
+    let o = unsafe { &mut *p };
     if o.by_id.remove(&id).is_some() { 1 } else { 0 }
 }
 
@@ -303,4 +299,25 @@ pub extern "C" fn wir_memo_put4(fid: i64, k0: i64, k1: i64, k2: i64, k3: i64, va
     let entry = guard.entry(fid_u).or_insert_with(HashMap::new);
     entry.insert(Key4(k0,k1,k2,k3), val);
     0
+}
+
+
+#[inline(always)]
+unsafe fn as_wirobj_const(obj: i64) -> Option<*const WirObj> {
+    if obj == 0 || (obj & 1) == 1 { return None; }        // null or SMI
+    let base = obj as *const u8;
+
+    // Read a possible header tag without creating a typed reference.
+    let tag = core::ptr::read_unaligned(base as *const u32);
+    if tag == TAG_OBJECT {
+        // BoxedObj { ObjHeader, by_id, by_str } → skip header
+        Some(base.add(core::mem::size_of::<ObjHeader>()) as *const WirObj)
+    } else {
+        // Header-less WirObj starts at base
+        Some(base as *const WirObj)
+    }
+}
+#[inline(always)]
+unsafe fn as_wirobj_mut(obj: i64) -> Option<*mut WirObj> {
+    as_wirobj_const(obj).map(|p| p as *mut WirObj)
 }

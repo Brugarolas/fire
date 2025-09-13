@@ -1728,6 +1728,9 @@ pub extern "C" fn wir_method_trampoline(argv: *const i64, argc: usize) -> i64 {
     if argv.is_null() || argc == 0 {
         panic!("method trampoline: empty argv");
     }
+    if argv.is_null() || argc < 2 {
+        panic!("method trampoline: need at least env + this, got argc={}", argc);
+    }
 
     unsafe {
         let fid_smi = *argv;
