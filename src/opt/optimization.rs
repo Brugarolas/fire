@@ -8,7 +8,7 @@ use crate::opt::OptimizationPass;
 //use crate::opt::pass::copy_propagation::CopyPropagation;
 //use crate::opt::pass::branch_fold::BranchFold;
 //use crate::opt::pass::strength_reduction::StrengthReduction;
-//use crate::opt::pass::licm::Licm;
+use crate::opt::pass::licm::Licm;
 //use crate::opt::pass::sccp::Sccp;
 use crate::opt::pass::value_numbering::GlobalValueNumbering;
 //use crate::opt::pass::dead_code_elim::MegaDCE;
@@ -26,7 +26,7 @@ pub fn optimization_passes() -> Optimize {
         //Box::new(MegaDCE::default()), // after local rewrites to clean up dead code
         //Box::new(BranchFold::default()), // cheap local rewrites first to expose CSE opportunities
 
-        //Box::new(Licm), // loop invariant code motion to hoist out of loops
+        Box::new(Licm::default()), // loop invariant code motion to hoist out of loops
         //Box::new(Sccp::default()), // sparse conditional constant propagation to simplify based on known values
         Box::new(GlobalValueNumbering::default()), // global value numbering to eliminate redundant calculations
         //Box::new(MegaDCE::default()), // final DCE to clean up after all the other passes

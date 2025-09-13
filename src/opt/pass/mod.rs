@@ -11,7 +11,7 @@ pub mod tail_call;
 
 //pub mod branch_fold;
 
-//pub mod licm;
+pub mod licm;
 //pub mod sccp;
 pub mod value_numbering;
 

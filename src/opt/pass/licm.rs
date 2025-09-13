@@ -1,186 +1,228 @@
-// src/opt/pass/licm.rs
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
-use std::collections::{BTreeSet, HashSet, VecDeque};
 use ahash::AHashMap as HashMap;
-use crate::opt::InstCursor;
-use crate::opt::WirEditQueue;
-use crate::opt::OptimizationWIR;
+use ahash::AHashSet as HashSet;
+use smallvec::SmallVec;
+use std::mem::{discriminant, Discriminant};
+
+use crate::opt::{InstCursor, OptimizationWIR, WirEditQueue};
 use crate::wir::{
-    Block, BlockId, Function, Inst, InstId, Type, ValueDef, ValueId,
-    IntBinOp, F64BinOp, CmpKind,
+    BlockId, Function, Inst, InstId, ValueDef, ValueId, IntBinOp, F64BinOp, CmpKind,
 };
 
-/// Loop-Invariant Code Motion (function pass).
-/// Returns `true` if it moved at least one instruction.
-pub struct Licm;
+/// Loop-Invariant Code Motion (function pass; emits edits via WirEditQueue).
+pub struct Licm {
+    last_func_ptr: Option<usize>,
+}
+
+impl Default for Licm {
+    fn default() -> Self { Self { last_func_ptr: None } }
+}
 
 impl OptimizationWIR for Licm {
-    fn optimize_node(&mut self, cur: &mut InstCursor, _q: &mut WirEditQueue) -> bool {
-        cur.with_func(|f| Licm::run_on_function(f));
-        // function-level pass; per-node "changed" not meaningful
+    /// Wake up on things that indicate loops (terminators) and things we may hoist.
+    fn maybe_interesting(&self, tag: Discriminant<Inst>) -> bool {
+        use Inst::*;
+        let v0 = ValueId(0);
+        let tags = [
+            // Terminators (for CFG/loop discovery)
+            discriminant(&Jump(BlockId(0), Vec::<ValueId>::new())),
+            discriminant(&Branch { cond: v0, then_b: BlockId(0), else_b: BlockId(0) }),
+            // NOTE: we intentionally skip Switch's discriminant construction to avoid depending
+            // on exact fields; LICM will still be woken by arithmetic/comparison ops below.
+
+            // Hoistable pure ops (also wake the pass inside loops)
+            discriminant(&IntBin { op: IntBinOp::Add, a: v0, b: v0 }),
+            discriminant(&F64Bin { op: F64BinOp::Add, a: v0, b: v0 }),
+            discriminant(&NumAdd(v0, v0)),
+            discriminant(&NumSub(v0, v0)),
+            discriminant(&NumMul(v0, v0)),
+            discriminant(&NumDiv(v0, v0)),
+            discriminant(&NumRem(v0, v0)),
+            discriminant(&CmpInt { kind: CmpKind::Eq, a: v0, b: v0 }),
+            discriminant(&CmpF64 { kind: CmpKind::Eq, a: v0, b: v0 }),
+            discriminant(&StrLen(v0)),
+            discriminant(&StrCompare { a: v0, b: v0 }),
+        ];
+        tags.contains(&tag)
+    }
+
+    fn optimize_node(&mut self, cur: &mut InstCursor, q: &mut WirEditQueue) -> bool {
+        cur.with_func(|f| {
+            let ptr = f as *mut Function as usize;
+            if self.last_func_ptr != Some(ptr) {
+                self.last_func_ptr = Some(ptr);
+                run_licm_once(f, q);
+            }
+        });
         false
     }
 }
 
-impl Licm {
-    pub fn run_on_function(func: &mut Function) -> bool {
-        // Build quick indices
-        let bid_to_idx: HashMap<BlockId, usize> = func.blocks.iter()
-            .enumerate().map(|(i,b)| (b.id, i)).collect();
-        let idx_to_bid: Vec<BlockId> = func.blocks.iter().map(|b| b.id).collect();
+// ------------------------------------------------------------
+// Core LICM
+// ------------------------------------------------------------
 
-        let (succs, preds) = build_cfg(func, &bid_to_idx);
-        let doms = compute_dominators(func, &succs, &preds, &bid_to_idx);
+fn run_licm_once(func: &Function, q: &mut WirEditQueue) {
+    if func.blocks.is_empty() { return; }
 
-        let backedges = collect_backedges(&succs, &doms);
-        if backedges.is_empty() {
-            return false;
+    // -------- indices / fast lookups --------
+    let mut bix_of: HashMap<BlockId, usize> = HashMap::with_capacity(func.blocks.len());
+    let mut bid_of: Vec<BlockId> = Vec::with_capacity(func.blocks.len());
+    for (i, b) in func.blocks.iter().enumerate() {
+        bix_of.insert(b.id, i);
+        bid_of.push(b.id);
+    }
+
+    // InstId -> (block_ix, pos)  [dense, O(1)]
+    let mut pos_of_inst: Vec<Option<(usize, usize)>> = vec![None; func.nodes.len()];
+    for (bi, bb) in func.blocks.iter().enumerate() {
+        for (i, &iid) in bb.insts.iter().enumerate() {
+            pos_of_inst[iid.0 as usize] = Some((bi, i));
         }
+    }
+    let pos = |iid: InstId| pos_of_inst[iid.0 as usize];
 
-        // Map InstId -> BlockId for fast lookup
-        let inst_block: HashMap<InstId, BlockId> = map_inst_to_block(func);
+    // -------- CFG / Dominators / Loops --------
+    let (succs, preds) = build_cfg(func, &bix_of);
+    let doms = compute_dominators_bitset(func, &succs, &preds, &bix_of); // doms[b] is bitset of dominators of b
+    let backedges = collect_backedges(&succs, &doms); // (tail_idx, header_idx)
+    if backedges.is_empty() { return; }
 
-        // Build natural loops and (unique) preheaders.
-        let loops = build_loops(&preds, &idx_to_bid, &backedges);
-        let mut header_to_preheader: HashMap<BlockId, BlockId> = HashMap::new();
-        for lp in &loops {
-            if let Some(pre) = find_preheader(lp, &preds, &bid_to_idx, &idx_to_bid) {
-                header_to_preheader.insert(lp.header, pre);
-            }
+    // Build natural loops and unique preheaders
+    let loops = build_loops(&preds, &bid_of, &backedges);
+    let mut header_to_preheader: HashMap<BlockId, BlockId> = HashMap::new();
+    for lp in &loops {
+        if let Some(pre) = find_preheader(lp, &preds, &bix_of, &bid_of) {
+            header_to_preheader.insert(lp.header, pre);
         }
+    }
+    if header_to_preheader.is_empty() { return; }
 
-        // Nothing to hoist if no unique preheaders.
-        if header_to_preheader.is_empty() {
-            return false;
-        }
+    // -------- Hoisting: per-loop --------
+    // We'll accumulate per-block edits using IX-based APIs.
+    let mut inserts_for_pre: HashMap<usize, SmallVec<[InstId; 16]>> = HashMap::new();
+    let mut erases_for_block: HashMap<usize, SmallVec<[usize; 16]>> = HashMap::new();
 
-        // Per loop, identify & hoist candidates.
-        let mut changed = false;
+    // Process inner loops first
+    let mut loops_sorted = loops.clone();
+    loops_sorted.sort_by_key(|lp| lp.members.len());
 
-        // Process inner loops first (smaller set first)
-        let mut loops_sorted = loops.clone();
-        loops_sorted.sort_by_key(|lp| lp.members.len());
+    for lp in loops_sorted {
+        let Some(pre_bid) = header_to_preheader.get(&lp.header).copied() else { continue; };
+        let pre_bix = bix_of[&pre_bid];
 
-        for lp in loops_sorted {
-            let Some(preheader) = header_to_preheader.get(&lp.header).copied() else { continue; };
+        // Build fast membership bitset
+        let mut in_loop = vec![false; func.blocks.len()];
+        for &bid in &lp.members { in_loop[bix_of[&bid]] = true; }
 
-            // Build invariants set: values defined outside loop are initially invariant.
-            let mut invariant_vals: HashSet<ValueId> = HashSet::new();
-            for v in &func.values {
-                if is_value_defined_outside_loop(v, &inst_block, &lp.members) {
-                    invariant_vals.insert(v.id);
-                }
-            }
-
-            // Gather hoistable insts (and do it in a stable order).
-            let mut hoist_list: Vec<InstId> = Vec::new();
-
-            for &bid in &lp.members {
-                let blk = &func.blocks[bid_to_idx[&bid]];
-                // Iterate in block order — simple and predictable.
-                for &nid in &blk.insts {
-                    let n = &func.nodes[nid.0 as usize];
-
-                    if !is_hoistable_pure(&n.kind) {
-                        continue;
-                    }
-
-                    // Don't re-hoist if it's already in preheader.
-                    if bid == preheader {
-                        continue;
-                    }
-
-                    // All operands must be invariant *at this point*.
-                    if inst_operands(&n.kind).into_iter().all(|op| invariant_vals.contains(&op)) {
-                        hoist_list.push(nid);
-                        for &res in &n.results {
-                            invariant_vals.insert(res);
-                        }
+        // Track values proven invariant inside this run
+        let mut locally_invariant: HashSet<ValueId> = HashSet::default();
+        let is_invariant = |v: ValueId, in_loop: &Vec<bool>, pos_of_inst: &Vec<Option<(usize, usize)>>| -> bool {
+            match &func.values[v.0 as usize].def {
+                ValueDef::Const(_) => true,
+                ValueDef::EffectToken(_) => false, // don't hoist anything depending on effects
+                ValueDef::BlockParam(bid, _) => !in_loop[bix_of[bid]],
+                ValueDef::InstResult(iid, _) => {
+                    if let Some((bi, _)) = pos_of_inst[iid.0 as usize] {
+                        !in_loop[bi]
+                    } else {
+                        false
                     }
                 }
             }
+        };
 
-            if hoist_list.is_empty() {
-                continue;
-            }
+        // Preheader insertion anchor (before terminator, or append)
+        let pre_blk = &func.blocks[pre_bix];
+        let insert_anchor = pre_blk.insts.iter().rposition(|&iid| !is_terminator(&func.nodes[iid.0 as usize].kind))
+            .map(|i| i + 1)
+            .unwrap_or(0);
 
-            // Mutate CFG order: move each candidate to the preheader,
-            // inserting right before the preheader's terminator (if any),
-            // or append to the end otherwise.
-            for nid in hoist_list {
-                let from_bid = inst_block[&nid];
+        // Gather hoistable instructions in stable order (by block, then position)
+        for (bi, bb) in func.blocks.iter().enumerate() {
+            if !in_loop[bi] || bi == pre_bix { continue; }
+            for (i, &iid) in bb.insts.iter().enumerate() {
+                let node = &func.nodes[iid.0 as usize];
+                if !is_hoistable_pure(&node.kind) { continue; }
 
-                // Remove from old block
-                {
-                    let bi = bid_to_idx[&from_bid];
-                    let insts = &mut func.blocks[bi].insts;
-                    if let Some(pos) = insts.iter().position(|&x| x == nid) {
-                        insts.remove(pos);
-                    }
-                }
-
-                // Insert at preheader: just before a terminating control inst if present
-                {
-                    let bi = bid_to_idx[&preheader];
-                    let insts = &mut func.blocks[bi].insts;
-                    let insert_pos = insts.iter().rposition(|&iid| !is_terminator(&func.nodes[iid.0 as usize].kind))
-                        .map(|i| i + 1)
-                        .unwrap_or(0);
-                    insts.insert(insert_pos, nid);
+                if inst_operands_small(&node.kind).iter().all(|&op|
+                    locally_invariant.contains(&op) || is_invariant(op, &in_loop, &pos_of_inst)
+                ) {
+                    erases_for_block.entry(bi).or_default().push(i);
+                    inserts_for_pre.entry(pre_bix).or_default().push(iid);
+                    for &r in &node.results { locally_invariant.insert(r); }
                 }
             }
-
-            changed = true;
         }
 
-        changed
+        // Emit edits for this loop
+        if let Some(list) = inserts_for_pre.get(&pre_bix) {
+            if !list.is_empty() {
+                // Into<SmallVec<[InstId; 4]>> via Vec<InstId>
+                q.insert_before_ix(pre_bix, insert_anchor, list.clone().into_vec());
+            }
+        }
+        if let Some(poss) = erases_for_block.get_mut(&pre_bix) {
+            // nothing to erase in preheader; leave as-is
+            let _ = poss;
+        }
+        for (bi, poss) in erases_for_block.iter_mut() {
+            if poss.is_empty() { continue; }
+            poss.sort_unstable();
+            poss.dedup();
+            for &p in poss.iter().rev() {
+                q.erase_ix(*bi, p);
+            }
+            poss.clear();
+        }
     }
 }
 
-/* ---------- helpers ---------- */
+// ------------------------------------------------------------
+// Helpers
+// ------------------------------------------------------------
 
 #[derive(Clone)]
 struct NaturalLoop {
     header: BlockId,
-    tail: BlockId,          // backedge: tail -> header
-    members: BTreeSet<BlockId>,
+    tail: BlockId,                    // backedge: tail -> header
+    members: SmallVec<[BlockId; 16]>, // deterministic order
 }
 
 fn build_cfg(
     func: &Function,
-    bid_to_idx: &HashMap<BlockId, usize>,
+    bix_of: &HashMap<BlockId, usize>,
 ) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
     let n = func.blocks.len();
-    let mut succs = vec![Vec::<usize>::new(); n];
-    let mut preds = vec![Vec::<usize>::new(); n];
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
 
     for (i, b) in func.blocks.iter().enumerate() {
         if let Some(&last) = b.insts.last() {
             use Inst::*;
             match &func.nodes[last.0 as usize].kind {
                 Jump(tgt, _) => {
-                    let j = bid_to_idx[tgt];
+                    let j = bix_of[tgt];
                     succs[i].push(j);
                     preds[j].push(i);
                 }
                 Branch { then_b, else_b, .. } => {
-                    let j1 = bid_to_idx[then_b];
-                    let j2 = bid_to_idx[else_b];
+                    let j1 = bix_of[then_b];
+                    let j2 = bix_of[else_b];
                     succs[i].push(j1); preds[j1].push(i);
                     succs[i].push(j2); preds[j2].push(i);
                 }
                 Switch { default_b, table, .. } => {
-                    let jd = bid_to_idx[default_b];
+                    let jd = bix_of[default_b];
                     succs[i].push(jd); preds[jd].push(i);
                     for &(_, bid) in table {
-                        let j = bid_to_idx[&bid];
+                        let j = bix_of[&bid];
                         succs[i].push(j); preds[j].push(i);
                     }
                 }
-                Return(_) | Throw(_) => { /* no succs */ }
-                _ => { /* block may not be terminated yet; no edges */ }
+                _ => { /* Return/Throw or unterminated: no succs */ }
             }
         }
     }
@@ -188,32 +230,42 @@ fn build_cfg(
     (succs, preds)
 }
 
-fn compute_dominators(
+/// Dominators via simple bitset fixed-point: dom[b][x] == x dominates b.
+fn compute_dominators_bitset(
     func: &Function,
     succs: &[Vec<usize>],
     preds: &[Vec<usize>],
-    bid_to_idx: &HashMap<BlockId, usize>,
-) -> Vec<HashSet<usize>> {
+    bix_of: &HashMap<BlockId, usize>,
+) -> Vec<Vec<bool>> {
     let n = func.blocks.len();
-    let entry_idx = bid_to_idx[&func.entry];
+    let entry = bix_of[&func.entry];
 
-    let universe: HashSet<usize> = (0..n).collect();
-    let mut dom: Vec<HashSet<usize>> = vec![universe.clone(); n];
-    dom[entry_idx] = [entry_idx].into_iter().collect();
+    let mut dom = vec![vec![true; n]; n];
+    for b in 0..n {
+        if b == entry {
+            dom[b].fill(false);
+            dom[b][entry] = true;
+        }
+    }
 
     let mut changed = true;
     while changed {
         changed = false;
         for b in 0..n {
-            if b == entry_idx { continue; }
-            let mut new = universe.clone();
-            for &p in &preds[b] {
-                if new.is_empty() { break; }
-                new = &new & &dom[p]; // intersection
+            if b == entry { continue; }
+            let mut new_row = vec![true; n];
+            if preds[b].is_empty() {
+                new_row.fill(false);
+            } else {
+                for &p in &preds[b] {
+                    for x in 0..n {
+                        new_row[x] = new_row[x] & dom[p][x];
+                    }
+                }
             }
-            new.insert(b);
-            if new != dom[b] {
-                dom[b] = new;
+            new_row[b] = true;
+            if new_row != dom[b] {
+                dom[b] = new_row;
                 changed = true;
             }
         }
@@ -223,18 +275,15 @@ fn compute_dominators(
 
 fn collect_backedges(
     succs: &[Vec<usize>],
-    doms: &[HashSet<usize>],
-) -> Vec<(usize, usize)> {
-    // (tail_idx, header_idx)
-    let mut res = Vec::new();
+    doms: &[Vec<bool>],
+) -> SmallVec<[(usize, usize); 16]> {
+    let mut out = SmallVec::new();
     for (u, outs) in succs.iter().enumerate() {
         for &v in outs {
-            if doms[u].contains(&v) {
-                res.push((u, v));
-            }
+            if doms[u][v] { out.push((u, v)); }
         }
     }
-    res
+    out
 }
 
 fn build_loops(
@@ -248,17 +297,20 @@ fn build_loops(
         let header_bid = idx_to_bid[header];
         let tail_bid = idx_to_bid[tail];
 
-        let mut members: BTreeSet<BlockId> = BTreeSet::new();
-        members.insert(header_bid);
-        members.insert(tail_bid);
+        let mut members: SmallVec<[BlockId; 16]> = SmallVec::new();
+        let mut in_set: HashSet<BlockId> = HashSet::default();
+        members.push(header_bid); in_set.insert(header_bid);
+        members.push(tail_bid);   in_set.insert(tail_bid);
 
-        // Worklist backward through predecessors of `tail` to gather the loop.
-        let mut stack = vec![tail];
+        // Worklist: backward from tail through preds to gather loop.
+        let mut stack = SmallVec::<[usize; 32]>::new();
+        stack.push(tail);
         while let Some(x) = stack.pop() {
             for &p in &preds[x] {
                 let pb = idx_to_bid[p];
-                if !members.contains(&pb) {
-                    members.insert(pb);
+                if !in_set.contains(&pb) {
+                    in_set.insert(pb);
+                    members.push(pb);
                     if p != header { stack.push(p); }
                 }
             }
@@ -266,57 +318,24 @@ fn build_loops(
 
         loops.push(NaturalLoop { header: header_bid, tail: tail_bid, members });
     }
-
     loops
 }
 
-/// Safer version that requires an index map (callers can precompute).
-fn find_preheader(lp: &NaturalLoop, preds_full: &[Vec<usize>], bid_to_idx: &HashMap<BlockId, usize>, idx_to_bid: &[BlockId]) -> Option<BlockId> {
-    let h_idx = bid_to_idx[&lp.header];
-    let mut outside_preds = Vec::new();
+/// Unique preheader = only one predecessor of header that is outside the loop.
+fn find_preheader(lp: &NaturalLoop, preds_full: &[Vec<usize>], bix_of: &HashMap<BlockId, usize>, idx_to_bid: &[BlockId]) -> Option<BlockId> {
+    let h_idx = bix_of[&lp.header];
+    let mut outside: SmallVec<[BlockId; 4]> = SmallVec::new();
+    // Build quick membership test
+    let mut in_loop = HashSet::default();
+    for &bid in &lp.members { in_loop.insert(bid); }
+
     for &p_idx in &preds_full[h_idx] {
         let pb = idx_to_bid[p_idx];
-        if !lp.members.contains(&pb) {
-            outside_preds.push(pb);
+        if !in_loop.contains(&pb) {
+            outside.push(pb);
         }
     }
-    if outside_preds.len() == 1 {
-        Some(outside_preds[0])
-    } else {
-        None
-    }
-}
-
-fn map_inst_to_block(func: &Function) -> HashMap<InstId, BlockId> {
-    let mut m = HashMap::new();
-    for b in &func.blocks {
-        for &nid in &b.insts {
-            m.insert(nid, b.id);
-        }
-    }
-    m
-}
-
-fn is_value_defined_outside_loop(
-    v: &crate::wir::Value,
-    inst_block: &HashMap<crate::wir::InstId, crate::wir::BlockId>,
-    loop_members: &BTreeSet<crate::wir::BlockId>,
-) -> bool {
-    use crate::wir::ValueDef;
-    match &v.def {
-        ValueDef::Const(_) => true,
-        ValueDef::EffectToken(_) => true, // effect tokens aren't data defs; safe to consider "outside"
-        ValueDef::BlockParam(bid, _) => !loop_members.contains(bid),
-        ValueDef::InstResult(inst, _) => {
-            // Be conservative: if the defining Inst isn't currently placed in any block,
-            // treat it as defined "inside" (not invariant), which avoids hoisting and avoids panic.
-            if let Some(b) = inst_block.get(inst) {
-                !loop_members.contains(b)
-            } else {
-                false
-            }
-        }
-    }
+    if outside.len() == 1 { Some(outside[0]) } else { None }
 }
 
 fn is_terminator(k: &Inst) -> bool {
@@ -328,33 +347,35 @@ fn is_hoistable_pure(k: &Inst) -> bool {
     use Inst::*;
     // Only side-effect-free, non-memory instructions. Be conservative.
     match k {
-        // Never hoist these trivial “defs”
+        // Never hoist trivial defs
         Const(_) | Mov(_) => false,
 
         // Arithmetic / comparisons
         IntBin { .. } |
         F64Bin { .. } |
         NumAdd(_,_) | NumSub(_,_) | NumMul(_,_) | NumDiv(_,_) | NumRem(_,_) |
-        CmpInt { .. } | CmpF64 { .. } => true,
+        CmpInt { .. } | CmpF64 { .. } |
 
-        // String ops that are pure and cheap/safe to move
+        // Simple string ops
         StrLen(_) | StrCompare { .. } => true,
 
-        // Everything else: be conservative (loads, calls, guards, arrays, etc.)
         _ => false,
     }
 }
 
-fn inst_operands(k: &Inst) -> Vec<ValueId> {
+#[inline]
+fn inst_operands_small(k: &Inst) -> SmallVec<[ValueId; 4]> {
     use Inst::*;
+    let mut out = SmallVec::<[ValueId; 4]>::new();
     match k {
-        IntBin { a, b, .. } => vec![*a, *b],
-        F64Bin { a, b, .. } => vec![*a, *b],
-        NumAdd(a,b) | NumSub(a,b) | NumMul(a,b) | NumDiv(a,b) | NumRem(a,b) => vec![*a, *b],
-        CmpInt { a, b, .. } => vec![*a, *b],
-        CmpF64 { a, b, .. } => vec![*a, *b],
-        StrLen(v) => vec![*v],
-        StrCompare { a, b } => vec![*a, *b],
-        _ => Vec::new(),
+        IntBin { a, b, .. } => { out.push(*a); out.push(*b); }
+        F64Bin { a, b, .. } => { out.push(*a); out.push(*b); }
+        NumAdd(a,b) | NumSub(a,b) | NumMul(a,b) | NumDiv(a,b) | NumRem(a,b) => { out.push(*a); out.push(*b); }
+        CmpInt { a, b, .. } => { out.push(*a); out.push(*b); }
+        CmpF64 { a, b, .. } => { out.push(*a); out.push(*b); }
+        StrLen(v) => { out.push(*v); }
+        StrCompare { a, b } => { out.push(*a); out.push(*b); }
+        _ => {}
     }
+    out
 }
