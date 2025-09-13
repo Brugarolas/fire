@@ -3256,16 +3256,59 @@ fn lower_expr_free<'m>(
                 return Ok(res[0]);
             }
 
-            // General object property read with fallback chain:
-            // 1) fast field → return
-            // 2) string table lookup → if present return
-            // 3) getter method "__get__<name>" → if present call it as fn(obj) and return
+            // General property read:
+            // 1) string-table lookup (authoritative)
+            // 2) if missing, try fast field (good for same-function object-literals)
+            // 3) if still missing, try getter "__get__<name>"
             // 4) else return 0/null
-            let obj     = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
+            let obj = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
+
+            // --- string-table check FIRST ---
+            let (_nid_sc, ks) = b.push_node(
+                Inst::Const(Constant::Str(name.clone())),
+                Some(Type::Str),
+                1,
+                false,
+            );
+            let (_nid_hs, has_str) = b.push_node(
+                Inst::CallNative {
+                    name: "wir_obj_has_str".into(),
+                    args: vec![obj, ks[0]],
+                    pure: false,
+                    can_throw: false,
+                },
+                Some(Type::Bool),
+                1,
+                true,
+            );
+
+            let str_hit = b.block();
+            let try_fast = b.block();
+            let cont     = b.block();
+            let out_val  = b.add_block_param(cont, Type::Int32);
+
+            b.branch(has_str[0], str_hit, try_fast);
+
+            // Found in string table → return it
+            b.position_at(str_hit);
+            let (_nid_gs, sv) = b.push_node(
+                Inst::CallNative {
+                    name: "wir_obj_get_str".into(),
+                    args: vec![obj, ks[0]],
+                    pure: false,
+                    can_throw: false,
+                },
+                None,
+                1,
+                true,
+            );
+            b.jump(cont, &[sv[0]]);
+
+            // Not in string table → try fast field next
+            b.position_at(try_fast);
             let field   = intern_field_local(fields, next_field, name);
             let fid_smi = b.const_i32(field.0 as i32);
-
-            let (_nid_h, hasf) = b.push_node(
+            let (_nid_hf, hasf) = b.push_node(
                 Inst::CallNative {
                     name: "wir_obj_has_field".into(),
                     args: vec![obj, fid_smi],
@@ -3277,14 +3320,11 @@ fn lower_expr_free<'m>(
                 true,
             );
 
-            let fast_b   = b.block();
-            let slow_b   = b.block();
-            let cont     = b.block();
-            let out_val  = b.add_block_param(cont, Type::Int32);
+            let fast_b    = b.block();
+            let try_gettr = b.block();
+            b.branch(hasf[0], fast_b, try_gettr);
 
-            b.branch(hasf[0], fast_b, slow_b);
-
-            // --- Fast field path
+            // fast slot
             b.position_at(fast_b);
             let (_nid_f, fv) = b.push_node(
                 Inst::LoadField { obj, field, expected: None },
@@ -3294,46 +3334,8 @@ fn lower_expr_free<'m>(
             );
             b.jump(cont, &[fv[0]]);
 
-            // --- Slow path: string-table, then "__get__<name>" getter
-            b.position_at(slow_b);
-
-            // string lookup
-            let (_nid_sc, ks) = b.push_node(
-                Inst::Const(Constant::Str(name.clone())),
-                Some(Type::Str),
-                1,
-                false,
-            );
-            let (_nid_s, sv)  = b.push_node(
-                Inst::CallNative {
-                    name: "wir_obj_get_str".into(),
-                    args: vec![obj, ks[0]],
-                    pure: false,
-                    can_throw: false,
-                },
-                None,
-                1,
-                true,
-            );
-
-            // if (sv != 0) goto cont(sv) else try getter
-            let z = b.const_i32(0);
-            let (_nid_has_str, has_str) = b.push_node(
-                Inst::CmpInt { kind: crate::wir::CmpKind::Ne, a: sv[0], b: z },
-                Some(Type::Bool),
-                1,
-                false,
-            );
-
-            let got_str_b   = b.block();
-            let try_getter  = b.block();
-            b.branch(has_str[0], got_str_b, try_getter);
-
-            b.position_at(got_str_b);
-            b.jump(cont, &[sv[0]]);
-
-            // "__get__<name>" lookup and call
-            b.position_at(try_getter);
+            // fallback: "__get__<name>" getter
+            b.position_at(try_gettr);
             let getter_key = format!("__get__{}", name);
             let (_nid_gk, gk) = b.push_node(
                 Inst::Const(Constant::Str(getter_key)),
@@ -3341,7 +3343,24 @@ fn lower_expr_free<'m>(
                 1,
                 false,
             );
-            let (_nid_g, gv) = b.push_node(
+            let (_nid_hg, has_g) = b.push_node(
+                Inst::CallNative {
+                    name: "wir_obj_has_str".into(),
+                    args: vec![obj, gk[0]],
+                    pure: false,
+                    can_throw: false,
+                },
+                Some(Type::Bool),
+                1,
+                true,
+            );
+
+            let call_g = b.block();
+            let miss   = b.block();
+            b.branch(has_g[0], call_g, miss);
+
+            b.position_at(call_g);
+            let (_nid_gv, gv) = b.push_node(
                 Inst::CallNative {
                     name: "wir_obj_get_str".into(),
                     args: vec![obj, gk[0]],
@@ -3352,19 +3371,6 @@ fn lower_expr_free<'m>(
                 1,
                 true,
             );
-
-            let (_nid_has_g, has_g) = b.push_node(
-                Inst::CmpInt { kind: crate::wir::CmpKind::Ne, a: gv[0], b: z },
-                Some(Type::Bool),
-                1,
-                false,
-            );
-
-            let call_g_b = b.block();
-            let miss_b   = b.block();
-            b.branch(has_g[0], call_g_b, miss_b);
-
-            b.position_at(call_g_b);
             let (_nid_call, gres) = b.push_node(
                 Inst::CallClosure { conv: crate::wir::CallConv::Fast, fun: gv[0], args: vec![obj] },
                 Some(Type::Int32),
@@ -3373,7 +3379,8 @@ fn lower_expr_free<'m>(
             );
             b.jump(cont, &[gres[0]]);
 
-            b.position_at(miss_b);
+            b.position_at(miss);
+            let z = b.const_i32(0);
             b.jump(cont, &[z]);
 
             // merge
@@ -3878,35 +3885,82 @@ fn lower_expr_free<'m>(
         }
 
         Expr::Index { recv, index } => {
-            // Fast path: string literal → unify with field access (fast-field if present, else string table)
+            // If index is a string literal, prefer string-table FIRST, then fast-field as a fallback.
             if let Expr::Str(s) = &**index {
-                let obj     = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
-                let field   = intern_field_local(fields, next_field, s);
-                let fid_smi = b.const_i32(field.0 as i32);
+                let obj = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
 
-                let (_nid_h, hasf) = b.push_node(
-                    Inst::CallNative { name: "wir_obj_has_field".into(), args: vec![obj, fid_smi], pure: false, can_throw: false },
-                    Some(Type::Bool), 1, true,
+                // string path first
+                let (_nid_sc, ks) = b.push_node(
+                    Inst::Const(Constant::Str(s.clone())),
+                    Some(Type::Str),
+                    1,
+                    false,
+                );
+                let (_nid_hs, has_str) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_obj_has_str".into(),
+                        args: vec![obj, ks[0]],
+                        pure: false,
+                        can_throw: false,
+                    },
+                    Some(Type::Bool),
+                    1,
+                    true,
                 );
 
-                let then_b = b.block();
-                let else_b = b.block();
-                let cont   = b.block();
-                let out    = b.add_block_param(cont, Type::Int32);
+                let str_hit = b.block();
+                let try_fast = b.block();
+                let cont = b.block();
+                let out  = b.add_block_param(cont, Type::Int32);
 
-                b.branch(hasf[0], then_b, else_b);
+                b.branch(has_str[0], str_hit, try_fast);
 
-                b.position_at(then_b);
-                let (_nid_f, fv) = b.push_node(Inst::LoadField { obj, field, expected: None }, None, 1, false);
-                b.jump(cont, &[fv[0]]);
-
-                b.position_at(else_b);
-                let (_nid_sc, ks) = b.push_node(Inst::Const(Constant::Str(s.clone())), Some(Type::Str), 1, false);
-                let (_nid_s, sv)  = b.push_node(
-                    Inst::CallNative { name: "wir_obj_get_str".into(), args: vec![obj, ks[0]], pure: false, can_throw: false },
-                    None, 1, true,
+                b.position_at(str_hit);
+                let (_nid_s, sv) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_obj_get_str".into(),
+                        args: vec![obj, ks[0]],
+                        pure: false,
+                        can_throw: false,
+                    },
+                    None,
+                    1,
+                    true,
                 );
                 b.jump(cont, &[sv[0]]);
+
+                // fallback: fast field (works when literal and same lowering context)
+                b.position_at(try_fast);
+                let field   = intern_field_local(fields, next_field, s);
+                let fid_smi = b.const_i32(field.0 as i32);
+                let (_nid_hf, hasf) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_obj_has_field".into(),
+                        args: vec![obj, fid_smi],
+                        pure: false,
+                        can_throw: false,
+                    },
+                    Some(Type::Bool),
+                    1,
+                    true,
+                );
+
+                let fast_b = b.block();
+                let miss   = b.block();
+                b.branch(hasf[0], fast_b, miss);
+
+                b.position_at(fast_b);
+                let (_nid_f, fv) = b.push_node(
+                    Inst::LoadField { obj, field, expected: None },
+                    None,
+                    1,
+                    false,
+                );
+                b.jump(cont, &[fv[0]]);
+
+                b.position_at(miss);
+                let z = b.const_i32(0);
+                b.jump(cont, &[z]);
 
                 b.position_at(cont);
                 return Ok(out);
@@ -3916,7 +3970,6 @@ fn lower_expr_free<'m>(
             let obj  = lower_expr_free(b, locals, fields, next_field, recv,  funcs, lam_caps)?;
             let idxv = lower_expr_free(b, locals, fields, next_field, index, funcs, lam_caps)?;
 
-            // Requires a tiny native: bool wir_is_str(value)
             let (_nid_is, is_str) = b.push_node(
                 Inst::CallNative { name: "wir_is_str".into(), args: vec![idxv], pure: false, can_throw: false },
                 Some(Type::Bool), 1, true,
@@ -3929,9 +3982,9 @@ fn lower_expr_free<'m>(
 
             b.branch(is_str[0], str_b, arr_b);
 
-            // object["key"]
+            // object["key"]  — dynamic string path (no fast-field here; we can't safely pick a FieldId)
             b.position_at(str_b);
-            let (_nid_s, sv) = b.push_node(
+            let (_nid_hs, sv) = b.push_node(
                 Inst::CallNative { name: "wir_obj_get_str".into(), args: vec![obj, idxv], pure: false, can_throw: false },
                 None, 1, true,
             );
