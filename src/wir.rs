@@ -584,6 +584,7 @@ pub struct Module {
     pub next_envshape: u32,
     pub next_site: u32,
     pub next_deopt: u32,
+    pub next_class: u32,
     pub strings: BTreeMap<String, ValueId>,
     pub shapes: BTreeMap<String, ShapeId>, // named shapes (for testing)
     pub fields: BTreeMap<String, FieldId>, // named fields (for testing)
@@ -591,6 +592,11 @@ pub struct Module {
 
 impl Module {
     pub fn new() -> Self { Self::default() }
+    pub fn fresh_class(&mut self) -> ClassId {
+        let id = ClassId(self.next_class);
+        self.next_class += 1;
+        id
+    }
     pub fn fresh_shape(&mut self) -> ShapeId {
         let id = ShapeId(self.next_shape);
         self.next_shape += 1;
@@ -828,6 +834,97 @@ impl<'m> Builder<'m> {
         let id = dp.id;
         self.func.deopts.push(dp);
         id
+    }
+
+    // ---- classes ----
+    pub fn register_class(
+        &mut self,
+        meta: ClassMeta,
+        fields: Vec<FieldId>,
+        statics: Vec<FieldId>,
+        methods: Vec<(FieldId, FuncId, bool)>,
+        accessors: Vec<(FieldId, Option<FuncId>, Option<FuncId>, bool)>,
+        ctor: Option<FuncId>,
+    ) {
+        let _ = self.push_node(
+            Inst::RegisterClass { meta, fields, statics, methods, accessors, ctor },
+            Some(Type::Top),
+            0,
+            true,
+        );
+    }
+
+    pub fn alloc_instance(&mut self, class: ClassId) -> ValueId {
+        let (_nid, res) = self.push_node(
+            Inst::AllocInstance { class },
+            Some(Type::Obj(ShapeSet::default())), // precise shape comes from runtime/class meta
+            1,
+            true,
+        );
+        res[0]
+    }
+
+    pub fn load_method(&mut self, obj: ValueId, method: FieldId, expected: Option<ShapeId>) -> ValueId {
+        let (_nid, res) = self.push_node(
+            Inst::LoadMethod { obj, method, expected },
+            Some(Type::Closure(None)),
+            1,
+            false,
+        );
+        res[0]
+    }
+
+    pub fn load_super_method(&mut self, recv: ValueId, home_class: ClassId, method: FieldId) -> ValueId {
+        let (_nid, res) = self.push_node(
+            Inst::LoadSuperMethod { recv, home_class, method },
+            Some(Type::Closure(None)),
+            1,
+            false,
+        );
+        res[0]
+    }
+
+    pub fn call_method_ic(
+        &mut self,
+        site: SiteId,
+        recv: ValueId,
+        method: FieldId,
+        args: Vec<ValueId>,
+        seed_pic: Vec<PicEntry>,
+    ) -> ValueId {
+        let (_nid, res) = self.push_node(
+            Inst::CallMethodIC { site, recv, method, args, seed_pic },
+            Some(Type::Int32), // adjust per language return typing; keep Top/Union if unknown
+            1,
+            true,
+        );
+        res[0]
+    }
+
+    pub fn call_super(
+        &mut self,
+        home_class: ClassId,
+        recv: ValueId,
+        method: FieldId,
+        args: Vec<ValueId>,
+    ) -> ValueId {
+        let (_nid, res) = self.push_node(
+            Inst::CallSuper { home_class, recv, method, args },
+            Some(Type::Int32),
+            1,
+            true,
+        );
+        res[0]
+    }
+
+    pub fn instanceof(&mut self, obj: ValueId, class: ClassId) -> ValueId {
+        let (_nid, res) = self.push_node(
+            Inst::InstanceOf { obj, class },
+            Some(Type::Bool),
+            1,
+            false,
+        );
+        res[0]
     }
 }
 
