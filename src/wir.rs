@@ -51,6 +51,7 @@ id_newtype!(EnvShapeId);
 id_newtype!(SiteId); // callsite / IC site id
 id_newtype!(DeoptId);
 id_newtype!(EffectId); // special: also a ValueId in practice
+id_newtype!(ClassId);
 
 /// -------- Type lattice --------
 
@@ -78,6 +79,8 @@ pub enum Type {
     Foreign, // host/FFI box (opaque)
     // Unions (compact but general). Keep small; normalize frequently.
     Union(Vec<Type>),
+
+    Class(Option<ClassId>),
 }
 
 impl fmt::Debug for Type {
@@ -114,6 +117,8 @@ impl fmt::Debug for Type {
                 }
                 write!(f, ")")
             }
+            Class(Some(id)) => write!(f, "Class#{:?}", id),
+            Class(None) => write!(f, "Class<?>"),
         }
     }
 }
@@ -224,6 +229,15 @@ pub struct PicEntry {
     pub inlineable: bool,
     pub env_shape: Option<EnvShapeId>,
     pub arg_spec: Vec<Type>,     // observed arg types (narrowed)
+}
+
+#[derive(Clone, Debug)]
+pub struct ClassMeta {
+    pub id: ClassId,
+    pub name: String,
+    pub base: Option<ClassId>,
+    pub instance_shape: ShapeId, // initial hidden-class for instances
+    pub static_shape: ShapeId,   // hidden-class for the class object (statics)
 }
 
 /// Main instruction enum. SSA values are referenced by ValueId.
@@ -342,16 +356,60 @@ pub enum Inst {
     MakeClosure { callee: FuncId, env: ValueId },
     CallClosure { conv: CallConv, fun: ValueId, args: Vec<ValueId> },
 
+        /// Register a class with the runtime. Prefer ids to strings for stability.
     RegisterClass {
-        name: String,
-        base: Option<String>,
-        // runtime receives these maps; we serialize into arrays of tuples at lowering
-        fields: Vec<String>,                     // stored property names (instance)
-        statics: Vec<String>,                    // static stored property names
-        methods: Vec<(String, FuncId, bool)>,    // (name, func, is_static)
-        accessors: Vec<(String, Option<FuncId>, Option<FuncId>, bool)>, // name, get, set, is_static
+        meta: ClassMeta,
+        // Pre-resolved field ids (avoid string lookups at runtime)
+        fields: Vec<FieldId>,                                  // instance fields
+        statics: Vec<FieldId>,                                 // static fields
+        methods: Vec<(FieldId, FuncId, /*is_static*/ bool)>,   // name, target, static?
+        accessors: Vec<(FieldId, Option<FuncId>, Option<FuncId>, /*is_static*/ bool)>,
+        // Optional known constructor (instance). If None, default ctor.
+        ctor: Option<FuncId>,
     },
-    AllocInstance { class: String }, // or ShapeId if you pre-shape
+
+    /// Allocate a zeroed instance (does NOT run the constructor).
+    AllocInstance { class: ClassId },
+
+    /// Resolve a method by name on the receiver’s shape (non-super).
+    /// Returns a callable value (lowered to closure or direct target).
+    LoadMethod {
+        obj: ValueId,
+        method: FieldId,
+        /// If present, we guard receiver’s shape before lookup.
+        expected: Option<ShapeId>,
+    },
+
+    /// Resolve a method starting from the base (super) of `home_class`.
+    /// Used exactly for `super.m`.
+    LoadSuperMethod {
+        recv: ValueId,
+        home_class: ClassId,
+        method: FieldId,
+    },
+
+    /// PIC-based method call: `recv.method(args...)` (no separate lookup result flows).
+    CallMethodIC {
+        site: SiteId,
+        recv: ValueId,
+        method: FieldId,           // the name at this callsite
+        args: Vec<ValueId>,
+        seed_pic: Vec<PicEntry>,
+    },
+
+    /// Direct `super.m(args...)` call. Can be lowered as LoadSuperMethod + CallDirect.
+    CallSuper {
+        home_class: ClassId,
+        recv: ValueId,
+        method: FieldId,
+        args: Vec<ValueId>,
+    },
+
+    /// `obj instanceof C`
+    InstanceOf {
+        obj: ValueId,
+        class: ClassId,
+    },
 
     // ---- Natives / intrinsics ----
     CallNative {
@@ -437,6 +495,10 @@ impl Inst {
                 | CallNative { .. }
                 | PostWriteBarrier { .. }
                 | ReadBarrier { .. }
+                | RegisterClass { .. }  // mutates global class registry
+                | AllocInstance { .. }
+                | CallMethodIC { .. }
+                | CallSuper { .. }
         )
     }
 
@@ -772,7 +834,11 @@ impl<'m> Builder<'m> {
 impl EffectKind {
     fn from_inst(i: &Inst) -> EffectKind {
         match i {
-            crate::wir::Inst::EffectEntry => EffectKind::Entry,
+            crate::wir::Inst::EffectEntry
+            | crate::wir::Inst::LoadMethod { .. }
+            | crate::wir::Inst::LoadSuperMethod { .. }
+            | crate::wir::Inst::InstanceOf { .. } => EffectKind::Entry,
+
             crate::wir::Inst::Safepoint   => EffectKind::Safepoint,
 
             crate::wir::Inst::GuardType { .. }
@@ -784,7 +850,9 @@ impl EffectKind {
             | crate::wir::Inst::Bailout { .. } => EffectKind::Guard,
 
             crate::wir::Inst::AllocObj { .. }
-            | crate::wir::Inst::AllocArray { .. } => EffectKind::Alloc,
+            | crate::wir::Inst::AllocArray { .. }
+            | crate::wir::Inst::RegisterClass { .. }
+            | crate::wir::Inst::AllocInstance { .. } => EffectKind::Alloc,
 
             crate::wir::Inst::StoreField { .. }
             | crate::wir::Inst::StoreElem { .. }
@@ -810,11 +878,22 @@ impl EffectKind {
             | crate::wir::Inst::ArrayFind { .. }
             | crate::wir::Inst::ArrayFindIndex { .. }
             | crate::wir::Inst::ArrayFilter { .. }
-            | crate::wir::Inst::StrToNumber(_) => EffectKind::Call,
+            | crate::wir::Inst::StrToNumber(_)
+            | crate::wir::Inst::CallMethodIC { .. }
+            | crate::wir::Inst::CallSuper { .. } => EffectKind::Call,
 
             crate::wir::Inst::PostWriteBarrier { .. }
             | crate::wir::Inst::ReadBarrier { .. } => EffectKind::Barrier,
 
+            _ => EffectKind::from_inst_default(i),
+        }
+    }
+}
+
+impl EffectKind {
+    fn from_inst_default(i: &Inst) -> EffectKind {
+        match i {
+            // paste your existing big match body here, EXCEPT the new cases handled above
             _ => EffectKind::Entry,
         }
     }

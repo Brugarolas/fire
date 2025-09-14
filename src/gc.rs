@@ -527,6 +527,12 @@ impl Scanning<NapalmVM> for VMScanning {
                 TAG_OBJECT => {
                     let obj = &mut *(base as *mut BoxedObj);
 
+                    // visit proto
+                    if is_ptr(obj.proto) && obj.proto != NULL {
+                        let slot = &mut obj.proto as *mut ValueRepr;
+                        slot_visitor.visit_slot(SlotItem(Address::from_ptr(slot.cast::<u8>())));
+                    }
+
                     for v in obj.by_id.values_mut() {
                         let slot_ptr: *mut i64 = v as *mut i64;
                         let val = *slot_ptr;
@@ -1081,11 +1087,6 @@ impl NapalmGc {
                     for i in 0..len {
                         f(ptr.add(i));
                     }
-                }
-                TAG_OBJECT => {
-                    let o = &mut *(base as *mut crate::value::BoxedObj);
-                    for v in o.by_id.values_mut()  { f(v as *mut _); }
-                    for v in o.by_str.values_mut() { f(v as *mut _); }
                 }
                 _ => {}
             }

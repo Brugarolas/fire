@@ -688,6 +688,7 @@ pub unsafe fn closure_set_env_slot(v: ValueRepr, idx: usize, val: ValueRepr) {
 #[repr(C)]
 pub struct BoxedObj {
     pub hdr: ObjHeader,
+    pub proto: ValueRepr,
     pub by_id:  HashMap<u32, ValueRepr>,   // FieldId fast path
     pub by_str: HashMap<String, ValueRepr> // string-key path
 }
@@ -703,10 +704,11 @@ pub fn obj_new() -> ValueRepr {
             if p.is_null() { p = NAPALM_GC.alloc_slow_path(size, align); }
 
             let obj = p as *mut BoxedObj;
-            core::ptr::write(
+                core::ptr::write(
                 obj,
                 BoxedObj {
                     hdr: ObjHeader { tag: TAG_OBJECT, aux: 0 },
+                    proto: NULL,                  // NEW
                     by_id:  HashMap::new(),
                     by_str: HashMap::new(),
                 }
@@ -730,6 +732,7 @@ pub fn obj_new() -> ValueRepr {
                 obj,
                 BoxedObj {
                     hdr: ObjHeader { tag: TAG_OBJECT, aux: 0 },
+                    proto: NULL,
                     by_id:  HashMap::new(),
                     by_str: HashMap::new(),
                 }
@@ -743,6 +746,23 @@ pub fn obj_new() -> ValueRepr {
 #[inline(always)]
 pub unsafe fn as_obj_mut(v: ValueRepr) -> *mut BoxedObj {
     v as *mut BoxedObj
+}
+
+#[inline(always)]
+pub unsafe fn obj_set_proto(obj_v: ValueRepr, proto: ValueRepr) -> ValueRepr {
+    let o = &mut *as_obj_mut(obj_v);
+    o.proto = proto;
+
+    #[cfg(feature = "gc")]
+    NAPALM_GC.post_write_barrier(obj_v as *mut u8, &mut o.proto, proto);
+
+    0
+}
+
+#[inline(always)]
+pub unsafe fn obj_get_proto(obj_v: ValueRepr) -> ValueRepr {
+    let o = &*as_obj_mut(obj_v);
+    o.proto
 }
 
 // ---- FieldId-based (u32) helpers ----
@@ -779,6 +799,16 @@ pub unsafe fn obj_del_field(obj_v: ValueRepr, fid: u32) -> ValueRepr {
     if o.by_id.remove(&fid).is_some() { 1 } else { 0 }
 }
 
+#[inline(always)]
+pub unsafe fn obj_get_field_deep(mut obj_v: ValueRepr, fid: u32) -> ValueRepr {
+    while obj_v != NULL {
+        let o = &*(obj_v as *const BoxedObj);
+        if let Some(&v) = o.by_id.get(&fid) { return v; }
+        obj_v = o.proto;
+    }
+    NULL
+}
+
 // ---- String-key helpers ----
 
 #[inline(always)]
@@ -810,6 +840,16 @@ pub unsafe fn obj_has_str(obj_v: ValueRepr, key: &str) -> ValueRepr {
 pub unsafe fn obj_del_str(obj_v: ValueRepr, key: &str) -> ValueRepr {
     let o = &mut *as_obj_mut(obj_v);
     if o.by_str.remove(key).is_some() { 1 } else { 0 }
+}
+
+#[inline(always)]
+pub unsafe fn obj_get_str_deep(mut obj_v: ValueRepr, key: &str) -> ValueRepr {
+    while obj_v != NULL {
+        let o = &*(obj_v as *const BoxedObj);
+        if let Some(&v) = o.by_str.get(key) { return v; }
+        obj_v = o.proto;
+    }
+    NULL
 }
 
 // ============================================================================

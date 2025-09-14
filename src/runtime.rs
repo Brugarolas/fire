@@ -2,7 +2,8 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
-use crate::value::{TAG_STRING, BoxedStr, ObjHeader, TAG_OBJECT, is_imm, NULL};
+use crate::jit::wir_make_method_closure;
+use crate::value::{TAG_STRING, BoxedStr, ObjHeader, TAG_OBJECT, is_imm, NULL, obj_set_proto, obj_get_proto, obj_get_field_deep, obj_get_str_deep};
 use crate::value as v;
 use crate::gc::NAPALM_GC;
 
@@ -83,6 +84,51 @@ pub extern "C" fn wir_obj_del_field(obj: i64, field_id_smi: i64) -> i64 {
     if obj == 0 { return 0; }
     let id = decode_field_smi(field_id_smi);
     unsafe { v::obj_del_field(obj, id) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_obj_set_proto(obj: i64, proto: i64) -> i64 {
+    if obj == 0 { return 0; }
+    unsafe { obj_set_proto(obj, proto) }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_obj_get_proto(obj: i64) -> i64 {
+    if obj == 0 { return 0; }
+    unsafe { obj_get_proto(obj) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_obj_get_field_deep(obj: i64, field_id_smi: i64) -> i64 {
+    if obj == 0 { return 0; }
+    unsafe { obj_get_field_deep(obj, decode_field_smi(field_id_smi)) }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_obj_get_str_deep(obj: i64, key_ptr: i64) -> i64 {
+    if obj == 0 { return 0; }
+    let Some(k) = (unsafe { boxedstr_to_string(key_ptr) }) else { return 0; };
+    unsafe { obj_get_str_deep(obj, &k) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_obj_get_method(obj: i64, field_id_smi: i64) -> i64 {
+    if obj == 0 { return 0; }
+    let fid_smi_or_val = unsafe { obj_get_field_deep(obj, decode_field_smi(field_id_smi)) };
+    if fid_smi_or_val == 0 { return 0; }
+
+    // If it’s an SMI(FuncId), bind it via method trampoline.
+    if (fid_smi_or_val & 1) == 1 {
+        return unsafe { wir_make_method_closure(fid_smi_or_val) };
+    }
+    // Otherwise (already-closure or data), return as-is.
+    fid_smi_or_val
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_super_get_method(home_proto: i64, field_id_smi: i64) -> i64 {
+    let super_proto = wir_obj_get_proto(home_proto);
+    if super_proto == 0 { return 0; }
+    let fid = unsafe { obj_get_field_deep(super_proto, decode_field_smi(field_id_smi)) };
+    if (fid & 1) == 1 { (unsafe { wir_make_method_closure(fid) }) } else { fid } // same binding rule
 }
 
 // -------- string-key path (key is a BoxedStr pointer) --------

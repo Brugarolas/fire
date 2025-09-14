@@ -37,6 +37,7 @@ use crate::runtime::{
     wir_obj_get_field, wir_obj_set_field, wir_obj_has_field, wir_obj_del_field,
     wir_obj_get_str, wir_obj_set_str, wir_obj_has_str, wir_obj_del_str,
     wir_memo_get, wir_memo_put,
+    wir_obj_set_proto, wir_obj_get_proto, wir_obj_get_field_deep, wir_obj_get_str_deep,
 };
 #[allow(unused_imports)]
 use crate::native_timers::{
@@ -143,6 +144,11 @@ impl Default for JIT {
 
             fn wir_memo_get4(fid: i64, k0: i64, k1: i64, k2: i64, k3: i64, out_ptr: *mut i64) -> i64;
             fn wir_memo_put4(fid: i64, k0: i64, k1: i64, k2: i64, k3: i64, val: i64) -> i64;
+
+            fn wir_obj_set_proto(obj: i64, proto: i64) -> i64;
+            fn wir_obj_get_proto(obj: i64) -> i64;
+            fn wir_obj_get_field_deep(obj: i64, field_id: i64) -> i64;
+            fn wir_obj_get_str_deep(obj: i64, key: i64) -> i64;
         }
 
         // --- declare the object natives so we can take typed fn pointers ---
@@ -337,6 +343,11 @@ impl Default for JIT {
             jb.symbol("wir_http_start_stream_from_req", wir_http_start_stream_from_req as *const extern "C" fn(i64,i64,i64)->i64 as *const u8);
             jb.symbol("wir_json_parse",          wir_json_parse       as *const extern "C" fn(i64)->i64 as *const u8);
             jb.symbol("wir_http_send_json",      wir_http_send_json   as *const extern "C" fn(i64,i64,i64)->i64 as *const u8);
+
+            jb.symbol("wir_obj_set_proto",     wir_obj_set_proto     as *const extern "C" fn(i64,i64)->i64 as *const u8);
+            jb.symbol("wir_obj_get_proto",     wir_obj_get_proto     as *const extern "C" fn(i64)->i64 as *const u8);
+            jb.symbol("wir_obj_get_field_deep", wir_obj_get_field_deep as *const extern "C" fn(i64,i64)->i64 as *const u8);
+            jb.symbol("wir_obj_get_str_deep",  wir_obj_get_str_deep  as *const extern "C" fn(i64,i64)->i64 as *const u8);
         }
 
         let module = cranelift_jit::JITModule::new(jb);
@@ -1748,8 +1759,8 @@ pub extern "C" fn wir_method_trampoline(argv: *const i64, argc: usize) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_make_method_closure(fid_smi: i64) -> i64 {
-    // Sentinel: code_ptr == 0 means “method closure”; env[0] = SMI(fid).
-    let clo_val = closure_new(0usize, 1);
+    unsafe extern "C" { fn wir_method_trampoline(argv: *const i64, argc: usize) -> i64; }
+    let clo_val = closure_new(wir_method_trampoline as usize, 1);
     unsafe { closure_set_env_slot(clo_val, 0, fid_smi); }
     clo_val
 }
