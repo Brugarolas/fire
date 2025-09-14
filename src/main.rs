@@ -14,8 +14,8 @@ mod native_timers;
 mod native_promises;
 mod http;
 
-//use crate::opt::Optimize;
-//use crate::opt::optimization::optimization_passes;
+use crate::opt::Optimize;
+use crate::opt::optimization::optimization_passes;
 use mimalloc::MiMalloc;
 use ahash::AHashMap as HashMap;
 use std::time::Instant;
@@ -54,6 +54,10 @@ fn main() {
         default_script().to_string()
     };
 
+    #[cfg(debug_assertions)]
+    eprintln!("(Debug build) Parsing and lowering the code...");
+    let p0 = Instant::now(); // Start timing just before the function returns
+
     // 2) Parse
     let mut p = front::Parser::new(&src);
     let prog = match p.program() {
@@ -69,9 +73,25 @@ fn main() {
         return;
     }
 
+    let p1 = Instant::now(); // End timing just after the function returns
+    let duration = p1.duration_since(p0);
+    let secs_parse = duration.as_secs_f64();
+    #[cfg(debug_assertions)]
+    eprintln!("(Debug build) Parsing and lowering the code took {:.6} seconds", secs_parse);
+
+    #[cfg(debug_assertions)]
+    eprintln!("(Debug build) Optimizing the code...");
+    let o0 = Instant::now(); // Start timing just before the function returns
+
     // 3.5) Optimize WIR
-    //let optimize = optimization_passes();
-    //optimize.optimize_module(&mut module); // TODO Too Slow?
+    let optimize = optimization_passes();
+    optimize.optimize_module(&mut module);
+
+    let o1 = Instant::now(); // End timing just after the function returns
+    let duration = o1.duration_since(o0);
+    let secs_optimize = duration.as_secs_f64();
+    #[cfg(debug_assertions)]
+    eprintln!("(Debug build) Optimizing the code took {:.6} seconds", secs_optimize);
 
     // 4.1) Init GC and bind to this thread
     #[cfg(feature = "gc")] {
