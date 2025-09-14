@@ -1,244 +1,293 @@
-// src/opt/pass/const_fold.rs
 #![allow(dead_code)]
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
+use std::mem::{discriminant, Discriminant};
+
 use crate::opt::{InstCursor, OptimizationWIR, WirEditQueue};
-use crate::opt::helpers::{
-    value_const, value_as_i32, value_as_f64, value_is_const_i32, value_is_const_f64,
-};
-use crate::wir::{Constant, Inst, IntBinOp, F64BinOp, CmpKind, Type};
+use crate::opt::helpers::{ value_const, value_as_i32, value_as_f64 };
+use crate::opt::EditQueueExt;
+use crate::wir::{Constant, Inst, IntBinOp, F64BinOp, CmpKind, Type, ValueId};
 
 pub struct ConstFold;
+impl Default for ConstFold { fn default() -> Self { Self } }
 
 impl OptimizationWIR for ConstFold {
-    fn optimize_node(&mut self, cur: &mut InstCursor, _q: &mut WirEditQueue) -> bool {
+    // Keep bucketing tight; avoid constructing variants that need extra fields (e.g., guards with `deopt`).
+    fn maybe_interesting(&self, tag: Discriminant<Inst>) -> bool {
         use Inst::*;
-        let mut changed = false;
+        let v0 = ValueId(0);
+        let tags = [
+            discriminant(&Mov(v0)),
+            discriminant(&IntBin { op: IntBinOp::Add, a: v0, b: v0 }),
+            discriminant(&F64Bin { op: F64BinOp::Add, a: v0, b: v0 }),
+            discriminant(&NumAdd(v0, v0)),
+            discriminant(&NumSub(v0, v0)),
+            discriminant(&NumMul(v0, v0)),
+            discriminant(&NumDiv(v0, v0)),
+            discriminant(&NumRem(v0, v0)),
+            discriminant(&CmpInt { kind: CmpKind::Eq, a: v0, b: v0 }),
+            discriminant(&CmpF64 { kind: CmpKind::Eq, a: v0, b: v0 }),
+            discriminant(&CmpRefEq { a: v0, b: v0 }),
+            discriminant(&StrLen(v0)),
+            discriminant(&StrConcat { a: v0, b: v0 }),
+            discriminant(&StrSlice { s: v0, start: v0, end: v0 }),
+            discriminant(&StrCompare { a: v0, b: v0 }),
+            discriminant(&StrContains { s: v0, sub: v0 }),
+        ];
+        tags.contains(&tag)
+    }
 
-        // Small helpers -------------------------------------------------------
-        macro_rules! replace_with_const {
-            ($c:expr, $ty:expr) => {{
-                cur.with_cur(|n| { n.kind = Inst::Const($c); n.ty = Some($ty); });
-                changed = true;
-            }};
-        }
-        macro_rules! replace_with_value {
-            ($v:expr) => {{
-                cur.with_cur(|n| { n.kind = Inst::Mov($v); /* type will be tightened elsewhere */ });
-                changed = true;
-            }};
+    fn optimize_node(&mut self, cur: &mut InstCursor, q: &mut WirEditQueue) -> bool {
+        use Inst::*;
+
+        // Decide a single action first (purely from a cloned kind),
+        // then apply once to avoid borrowing conflicts.
+        enum Action {
+            None,
+            ReplaceKind(Inst, Option<Type>),
         }
 
+        let mut act = Action::None;
+
+        // Helpers (pure, no mutable borrows)
         let is_commutative_int = |op: IntBinOp| {
             matches!(op, IntBinOp::Add | IntBinOp::Mul | IntBinOp::And | IntBinOp::Or | IntBinOp::Xor)
         };
 
-        match cur.cur_kind() {
-            // Mov(Const c) -> Const c   (also tighten obvious type)
+        let kind = cur.cur_kind(); // clone snapshot
+
+        match kind {
+            // ===== MOV canonicalizations =====
+            // Mov(Const c) -> Const c ; Mov(Mov(x)) -> Mov(x)
             Mov(v) => {
                 if let Some(c) = cur.with_func(|f| value_const(f, v)) {
-                    cur.with_cur(|n| {
-                        n.kind = Const(c.clone());
-                        n.ty = Some(match n.ty.clone().unwrap_or(Type::Top) {
-                            _ => const_type_hint(&n.kind),
-                        });
-                    });
-                    changed = true;
+                    act = Action::ReplaceKind(Const(c.clone()), Some(const_type_hint(&Const(c))));
+                } else if let Some(src) = cur.with_func(|f| mov_source(f, v)) {
+                    act = Action::ReplaceKind(Mov(src), None);
                 }
             }
 
-            // -------- Canonicalize commutative IntBin to put constants on RHS
+            // ===== INT rules =====
+            // Put constant on RHS for commutative ops
             IntBin { op, a, b } if is_commutative_int(op) => {
-                let (a_is_c, b_is_c) = cur.with_func(|f| {
-                    (
-                        matches!(value_const(f, a), Some(Constant::Int32(_))),
-                        matches!(value_const(f, b), Some(Constant::Int32(_))),
-                    )
-                });
+                let (a_is_c, b_is_c) = cur.with_func(|f|
+                    (value_as_i32(f, a).is_some(), value_as_i32(f, b).is_some()));
                 if a_is_c && !b_is_c {
-                    cur.with_cur(|n| if let Inst::IntBin { a: aa, b: bb, .. } = &mut n.kind {
-                        std::mem::swap(aa, bb);
-                    });
-                    changed = true;
+                    act = Action::ReplaceKind(IntBin { op, a: b, b: a }, None);
                 }
             }
 
-            // ---------- Int constant folding + identities ----------
+            // Identities/same-operand/full folds
             IntBin { op, a, b } => {
                 let (ac, bc) = cur.with_func(|f| (value_as_i32(f, a), value_as_i32(f, b)));
 
-                // Algebraic/bitwise/shift identities when one side is a constant
-                if ac.is_none() || bc.is_none() {
-                    let a_is_c = ac.is_some();
-                    let b_is_c = bc.is_some();
-
+                // Same-operand simplifications (no new const values required)
+                if a == b {
                     match op {
-                        IntBinOp::Add => {
-                            if b_is_c && bc == Some(0) { replace_with_value!(a); }
-                            else if a_is_c && ac == Some(0) { replace_with_value!(b); }
-                        }
-                        IntBinOp::Sub => {
-                            if b_is_c && bc == Some(0) { replace_with_value!(a); }
-                            // 0 - x left as-is (no Neg op in IR)
-                        }
-                        IntBinOp::Mul => {
-                            if b_is_c {
-                                match bc.unwrap() {
-                                    0 => replace_with_const!(Constant::Int32(0), Type::Int32),
-                                    1 => replace_with_value!(a),
-                                    _ => {}
-                                }
-                            } else if a_is_c {
-                                match ac.unwrap() {
-                                    0 => replace_with_const!(Constant::Int32(0), Type::Int32),
-                                    1 => replace_with_value!(b),
-                                    _ => {}
-                                }
-                            }
-                        }
-                        IntBinOp::And => {
-                            if b_is_c {
-                                let y = bc.unwrap();
-                                if y == 0 { replace_with_const!(Constant::Int32(0), Type::Int32); }
-                                else if y == -1 { replace_with_value!(a); }
-                            } else if a_is_c {
-                                let x = ac.unwrap();
-                                if x == 0 { replace_with_const!(Constant::Int32(0), Type::Int32); }
-                                else if x == -1 { replace_with_value!(b); }
-                            }
-                        }
-                        IntBinOp::Or => {
-                            if b_is_c {
-                                let y = bc.unwrap();
-                                if y == 0 { replace_with_value!(a); }
-                                else if y == -1 { replace_with_const!(Constant::Int32(-1), Type::Int32); }
-                            } else if a_is_c {
-                                let x = ac.unwrap();
-                                if x == 0 { replace_with_value!(b); }
-                                else if x == -1 { replace_with_const!(Constant::Int32(-1), Type::Int32); }
-                            }
-                        }
-                        IntBinOp::Xor => {
-                            if b_is_c && bc == Some(0) { replace_with_value!(a); }
-                            else if a_is_c && ac == Some(0) { replace_with_value!(b); }
-                        }
-                        IntBinOp::Shl | IntBinOp::ShrU | IntBinOp::Sar => {
-                            if b_is_c {
-                                let sh = (bc.unwrap() as u32) & 31;
-                                if sh == 0 { replace_with_value!(a); }
-                            }
-                        }
-                        IntBinOp::DivS | IntBinOp::RemS => { /* only fold when both consts (below) */ }
+                        IntBinOp::Sub | IntBinOp::Xor =>
+                            act = Action::ReplaceKind(Const(Constant::Int32(0)), Some(Type::Int32)),
+                        IntBinOp::And | IntBinOp::Or =>
+                            act = Action::ReplaceKind(Mov(a), None),
+                        // Shifts with same SSA are not a standard identity; leave alone.
+                        _ => {}
                     }
                 }
 
-                // Full constant fold when both sides are constants
-                if let (Some(x), Some(y)) = (ac, bc) {
-                    let folded = match op {
-                        IntBinOp::Add => Some(x.wrapping_add(y)),
-                        IntBinOp::Sub => Some(x.wrapping_sub(y)),
-                        IntBinOp::Mul => Some(x.wrapping_mul(y)),
+                // One-constant identities
+                if matches!(act, Action::None) && (ac.is_some() || bc.is_some()) {
+                    match op {
+                        IntBinOp::Add => {
+                            if bc == Some(0)       { act = Action::ReplaceKind(Mov(a), None); }
+                            else if ac == Some(0)  { act = Action::ReplaceKind(Mov(b), None); }
+                        }
+                        IntBinOp::Sub => {
+                            if bc == Some(0)       { act = Action::ReplaceKind(Mov(a), None); }
+                        }
+                        IntBinOp::Mul => {
+                            if let Some(y) = bc {
+                                if y == 0 { act = Action::ReplaceKind(Const(Constant::Int32(0)), Some(Type::Int32)); }
+                                else if y == 1 { act = Action::ReplaceKind(Mov(a), None); }
+                            } else if let Some(x) = ac {
+                                if x == 0 { act = Action::ReplaceKind(Const(Constant::Int32(0)), Some(Type::Int32)); }
+                                else if x == 1 { act = Action::ReplaceKind(Mov(b), None); }
+                            }
+                        }
                         IntBinOp::DivS => {
-                            if y == 0 || (x == i32::MIN && y == -1) { None } else { Some(x.wrapping_div(y)) }
+                            // x/1 -> x   (avoid /-1 unless both consts)
+                            if bc == Some(1) { act = Action::ReplaceKind(Mov(a), None); }
                         }
                         IntBinOp::RemS => {
-                            if y == 0 { None } else { Some(x.wrapping_rem(y)) }
+                            // x%1 -> 0 ; x%-1 -> 0
+                            if bc == Some(1) || bc == Some(-1) {
+                                act = Action::ReplaceKind(Const(Constant::Int32(0)), Some(Type::Int32));
+                            }
                         }
-                        IntBinOp::And => Some(x & y),
-                        IntBinOp::Or  => Some(x | y),
-                        IntBinOp::Xor => Some(x ^ y),
-                        IntBinOp::Shl => Some(x.wrapping_shl((y as u32) & 31)),
-                        IntBinOp::ShrU => Some(((x as u32) >> ((y as u32) & 31)) as i32),
-                        IntBinOp::Sar => Some(x >> ((y as u32) & 31)), // arithmetic shift
-                    };
-                    if let Some(v) = folded {
-                        replace_with_const!(Constant::Int32(v), Type::Int32);
+                        IntBinOp::And => {
+                            if let Some(y) = bc {
+                                if y == 0 { act = Action::ReplaceKind(Const(Constant::Int32(0)), Some(Type::Int32)); }
+                                else if y == -1 { act = Action::ReplaceKind(Mov(a), None); }
+                            } else if let Some(x) = ac {
+                                if x == 0 { act = Action::ReplaceKind(Const(Constant::Int32(0)), Some(Type::Int32)); }
+                                else if x == -1 { act = Action::ReplaceKind(Mov(b), None); }
+                            }
+                        }
+                        IntBinOp::Or => {
+                            if let Some(y) = bc {
+                                if y == 0 { act = Action::ReplaceKind(Mov(a), None); }
+                                else if y == -1 { act = Action::ReplaceKind(Const(Constant::Int32(-1)), Some(Type::Int32)); }
+                            } else if let Some(x) = ac {
+                                if x == 0 { act = Action::ReplaceKind(Mov(b), None); }
+                                else if x == -1 { act = Action::ReplaceKind(Const(Constant::Int32(-1)), Some(Type::Int32)); }
+                            }
+                        }
+                        IntBinOp::Xor => {
+                            if bc == Some(0) { act = Action::ReplaceKind(Mov(a), None); }
+                            else if ac == Some(0) { act = Action::ReplaceKind(Mov(b), None); }
+                        }
+                        IntBinOp::Shl | IntBinOp::ShrU | IntBinOp::Sar => {
+                            if let Some(y) = bc {
+                                if ((y as u32) & 31) == 0 {
+                                    act = Action::ReplaceKind(Mov(a), None);
+                                } else if y != ((y as u32) & 31) as i32 {
+                                    // Canonicalize large/neg shift immediates to masked amount
+                                    let m = ((y as u32) & 31) as i32;
+                                    // Can't synthesize a new constant ValueId for `m` here,
+                                    // so only handle the zero case; keep others as-is.
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Both-constant fold (wrap semantics)
+                if matches!(act, Action::None) {
+                    if let (Some(x), Some(y)) = (ac, bc) {
+                        let folded = match op {
+                            IntBinOp::Add => Some(x.wrapping_add(y)),
+                            IntBinOp::Sub => Some(x.wrapping_sub(y)),
+                            IntBinOp::Mul => Some(x.wrapping_mul(y)),
+                            IntBinOp::DivS => {
+                                if y == 0 || (x == i32::MIN && y == -1) { None } else { Some(x.wrapping_div(y)) }
+                            }
+                            IntBinOp::RemS => {
+                                if y == 0 { None } else { Some(x.wrapping_rem(y)) }
+                            }
+                            IntBinOp::And => Some(x & y),
+                            IntBinOp::Or  => Some(x | y),
+                            IntBinOp::Xor => Some(x ^ y),
+                            IntBinOp::Shl => Some(x.wrapping_shl((y as u32) & 31)),
+                            IntBinOp::ShrU => Some(((x as u32) >> ((y as u32) & 31)) as i32),
+                            IntBinOp::Sar => Some(x >> ((y as u32) & 31)),
+                        };
+                        if let Some(v) = folded {
+                            act = Action::ReplaceKind(Const(Constant::Int32(v)), Some(Type::Int32));
+                        }
                     }
                 }
             }
 
-            // ---------- F64 constant folding + IEEE-safe identities ----------
+            // ===== F64 rules =====
             F64Bin { op, a, b } => {
                 let (ac, bc) = cur.with_func(|f| (value_as_f64(f, a), value_as_f64(f, b)));
 
-                // Identities with one const side that are always IEEE-safe
-                if ac.is_none() || bc.is_none() {
-                    let a_is_c = ac.is_some();
-                    let b_is_c = bc.is_some();
-
+                // One-const IEEE-safe identities
+                if let Action::None = act {
                     match op {
                         F64BinOp::Add => {
-                            if b_is_c && bc.unwrap() == 0.0 { replace_with_value!(a); }
-                            else if a_is_c && ac.unwrap() == 0.0 { replace_with_value!(b); }
+                            if bc == Some(0.0) { act = Action::ReplaceKind(Mov(a), None); }
+                            else if ac == Some(0.0) { act = Action::ReplaceKind(Mov(b), None); }
                         }
                         F64BinOp::Sub => {
-                            if b_is_c && bc.unwrap() == 0.0 { replace_with_value!(a); }
+                            if bc == Some(0.0) { act = Action::ReplaceKind(Mov(a), None); }
                         }
                         F64BinOp::Mul => {
-                            if b_is_c && bc.unwrap() == 1.0 { replace_with_value!(a); }
-                            else if a_is_c && ac.unwrap() == 1.0 { replace_with_value!(b); }
-                            // DO NOT fold *0.0 due to NaN*0.0 = NaN
+                            if bc == Some(1.0) { act = Action::ReplaceKind(Mov(a), None); }
+                            else if ac == Some(1.0) { act = Action::ReplaceKind(Mov(b), None); }
+                            // avoid *0.0 due to NaN*0.0 = NaN
                         }
                         F64BinOp::Div => {
-                            if b_is_c && bc.unwrap() == 1.0 { replace_with_value!(a); }
-                            // DO NOT fold 0.0/x or x/0.0 etc.
+                            if bc == Some(1.0) { act = Action::ReplaceKind(Mov(a), None); }
                         }
                         F64BinOp::Rem => { /* both-const only */ }
                     }
                 }
 
-                if let (Some(x), Some(y)) = (ac, bc) {
-                    let folded = match op {
-                        F64BinOp::Add => x + y,
-                        F64BinOp::Sub => x - y,
-                        F64BinOp::Mul => x * y,
-                        F64BinOp::Div => x / y,
-                        F64BinOp::Rem => x % y,
-                    };
-                    replace_with_const!(Constant::F64(folded), Type::F64);
+                // Both-const fold
+                if let Action::None = act {
+                    if let (Some(x), Some(y)) = (ac, bc) {
+                        let v = match op {
+                            F64BinOp::Add => x + y,
+                            F64BinOp::Sub => x - y,
+                            F64BinOp::Mul => x * y,
+                            F64BinOp::Div => x / y,
+                            F64BinOp::Rem => x % y,
+                        };
+                        act = Action::ReplaceKind(Const(Constant::F64(v)), Some(Type::F64));
+                    }
                 }
             }
 
-            // ---------- Generic numeric ops (Num*) when both sides constant ----------
-            NumAdd(a, b) | NumSub(a, b) | NumMul(a, b) | NumDiv(a, b) | NumRem(a, b) => {
+            // ===== Generic numeric (Num*) =====
+            NumAdd(a,b) => {
                 let (ai, bi) = cur.with_func(|f| (value_as_i32(f, a), value_as_i32(f, b)));
                 let (af, bf) = cur.with_func(|f| (value_as_f64(f, a), value_as_f64(f, b)));
-
-                // both int -> fold to Int32
-                if let (Some(x), Some(y)) = (ai, bi) {
-                    let v = match cur.cur_kind() {
-                        NumAdd(_,_) => x.wrapping_add(y),
-                        NumSub(_,_) => x.wrapping_sub(y),
-                        NumMul(_,_) => x.wrapping_mul(y),
-                        NumDiv(_,_) => {
-                            if y == 0 || (x == i32::MIN && y == -1) { return changed; }
-                            x.wrapping_div(y)
-                        }
-                        NumRem(_,_) => {
-                            if y == 0 { return changed; }
-                            x.wrapping_rem(y)
-                        }
-                        _ => unreachable!(),
-                    };
-                    replace_with_const!(Constant::Int32(v), Type::Int32);
+                if ai == Some(0) || af == Some(0.0)      { act = Action::ReplaceKind(Mov(b), None); }
+                else if bi == Some(0) || bf == Some(0.0) { act = Action::ReplaceKind(Mov(a), None); }
+                else if let (Some(x), Some(y)) = (ai, bi) {
+                    act = Action::ReplaceKind(Const(Constant::Int32(x.wrapping_add(y))), Some(Type::Int32));
+                } else if let (Some(x), Some(y)) = (af, bf) {
+                    act = Action::ReplaceKind(Const(Constant::F64(x + y)), Some(Type::F64));
                 }
-                // else if any f64 -> promote and fold to F64
-                else if let (Some(x), Some(y)) = (af, bf) {
-                    let v = match cur.cur_kind() {
-                        NumAdd(_,_) => x + y,
-                        NumSub(_,_) => x - y,
-                        NumMul(_,_) => x * y,
-                        NumDiv(_,_) => x / y,
-                        NumRem(_,_) => x % y,
-                        _ => unreachable!(),
-                    };
-                    replace_with_const!(Constant::F64(v), Type::F64);
+            }
+            NumSub(a,b) => {
+                let (ai, bi) = cur.with_func(|f| (value_as_i32(f, a), value_as_i32(f, b)));
+                let (af, bf) = cur.with_func(|f| (value_as_f64(f, a), value_as_f64(f, b)));
+                if bi == Some(0) || bf == Some(0.0) { act = Action::ReplaceKind(Mov(a), None); }
+                else if let (Some(x), Some(y)) = (ai, bi) {
+                    if !(y == 0) {
+                        act = Action::ReplaceKind(Const(Constant::Int32(x.wrapping_sub(y))), Some(Type::Int32));
+                    }
+                } else if let (Some(x), Some(y)) = (af, bf) {
+                    act = Action::ReplaceKind(Const(Constant::F64(x - y)), Some(Type::F64));
+                }
+            }
+            NumMul(a,b) => {
+                let (ai, bi) = cur.with_func(|f| (value_as_i32(f, a), value_as_i32(f, b)));
+                let (af, bf) = cur.with_func(|f| (value_as_f64(f, a), value_as_f64(f, b)));
+                if bi == Some(1) || bf == Some(1.0) { act = Action::ReplaceKind(Mov(a), None); }
+                else if ai == Some(1) || af == Some(1.0) { act = Action::ReplaceKind(Mov(b), None); }
+                else if let (Some(x), Some(y)) = (ai, bi) {
+                    act = Action::ReplaceKind(Const(Constant::Int32(x.wrapping_mul(y))), Some(Type::Int32));
+                } else if let (Some(x), Some(y)) = (af, bf) {
+                    act = Action::ReplaceKind(Const(Constant::F64(x * y)), Some(Type::F64));
+                }
+            }
+            NumDiv(a,b) => {
+                let (ai, bi) = cur.with_func(|f| (value_as_i32(f, a), value_as_i32(f, b)));
+                let (af, bf) = cur.with_func(|f| (value_as_f64(f, a), value_as_f64(f, b)));
+                if bi == Some(1) || bf == Some(1.0) { act = Action::ReplaceKind(Mov(a), None); }
+                else if let (Some(x), Some(y)) = (ai, bi) {
+                    if !(y == 0 || (x == i32::MIN && y == -1)) {
+                        act = Action::ReplaceKind(Const(Constant::Int32(x.wrapping_div(y))), Some(Type::Int32));
+                    }
+                } else if let (Some(x), Some(y)) = (af, bf) {
+                    act = Action::ReplaceKind(Const(Constant::F64(x / y)), Some(Type::F64));
+                }
+            }
+            NumRem(a,b) => {
+                let (ai, bi) = cur.with_func(|f| (value_as_i32(f, a), value_as_i32(f, b)));
+                let (af, bf) = cur.with_func(|f| (value_as_f64(f, a), value_as_f64(f, b)));
+                if let (Some(x), Some(y)) = (ai, bi) {
+                    if y != 0 {
+                        act = Action::ReplaceKind(Const(Constant::Int32(x.wrapping_rem(y))), Some(Type::Int32));
+                    }
+                } else if let (Some(x), Some(y)) = (af, bf) {
+                    act = Action::ReplaceKind(Const(Constant::F64(x % y)), Some(Type::F64));
                 }
             }
 
-            // ---------- Comparisons ----------
-            // Same-SSA comparisons
+            // ===== Comparisons =====
             CmpInt { kind, a, b } if a == b => {
                 let v = match kind {
                     CmpKind::Eq => true,
@@ -248,24 +297,22 @@ impl OptimizationWIR for ConstFold {
                     CmpKind::Gt => false,
                     CmpKind::Ge => true,
                 };
-                replace_with_const!(Constant::Bool(v), Type::Bool);
+                act = Action::ReplaceKind(Const(Constant::Bool(v)), Some(Type::Bool));
             }
             CmpF64 { kind, a, b } if a == b => {
                 if let Some(x) = cur.with_func(|f| value_as_f64(f, a)) {
-                    let (eq, ne, ord_true) = (x == x, x != x, !x.is_nan());
+                    let ord = !x.is_nan();
                     let v = match kind {
-                        CmpKind::Eq => eq,
-                        CmpKind::Ne => ne,
+                        CmpKind::Eq => x == x,
+                        CmpKind::Ne => x != x,
                         CmpKind::Lt => false,
-                        CmpKind::Le => ord_true, // true for non-NaN, false for NaN
+                        CmpKind::Le => ord,
                         CmpKind::Gt => false,
-                        CmpKind::Ge => ord_true, // true for non-NaN, false for NaN
+                        CmpKind::Ge => ord,
                     };
-                    replace_with_const!(Constant::Bool(v), Type::Bool);
+                    act = Action::ReplaceKind(Const(Constant::Bool(v)), Some(Type::Bool));
                 }
             }
-
-            // Both-const fast paths
             CmpInt { kind, a, b } => {
                 if let (Some(x), Some(y)) = cur.with_func(|f| (value_as_i32(f, a), value_as_i32(f, b))) {
                     let r = match kind {
@@ -276,7 +323,7 @@ impl OptimizationWIR for ConstFold {
                         CmpKind::Gt => x > y,
                         CmpKind::Ge => x >= y,
                     };
-                    replace_with_const!(Constant::Bool(r), Type::Bool);
+                    act = Action::ReplaceKind(Const(Constant::Bool(r)), Some(Type::Bool));
                 }
             }
             CmpF64 { kind, a, b } => {
@@ -289,107 +336,110 @@ impl OptimizationWIR for ConstFold {
                         CmpKind::Gt => x > y,
                         CmpKind::Ge => x >= y,
                     };
-                    replace_with_const!(Constant::Bool(r), Type::Bool);
+                    act = Action::ReplaceKind(Const(Constant::Bool(r)), Some(Type::Bool));
                 }
             }
 
-            // ---------- Guards on constants ----------
-            GuardIsInt { val, .. } => {
-                if let Some(c) = cur.with_func(|f| value_const(f, val)) {
-                    if let Constant::Int32(i) = c {
-                        replace_with_const!(Constant::Int32(i), Type::Int32);
-                    }
-                }
-            }
-            GuardIsF64 { val, .. } => {
-                if let Some(c) = cur.with_func(|f| value_const(f, val)) {
-                    if let Constant::F64(x) = c {
-                        replace_with_const!(Constant::F64(x), Type::F64);
-                    }
-                }
-            }
-            GuardNotNull { val, .. } => {
-                if let Some(c) = cur.with_func(|f| value_const(f, val)) {
-                    if !matches!(c, Constant::Null) {
-                        replace_with_value!(val);
-                    }
-                }
-            }
-
-            // ---------- Strings ----------
+            // ===== String ops =====
             StrLen(sv) => {
                 if let Some(Constant::Str(s)) = cur.with_func(|f| value_const(f, sv)) {
-                    replace_with_const!(Constant::Int32(s.len() as i32), Type::Int32);
+                    act = Action::ReplaceKind(Const(Constant::Int32(s.len() as i32)), Some(Type::Int32));
                 }
             }
-
             StrConcat { a, b } => {
                 let (ac, bc) = cur.with_func(|f| (value_const(f, a), value_const(f, b)));
                 match (ac, bc) {
                     (Some(Constant::Str(sa)), Some(Constant::Str(sb))) => {
                         let mut s = String::with_capacity(sa.len() + sb.len());
                         s.push_str(&sa); s.push_str(&sb);
-                        replace_with_const!(Constant::Str(s), Type::Str);
+                        act = Action::ReplaceKind(Const(Constant::Str(s)), Some(Type::Str));
                     }
-                    (Some(Constant::Str(sa)), None) if sa.is_empty() => replace_with_value!(b),
-                    (None, Some(Constant::Str(sb))) if sb.is_empty() => replace_with_value!(a),
+                    (Some(Constant::Str(sa)), None) if sa.is_empty() =>
+                        act = Action::ReplaceKind(Mov(b), None),
+                    (None, Some(Constant::Str(sb))) if sb.is_empty() =>
+                        act = Action::ReplaceKind(Mov(a), None),
                     _ => {}
                 }
             }
-
             StrSlice { s, start, end } => {
-                if let (Some(Constant::Str(src)),
-                        Some(i), Some(j)) =
-                    cur.with_func(|f| (value_const(f, s),
-                                       value_as_i32(f, start),
-                                       value_as_i32(f, end)))
+                if let (Some(Constant::Str(src)), Some(i), Some(j)) =
+                    cur.with_func(|f| (value_const(f, s), value_as_i32(f, start), value_as_i32(f, end)))
                 {
                     let len = src.len() as i32;
                     if 0 <= i && i <= j && j <= len {
                         let ss = &src[(i as usize)..(j as usize)];
-                        replace_with_const!(Constant::Str(ss.to_string()), Type::Str);
+                        act = Action::ReplaceKind(Const(Constant::Str(ss.to_string())), Some(Type::Str));
                     }
                 }
             }
-
             StrCompare { a, b } => {
                 if let (Some(Constant::Str(sa)), Some(Constant::Str(sb))) =
                     cur.with_func(|f| (value_const(f, a), value_const(f, b)))
                 {
-                    replace_with_const!(Constant::Bool(sa == sb), Type::Bool);
+                    act = Action::ReplaceKind(Const(Constant::Bool(sa == sb)), Some(Type::Bool));
                 }
             }
-
             StrContains { s, sub } => {
                 if let (Some(Constant::Str(hay)), Some(Constant::Str(needle))) =
                     cur.with_func(|f| (value_const(f, s), value_const(f, sub)))
                 {
-                    replace_with_const!(Constant::Bool(hay.contains(&needle)), Type::Bool);
+                    act = Action::ReplaceKind(Const(Constant::Bool(hay.contains(&needle))), Some(Type::Bool));
                 }
             }
 
-            // ---------- Ref equality on easy constants ----------
+            // ===== Ref equality quick wins =====
             CmpRefEq { a, b } => {
                 if a == b {
-                    replace_with_const!(Constant::Bool(true), Type::Bool);
+                    act = Action::ReplaceKind(Const(Constant::Bool(true)), Some(Type::Bool));
                 } else if let (Some(ca), Some(cb)) = cur.with_func(|f| (value_const(f, a), value_const(f, b))) {
-                    let v = match (ca, cb) {
-                        (Constant::Null, Constant::Null) => true,
-                        (Constant::Null, _) | (_, Constant::Null) => false,
-                        _ => return changed, // don't guess pointer equality for heap refs
+                    let res = match (ca, cb) {
+                        (Constant::Null, Constant::Null) => Some(true),
+                        (Constant::Null, _) | (_, Constant::Null) => Some(false),
+                        _ => None, // don’t guess heap pointer equality
                     };
-                    replace_with_const!(Constant::Bool(v), Type::Bool);
+                    if let Some(v) = res {
+                        act = Action::ReplaceKind(Const(Constant::Bool(v)), Some(Type::Bool));
+                    }
+                }
+            }
+
+            // Guards (won’t be woken by bucketing; pattern kept with `..` for IR compat)
+            GuardIsInt { val, .. } => {
+                if let Some(Constant::Int32(i)) = cur.with_func(|f| value_const(f, val)) {
+                    act = Action::ReplaceKind(Const(Constant::Int32(i)), Some(Type::Int32));
+                }
+            }
+            GuardIsF64 { val, .. } => {
+                if let Some(Constant::F64(x)) = cur.with_func(|f| value_const(f, val)) {
+                    act = Action::ReplaceKind(Const(Constant::F64(x)), Some(Type::F64));
+                }
+            }
+            GuardNotNull { val, .. } => {
+                if let Some(c) = cur.with_func(|f| value_const(f, val)) {
+                    if !matches!(c, Constant::Null) {
+                        act = Action::ReplaceKind(Mov(val), None);
+                    }
                 }
             }
 
             _ => {}
         }
 
-        changed
+        match act {
+            Action::None => false,
+            Action::ReplaceKind(newk, ty_hint) => {
+                q.replace_cur_kind(cur, newk);
+                if let Some(ty) = ty_hint {
+                    cur.with_cur(|n| n.ty = Some(ty));
+                }
+                true
+            }
+        }
     }
 }
 
-// Heuristic type hint for Const nodes created here.
+/* ---------------- helpers ---------------- */
+
 fn const_type_hint(kind: &Inst) -> Type {
     match kind {
         Inst::Const(Constant::Int32(_)) => Type::Int32,
@@ -399,4 +449,15 @@ fn const_type_hint(kind: &Inst) -> Type {
         Inst::Const(Constant::Str(_))   => Type::Str,
         _ => Type::Top,
     }
+}
+
+// Mov(Mov(x)) ⇒ return inner source ValueId (if any)
+fn mov_source(f: &crate::wir::Function, v: ValueId) -> Option<ValueId> {
+    use crate::wir::ValueDef;
+    if let ValueDef::InstResult(iid, _) = f.values[v.0 as usize].def {
+        if let Inst::Mov(src) = f.nodes[iid.0 as usize].kind {
+            return Some(src);
+        }
+    }
+    None
 }

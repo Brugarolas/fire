@@ -100,14 +100,13 @@ impl RepCtx {
         self.val2rep[idx] = Some(r);
     }
 
-    /// If `v` is (or produces) a constant, return/record a dominating leader for that constant.
-    fn const_leader(&mut self, func: &Function, v: ValueId) -> Option<ValueId> {
+    /// If `v` is (or produces) a constant, return a previously seen dominating leader for that constant.
+    fn const_leader(&self, func: &Function, v: ValueId) -> Option<ValueId> {
         if let Some(ck) = constant_of_value(func, v) {
-            if let Some(&ldr) = self.const2leader.get(&ck) {
-                return Some(ldr);
-            }
+            self.const2leader.get(&ck).copied()
+        } else {
+            None
         }
-        None
     }
 
     /// Record `dst` as the leader for constant `ck` (first time we see it in scope).
@@ -176,19 +175,16 @@ enum ExprKey {
 
     // Comparisons
     CmpInt   { kind: CmpKind, a: ValueId, b: ValueId },
-    CmpF64   { kind: CmpKind, a: CmpKinded<ValueId>, b: CmpKinded<ValueId> }, // handled via flip
-    CmpF64N  { kind: CmpKind, a: ValueId, b: ValueId }, // (kept for symmetry; see canonicalize)
+    // We'll canonicalize F64 cmps identically to int cmps (flip+order)
+    CmpF64   { kind: CmpKind, a: ValueId, b: ValueId },
     CmpRefEq { a: ValueId, b: ValueId },
 
-    // Simple queries
+    // Simple queries (pure, non-allocating)
     ArrayLen { a: ValueId },
     StrLen   { a: ValueId },
-    StrCompare { a: ValueId, b: ValueId },
+    StrCompare  { a: ValueId, b: ValueId },
+    StrContains { a: ValueId, b: ValueId }, // contains(a,b) is NOT commutative
 }
-
-// Helper wrapper to show intent in type; we still canonicalize below.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct CmpKinded<T>(T);
 
 impl ExprKey {
     fn canonicalized(mut self) -> Self {
@@ -209,7 +205,8 @@ impl ExprKey {
                     if *a > *b { std::mem::swap(a, b); }
                 }
             }
-            ExprKey::CmpInt { kind, a, b } => {
+            ExprKey::CmpInt { kind, a, b } |
+            ExprKey::CmpF64 { kind, a, b } => {
                 if matches!(kind, Eq | Ne) {
                     if *a > *b { std::mem::swap(a, b); }
                 } else if *a > *b {
@@ -221,6 +218,7 @@ impl ExprKey {
             ExprKey::StrCompare { a, b } => {
                 if *a > *b { std::mem::swap(a, b); }
             }
+            // ArrayLen, StrLen, StrContains: nothing to do
             _ => {}
         }
         self
@@ -257,18 +255,23 @@ fn visit_block(
     for &nid in &block.insts {
         let node = &func.nodes[nid.0 as usize];
 
-        // Helpers: canonical reps for operands
+        // Helper: canonical rep for an operand
         let rep = |v: ValueId, reps: &RepCtx| -> ValueId { reps.rep(v) };
 
         match &node.kind {
             // Mov: tie the result to the source representative.
             Inst::Mov(src) => {
                 if let Some(&dst) = node.results.get(0) {
-                    let r = rep(*src, reps);
-                    reps.union_to(dst, r);
-                    // Optional: normalize Mov to Mov(rep(src)) for cleanliness.
-                    if r != *src {
-                        q.replace_kind(nid, Inst::Mov(r));
+                    // If the source (or its producer) is a constant with a seen leader, prefer it.
+                    if let Some(kldr) = reps.const_leader(func, *src) {
+                        q.replace_kind(nid, Inst::Mov(kldr));
+                        reps.union_to(dst, kldr);
+                    } else {
+                        let r = rep(*src, reps);
+                        reps.union_to(dst, r);
+                        if r != *src {
+                            q.replace_kind(nid, Inst::Mov(r));
+                        }
                     }
                 }
             }
@@ -277,12 +280,13 @@ fn visit_block(
             Inst::Const(c) => {
                 if let Some(&dst) = node.results.get(0) {
                     let ck = ConstKey::from_const(c);
-                    if let Some(&ldr) = expr2leader.get(&ExprKey::Const(ck.clone())) {
+                    let key = ExprKey::Const(ck.clone());
+                    if let Some(&ldr) = expr2leader.get(&key) {
                         q.replace_kind(nid, Inst::Mov(ldr));
                         reps.union_to(dst, reps.rep(ldr));
                     } else {
-                        expr2leader.insert(ExprKey::Const(ck.clone()), dst);
-                        expr_stack.push(ExprKey::Const(ck.clone()));
+                        expr2leader.insert(key.clone(), dst);
+                        expr_stack.push(key);
                         reps.remember_const_leader(ck, dst);
                         reps.union_to(dst, dst);
                     }
@@ -323,8 +327,7 @@ fn visit_block(
             Inst::CmpF64 { kind, a, b } => {
                 if let Some(dst) = node.results.get(0).copied() {
                     let (a, b) = (rep(*a, reps), rep(*b, reps));
-                    // We just reuse the same canonicalization as integer cmps.
-                    let key = ExprKey::CmpInt { kind: *kind, a, b }.canonicalized(); // reuse logic
+                    let key = ExprKey::CmpF64 { kind: *kind, a, b }.canonicalized();
                     cse_lookup_or_insert(key, dst, expr2leader, expr_stack, q, nid, reps);
                 }
             }
@@ -358,8 +361,15 @@ fn visit_block(
                     cse_lookup_or_insert(key, dst, expr2leader, expr_stack, q, nid, reps);
                 }
             }
+            Inst::StrContains { s, sub } => {
+                if let Some(dst) = node.results.get(0).copied() {
+                    let (a, b) = (rep(*s, reps), rep(*sub, reps));
+                    let key = ExprKey::StrContains { a, b }.canonicalized();
+                    cse_lookup_or_insert(key, dst, expr2leader, expr_stack, q, nid, reps);
+                }
+            }
 
-            // Anything with effects / control / alloc / guards: do not CSE.
+            // Anything with effects / control / alloc / loads / stores / guards: do not CSE.
             _ => {
                 // For completeness, make each produced value its own leader
                 for &dst in &node.results {
@@ -428,6 +438,7 @@ fn build_cfg(func: &Function) -> (HashMap<BlockId, Vec<BlockId>>, HashMap<BlockI
         }
         succs.insert(b.id, list.clone());
         for s in list { preds.entry(s).or_default().push(b.id); }
+        // Ensure key present even if block has no preds
         preds.entry(b.id).or_default();
     }
     (preds, succs)
@@ -463,6 +474,7 @@ fn compute_idom(entry: BlockId, preds: &HashMap<BlockId, Vec<BlockId>>, rpo: &Ve
         changed = false;
         for &b in rpo {
             if b == entry { continue; }
+            // Pick one processed predecessor as seed
             let mut new_idom: Option<BlockId> = None;
             if let Some(ps) = preds.get(&b) {
                 for &p in ps {
@@ -497,9 +509,9 @@ fn intersect(mut a: BlockId, mut b: BlockId, idom: &HashMap<BlockId, BlockId>, i
 fn build_dom_tree(idom: &HashMap<BlockId, BlockId>) -> HashMap<BlockId, Vec<BlockId>> {
     let mut tree: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
     for (b, &id) in idom {
-        if *b == id { continue; }
+        if *b == id { continue; } // entry
         tree.entry(id).or_default().push(*b);
-        tree.entry(*b).or_default();
+        tree.entry(*b).or_default(); // ensure key present
     }
     tree
 }
