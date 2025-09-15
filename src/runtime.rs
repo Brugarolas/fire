@@ -1,6 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 #![allow(unused_imports)]
 #![allow(unused_variables)]
+#![allow(unused_unsafe)]
 
 use crate::jit::wir_make_method_closure;
 use crate::value::{TAG_STRING, BoxedStr, ObjHeader, TAG_OBJECT, is_imm, NULL, obj_set_proto, obj_get_proto, obj_get_field_deep, obj_get_str_deep};

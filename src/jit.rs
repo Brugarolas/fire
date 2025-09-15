@@ -2,6 +2,7 @@
 //! jit.rs — Cranelift JIT for WIR/Napalm (Cranelift 0.121.x compatible)
 #![allow(unused_imports)]
 #![allow(unused_variables)]
+#![allow(unused_unsafe)]
 
 use cranelift::prelude::*;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};

@@ -1,6 +1,7 @@
 // src/http.rs
 #![allow(unused_imports)]
 #![allow(unused_variables)]
+#![allow(unused_unsafe)]
 
 #![allow(unsafe_op_in_unsafe_fn)]
 use axum::{

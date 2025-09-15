@@ -2,6 +2,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 #![allow(unused_imports)]
 #![allow(unused_variables)]
+#![allow(unused_unsafe)]
 
 use core::mem;
 use ahash::AHashMap as HashMap;

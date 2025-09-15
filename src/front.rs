@@ -232,10 +232,12 @@ pub enum Expr {
     LitNull,
     Str(String),
     Ident(String),
+
     Assign(SmallBox<LValue, u8>, SmallBox<Expr, u8>),
     Binary { op: BinOp, a: SmallBox<Expr, u8>, b: SmallBox<Expr, u8> },
     Unary { op: UnOp, e: SmallBox<Expr, u8> },
     Call { callee: SmallBox<Expr, u8>, args: Vec<Expr> },
+
     GetProp { recv: SmallBox<Expr, u8>, name: String },
     Index { recv: SmallBox<Expr, u8>, index: SmallBox<Expr, u8> },
     Group(SmallBox<Expr, u8>),
@@ -243,27 +245,18 @@ pub enum Expr {
     FnRef { name: String },
     ArrayLit(Vec<Expr>),
 
-    This,                            // `this`
-    Super,                           // `super` (used with member access or super(...) in ctor)
+    This,                                   // `this`
+    SuperProp(String),                      // `super.m`
+    SuperCall(Vec<Expr>),                   // `super(args...)` (only valid in derived ctor)
     New { class: String, args: Vec<Expr> }, // `new ClassName(args...)`
 
-    // { a: 1, "b": 2, c: x+y }
-    ObjLit(Vec<(PropKey, Expr)>),
+    ObjLit(Vec<(PropKey, Expr)>),                                                    // { a: 1, "b": 2, c: x+y }
+    GetPropObj { obj: SmallBox<Expr, u8>, key: PropKey },                            // obj.x   or   obj["x"]
+    SetPropObj { obj: SmallBox<Expr, u8>, key: PropKey, value: SmallBox<Expr, u8> }, // obj.x = value   or   obj["x"] = value
+    In { key: SmallBox<Expr, u8>, obj: SmallBox<Expr, u8> },                         // "<key>" in obj
+    DeleteProp { obj: SmallBox<Expr, u8>, key: PropKey },                            // delete obj.x / delete obj["x"]
 
-    // obj.x   or   obj["x"]
-    GetPropObj { obj: SmallBox<Expr, u8>, key: PropKey },
-
-    // obj.x = value   or   obj["x"] = value
-    SetPropObj { obj: SmallBox<Expr, u8>, key: PropKey, value: SmallBox<Expr, u8> },
-
-    // "<key>" in obj   — key is a general Expr; at lowering we'll coerce to string/symbol
-    In { key: SmallBox<Expr, u8>, obj: SmallBox<Expr, u8> },
-
-    // delete obj.x / delete obj["x"]
-    DeleteProp { obj: SmallBox<Expr, u8>, key: PropKey },
-
-    // await <expression>
-    Await(SmallBox<Expr, u8>)
+    Await(SmallBox<Expr, u8>) // await <expression>
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1001,7 +994,31 @@ impl<'src> Parser<'src> {
         let t = self.next();
         match t.tok {
             Tok::This  => Ok(Expr::This),
-            Tok::Super => Ok(Expr::Super),
+
+            Tok::Super => {
+                if self.check(&Tok::LParen) {
+                    // super(...)
+                    self.i += 1; // consume '('
+                    let mut args = Vec::new();
+                    if !self.matches(&Tok::RParen) {
+                        loop {
+                            args.push(self.expr()?);
+                            if self.matches(&Tok::RParen) { break; }
+                            self.expect(Tok::Comma, "expected ',' in super(...)")?;
+                        }
+                    }
+                    Ok(Expr::SuperCall(args))
+                } else if self.matches(&Tok::Dot) {
+                    // super.name
+                    let name = match self.next().tok {
+                        Tok::Ident(s) => s,
+                        _ => return Err(self.err_here("expected identifier after 'super.'")),
+                    };
+                    Ok(Expr::SuperProp(name))
+                } else {
+                    Err(self.err_here("`super` must be used as `super(...)` or `super.name`"))
+                }
+            }
 
             Tok::New => {
                 // new <Ident>(args...)
@@ -1338,6 +1355,11 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
                 collect_uses_expr(obj, uses);
             }
 
+            Expr::SuperProp(_) => { /* no local uses */ }
+            Expr::SuperCall(args) => {
+                for a in args { collect_uses_expr(a, uses); }
+            }
+
             _ => { /* other expr types have no uses */ }
         }
     }
@@ -1602,7 +1624,14 @@ fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String
 
             Expr::This => Expr::This,
 
-            Expr::Super => Expr::Super,
+            Expr::SuperProp(name) => Expr::SuperProp(name.clone()),
+            Expr::SuperCall(args) => {
+                Expr::SuperCall(
+                    args.iter()
+                        .map(|a| rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out))
+                        .collect()
+                )
+            }
 
             Expr::New { class, args } => {
                 Expr::New {
@@ -3239,6 +3268,19 @@ fn lower_expr_free<'m>(
 
         // obj.<propKey>  where propKey is an identifier or string
         Expr::GetProp { recv, name } => {
+            if let Expr::Ident(cn) = &**recv {
+                if let Some(&mfid) = funcs.get(&format!("__static_{}_{}", cn, name)) {
+                    let (_nid, env_null) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
+                    let (_nid, clos) = b.push_node(
+                        Inst::MakeClosure { callee: mfid, env: env_null[0] },
+                        Some(Type::Closure(None)),
+                        1,
+                        false,
+                    );
+                    return Ok(clos[0]);
+                }
+            }
+
             // Special-case: arr.length
             if name == "length" {
                 let arr = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
@@ -3864,8 +3906,11 @@ fn lower_expr_free<'m>(
             if let Some(&v) = locals.get("this") { Ok(v) } else { Err(LowerError::UnknownVar("this".into())) }
         }
 
-        Expr::Super => {
-            return Err(LowerError::NotLowerable("bare 'super' only valid as callee (e.g. super(...))"));
+        Expr::SuperProp(_) => {
+            return Err(LowerError::NotLowerable("`super.prop` is only valid when called: use `super.prop(...)`"));
+        }
+        Expr::SuperCall(_) => {
+            return Err(LowerError::NotLowerable("`super(...)` is only valid in a derived constructor"));
         }
 
         Expr::New { class, args } => {
@@ -4440,33 +4485,161 @@ impl<'m> Lowerer<'m> {
         Ok(())
     }
 
-    fn rewrite_privates_in_block(&self, _class_name: &str, body: &Block) -> Block {
-        body.clone()
+    fn rewrite_privates_in_block(&self, class_name: &str, body: &Block) -> Block {
+        // Resolve base class name once (if any). We’ll still rewrite even if there is none;
+        // in that case unknown-func errors will be raised later if user wrote `super`.
+        let base = self.classes
+            .get(class_name)
+            .and_then(|ci| ci.base.clone());
+
+        fn rw_block<F: Fn(&Expr) -> Expr + Copy>(b: &Block, f: F) -> Block {
+            Block { stmts: b.stmts.iter().map(|s| rw_stmt(s, f)).collect() }
+        }
+        fn rw_stmt<F: Fn(&Expr) -> Expr + Copy>(s: &Stmt, f: F) -> Stmt {
+            match s {
+                Stmt::Var { name, init } =>
+                    Stmt::Var { name: name.clone(), init: init.as_ref().map(|e| rw_expr(e, f)) },
+                Stmt::If { cond, then_b, else_b } =>
+                    Stmt::If {
+                        cond: rw_expr(cond, f),
+                        then_b: rw_block(then_b, f),
+                        else_b: else_b.as_ref().map(|b| rw_block(b, f)),
+                    },
+                Stmt::While { cond, body } =>
+                    Stmt::While { cond: rw_expr(cond, f), body: rw_block(body, f) },
+                Stmt::For { init, cond, step, body } =>
+                    Stmt::For {
+                        init: init.as_deref().map(|i| SmallBox::new(rw_stmt(i, f))),
+                        cond: cond.as_ref().map(|e| rw_expr(e, f)),
+                        step: step.as_ref().map(|e| rw_expr(e, f)),
+                        body: rw_block(body, f),
+                    },
+                Stmt::Return(e) => Stmt::Return(e.as_ref().map(|x| rw_expr(x, f))),
+                Stmt::Expr(e) => Stmt::Expr(rw_expr(e, f)),
+                Stmt::Listen(ld) => {
+                    let routes = ld.routes.iter().map(|r| RouteDecl {
+                        method: r.method.clone(),
+                        pattern: rw_expr(&r.pattern, f),
+                        handler: rw_expr(&r.handler, f),
+                    }).collect();
+                    Stmt::Listen(ListenDecl { addr: ld.addr.clone(), routes })
+                }
+            }
+        }
+        fn rw_expr<F: Fn(&Expr) -> Expr + Copy>(e: &Expr, f: F) -> Expr {
+            use Expr::*;
+            let m = f(e);
+            if !std::mem::discriminant(&m).eq(&std::mem::discriminant(e)) {
+                // f() replaced the node entirely (e.g. super-rewrite) – don’t recurse
+                return m;
+            }
+            match m {
+                Assign(ref lv, ref rhs) => Expr::Assign(lv.clone(), SmallBox::new(rw_expr(rhs, f))),
+                Binary { op, ref a, ref b } =>
+                    Expr::Binary { op, a: SmallBox::new(rw_expr(a, f)), b: SmallBox::new(rw_expr(b, f)) },
+                Unary { op, ref e } =>
+                    Expr::Unary { op, e: SmallBox::new(rw_expr(e, f)) },
+                Call { ref callee, ref args } =>
+                    Expr::Call {
+                        callee: SmallBox::new(rw_expr(callee, f)),
+                        args: args.iter().map(|x| rw_expr(x, f)).collect(),
+                    },
+                GetProp { ref recv, ref name } =>
+                    Expr::GetProp { recv: SmallBox::new(rw_expr(recv, f)), name: name.clone() },
+                Index { ref recv, ref index } =>
+                    Expr::Index {
+                        recv: SmallBox::new(rw_expr(recv, f)),
+                        index: SmallBox::new(rw_expr(index, f)),
+                    },
+                Group(ref g) => Expr::Group(SmallBox::new(rw_expr(g, f))),
+                ArrayLit(ref es) => Expr::ArrayLit(es.iter().map(|x| rw_expr(x, f)).collect()),
+                ObjLit(ref kvs) => Expr::ObjLit(kvs.iter().map(|(k, v)| (k.clone(), rw_expr(v, f))).collect()),
+                GetPropObj { ref obj, ref key } =>
+                    Expr::GetPropObj { obj: SmallBox::new(rw_expr(obj, f)), key: key.clone() },
+                SetPropObj { ref obj, ref key, ref value } =>
+                    Expr::SetPropObj { obj: SmallBox::new(rw_expr(obj, f)), key: key.clone(), value: SmallBox::new(rw_expr(value, f)) },
+                In { ref key, ref obj } =>
+                    Expr::In { key: SmallBox::new(rw_expr(key, f)), obj: SmallBox::new(rw_expr(obj, f)) },
+                DeleteProp { ref obj, ref key } =>
+                    Expr::DeleteProp { obj: SmallBox::new(rw_expr(obj, f)), key: key.clone() },
+                Await(ref inner) => Expr::Await(SmallBox::new(rw_expr(inner, f))),
+                // terminals and simple refs
+                _ => m,
+            }
+        }
+
+        // Rewriter: (super(...)) and (super.m)(...) → direct calls with implicit `this`
+        let base = base.unwrap_or_else(|| "<no-base>".to_string());
+        let class_name = class_name.to_string();
+
+        let f = |e: &Expr| -> Expr {
+            match e {
+                // super(args...)  →  __ctor_Base(this, args...)
+                Expr::SuperCall(args) => {
+                    let mut new_args = Vec::with_capacity(args.len() + 1);
+                    new_args.push(Expr::This);
+                    new_args.extend(args.iter().cloned());
+                    Expr::Call {
+                        callee: SmallBox::new(Expr::Ident(format!("__ctor_{}", base))),
+                        args: new_args,
+                    }
+                }
+                // (super.m)(args...) is handled in the Call case; here we only rewrite
+                // the *value* form super.m to a sentinel that will error if used as value.
+                Expr::SuperProp(name) => {
+                    // Leave as-is; value-position `super.m` will be rejected during lowering.
+                    Expr::SuperProp(name.clone())
+                }
+                // (super.m)(args...)  →  __method_Base_m(this, args...)
+                Expr::Call { callee, args } => {
+                    if let Expr::SuperProp(m) = &**callee{
+                        let mut new_args = Vec::with_capacity(args.len() + 1);
+                        new_args.push(Expr::This);
+                        new_args.extend(args.iter().cloned());
+                        Expr::Call {
+                            callee: SmallBox::new(Expr::Ident(format!("__method_{}_{}", base, m))),
+                            args: new_args,
+                        }
+                    } else {
+                        e.clone()
+                    }
+                }
+                _ => e.clone(),
+            }
+        };
+
+        rw_block(body, f)
     }
 
     fn lower_allocator(
         &mut self,
         ci: &ClassInfo,
-        // Keep signature parallel to instance lowering (fields are not used here,
-        // but we accept them so the call site can be uniform).
-        _fields: &mut HashMap<String, FieldId>,
-        _next_field: &mut u32,
+        fields: &mut HashMap<String, FieldId>,
+        next_field: &mut u32,
     ) -> LResult<()> {
         use crate::wir::{Inst, Type};
 
         let fname = format!("__class_new_{}", ci.name);
 
-        // Discover ctor param list (for arity)
-        let ctor_params: Vec<String> = ci.methods
-            .iter()
-            .find(|(n, _, _, _)| n == "constructor")
-            .map(|(_, ps, _, _)| ps.clone())
-            .unwrap_or_default();
+        // Collect base chain names from root → ... → direct base (so overrides later will win)
+        let mut base_chain: Vec<String> = Vec::new();
+        let mut cur = ci.base.clone();
+        while let Some(bn) = cur {
+            base_chain.push(bn.clone());
+            cur = self.classes.get(&bn).and_then(|x| x.base.clone());
+        }
+        base_chain.reverse();
 
+        // helper closures inside this fn
         let mut f = {
+            let ctor_params: Vec<String> = ci.methods
+                .iter()
+                .find(|(n, _, _, _)| n == "constructor")
+                .map(|(_, ps, _, _)| ps.clone())
+                .unwrap_or_default();
+
             let mut b = Builder::new(
-                self.module,
-                &fname,
+                self.module, &fname,
                 vec![Type::Int32; ctor_params.len()],
                 vec![Type::Int32],
             );
@@ -4478,7 +4651,129 @@ impl<'m> Lowerer<'m> {
             );
             let obj = obj_r[0];
 
-            // call ctor if present — uses shared field IDs via how ctor was lowered
+            // null for closures
+            let (_nid_null, nul) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
+
+            // ---- Install inherited methods/accessors (root base first) ----
+            for bn in &base_chain {
+                if let Some(bci) = self.classes.get(bn) {
+                    // methods (skip ctor/dtor)
+                    for (mname, _ps, _body, _ia) in &bci.methods {
+                        if mname == "constructor" || mname == "destructor" { continue; }
+                        if let Some(&mfid) = self.funcs.get(&format!("__method_{}_{}", bn, mname)) {
+                            let (_nid_clo, clos) = b.push_node(
+                                Inst::MakeClosure { callee: mfid, env: nul[0] },
+                                Some(Type::Closure(None)), 1, false
+                            );
+                            let (_nid_k, ks) = b.push_node(Inst::Const(Constant::Str(mname.clone())), Some(Type::Str), 1, false);
+                            let _ = b.push_node(
+                                Inst::CallNative { name: "wir_obj_set_str".into(), args: vec![obj, ks[0], clos[0]], pure: false, can_throw: false },
+                                Some(Type::Int32), 1, true
+                            );
+                        }
+                    }
+                    // accessors: "__get__p" / "__set__p"
+                    for (pname, getb, setb) in &bci.props {
+                        if getb.is_some() {
+                            if let Some(&gid) = self.funcs.get(&format!("__get_{}_{}", bn, pname)) {
+                                let (_nid_clo, clos) = b.push_node(
+                                    Inst::MakeClosure { callee: gid, env: nul[0] },
+                                    Some(Type::Closure(None)), 1, false
+                                );
+                                let key = format!("__get__{}", pname);
+                                let (_nid_k, ks) = b.push_node(Inst::Const(Constant::Str(key)), Some(Type::Str), 1, false);
+                                let _ = b.push_node(
+                                    Inst::CallNative { name: "wir_obj_set_str".into(), args: vec![obj, ks[0], clos[0]], pure: false, can_throw: false },
+                                    Some(Type::Int32), 1, true
+                                );
+                            }
+                        }
+                        if setb.is_some() {
+                            if let Some(&sid) = self.funcs.get(&format!("__set_{}_{}", bn, pname)) {
+                                let (_nid_clo, clos) = b.push_node(
+                                    Inst::MakeClosure { callee: sid, env: nul[0] },
+                                    Some(Type::Closure(None)), 1, false
+                                );
+                                let key = format!("__set__{}", pname);
+                                let (_nid_k, ks) = b.push_node(Inst::Const(Constant::Str(key)), Some(Type::Str), 1, false);
+                                let _ = b.push_node(
+                                    Inst::CallNative { name: "wir_obj_set_str".into(), args: vec![obj, ks[0], clos[0]], pure: false, can_throw: false },
+                                    Some(Type::Int32), 1, true
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---- Install own methods/accessors (override base if name matches) ----
+            for (mname, _ps, _body, _ia) in &ci.methods {
+                if mname == "constructor" || mname == "destructor" { continue; }
+                if let Some(&mfid) = self.funcs.get(&format!("__method_{}_{}", ci.name, mname)) {
+                    let (_nid_clo, clos) = b.push_node(
+                        Inst::MakeClosure { callee: mfid, env: nul[0] },
+                        Some(Type::Closure(None)), 1, false
+                    );
+                    let (_nid_k, ks) = b.push_node(Inst::Const(Constant::Str(mname.clone())), Some(Type::Str), 1, false);
+                    let _ = b.push_node(
+                        Inst::CallNative { name: "wir_obj_set_str".into(), args: vec![obj, ks[0], clos[0]], pure: false, can_throw: false },
+                        Some(Type::Int32), 1, true
+                    );
+                }
+            }
+            for (pname, getb, setb) in &ci.props {
+                if getb.is_some() {
+                    if let Some(&gid) = self.funcs.get(&format!("__get_{}_{}", ci.name, pname)) {
+                        let (_nid_clo, clos) = b.push_node(
+                            Inst::MakeClosure { callee: gid, env: nul[0] },
+                            Some(Type::Closure(None)), 1, false
+                        );
+                        let key = format!("__get__{}", pname);
+                        let (_nid_k, ks) = b.push_node(Inst::Const(Constant::Str(key)), Some(Type::Str), 1, false);
+                        let _ = b.push_node(
+                            Inst::CallNative { name: "wir_obj_set_str".into(), args: vec![obj, ks[0], clos[0]], pure: false, can_throw: false },
+                            Some(Type::Int32), 1, true
+                        );
+                    }
+                }
+                if setb.is_some() {
+                    if let Some(&sid) = self.funcs.get(&format!("__set_{}_{}", ci.name, pname)) {
+                        let (_nid_clo, clos) = b.push_node(
+                            Inst::MakeClosure { callee: sid, env: nul[0] },
+                            Some(Type::Closure(None)), 1, false
+                        );
+                        let key = format!("__set__{}", pname);
+                        let (_nid_k, ks) = b.push_node(Inst::Const(Constant::Str(key)), Some(Type::Str), 1, false);
+                        let _ = b.push_node(
+                            Inst::CallNative { name: "wir_obj_set_str".into(), args: vec![obj, ks[0], clos[0]], pure: false, can_throw: false },
+                            Some(Type::Int32), 1, true
+                        );
+                    }
+                }
+            }
+
+            // ---- Initialize fields that have literal initializers (MVP) ----
+            for (fname, init_opt) in &ci.instance_fields {
+                if let Some(init_e) = init_opt {
+                    // We best-effort lower, but only pure/literal inits will succeed (no `this`/params).
+                    // Use the same field-id table as methods so fast-field loads match.
+                    if let Ok(v) = lower_expr_free(&mut b, &mut Default::default(), fields, next_field, init_e, &self.funcs, &self.lam_captures) {
+                        let field = intern_field_local(fields, next_field, fname);
+                        let _ = b.push_node(
+                            Inst::StoreField { obj, field, val: v, expected: None },
+                            Some(Type::Top), 1, true
+                        );
+                        // Also mirror into string table for consistency
+                        let (_nid_k, ks) = b.push_node(Inst::Const(Constant::Str(fname.clone())), Some(Type::Str), 1, false);
+                        let _ = b.push_node(
+                            Inst::CallNative { name: "wir_obj_set_str".into(), args: vec![obj, ks[0], v], pure: false, can_throw: false },
+                            Some(Type::Int32), 1, true
+                        );
+                    }
+                }
+            }
+
+            // ---- Call derived ctor if present ----
             if ci.has_ctor {
                 if let Some(&fid) = self.funcs.get(&format!("__ctor_{}", ci.name)) {
                     let mut argv = Vec::with_capacity(1 + ctor_params.len());
@@ -4487,41 +4782,6 @@ impl<'m> Lowerer<'m> {
                     let (_nid, _res) = b.push_node(
                         Inst::CallDirect { conv: crate::wir::CallConv::Fast, callee: fid, args: argv },
                         Some(Type::Int32), 1, true
-                    );
-                }
-            }
-
-            // ---- Install instance methods as closures on the object ----
-            // So that `p.sum` resolves to a callable closure.
-            let (_nid_null, nul) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
-            for (mname, _params, _body, _is_async) in &ci.methods {
-                if mname == "constructor" || mname == "destructor" { continue; }
-                let mfun = format!("__method_{}_{}", ci.name, mname);
-                if let Some(&mfid) = self.funcs.get(&mfun) {
-                    // closure = MakeClosure(mfid, env = null)
-                    let (_nid_clo, clos) = b.push_node(
-                        Inst::MakeClosure { callee: mfid, env: nul[0] },
-                        Some(Type::Closure(None)),
-                        1,
-                        false,
-                    );
-                    // obj["<name>"] = closure
-                    let (_nid_k, ks) = b.push_node(
-                        Inst::Const(Constant::Str(mname.clone())),
-                        Some(Type::Str),
-                        1,
-                        false,
-                    );
-                    let _ = b.push_node(
-                        Inst::CallNative {
-                            name: "wir_obj_set_str".into(),
-                            args: vec![obj, ks[0], clos[0]],
-                            pure: false,
-                            can_throw: false,
-                        },
-                        Some(Type::Int32),
-                        1,
-                        true,
                     );
                 }
             }
