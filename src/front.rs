@@ -3521,6 +3521,26 @@ fn lower_expr_free<'m>(
 
         // Calls / builtins
         Expr::Call { callee, args } => {
+            // --- Bracket-literal method call: o["m"](... ) -> inject receiver as first arg ---
+            if let Expr::Index { recv, index } = &**callee {
+                if matches!(&**index, Expr::Str(_)) {
+                    let this_v = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps)?;
+                    let fun_v  = lower_expr_free(b, locals, fields, next_field, callee, funcs, lam_caps)?;
+                    let mut argv = Vec::with_capacity(args.len() + 1);
+                    argv.push(this_v);
+                    for a in args {
+                        argv.push(lower_expr_free(b, locals, fields, next_field, a, funcs, lam_caps)?);
+                    }
+                    let (_nid, res) = b.push_node(
+                        Inst::CallClosure { conv: crate::wir::CallConv::Fast, fun: fun_v, args: argv },
+                        Some(Type::Int32),
+                        1,
+                        true,
+                    );
+                    return Ok(res[0]);
+                }
+            }
+
             // --- Property-call fast paths ---
             if let Expr::GetProp { recv, name } = &**callee {
                 // 0a) Promise-style instance methods
@@ -4488,7 +4508,7 @@ impl<'m> Lowerer<'m> {
     fn rewrite_privates_in_block(&self, class_name: &str, body: &Block) -> Block {
         // Resolve base class name once (if any). We’ll still rewrite even if there is none;
         // in that case unknown-func errors will be raised later if user wrote `super`.
-        let base = self.classes
+        let base_opt = self.classes
             .get(class_name)
             .and_then(|ci| ci.base.clone());
 
@@ -4569,41 +4589,47 @@ impl<'m> Lowerer<'m> {
         }
 
         // Rewriter: (super(...)) and (super.m)(...) → direct calls with implicit `this`
-        let base = base.unwrap_or_else(|| "<no-base>".to_string());
         let class_name = class_name.to_string();
 
         let f = |e: &Expr| -> Expr {
             match e {
-                // super(args...)  →  __ctor_Base(this, args...)
+                // super(args...)  →  __ctor_Base(this, args...)  (only if there *is* a base)
                 Expr::SuperCall(args) => {
-                    let mut new_args = Vec::with_capacity(args.len() + 1);
-                    new_args.push(Expr::This);
-                    new_args.extend(args.iter().cloned());
-                    Expr::Call {
-                        callee: SmallBox::new(Expr::Ident(format!("__ctor_{}", base))),
-                        args: new_args,
-                    }
-                }
-                // (super.m)(args...) is handled in the Call case; here we only rewrite
-                // the *value* form super.m to a sentinel that will error if used as value.
-                Expr::SuperProp(name) => {
-                    // Leave as-is; value-position `super.m` will be rejected during lowering.
-                    Expr::SuperProp(name.clone())
-                }
-                // (super.m)(args...)  →  __method_Base_m(this, args...)
-                Expr::Call { callee, args } => {
-                    if let Expr::SuperProp(m) = &**callee{
+                    if let Some(ref base) = base_opt {
                         let mut new_args = Vec::with_capacity(args.len() + 1);
                         new_args.push(Expr::This);
                         new_args.extend(args.iter().cloned());
                         Expr::Call {
-                            callee: SmallBox::new(Expr::Ident(format!("__method_{}_{}", base, m))),
+                            callee: SmallBox::new(Expr::Ident(format!("__ctor_{}", base))),
                             args: new_args,
+                        }
+                    } else {
+                        e.clone() // leave for lowerer to complain
+                    }
+                }
+
+                // (super.m)(args...)  →  __method_Base_m(this, args...)  (only if base exists)
+                Expr::Call { callee, args } => {
+                    if let Expr::SuperProp(m) = &**callee {
+                        if let Some(ref base) = base_opt {
+                            let mut new_args = Vec::with_capacity(args.len() + 1);
+                            new_args.push(Expr::This);
+                            new_args.extend(args.iter().cloned());
+                            Expr::Call {
+                                callee: SmallBox::new(Expr::Ident(format!("__method_{}_{}", base, m))),
+                                args: new_args,
+                            }
+                        } else {
+                            e.clone()
                         }
                     } else {
                         e.clone()
                     }
                 }
+
+                // Value-position super.m stays as-is so the lowerer raises your existing error.
+                Expr::SuperProp(_) => e.clone(),
+
                 _ => e.clone(),
             }
         };

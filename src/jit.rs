@@ -39,6 +39,7 @@ use crate::runtime::{
     wir_obj_get_str, wir_obj_set_str, wir_obj_has_str, wir_obj_del_str,
     wir_memo_get, wir_memo_put,
     wir_obj_set_proto, wir_obj_get_proto, wir_obj_get_field_deep, wir_obj_get_str_deep,
+    wir_obj_get_method, wir_super_get_method
 };
 #[allow(unused_imports)]
 use crate::native_timers::{
@@ -150,6 +151,8 @@ impl Default for JIT {
             fn wir_obj_get_proto(obj: i64) -> i64;
             fn wir_obj_get_field_deep(obj: i64, field_id: i64) -> i64;
             fn wir_obj_get_str_deep(obj: i64, key: i64) -> i64;
+            fn wir_obj_get_method(obj: i64, field_id_smi: i64) -> i64;
+            fn wir_super_get_method(home_proto: i64, field_id_smi: i64) -> i64;
         }
 
         // --- declare the object natives so we can take typed fn pointers ---
@@ -349,6 +352,8 @@ impl Default for JIT {
             jb.symbol("wir_obj_get_proto",     wir_obj_get_proto     as *const extern "C" fn(i64)->i64 as *const u8);
             jb.symbol("wir_obj_get_field_deep", wir_obj_get_field_deep as *const extern "C" fn(i64,i64)->i64 as *const u8);
             jb.symbol("wir_obj_get_str_deep",  wir_obj_get_str_deep  as *const extern "C" fn(i64,i64)->i64 as *const u8);
+            jb.symbol("wir_obj_get_method",    wir_obj_get_method    as *const extern "C" fn(i64,i64)->i64 as *const u8);
+            jb.symbol("wir_super_get_method",  wir_super_get_method  as *const extern "C" fn(i64,i64)->i64 as *const u8);
         }
 
         let module = cranelift_jit::JITModule::new(jb);

@@ -1,0 +1,53 @@
+// --- Base class: ctor, instance methods, static, getter ---
+class Base {
+  constructor(a) { this.a = a; }
+
+  fn m(k) { return this.a + k; }
+
+  // mutate via instance method (used to confirm 'this' works)
+  fn inc(n) { this.a = this.a + n; return this.a; }
+
+  static fn S(v) { return v + 100; }
+
+  get double() { return this.a + this.a; }
+}
+
+// --- Derived: single inheritance + super(...) + super.m(...) override ---
+class Derived extends Base {
+  constructor(a) {
+    super(a + 1);           // exercise super(...) rewrite
+  }
+  fn m(k) {
+    return super.m(k + 1) + 1;  // exercise super.m(...) rewrite
+  }
+}
+
+// --- Class with literal field initializer (pure) ---
+class InitOnly {
+  var z = 7;                 // tested during allocation
+  fn getZ() { return this.z; }
+}
+
+// ======================
+//      Test body
+// ======================
+
+var b = new Base(10);
+print("T1"); print(b.m(5));          // expect 15
+
+// If your tiny patch added bracket-call 'this' injection, this should also be 15:
+print("T2"); print(b);       // expect 15 (or skip if not yet supported)
+
+print("T3"); print(Base.S(1));       // expect 101
+
+var d = new Derived(10);             // Base.a receives 11
+print("T4"); print(d.m(5));          // super.m(6)=17; +1 => 18
+print("T5"); print(d);       // expect 18 (same caveat as T2)
+
+print("T6"); print(b.double);        // getter → 20
+
+var i = new InitOnly();
+print("T7"); print(i.getZ());        // expect 7
+
+b;                         // a: 10 -> 15
+print("T8"); print(b.a);             // expect 15
