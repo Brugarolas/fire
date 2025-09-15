@@ -3702,6 +3702,78 @@ fn lower_expr_free<'m>(
                 return Ok(res[0]);
             }
 
+            // 0f) Bracket-call: o["m"](...)
+            // - If recv is a class ident and key is a string matching a static, direct-call it.
+            // - Else, if key is a string at runtime, inject `this`.
+            // - Otherwise treat as array[index] function call (no `this`).
+            if let Expr::Index { recv, index } = &**callee {
+                // Static: Class["M"](...)
+                if let (Expr::Ident(cn), Expr::Str(m)) = (&**recv, &**index) {
+                    if let Some(&fid) = funcs.get(&format!("__static_{}_{}", cn, m)) {
+                        let mut argv = Vec::with_capacity(args.len());
+                        for a in args {
+                            argv.push(lower_expr_free(b, locals, fields, next_field, a, funcs, lam_caps)?);
+                        }
+                        let (_nid, res) = b.push_node(
+                            Inst::CallDirect { conv: crate::wir::CallConv::Fast, callee: fid, args: argv },
+                            Some(Type::Int32), 1, true
+                        );
+                        return Ok(res[0]);
+                    }
+                }
+
+                // General bracket-call
+                let obj  = lower_expr_free(b, locals, fields, next_field, recv,  funcs, lam_caps)?;
+                let idxv = lower_expr_free(b, locals, fields, next_field, index, funcs, lam_caps)?;
+                let mut argvals = Vec::with_capacity(args.len());
+                for a in args {
+                    argvals.push(lower_expr_free(b, locals, fields, next_field, a, funcs, lam_caps)?);
+                }
+
+                // Is the key a string? -> method call (inject `this`)
+                let (_nid_is, is_str) = b.push_node(
+                    Inst::CallNative { name: "wir_is_str".into(), args: vec![idxv], pure: false, can_throw: false },
+                    Some(Type::Bool), 1, true
+                );
+
+                let str_b = b.block();
+                let arr_b = b.block();
+                let cont  = b.block();
+                let out   = b.add_block_param(cont, Type::Int32);
+
+                b.branch(is_str[0], str_b, arr_b);
+
+                // String-key path: fun = obj[key]; CallClosure(fun, this, args...)
+                b.position_at(str_b);
+                let (_nid_gs, sv) = b.push_node(
+                    Inst::CallNative { name: "wir_obj_get_str".into(), args: vec![obj, idxv], pure: false, can_throw: false },
+                    None, 1, true
+                );
+                let mut with_this = Vec::with_capacity(1 + argvals.len());
+                with_this.push(obj);
+                with_this.extend_from_slice(&argvals);
+                let (_nid_call_s, sret) = b.push_node(
+                    Inst::CallClosure { conv: crate::wir::CallConv::Fast, fun: sv[0], args: with_this },
+                    Some(Type::Int32), 1, true
+                );
+                b.jump(cont, &[sret[0]]);
+
+                // Non-string index: fun = arr[index]; CallClosure(fun, args...)
+                b.position_at(arr_b);
+                let (_nid_ga, av) = b.push_node(
+                    Inst::CallNative { name: "wir_array_get".into(), args: vec![obj, idxv], pure: false, can_throw: false },
+                    None, 1, true
+                );
+                let (_nid_call_a, aret) = b.push_node(
+                    Inst::CallClosure { conv: crate::wir::CallConv::Fast, fun: av[0], args: argvals },
+                    Some(Type::Int32), 1, true
+                );
+                b.jump(cont, &[aret[0]]);
+
+                b.position_at(cont);
+                return Ok(out);
+            }
+
             // --- Bare identifier callee & other cases ---
             if let Expr::Ident(name) = &**callee {
                 // Timers
@@ -3841,6 +3913,7 @@ fn lower_expr_free<'m>(
                     if args.len() != 1 { return Err(LowerError::NotLowerable("print(value) expects 1 arg")); }
 
                     // Fast string-literal path
+                    // Fast path for string literals: avoid allocation/inspection.
                     if matches!(args[0], Expr::Str(_)) {
                         let v = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
                         let (_nid, res) = b.push_node(
@@ -3849,6 +3922,13 @@ fn lower_expr_free<'m>(
                         );
                         return Ok(res[0]);
                     }
+
+                    // General case: let the runtime pretty-print *any* value.
+                    let v = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
+                    let (_nid, res) = b.push_node(
+                        Inst::CallNative { name: "wir_print_any".into(), args: vec![v], pure: false, can_throw: false },
+                        Some(Type::Int32), 1, true
+                    );
 
                     // Bool-ish detection: normalize to 0/1 for integer printer
                     let is_boolish = matches!(

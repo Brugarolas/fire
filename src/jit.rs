@@ -93,6 +93,7 @@ impl Default for JIT {
             fn wir_resolve_funptr(fid: i64) -> *const u8;
 
             fn wir_print_i64(x: i64) -> i64;
+            fn wir_print_any(v: i64) -> i64;
             fn wir_print_str(p: *const std::os::raw::c_char) -> i64;
             fn wir_method_trampoline(argv: *const i64, argc: usize) -> i64;
             fn wir_make_method_closure(fid_smi: i64) -> i64;
@@ -220,6 +221,7 @@ impl Default for JIT {
             );
 
             jb.symbol("wir_print_i64", wir_print_i64 as *const extern "C" fn(i64) -> i64 as *const u8);
+            jb.symbol("wir_print_any", wir_print_any as *const extern "C" fn(i64) -> i64 as *const u8);
             jb.symbol("wir_print_str", wir_print_str as *const extern "C" fn(*const std::os::raw::c_char) -> i64 as *const u8);
             jb.symbol("wir_method_trampoline", wir_method_trampoline as *const extern "C" fn(*const i64, usize) -> i64 as *const u8);
             jb.symbol("wir_make_method_closure", wir_make_method_closure as *const extern "C" fn(i64) -> i64 as *const u8);

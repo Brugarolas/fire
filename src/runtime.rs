@@ -4,13 +4,22 @@
 #![allow(unused_unsafe)]
 
 use crate::jit::wir_make_method_closure;
-use crate::value::{TAG_STRING, BoxedStr, ObjHeader, TAG_OBJECT, is_imm, NULL, obj_set_proto, obj_get_proto, obj_get_field_deep, obj_get_str_deep};
+use crate::value::{
+    TAG_STRING, BoxedStr, ObjHeader, TAG_OBJECT, is_imm, NULL,
+    obj_set_proto, obj_get_proto, obj_get_field_deep, obj_get_str_deep,
+    is_bool, to_bool,
+    TAG_BOXED_F64, BoxedF64,
+    TAG_ARRAY, BoxedArray,
+    BoxedObj, TAG_CLOSURE, BoxedClosure,
+};
 use crate::value as v;
 use crate::gc::NAPALM_GC;
 
-use ahash::AHashMap as HashMap;
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use std::sync::OnceLock;
 use parking_lot::Mutex;
+use core::cmp::min;
+use std::slice;
 
 // Simple object storage: fast slots by FieldId (u32) + string-key map.
 #[repr(C)]
@@ -293,4 +302,158 @@ unsafe fn as_wirobj_const(obj: i64) -> Option<*const WirObj> {
 #[inline(always)]
 unsafe fn as_wirobj_mut(obj: i64) -> Option<*mut WirObj> {
     as_wirobj_const(obj).map(|p| p as *mut WirObj)
+}
+
+// -----------------------------------------------------------------------------
+// Pretty printer (safe for cycles; bounded depth/width)
+// -----------------------------------------------------------------------------
+
+const PP_MAX_DEPTH: usize = 3;
+const PP_MAX_ELEMS: usize = 50;
+
+pub fn fmt_value(v: i64) -> String {
+    let mut seen: HashSet<u64> = HashSet::new();
+    pp(v, 0, PP_MAX_DEPTH, PP_MAX_ELEMS, &mut seen)
+}
+
+fn pp(v: i64, depth: usize, max_depth: usize, max_elems: usize, seen: &mut HashSet<u64>) -> String {
+    // Booleans are raw 0/1 in this runtime
+    if is_bool(v) {
+        return if to_bool(v) { "1".to_string() } else { "0".to_string() };
+    }
+
+    // Small ints (SMI)
+    if is_imm(v) {
+        return smi_to_i64(v).to_string();
+    }
+
+    // Null
+    if v == NULL {
+        return "null".to_string();
+    }
+
+    // Heap objects: guard cycles
+    let addr = v as u64;
+    if !seen.insert(addr) {
+        return "<cycle>".to_string();
+    }
+
+    let out = unsafe {
+        let hdr = (v as *const ObjHeader).as_ref();
+        if let Some(h) = hdr {
+            match h.tag {
+                TAG_BOXED_F64 => {
+                    let f = &*(v as *const BoxedF64);
+                    format!("{}", f.val)
+                }
+
+                TAG_STRING => {
+                    // "{:?}" gives us quoted + escaped output
+                    let s = &*(v as *const BoxedStr);
+                    let bytes: &[u8] = if s.data.is_null() || s.len == 0 {
+                        &[]
+                    } else {
+                        slice::from_raw_parts(s.data, s.len)
+                    };
+                    format!("{:?}", String::from_utf8_lossy(bytes))
+                }
+
+                TAG_ARRAY => {
+                    if depth >= max_depth {
+                        "[]".to_string()
+                    } else {
+                        let a = &*(v as *const BoxedArray);
+                        let mut s = String::from("[");
+                        let n = min(a.buf.len(), max_elems);
+                        for i in 0..n {
+                            if i > 0 { s.push_str(", "); }
+                            s.push_str(&pp(a.buf[i], depth + 1, max_depth, max_elems, seen));
+                        }
+                        if a.buf.len() > n { s.push_str(", …"); }
+                        s.push(']');
+                        s
+                    }
+                }
+
+                TAG_OBJECT => {
+                    if depth >= max_depth {
+                        "{}".to_string()
+                    } else {
+                        let o = &*(v as *const BoxedObj);
+                        let mut s = String::from("{");
+                        let mut wrote = 0usize;
+                        let mut first = true;
+
+                        // Print string-keyed props first (sorted for stability)
+                        let mut skeys: Vec<&String> = o.by_str.keys().collect();
+                        skeys.sort_unstable();
+                        for k in skeys {
+                            if wrote >= max_elems { break; }
+                            if !first { s.push_str(", "); } else { first = false; }
+                            let val = o.by_str.get(k).copied().unwrap_or(NULL);
+                            s.push_str(&format!("{:?}: {}", k, pp(val, depth + 1, max_depth, max_elems, seen)));
+                            wrote += 1;
+                        }
+
+                        // Then FieldId (u32) props (also sorted)
+                        if wrote < max_elems {
+                            let mut fids: Vec<u32> = o.by_id.keys().copied().collect();
+                            fids.sort_unstable();
+                            for id in fids {
+                                if wrote >= max_elems { break; }
+                                if !first { s.push_str(", "); } else { first = false; }
+                                let val = o.by_id.get(&id).copied().unwrap_or(NULL);
+                                s.push_str(&format!("f{}: {}", id, pp(val, depth + 1, max_depth, max_elems, seen)));
+                                wrote += 1;
+                            }
+                        }
+
+                        // Optionally show proto (kept last)
+                        if wrote < max_elems && o.proto != NULL {
+                            if !first { s.push_str(", "); }
+                            s.push_str(&format!("__proto__: {}", pp(o.proto, depth + 1, max_depth, max_elems, seen)));
+                        }
+
+                        if wrote >= max_elems { s.push_str(", …"); }
+                        s.push('}');
+                        s
+                    }
+                }
+
+                TAG_CLOSURE => {
+                    let c = &*(v as *const BoxedClosure);
+                    let mut s = format!("<closure code=0x{:x} env=[", c.code_ptr as u64);
+                    let n = min(c.env.len(), max_elems);
+                    for i in 0..n {
+                        if i > 0 { s.push_str(", "); }
+                        s.push_str(&pp(c.env[i], depth + 1, max_depth, max_elems, seen));
+                    }
+                    if c.env.len() > n { s.push_str(", …"); }
+                    s.push_str("]>");
+                    s
+                }
+
+                _ => format!("<tag={} @ 0x{:x}>", h.tag, addr),
+            }
+        } else {
+            // Corrupt or invalid pointer
+            format!("0x{:x}", addr)
+        }
+    };
+
+    // allow other branches to render this address again elsewhere
+    seen.remove(&addr);
+    out
+}
+
+// -----------------------------------------------------------------------------
+// Optional: a single native that prints *any* value using fmt_value
+// -----------------------------------------------------------------------------
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_print_any(v: i64) -> i64 {
+    use std::io::Write;
+    let s = fmt_value(v);
+    let _ = std::io::stdout().write_all(s.as_bytes());
+    let _ = std::io::stdout().write_all(b"\n");
+    0
 }
