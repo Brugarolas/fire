@@ -3929,49 +3929,6 @@ fn lower_expr_free<'m>(
                         Inst::CallNative { name: "wir_print_any".into(), args: vec![v], pure: false, can_throw: false },
                         Some(Type::Int32), 1, true
                     );
-
-                    // Bool-ish detection: normalize to 0/1 for integer printer
-                    let is_boolish = matches!(
-                        args[0],
-                        Expr::Binary { op: BinOp::Eq  , .. }
-                        | Expr::Binary { op: BinOp::Ne , .. }
-                        | Expr::Binary { op: BinOp::Lt , .. }
-                        | Expr::Binary { op: BinOp::Le , .. }
-                        | Expr::Binary { op: BinOp::Gt , .. }
-                        | Expr::Binary { op: BinOp::Ge , .. }
-                        | Expr::Binary { op: BinOp::And, .. }
-                        | Expr::Binary { op: BinOp::Or , .. }
-                        | Expr::Unary  { op: UnOp::Not, .. }
-                        | Expr::In { .. }
-                    );
-
-                    let v0 = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps)?;
-                    let v_to_print = if is_boolish {
-                        let then_b = b.block();
-                        let else_b = b.block();
-                        let cont   = b.block();
-                        let out_i  = b.add_block_param(cont, Type::Int32);
-
-                        b.branch(v0, then_b, else_b);
-
-                        b.position_at(then_b);
-                        let one = b.const_i32(1);
-                        b.jump(cont, &[one]);
-
-                        b.position_at(else_b);
-                        let zero = b.const_i32(0);
-                        b.jump(cont, &[zero]);
-
-                        b.position_at(cont);
-                        out_i
-                    } else {
-                        v0
-                    };
-
-                    let (_nid, res) = b.push_node(
-                        Inst::CallNative { name: "wir_print_i64".into(), args: vec![v_to_print], pure: false, can_throw: false },
-                        Some(Type::Int32), 1, true
-                    );
                     return Ok(res[0]);
                 }
 
@@ -4535,22 +4492,21 @@ impl<'m> Lowerer<'m> {
         params: &[String],
         body: &Block,
         is_async: bool,
-        // NEW: class-shared field-id table
+        // class-shared field-id table (important!)
         fields: &mut HashMap<String, FieldId>,
         next_field: &mut u32,
     ) -> LResult<()> {
-        use crate::wir::Type;
+        use crate::wir::{Inst, Type};
 
-        // Optional rewrite stage you already have
+        // Keep your private/super rewriter
         let body_rw = self.rewrite_privates_in_block(class_name, body);
 
-        // Build the function
+        // Build function: hidden `this` + user params
         let mut f = {
-            // +1 for hidden `this`
             let argc = params.len() + 1;
             let mut b = Builder::new(self.module, fname, vec![Type::Int32; argc], vec![Type::Int32]);
 
-            // Bind hidden `this`, then user params
+            // Bind locals
             let mut locals: HashMap<String, ValueId> = Default::default();
             locals.insert("this".to_string(), b.param(0));
             for (i, name) in params.iter().enumerate() {
@@ -4558,9 +4514,51 @@ impl<'m> Lowerer<'m> {
             }
 
             if is_async {
-                return Err(LowerError::NotLowerable("async methods in classes not yet supported"));
+                // --- Async prologue: create Deferred and expose it to the async lowerer
+                let (_nid, d_res) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_deferred_new".into(),
+                        args: vec![],
+                        pure: false,
+                        can_throw: false,
+                    },
+                    None,
+                    1,
+                    true,
+                );
+                let d = d_res[0];
+                locals.insert("__deferred".to_string(), d);
+
+                // Lower the body in async mode, sharing the CLASS field-id map
+                lower_block_free_async(
+                    &mut b,
+                    &mut locals,
+                    fields,
+                    next_field,
+                    &body_rw,
+                    &self.funcs,
+                    &self.lam_captures,
+                    true, // in_async
+                )?;
+
+                // If the body didn’t return, resolve(0) and return the Deferred
+                if !b.current_block_terminated() {
+                    let zero = b.const_i32(0);
+                    let (_nid, _) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_deferred_resolve".into(),
+                            args: vec![d, zero],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        None,
+                        1,
+                        true,
+                    );
+                    b.ret(&[d]);
+                }
             } else {
-                // IMPORTANT: pass the class-shared fields/next_field
+                // --- Sync path (what you already had), but sharing the CLASS field-id map
                 lower_block_free(
                     &mut b,
                     &mut locals,
@@ -4579,6 +4577,7 @@ impl<'m> Lowerer<'m> {
             b.finish()
         };
 
+        // Register function in module
         let fid = FuncId(self.module.funcs.len() as u32);
         f.id = fid;
         self.module.funcs.push(f);

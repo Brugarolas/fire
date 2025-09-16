@@ -25,7 +25,7 @@ class Derived extends Base {
 // --- Class with literal field initializer (pure) ---
 class InitOnly {
   var z = 7;                 // tested during allocation
-  fn getZ() { return this.z; }
+  async fn getZ() { return await this.z; }
 }
 
 // ======================
@@ -47,7 +47,7 @@ print("== T5 =="); print(d);       // expect 18 (same caveat as T2)
 print("== T6 =="); print(b.double);        // getter → 20
 
 var i = new InitOnly();
-print("== T7 =="); print(i.getZ());        // expect 7
+print("== T7 =="); print(await i.getZ());        // expect 7
 
 b.a = b.a + 5;                         // a: 10 -> 15
 print("== T8 =="); print(b.a);             // expect 15
