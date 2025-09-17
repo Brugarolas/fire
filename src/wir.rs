@@ -52,6 +52,7 @@ id_newtype!(SiteId); // callsite / IC site id
 id_newtype!(DeoptId);
 id_newtype!(EffectId); // special: also a ValueId in practice
 id_newtype!(ClassId);
+id_newtype!(BindingId); // ESM live binding cell
 
 /// -------- Type lattice --------
 
@@ -356,7 +357,7 @@ pub enum Inst {
     MakeClosure { callee: FuncId, env: ValueId },
     CallClosure { conv: CallConv, fun: ValueId, args: Vec<ValueId> },
 
-        /// Register a class with the runtime. Prefer ids to strings for stability.
+    /// Register a class with the runtime. Prefer ids to strings for stability.
     RegisterClass {
         meta: ClassMeta,
         // Pre-resolved field ids (avoid string lookups at runtime)
@@ -434,6 +435,19 @@ pub enum Inst {
 
     // ---- OSR points ----
     OSRPoint, // mark loop header for on-stack replacement
+
+    // ---- Modules / ESM live bindings ----
+    /// Read from an ESM live binding cell. Throws on TDZ (uninitialized).
+    LoadBinding { binding: BindingId },
+
+    /// Write to an ESM live binding cell (used by the *owning* module for its exports).
+    StoreBinding { binding: BindingId, val: ValueId },
+
+    /// Build a frozen ESM namespace object with getters wired to live bindings.
+    MakeNamespace { exports: Vec<(String, BindingId)> },
+
+    /// Dynamic `import(spec)`: resolves/links/evaluates and returns a Promise for the namespace.
+    ImportDynamic { spec: ValueId },
 }
 
 #[derive(Debug, Clone)]
@@ -472,12 +486,12 @@ impl Inst {
                 | StoreElem { .. }
                 | ArrayFill { .. }
                 | ArrayCopy { .. }
-                // NEW: mutating array ops
+                // mutating array ops
                 | ArrayPush { .. }
                 | ArrayPop ( .. )
                 | ArrayShift ( .. )
                 | ArrayUnshift { .. }
-                // NEW: higher-order ops (call user code / runtime)
+                // higher-order ops (call user code / runtime)
                 | ArrayMap { .. }
                 | ArrayReduce { .. }
                 | ArrayForEach { .. }
@@ -499,6 +513,11 @@ impl Inst {
                 | AllocInstance { .. }
                 | CallMethodIC { .. }
                 | CallSuper { .. }
+                // Modules / ESM
+                | LoadBinding { .. }     // may throw TDZ → model as effectful guard
+                | StoreBinding { .. }    // writes a live cell
+                | MakeNamespace { .. }   // allocates a namespace object
+                | ImportDynamic { .. }   // schedules async load/eval (calls runtime)
         )
     }
 
@@ -931,26 +950,33 @@ impl<'m> Builder<'m> {
 impl EffectKind {
     fn from_inst(i: &Inst) -> EffectKind {
         match i {
+            // treated as structural; group with Entry for ordering
             crate::wir::Inst::EffectEntry
             | crate::wir::Inst::LoadMethod { .. }
             | crate::wir::Inst::LoadSuperMethod { .. }
             | crate::wir::Inst::InstanceOf { .. } => EffectKind::Entry,
 
-            crate::wir::Inst::Safepoint   => EffectKind::Safepoint,
+            crate::wir::Inst::Safepoint => EffectKind::Safepoint,
 
+            // Guards / checks
             crate::wir::Inst::GuardType { .. }
             | crate::wir::Inst::GuardShape { .. }
             | crate::wir::Inst::GuardBounds { .. }
             | crate::wir::Inst::GuardNotNull { .. }
             | crate::wir::Inst::GuardIsInt { .. }
             | crate::wir::Inst::GuardIsF64 { .. }
-            | crate::wir::Inst::Bailout { .. } => EffectKind::Guard,
+            | crate::wir::Inst::Bailout { .. }
+            // ESM: reading a binding may throw TDZ → clasifícalo como guard
+            | crate::wir::Inst::LoadBinding { .. } => EffectKind::Guard,
 
+            // Allocations
             crate::wir::Inst::AllocObj { .. }
             | crate::wir::Inst::AllocArray { .. }
             | crate::wir::Inst::RegisterClass { .. }
-            | crate::wir::Inst::AllocInstance { .. } => EffectKind::Alloc,
+            | crate::wir::Inst::AllocInstance { .. }
+            | crate::wir::Inst::MakeNamespace { .. } => EffectKind::Alloc,
 
+            // Stores / mutations
             crate::wir::Inst::StoreField { .. }
             | crate::wir::Inst::StoreElem { .. }
             | crate::wir::Inst::TransitionShape { .. }
@@ -959,9 +985,11 @@ impl EffectKind {
             | crate::wir::Inst::ArrayShift ( .. )
             | crate::wir::Inst::ArrayUnshift { .. }
             | crate::wir::Inst::ArrayFill { .. }
-            | crate::wir::Inst::ArrayCopy { .. } => EffectKind::Store,
+            | crate::wir::Inst::ArrayCopy { .. }
+            // ESM: write to an export cell
+            | crate::wir::Inst::StoreBinding { .. } => EffectKind::Store,
 
-            // Calls (user closures / runtime loops)
+            // Calls (user/runtime)
             crate::wir::Inst::CallDirect { .. }
             | crate::wir::Inst::CallDirectMemoized { .. }
             | crate::wir::Inst::CallIC { .. }
@@ -977,8 +1005,11 @@ impl EffectKind {
             | crate::wir::Inst::ArrayFilter { .. }
             | crate::wir::Inst::StrToNumber(_)
             | crate::wir::Inst::CallMethodIC { .. }
-            | crate::wir::Inst::CallSuper { .. } => EffectKind::Call,
+            | crate::wir::Inst::CallSuper { .. }
+            // ESM: dynamic import calls into the loader/runtime
+            | crate::wir::Inst::ImportDynamic { .. } => EffectKind::Call,
 
+            // Barriers
             crate::wir::Inst::PostWriteBarrier { .. }
             | crate::wir::Inst::ReadBarrier { .. } => EffectKind::Barrier,
 
@@ -1045,6 +1076,51 @@ impl<'m> Builder<'m> {
 }
 
 impl<'m> Builder<'m> {
+        /// Read from an ESM live binding cell. `ty` is optional; leave `None` and let the
+    /// type engine infer/attach after linking if no static info is available.
+    pub fn load_binding(&mut self, binding: BindingId, ty: Option<Type>) -> ValueId {
+        let (_nid, res) = self.push_node(
+            Inst::LoadBinding { binding },
+            ty,        // often None; can be Some if the resolver knows it
+            1,
+            true,      // may throw TDZ → needs effect
+        );
+        res[0]
+    }
+
+    /// Write to an ESM live binding cell (only the *owning* module should emit this).
+    pub fn store_binding(&mut self, binding: BindingId, val: ValueId) {
+        let _ = self.push_node(
+            Inst::StoreBinding { binding, val },
+            Some(Type::Top), // no value result
+            0,
+            true,            // it mutates shared binding state
+        );
+    }
+
+    /// Build a frozen namespace object backed by live getters to the given bindings.
+    /// The resolver lowers `import * as ns from "..."` to this single op.
+    pub fn make_namespace(&mut self, exports: Vec<(String, BindingId)>) -> ValueId {
+        let (_nid, res) = self.push_node(
+            Inst::MakeNamespace { exports },
+            Some(Type::AnyRef), // could be a dedicated ModuleNamespace type later
+            1,
+            true,               // allocates
+        );
+        res[0]
+    }
+
+    /// Dynamic `import(spec)`: `spec` must be a string at runtime; returns a Promise of namespace.
+    pub fn import_dynamic(&mut self, spec: ValueId) -> ValueId {
+        let (_nid, res) = self.push_node(
+            Inst::ImportDynamic { spec },
+            Some(Type::AnyRef), // Promise<any>; use a dedicated Promise<T> type later if desired
+            1,
+            true,               // calls into loader/runtime
+        );
+        res[0]
+    }
+
     pub fn array_push(&mut self, arr: ValueId, val: ValueId) -> ValueId {
         let (_nid, res) = self.push_node(Inst::ArrayPush { arr, val }, Some(Type::Int32), 1, true);
         res[0]
