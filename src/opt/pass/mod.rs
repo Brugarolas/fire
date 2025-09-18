@@ -12,5 +12,4 @@ pub mod sccp;
 pub mod value_numbering;
 pub mod recur_memo;
 pub mod simplify_cfg;
-//pub mod inliner;
 pub mod sroa;

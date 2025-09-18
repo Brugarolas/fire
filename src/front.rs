@@ -1955,9 +1955,7 @@ impl<'m> Lowerer<'m> {
         };
 
         // Publish into the module with the expected ID (sequential, matching predecl order).
-        let fid = FuncId(self.module.funcs.len() as u32);
-        func.id = fid;
-        self.module.funcs.push(func);
+        let fid = self.module.push_function(func);
         Ok(fid)
     }
 }
@@ -4578,9 +4576,7 @@ impl<'m> Lowerer<'m> {
         };
 
         // Register function in module
-        let fid = FuncId(self.module.funcs.len() as u32);
-        f.id = fid;
-        self.module.funcs.push(f);
+        let _fid = self.module.push_function(f);
         Ok(())
     }
 
@@ -4895,9 +4891,7 @@ impl<'m> Lowerer<'m> {
             b.finish()
         };
 
-        let fid = FuncId(self.module.funcs.len() as u32);
-        f.id = fid;
-        self.module.funcs.push(f);
+        let _ = self.module.push_function(f);
         Ok(())
     }
 
@@ -4993,9 +4987,7 @@ impl<'m> Lowerer<'m> {
             b.finish()
         };
 
-        let fid = FuncId(self.module.funcs.len() as u32);
-        f.id = fid;
-        self.module.funcs.push(f);
+        let _ = self.module.push_function(f);
         Ok(())
     }
 }

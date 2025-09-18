@@ -641,6 +641,12 @@ impl Module {
         self.next_deopt += 1;
         DeoptPoint { id, target_label: target_label.into(), snapshot: DeoptSnapshot::default() }
     }
+    pub fn push_function(&mut self, mut f: Function) -> FuncId {
+        let id = FuncId(self.funcs.len() as u32);
+        f.id = id;
+        self.funcs.push(f);
+        id
+    }
 }
 
 /// -------- IR Builder --------
