@@ -1,0 +1,15 @@
+// import — importa del módulo anterior y usa lo importado
+
+import { ANSWER, add, Counter } from "./math";
+
+print("SMOKE");        // etiqueta del test
+print(ANSWER);         // 42
+
+print(add(2, 3));      // 5
+
+let c = new Counter();
+c.inc();
+c.inc();
+print(c.getValue());   // 2
+
+print(Counter.times3(7)); // 21

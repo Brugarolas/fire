@@ -607,10 +607,16 @@ pub struct Module {
     pub strings: BTreeMap<String, ValueId>,
     pub shapes: BTreeMap<String, ShapeId>, // named shapes (for testing)
     pub fields: BTreeMap<String, FieldId>, // named fields (for testing)
+    pub next_binding: u32,
 }
 
 impl Module {
     pub fn new() -> Self { Self::default() }
+    pub fn fresh_binding(&mut self) -> BindingId {
+        let id = BindingId(self.next_binding);
+        self.next_binding += 1;
+        id
+    }
     pub fn fresh_class(&mut self) -> ClassId {
         let id = ClassId(self.next_class);
         self.next_class += 1;
