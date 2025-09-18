@@ -1,0 +1,66 @@
+// src/levenshtein.napalm
+
+print("===== Levenshtein distance =====");
+
+fn levenshtein(a, b) {
+    if (a == b) { return 0; }
+
+    var m = a.length;
+    var n = b.length;
+
+    if (m == 0) { return n; }
+    if (n == 0) { return m; }
+
+    // Two-row dynamic programming: O(min(m, n)) space
+    // Ensure we iterate over the shorter string horizontally for cache-friendliness
+    if (n > m) {
+        // swap a <-> b and m <-> n so that n <= m
+        var tmpS = a; a = b; b = tmpS;
+        var tmpL = m; m = n; n = tmpL;
+    }
+
+    var prev = Array(n + 1);
+    var curr = Array(n + 1);
+
+    // Initialize prev row: [0..n]
+    var j = 0;
+    while (j <= n) {
+        prev[j] = j;
+        j += 1;
+    }
+
+    var i = 1;
+    while (i <= m) {
+        curr[0] = i;
+
+        var ai = a[i - 1];   // assume string indexing returns 1-char string
+
+        j = 1;
+        while (j <= n) {
+            var cost = (ai == b[j - 1]) ? 0 : 1;
+
+            var del = prev[j] + 1;       // deletion
+            var ins = curr[j - 1] + 1;   // insertion
+            var sub = prev[j - 1] + cost; // substitution
+
+            // min of three
+            var t = (del < ins) ? del : ins;
+            curr[j] = (sub < t) ? sub : t;
+
+            j += 1;
+        }
+
+        // swap rows (no copy)
+        var trow = prev; prev = curr; curr = trow;
+
+        i += 1;
+    }
+
+    return prev[n];
+}
+
+// Demo (and correctness check)
+var A = "kitten";
+var B = "sitting";
+var d = levenshtein(A, B);
+print(d); // expect 3
