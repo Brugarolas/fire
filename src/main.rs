@@ -62,6 +62,12 @@ fn main() {
             Err(e) => {
                 eprintln!("Whole-program build failed: {e:?}");
                 eprintln!("Falling back to single-file mode with the file contents...");
+
+                #[cfg(debug_assertions)]
+                {
+                    eprintln!("[fallback] single-file build: LinkInfo de imports probablemente vacío");
+                }
+
                 // Fallback: leemos el archivo y seguimos flujo single-file
                 let src = std::fs::read_to_string(&args[1]).unwrap_or_else(|_| default_script().to_string());
                 build_single_file_module(&src)

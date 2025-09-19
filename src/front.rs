@@ -4,7 +4,7 @@
 
 use logos::Logos;
 use std::{collections::BTreeSet, ops::Deref};
-use ahash::AHashMap as HashMap;
+use ahash::{AHashSet as HashSet, AHashMap as HashMap};
 use smallbox::SmallBox;
 
 // Bring in the WIR types from your other file/module.
@@ -1898,7 +1898,7 @@ pub struct LinkInfo {
     /// Si no está, caemos al camino “MVP por uso” para compat.
     pub namespace_cells: HashMap<String, BindingId>,
     /// nombres locales que corresponden a `export class` del proveedor (para saber que son clase)
-    pub imported_classes: BTreeSet<String>,
+    pub imported_class_bindings: HashSet<BindingId>,
 }
 
 pub struct Lowerer<'m> {
@@ -1922,6 +1922,16 @@ impl<'m> Lowerer<'m> {
 
     pub fn set_links(&mut self, links: LinkInfo) {
         self.links = links;
+    }
+
+    fn is_class_ident(&self, name: &str) -> bool {
+        // Local classes win
+        if self.classes.contains_key(name) { return true; }
+        // Only treat as imported class if we can prove it by BindingId
+        if let Some(bid) = self.links.import_bindings.get(name) {
+            return self.links.imported_class_bindings.contains(bid);
+        }
+        false // fall back to generic value lowering
     }
 
     pub fn lower_program(&mut self, prog: &Program) -> LResult<Vec<FuncId>> {
@@ -2227,6 +2237,14 @@ fn lower_stmt_free<'m>(
             };
             locals.insert(name.clone(), val);
 
+            #[cfg(debug_assertions)]
+            {
+                eprintln!("lower_stmt_free() Stmt::Var {{ {} }}", name);
+                eprintln!("[links] exports        : {:?}", links.export_bindings.keys().collect::<Vec<_>>());
+                eprintln!("[links] imports        : {:?}", links.import_bindings.keys().collect::<Vec<_>>());
+                eprintln!("[links] namespace_imps : {:?}", links.namespace_imports.keys().collect::<Vec<_>>());
+                eprintln!("[links] namespace_cells: {:?}", links.namespace_cells);
+            }
             if let Some(&bid) = links.export_bindings.get(name) {
                 b.store_binding(bid, val);
             }
@@ -3259,6 +3277,9 @@ fn lower_expr_free<'m>(
         Expr::Ident(name) => {
             // 1) capturas boxeadas
             if locals.get(&boxed_key(name)).is_some() {
+                #[cfg(debug_assertions)]
+                { eprintln!("[ident] {:?} -> BOXED local (read box[0])", name); }
+
                 let box_arr = *locals.get(name).ok_or_else(|| LowerError::UnknownVar(name.clone()))?;
                 let zero = b.const_i32(0);
                 let (_nid, res) = b.push_node(
@@ -3267,10 +3288,19 @@ fn lower_expr_free<'m>(
                 );
                 return Ok(res[0]);
             }
+
             // 2) locals normales
-            if let Some(&v) = locals.get(name) { return Ok(v); }
+            if let Some(&v) = locals.get(name) {
+                #[cfg(debug_assertions)]
+                { eprintln!("[ident] {:?} -> local %{:?}", name, v); }
+                return Ok(v);
+            }
+
             // 3) función global conocida → closure(env=null)
             if let Some(&fid) = funcs.get(name) {
+                #[cfg(debug_assertions)]
+                { eprintln!("[ident] {:?} -> global function {:?} (closure null)", name, fid); }
+
                 let (_nid, env_null) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
                 let (_nid, clos) = b.push_node(
                     Inst::MakeClosure { callee: fid, env: env_null[0] },
@@ -3281,24 +3311,61 @@ fn lower_expr_free<'m>(
 
             // 4) import nombrado: lee la celda del proveedor
             if let Some(&bid) = links.import_bindings.get(name) {
+                #[cfg(debug_assertions)]
+                {
+                    eprintln!("[ident] {:?} -> IMPORT binding {:?}", name, bid);
+                    eprintln!("lower_expr_free() links.import_bindings.get({})", name);
+                    eprintln!("[links] exports        : {:?}", links.export_bindings.keys().collect::<Vec<_>>());
+                    eprintln!("[links] imports        : {:?}", links.import_bindings.keys().collect::<Vec<_>>());
+                    eprintln!("[links] namespace_imps : {:?}", links.namespace_imports.keys().collect::<Vec<_>>());
+                    eprintln!("[links] namespace_cells: {:?}", links.namespace_cells);
+                }
                 let v = b.load_binding(bid, None);
                 return Ok(v);
             }
 
             // 5) export propio: también se puede leer desde su celda (live binding)
             if let Some(&bid) = links.export_bindings.get(name) {
+                    #[cfg(debug_assertions)]
+                {
+                    eprintln!("[ident] {:?} -> EXPORT binding {:?}", name, bid);
+                    eprintln!("lower_expr_free() links.export_bindings.get({})", name);
+                    eprintln!("[links] exports        : {:?}", links.export_bindings.keys().collect::<Vec<_>>());
+                    eprintln!("[links] imports        : {:?}", links.import_bindings.keys().collect::<Vec<_>>());
+                    eprintln!("[links] namespace_imps : {:?}", links.namespace_imports.keys().collect::<Vec<_>>());
+                    eprintln!("[links] namespace_cells: {:?}", links.namespace_cells);
+                }
                 let v = b.load_binding(bid, None);
                 return Ok(v);
             }
 
             // 6) namespace import cacheado en __modinit__: ns es una celda local
             if let Some(&bid) = links.namespace_cells.get(name) {
+                #[cfg(debug_assertions)]
+                {
+                    eprintln!("[ident] {:?} -> NAMESPACE CELLS cell", name);
+                    eprintln!("lower_expr_free() links.namespace_cells.get({})", name);
+                    eprintln!("[links] exports        : {:?}", links.export_bindings.keys().collect::<Vec<_>>());
+                    eprintln!("[links] imports        : {:?}", links.import_bindings.keys().collect::<Vec<_>>());
+                    eprintln!("[links] namespace_imps : {:?}", links.namespace_imports.keys().collect::<Vec<_>>());
+                    eprintln!("[links] namespace_cells: {:?}", links.namespace_cells);
+                }
                 let ns = b.load_binding(bid, Some(Type::AnyRef));
                 return Ok(ns);
             }
 
             // 7) (compat MVP) si aún no hay cache (single-file o resolver no lo puso), construye on-demand
             if let Some(exports) = links.namespace_imports.get(name) {
+                #[cfg(debug_assertions)]
+                {
+                    eprintln!("[ident] {:?} -> NAMESPACE IMPORTS cell", name);
+                    eprintln!("lower_expr_free() links.namespace_imports.get({})", name);
+                    eprintln!("[links] exports        : {:?}", links.export_bindings.keys().collect::<Vec<_>>());
+                    eprintln!("[links] imports        : {:?}", links.import_bindings.keys().collect::<Vec<_>>());
+                    eprintln!("[links] namespace_imps : {:?}", links.namespace_imports.keys().collect::<Vec<_>>());
+                    eprintln!("[links] namespace_cells: {:?}", links.namespace_cells);
+                }
+
                 // idem: memoriza en locals para no recrearlo en el mismo bloque/función
                 if let Some(&cached) = locals.get(name) {
                     return Ok(cached);
@@ -3306,6 +3373,25 @@ fn lower_expr_free<'m>(
                 let ns = b.make_namespace(exports.clone());
                 locals.insert(name.clone(), ns);
                 return Ok(ns);
+            } else {
+                #[cfg(debug_assertions)]
+                { eprintln!("[ident] {:?} -> NAMESPACE IMPORTS declared but NO CELL", name); }
+            }
+
+            #[cfg(debug_assertions)]
+            {
+                let locals_keys: Vec<_> = locals.keys().cloned().collect();
+                let funcs_keys : Vec<_> = funcs.keys().cloned().collect();
+                let imps       : Vec<_> = links.import_bindings.keys().cloned().collect();
+                let exps       : Vec<_> = links.export_bindings.keys().cloned().collect();
+                let nss        : Vec<_> = links.namespace_imports.keys().cloned().collect();
+
+                eprintln!("[ident-miss] {:?} not found.", name);
+                eprintln!("  locals   = {:?}", locals_keys);
+                eprintln!("  funcs    = {:?}", funcs_keys);
+                eprintln!("  imports  = {:?}", imps);
+                eprintln!("  exports  = {:?}", exps);
+                eprintln!("  namespaces = {:?}", nss);
             }
 
             Err(LowerError::UnknownVar(name.clone()))
@@ -3506,6 +3592,15 @@ fn lower_expr_free<'m>(
                 LValue::Ident(name) => {
                     // Primero resuelve RHS
                     let rv = lower_expr_free(b, locals, fields, next_field, rhs, funcs, lam_caps, links)?;
+
+                    #[cfg(debug_assertions)]
+                    {
+                        eprintln!("lower_expr_free() LValue::Ident({})", name);
+                        eprintln!("[links] exports        : {:?}", links.export_bindings.keys().collect::<Vec<_>>());
+                        eprintln!("[links] imports        : {:?}", links.import_bindings.keys().collect::<Vec<_>>());
+                        eprintln!("[links] namespace_imps : {:?}", links.namespace_imports.keys().collect::<Vec<_>>());
+                        eprintln!("[links] namespace_cells: {:?}", links.namespace_cells);
+                    }
 
                     // a) no se puede asignar a un import
                     if links.import_bindings.contains_key(name) {
@@ -3966,26 +4061,15 @@ fn lower_expr_free<'m>(
                 // 0c) STATIC CLASS METHODS — check BEFORE anything that would lower `recv`
                 if let Expr::Ident(cn) = &**recv {
                     if let Some(&fid) = funcs.get(&format!("__static_{}_{}", cn, name)) {
+                        #[cfg(debug_assertions)]
+                        { eprintln!("[static] candidate {}.{}", cn, name); }
+
                         let mut argv = Vec::with_capacity(args.len());
                         for a in args {
                             argv.push(lower_expr_free(b, locals, fields, next_field, a, funcs, lam_caps, links)?);
                         }
                         let (_nid, res) = b.push_node(
                             Inst::CallDirect { conv: crate::wir::CallConv::Fast, callee: fid, args: argv },
-                            Some(Type::Int32), 1, true
-                        );
-                        return Ok(res[0]);
-                    }
-                }
-
-                if let Expr::Ident(cn) = &**recv {
-                    if links.imported_classes.contains(cn) {
-                        // times3 = Counter["times3"]; times3(...args)  (SIN 'this')
-                        let fun_v  = lower_expr_free(b, locals, fields, next_field, callee, funcs, lam_caps, links)?;
-                        let mut argv = Vec::with_capacity(args.len());
-                        for a in args { argv.push(lower_expr_free(b, locals, fields, next_field, a, funcs, lam_caps, links)?); }
-                        let (_nid, res) = b.push_node(
-                            Inst::CallClosure { conv: crate::wir::CallConv::Fast, fun: fun_v, args: argv },
                             Some(Type::Int32), 1, true
                         );
                         return Ok(res[0]);
@@ -4283,6 +4367,9 @@ fn lower_expr_free<'m>(
         }
 
         Expr::New { class, args } => {
+            #[cfg(debug_assertions)]
+            { eprintln!("[new] trying to resolve class {:?} via import/export/namespace", class); }
+
             // 1) ruta local (como ya tenías)
             let fname = format!("__class_new_{}", class);
             if let Some(&fid) = funcs.get(&fname) {
@@ -4297,6 +4384,15 @@ fn lower_expr_free<'m>(
                 return Ok(res[0]);
             }
 
+            #[cfg(debug_assertions)]
+            {
+                eprintln!("lower_expr_free() Expr::Call(...) Expr::New({})", class);
+                eprintln!("[links] exports        : {:?}", links.export_bindings.keys().collect::<Vec<_>>());
+                eprintln!("[links] imports        : {:?}", links.import_bindings.keys().collect::<Vec<_>>());
+                eprintln!("[links] namespace_imps : {:?}", links.namespace_imports.keys().collect::<Vec<_>>());
+                eprintln!("[links] namespace_cells: {:?}", links.namespace_cells);
+            }
+
             // 2) ruta IMPORTADA/EXPORTADA: el identificador 'class' es un binding a un "class object"
             if let Some(&bid) = links
                 .import_bindings
@@ -4304,6 +4400,9 @@ fn lower_expr_free<'m>(
                 .or_else(|| links.export_bindings.get(class))
                 .or_else(|| links.namespace_cells.get(class))
             {
+                #[cfg(debug_assertions)]
+                { eprintln!("[new] class {:?} -> binding {:?}; invoking 'new'", class, bid); }
+
                 let clazz = b.load_binding(bid, Some(Type::AnyRef));
                 // convention: el "class object" expone 'new' que apunta al allocator
                 let (_nk, k) = b.push_node(Inst::Const(Constant::Str("new".into())), Some(Type::Str), 1, false);
@@ -4760,6 +4859,15 @@ impl<'m> Lowerer<'m> {
     fn emit_module_init(&mut self) -> Option<FuncId> {
         use crate::wir::{Inst, Type};
 
+        #[cfg(debug_assertions)]
+        {
+            eprintln!("emit_module_init()");
+            eprintln!("[links] exports        : {:?}", self.links.export_bindings.keys().collect::<Vec<_>>());
+            eprintln!("[links] imports        : {:?}", self.links.import_bindings.keys().collect::<Vec<_>>());
+            eprintln!("[links] namespace_imps : {:?}", self.links.namespace_imports.keys().collect::<Vec<_>>());
+            eprintln!("[links] namespace_cells: {:?}", self.links.namespace_cells);
+        }
+
         let mut did_any = false;
         if self.links.export_bindings.is_empty() && self.links.namespace_cells.is_empty() {
             return None;
@@ -4796,41 +4904,63 @@ impl<'m> Lowerer<'m> {
     fn lower_modinit(&mut self, prog: &Program, links: &LinkInfo) -> LResult<FuncId> {
         use crate::wir::{Inst, Type};
 
-        // ---- SNAPSHOTS (sin tocar self.module) ----
-        // export function f: (binding, fid)
-        let mut fn_exports: Vec<(BindingId, FuncId)> = Vec::new();
-        for f in &prog.functions {
-            if let Some(&bid) = links.export_bindings.get(&f.name) {
-                if let Some(&fid) = self.funcs.get(&f.name) {
-                    fn_exports.push((bid, fid));
-                }
-            }
+        #[cfg(debug_assertions)]
+        {
+            eprintln!("lower_modinit()");
+            eprintln!("[links] exports        : {:?}", links.export_bindings.keys().collect::<Vec<_>>());
+            eprintln!("[links] imports        : {:?}", links.import_bindings.keys().collect::<Vec<_>>());
+            eprintln!("[links] namespace_imps : {:?}", links.namespace_imports.keys().collect::<Vec<_>>());
+            eprintln!("[links] namespace_cells: {:?}", links.namespace_cells);
         }
 
-        // export class C: (binding, allocator_fid_opt, [(static_name, fid)])
+        // ---- Build the export plan *from the link info* ----
+        // functions: (binding, fid)
+        let mut fn_exports: Vec<(BindingId, FuncId)> = Vec::new();
+
+        // classes: (binding, allocator_fid_opt, [(static_name, fid)])
         let mut class_exports: Vec<(BindingId, Option<FuncId>, Vec<(String, FuncId)>)> = Vec::new();
-        for (cname, ci) in self.classes.iter() {
-            if let Some(&bid) = links.export_bindings.get(cname) {
-                let alloc = self.funcs.get(&format!("__class_new_{}", cname)).copied();
+
+        for (name, &bid) in &links.export_bindings {
+            // Is this export a local function?
+            if let Some(&fid) = self.funcs.get(name) {
+                fn_exports.push((bid, fid));
+                continue;
+            }
+
+            // Is this export a local class?
+            if let Some(ci) = self.classes.get(name) {
+                let alloc = self.funcs.get(&format!("__class_new_{}", name)).copied();
+
                 let mut statics = Vec::new();
                 for (mname, _, _, _) in &ci.static_methods {
-                    if let Some(&sfid) = self.funcs.get(&format!("__static_{}_{}", cname, mname)) {
+                    if let Some(&sfid) = self.funcs.get(&format!("__static_{}_{}", name, mname)) {
                         statics.push((mname.clone(), sfid));
                     }
                 }
+
                 class_exports.push((bid, alloc, statics));
+                continue;
             }
+
+            // Neither a known local function nor class: leave it alone.
+            // (It might be a const/let/var, a re-exported binding, etc.,
+            // which is handled elsewhere by normal lowering.)
+            #[cfg(debug_assertions)]
+            eprintln!("[modinit] export {:?} not a local func/class; skipping", name);
         }
 
-        // ---- Construye la función con el Builder (solo toca self.module aquí) ----
+        // ---- Build the function body (only mutates self.module here) ----
         let func = {
             let mut b = Builder::new(self.module, "__modinit__", vec![], vec![Type::Int32]);
 
-            // null env para cierres
+            // null env for closures
             let (_nid_null, nul) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
 
-            // 1) export functions
+            // 1) materialize exported functions
             for (bid, fid) in fn_exports {
+                #[cfg(debug_assertions)]
+                eprintln!("[modinit] store function binding {:?} -> callee {:?}", bid, fid);
+
                 let (_nid, clos) = b.push_node(
                     Inst::MakeClosure { callee: fid, env: nul[0] },
                     Some(Type::Closure(None)), 1, false
@@ -4838,8 +4968,11 @@ impl<'m> Lowerer<'m> {
                 b.store_binding(bid, clos[0]);
             }
 
-            // 2) export classes: class object con 'new' + estáticos
+            // 2) materialize exported classes: object with 'new' + statics
             for (bid, alloc_opt, statics) in class_exports {
+                #[cfg(debug_assertions)]
+                eprintln!("[modinit] build class object into binding {:?}", bid);
+
                 let (_nid, obj) = b.push_node(
                     Inst::CallNative { name: "wir_obj_new".into(), args: vec![], pure: false, can_throw: false },
                     None, 1, true
@@ -4847,6 +4980,9 @@ impl<'m> Lowerer<'m> {
                 let objv = obj[0];
 
                 if let Some(afid) = alloc_opt {
+                    #[cfg(debug_assertions)]
+                    eprintln!("[modinit]   attach 'new' -> {:?}", afid);
+
                     let (_nid, clo) = b.push_node(
                         Inst::MakeClosure { callee: afid, env: nul[0] },
                         Some(Type::Closure(None)), 1, false
@@ -4859,6 +4995,9 @@ impl<'m> Lowerer<'m> {
                 }
 
                 for (mname, sfid) in statics {
+                    #[cfg(debug_assertions)]
+                    eprintln!("[modinit]   attach static {:?} -> {:?}", mname, sfid);
+
                     let (_nid, clo) = b.push_node(
                         Inst::MakeClosure { callee: sfid, env: nul[0] },
                         Some(Type::Closure(None)), 1, false
@@ -4870,12 +5009,15 @@ impl<'m> Lowerer<'m> {
                     );
                 }
 
-                // exporta el class object
+                // publish the class object
                 b.store_binding(bid, objv);
             }
 
-            // 3) cache de namespaces importados
+            // 3) cache imported namespaces (unchanged)
             for (ns, exports) in &links.namespace_imports {
+                #[cfg(debug_assertions)]
+                eprintln!("[modinit] cache namespace {:?}", ns);
+
                 if let Some(&cell) = links.namespace_cells.get(ns) {
                     let ns_obj = b.make_namespace(exports.clone());
                     b.store_binding(cell, ns_obj);
@@ -4887,7 +5029,6 @@ impl<'m> Lowerer<'m> {
             b.finish()
         };
 
-        // Fuera del alcance del Builder: ya no hay préstamo mutable activo
         let fid = self.module.push_function(func);
         Ok(fid)
     }

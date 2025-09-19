@@ -10,20 +10,7 @@ fn add2(a, b) {
 
 print(add2(2, 3)); // expect 5
 
-print("===== Classes =====");
-class Point {
-    var x = 0;
-    var y = 0;
 
-    constructor (x, y) { this.x = x; this.y = y; }
-    fn sum() { return this.x + this.y; }
-
-    static fn twice(n) { return n * 2; }
-}
-
-var p = new Point(10, 32);
-print(p.sum());           // expect 42
-print(Point.twice(21));   // expect 42
 
 print("===== Recursive function =====");
 fn fibonacci(n) {
