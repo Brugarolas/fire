@@ -298,7 +298,7 @@ pub struct ModuleUnit {
     pub code: Arc<str>,
     pub imports: Vec<String>,   // specifiers tal cual
     pub deps: Vec<Url>,         // URLs resueltas de imports estáticos
-    pub links: crate::front::LinkInfo, // link info snapshot (filled after lowering)
+    pub links: crate::lowerer::LinkInfo, // link info snapshot (filled after lowering)
     pub wir: crate::wir::Module,       // WIR after lowering+opt
     pub ast: crate::front::Program,    // keep the parsed AST so we can resolve imports before lowering
 }
@@ -397,8 +397,9 @@ fn build_incoming_links_for_unit<L: ModuleLoader>(
     loader: &Arc<L>,
     units: &HashMap<Url, ModuleUnit>,
     unit_url: &Url,
-) -> Result<crate::front::LinkInfo, BuildError> {
-    use crate::front::{Parser, ImportItem, LinkInfo};
+) -> Result<crate::lowerer::LinkInfo, BuildError> {
+    use crate::front::{Parser, ImportItem};
+    use crate::lowerer::LinkInfo;
 
     let unit = units.get(unit_url).expect("unit present");
 
@@ -483,7 +484,7 @@ fn lower_and_optimize_in_topo<L: ModuleLoader + 'static>(
 
         // Lower to WIR.
         let mut m = crate::wir::Module::new();
-        let mut lowerer = crate::front::Lowerer::new(&mut m);
+        let mut lowerer = crate::lowerer::Lowerer::new(&mut m);
         lowerer.set_links(incoming_links);
         lowerer.lower_program(&prog)
             .map_err(|e| BuildError::Lower(format!("{:?}", e)))?;
@@ -565,7 +566,7 @@ pub fn build_graph_parallel<L: ModuleLoader + 'static>(
             imports,
             deps: deps.clone(),
             ast,
-            links: crate::front::LinkInfo::default(),
+            links: crate::lowerer::LinkInfo::default(),
             wir: crate::wir::Module::new(),
         });
     }
@@ -582,10 +583,10 @@ pub fn build_graph_parallel<L: ModuleLoader + 'static>(
 
         // Prepare a fresh WIR for this module
         let mut m = crate::wir::Module::new();
-        let mut lowerer = crate::front::Lowerer::new(&mut m);
+        let mut lowerer = crate::lowerer::Lowerer::new(&mut m);
 
         // Seed namespace imports (cheap pre-scan, no need to re-lex entirely)
-        let mut seeded = crate::front::LinkInfo::default();
+        let mut seeded = crate::lowerer::LinkInfo::default();
         for ns in extract_namespace_import_idents(&unit.code) {
             seeded.namespace_imports.entry(ns).or_default();
         }

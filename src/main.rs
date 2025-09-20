@@ -5,6 +5,7 @@
 mod value;
 mod wir;
 mod front;
+mod lowerer;
 mod opt;
 mod gc;
 mod runtime;
@@ -155,7 +156,7 @@ fn build_single_file_module(src: &str) -> wir::Module {
 
     // Lower to WIR
     let mut module = wir::Module::new();
-    let mut lowerer = front::Lowerer::new(&mut module);
+    let mut lowerer = lowerer::Lowerer::new(&mut module);
     if let Err(e) = lowerer.lower_program(&prog) {
         eprintln!("Lowering error: {:?}", e);
         std::process::exit(1);
