@@ -30,8 +30,10 @@ pub enum Tok {
 
     // Keywords
     #[token("fn")] Fn,
+    #[token("function")] Function,
     #[token("var")] Var,
     #[token("let")] Let,
+    #[token("const")] Const,
     #[token("if")] If,
     #[token("unless")] Unless,
     #[token("else")] Else,
@@ -475,9 +477,9 @@ impl<'src> Parser<'src> {
                 self.parse_export_decl(&mut functions, &mut classes, &mut toplevel_stmts, &mut exports)?;
             } else if self.check(&Tok::Class) {
                 classes.push(self.class_decl()?);
-            } else if self.check(&Tok::Fn) || self.check(&Tok::Async) {
+            } else if self.check(&Tok::Fn) || self.check(&Tok::Function) || self.check(&Tok::Async) {
                 let is_async = if self.matches(&Tok::Async) {
-                    self.expect(Tok::Fn, "expected 'fn' after 'async'")?;
+                    self.expect(Tok::Fn, "expected 'fn'/'function' after 'async'")?;
                     true
                 } else {
                     self.i += 1; // consume Fn
@@ -526,7 +528,7 @@ impl<'src> Parser<'src> {
     }
 
     fn class_member(&mut self) -> PResult<ClassMember> {
-        // optional "static"
+        // optional `static`
         let is_static = self.matches(&Tok::Static);
 
         // constructor
@@ -549,7 +551,7 @@ impl<'src> Parser<'src> {
                 _ => return Err(self.err_here("expected field name after 'var'")),
             };
 
-            // (optional) type annotation — we just skip it for now
+            // ignore optional type annotation for now
             let _ = self.maybe_skip_type_annot()?;
 
             let init = if self.matches(&Tok::Eq) { Some(self.expr()?) } else { None };
@@ -562,7 +564,7 @@ impl<'src> Parser<'src> {
             });
         }
 
-        // accessor: get name() { ... }  |  set name(param) { ... }
+        // accessors: get name() { ... }  |  set name(param) { ... }
         if self.matches(&Tok::Get) {
             let name = match self.next().tok {
                 Tok::Ident(s) => s,
@@ -600,20 +602,19 @@ impl<'src> Parser<'src> {
             });
         }
 
-        // methods: [async] fn name(params) block
-        let is_async = if self.matches(&Tok::Async) {
-            self.expect(Tok::Fn, "expected 'fn' after 'async'")?;
-            true
-        } else if self.matches(&Tok::Fn) {
-            false
-        } else {
-            return Err(self.err_here("expected class member"));
-        };
+        // methods: [static] [async] [fn|function]? Ident(params) { block }
+        // Accept JS-style methods without the `fn` keyword.
+        let is_async = if self.matches(&Tok::Async) { true } else { false };
 
+        // Optional `fn` / `function` keyword (ignored if present)
+        let _ = self.matches(&Tok::Fn) || self.matches(&Tok::Function);
+
+        // Method name
         let name = match self.next().tok {
             Tok::Ident(s) => s,
             _ => return Err(self.err_here("expected method name")),
         };
+
         self.expect(Tok::LParen, "expected '(' after method name")?;
         let params = self.parse_param_list()?;
         let body = self.block()?;
@@ -715,6 +716,21 @@ impl<'src> Parser<'src> {
             return Ok(());
         }
 
+        // export function / export async function
+        if self.check(&Tok::Async) || self.check(&Tok::Function) {
+            let is_async = if self.matches(&Tok::Async) {
+                self.expect(Tok::Function, "expected 'function' after 'async'")?;
+                true
+            } else {
+                self.expect(Tok::Function, "expected 'function' after 'export'")?;
+                false
+            };
+            let f = self.fn_def_with_async(is_async)?;
+            exports.push(ExportDecl::Func(f.name.clone()));
+            functions.push(f);
+            return Ok(());
+        }
+
         // export class ...
         if self.check(&Tok::Class) {
             let c = self.class_decl()?;
@@ -724,7 +740,7 @@ impl<'src> Parser<'src> {
         }
 
         // export var/let X = ... ;
-        if self.matches(&Tok::Var) || self.matches(&Tok::Let) {
+        if self.matches(&Tok::Var) || self.matches(&Tok::Let) || self.matches(&Tok::Const) {
             let name = match self.next().tok {
                 Tok::Ident(s) => s,
                 _ => return Err(self.err_here("expected identifier after 'export var/let'")),
@@ -860,7 +876,7 @@ impl<'src> Parser<'src> {
             return self.parse_listen_stmt();
         }
 
-        if self.matches(&Tok::Var) || self.matches(&Tok::Let){
+        if self.matches(&Tok::Var) || self.matches(&Tok::Let) || self.matches(&Tok::Const) {
             let name = match self.next().tok {
                 Tok::Ident(s) => s,
                 _ => return Err(self.err_here("expected identifier after 'var'")),
@@ -1264,10 +1280,10 @@ impl<'src> Parser<'src> {
                 }
                 Ok(Expr::ArrayLit(elems))
             }
-            Tok::Fn => {
+            Tok::Fn | Tok::Function => {
                 // Stage #1: only the anonymous form inside expressions.
                 // Expect '(' immediately (no name allowed here).
-                self.expect(Tok::LParen, "expected '(' after 'fn' in function literal")?;
+                self.expect(Tok::LParen, "expected '(' after 'fn'/'function' in function literal")?;
                 let params = self.parse_param_list()?;
                 let body = self.block()?;
                 Ok(Expr::FnLit { params, body })
@@ -5678,6 +5694,8 @@ impl<'m> Lowerer<'m> {
             );
         }
     }
+
+    pub fn links_snapshot(&self) -> LinkInfo { self.links.clone() }
 }
 
 fn intern_field_local(

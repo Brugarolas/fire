@@ -298,7 +298,8 @@ pub struct ModuleUnit {
     pub code: Arc<str>,
     pub imports: Vec<String>,   // specifiers tal cual
     pub deps: Vec<Url>,         // URLs resueltas de imports estáticos
-    pub wir: crate::wir::Module // resultado de parse+lower+opt (pipeline 1)
+    pub links: crate::front::LinkInfo,          // link info snapshot (filled after lowering)
+    pub wir: crate::wir::Module,        // WIR after lowering+opt
 }
 
 pub struct ModuleGraph {
@@ -388,6 +389,119 @@ fn panic_to_string(e: Box<dyn std::any::Any + Send + 'static>) -> String {
     else { format!("{:?}", e) }
 }
 
+/// Build incoming LinkInfo for `unit` using:
+///  - namespace aliases from its AST,
+///  - named imports resolved against already-lowered provider modules.
+fn build_incoming_links_for_unit<L: ModuleLoader>(
+    loader: &Arc<L>,
+    units: &HashMap<Url, ModuleUnit>,
+    unit_url: &Url,
+) -> Result<crate::front::LinkInfo, BuildError> {
+    use crate::front::{Parser, ImportItem, LinkInfo};
+
+    let unit = units.get(unit_url).expect("unit present");
+
+    // Parse AST just to read the structured import declarations.
+    let mut p = Parser::new(&unit.code);
+    let prog = p.program().map_err(|e| BuildError::Parse {
+        url: unit_url.clone(),
+        msg: e.msg,
+        span: Some((e.span.start, e.span.end)),
+    })?;
+
+    let mut links = LinkInfo::default();
+
+    // Seed namespace aliases (even if we don't materialize members yet).
+    for imp in &prog.imports {
+        for it in &imp.items {
+            if let ImportItem::Namespace { alias } = it {
+                links.namespace_imports.entry(alias.clone()).or_default();
+            }
+        }
+    }
+
+    // Wire named imports from providers' export_bindings.
+    for imp in &prog.imports {
+        let prov_url = loader.resolve(&unit.url, &imp.specifier)?;
+        let prov = units.get(&prov_url).ok_or_else(|| {
+            BuildError::Load(LoadError::NotFound(prov_url.clone()))
+        })?;
+
+        for it in &imp.items {
+            match it {
+                ImportItem::Named { name, alias } => {
+                    let local = alias.clone().unwrap_or_else(|| name.clone());
+                    if let Some(&bid) = prov.links.export_bindings.get(name.as_str()) {
+                        links.import_bindings.insert(local, bid);
+                    } else {
+                        return Err(BuildError::Lower(format!(
+                            "Import resolution failed: '{}' not exported by {} (needed by {})",
+                            name,
+                            prov_url.display(),
+                            unit_url.display(),
+                        )));
+                    }
+                }
+                ImportItem::Namespace { alias } => {
+                    // Optional: materialize members list for make_namespace.
+                    let mut members = Vec::new();
+                    for (exp_name, &bid) in &prov.links.export_bindings {
+                        members.push((exp_name.clone(), bid));
+                    }
+                    links.namespace_imports.insert(alias.clone(), members);
+                }
+            }
+        }
+    }
+
+    Ok(links)
+}
+
+/// Lower and optimize all modules in topological order so that providers
+/// are lowered before importers. This lets us feed importers with the
+/// providers' BindingIds via LinkInfo.
+fn lower_and_optimize_in_topo<L: ModuleLoader + 'static>(
+    loader: Arc<L>,
+    topo: &[Url],
+    units: &mut HashMap<Url, ModuleUnit>,
+) -> Result<(), BuildError> {
+    use crate::front::Parser;
+
+    for url in topo {
+        // Re-parse the module to obtain its full AST for lowering.
+        let code = { units.get(url).expect("unit").code.clone() };
+        let mut p = Parser::new(&code);
+        let prog = p.program().map_err(|e| BuildError::Parse {
+            url: url.clone(),
+            msg: e.msg,
+            span: Some((e.span.start, e.span.end)),
+        })?;
+
+        // Build incoming links using already-lowered providers.
+        let incoming_links = build_incoming_links_for_unit(&loader, units, url)?;
+
+        // Lower to WIR.
+        let mut m = crate::wir::Module::new();
+        let mut lowerer = crate::front::Lowerer::new(&mut m);
+        lowerer.set_links(incoming_links);
+        lowerer.lower_program(&prog)
+            .map_err(|e| BuildError::Lower(format!("{:?}", e)))?;
+
+        // Snapshot final links (must include export_bindings).
+        let links_out = lowerer.links_snapshot();
+
+        // Optimize single module.
+        let optimize = optimization_passes();
+        optimize.optimize_module(&mut m);
+
+        // Store back.
+        let u = units.get_mut(url).expect("unit exists");
+        u.links = links_out;
+        u.wir = m;
+    }
+    Ok(())
+}
+
 pub fn build_graph_parallel<L: ModuleLoader + 'static>(
     loader: Arc<L>,
     entry: Url
@@ -398,16 +512,17 @@ pub fn build_graph_parallel<L: ModuleLoader + 'static>(
     queue.push_back(entry.clone());
     let mut seen = HashSet::new();
 
+    // Phase A: load + discover deps (no lowering)
     while let Some(url) = queue.pop_front() {
         if !seen.insert(url.clone()) { continue; }
 
-        // load
+        // Load file
         let loaded = loader.load(&url)?;
 
-        // prepara contenedor de edges (aunque no tenga deps)
+        // Ensure edge bucket exists
         edges.entry(url.clone()).or_default();
 
-        // descubrir imports
+        // Discover static imports with the quick scanner
         let imports = extract_static_imports(&loaded.code);
         let mut deps = Vec::new();
         for spec in &imports {
@@ -417,69 +532,22 @@ pub fn build_graph_parallel<L: ModuleLoader + 'static>(
             queue.push_back(dep);
         }
 
-        // parse + lower en fiber May
-        let code_arc = loaded.code.clone();
-        let url_for_err = url.clone();
-
-        let builder = coroutine::Builder::new()
-            .name(format!("parse:{}", url.display()))
-            .stack_size(WORKER_STACK_BYTES);
-
-        let handle = unsafe {
-            builder.spawn(move || -> Result<crate::wir::Module, BuildError> {
-                let mut m = crate::wir::Module::new();
-
-                // Seed LinkInfo with namespace imports found in source.
-                let mut links = crate::front::LinkInfo::default();
-                for ns in extract_namespace_import_idents(&code_arc) {
-                    // We only know the namespace identifier here. Export members will be materialized later if/when resolved.
-                    links.namespace_imports.entry(ns).or_default(); // empty vec is fine for now
-                }
-
-                #[cfg(debug_assertions)]
-                eprintln!("[modules] ns imports in {} => {:?}", url_for_err.display(), extract_namespace_import_idents(&code_arc));
-
-                // Create parsers and lowerers
-                let mut p = crate::front::Parser::new(&code_arc);
-                let prog = p.program().map_err(|e| BuildError::Parse {
-                    url: url_for_err.clone(),
-                    msg: e.msg,
-                    span: Some((e.span.start, e.span.end)),
-                })?;
-
-                let mut m = crate::wir::Module::new();
-                let mut lowerer = crate::front::Lowerer::new(&mut m);
-                lowerer.set_links(links);
-                lowerer.lower_program(&prog).map_err(|e| BuildError::Lower(format!("{:?}", e)))?;
-
-                // Optimize local module
-                let optimize = optimization_passes();
-                optimize.optimize_module(&mut m);
-
-                Ok(m)
-            })
-        }.map_err(BuildError::Io)?;
-
-        // Unimos y manejamos pánicos explícitamente
-        let mut wir = match handle.join() {
-            Ok(res) => res?, // propaga Parse/Lower de dentro del worker
-            Err(e) => {
-                // Si quieres, haz fallback a ejecutar en el hilo principal aquí.
-                return Err(BuildError::Panic(panic_to_string(e)));
-            }
-        };
-
+        // Initialize unit with placeholders (links, wir will be filled in Phase B)
         units.insert(url.clone(), ModuleUnit {
             url: url.clone(),
             code: loaded.code.clone(),
             imports,
             deps: deps.clone(),
-            wir,
+            links: crate::front::LinkInfo::default(),
+            wir: crate::wir::Module::new(),
         });
     }
 
     let topo = topo_sort(&edges, &entry);
     let sccs = scc_kosaraju(&edges);
+
+    // Phase B: lower + optimize in topo order so providers are ready for importers.
+    lower_and_optimize_in_topo(loader, &topo, &mut units)?;
 
     Ok(ModuleGraph { entry, units, edges, topo, sccs })
 }
@@ -622,6 +690,7 @@ pub fn merge_graph_into_single_wir(
 
     for url in &g.topo {
         let Some(u) = g.units.get(url) else { continue; };
+        let uwir = &u.wir;
 
         rb.func     = out.funcs.len() as u32;
         rb.shape    = out.next_shape;
@@ -631,8 +700,7 @@ pub fn merge_graph_into_single_wir(
         rb.deopt    = out.next_deopt;
         rb.class    = out.next_class;
 
-        for mut f in u.wir.funcs.clone() {
-            // Detecta top-level del módulo y renombra para evitar colisiones
+        for mut f in uwir.funcs.clone() {
             let is_mod_toplevel = f.sig.name == "__toplevel__";
             if is_mod_toplevel {
                 f.sig.name = format!("__mod_init__#{}", prog_inits.len());
@@ -649,16 +717,16 @@ pub fn merge_graph_into_single_wir(
             }
         }
 
-        out.next_shape    += u.wir.next_shape;
-        out.next_field    += u.wir.next_field;
-        out.next_envshape += u.wir.next_envshape;
-        out.next_site     += u.wir.next_site;
-        out.next_deopt    += u.wir.next_deopt;
-        out.next_class    += u.wir.next_class;
+        out.next_shape    += uwir.next_shape;
+        out.next_field    += uwir.next_field;
+        out.next_envshape += uwir.next_envshape;
+        out.next_site     += uwir.next_site;
+        out.next_deopt    += uwir.next_deopt;
+        out.next_class    += uwir.next_class;
 
-        for (k, v) in &u.wir.strings { out.strings.entry(k.clone()).or_insert(*v); }
-        for (k, v) in &u.wir.shapes  { out.shapes.entry(k.clone()).or_insert(crate::wir::ShapeId(v.0 + rb.shape)); }
-        for (k, v) in &u.wir.fields  { out.fields.entry(k.clone()).or_insert(crate::wir::FieldId(v.0 + rb.field)); }
+        for (k, v) in &uwir.strings { out.strings.entry(k.clone()).or_insert(*v); }
+        for (k, v) in &uwir.shapes  { out.shapes.entry(k.clone()).or_insert(crate::wir::ShapeId(v.0 + rb.shape)); }
+        for (k, v) in &uwir.fields  { out.fields.entry(k.clone()).or_insert(crate::wir::FieldId(v.0 + rb.field)); }
     }
 
     // Inserta el __toplevel__ global que llama a todos los inits en orden topo
