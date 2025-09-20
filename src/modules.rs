@@ -298,8 +298,9 @@ pub struct ModuleUnit {
     pub code: Arc<str>,
     pub imports: Vec<String>,   // specifiers tal cual
     pub deps: Vec<Url>,         // URLs resueltas de imports estáticos
-    pub links: crate::front::LinkInfo,          // link info snapshot (filled after lowering)
-    pub wir: crate::wir::Module,        // WIR after lowering+opt
+    pub links: crate::front::LinkInfo, // link info snapshot (filled after lowering)
+    pub wir: crate::wir::Module,       // WIR after lowering+opt
+    pub ast: crate::front::Program,    // keep the parsed AST so we can resolve imports before lowering
 }
 
 pub struct ModuleGraph {
@@ -512,17 +513,18 @@ pub fn build_graph_parallel<L: ModuleLoader + 'static>(
     queue.push_back(entry.clone());
     let mut seen = HashSet::new();
 
-    // Phase A: load + discover deps (no lowering)
+    // ----------------------------
+    // Phase A: load + parse (concurrent)
+    // ----------------------------
     while let Some(url) = queue.pop_front() {
         if !seen.insert(url.clone()) { continue; }
 
-        // Load file
         let loaded = loader.load(&url)?;
 
-        // Ensure edge bucket exists
+        // ensure adjacency list exists
         edges.entry(url.clone()).or_default();
 
-        // Discover static imports with the quick scanner
+        // discover raw "import ... from '...'" specifiers to expand BFS
         let imports = extract_static_imports(&loaded.code);
         let mut deps = Vec::new();
         for spec in &imports {
@@ -532,22 +534,112 @@ pub fn build_graph_parallel<L: ModuleLoader + 'static>(
             queue.push_back(dep);
         }
 
-        // Initialize unit with placeholders (links, wir will be filled in Phase B)
+        // parse AST in a May coroutine (cheap, parallel)
+        let code_arc = loaded.code.clone();
+        let url_for_err = url.clone();
+
+        let builder = coroutine::Builder::new()
+            .name(format!("parse:{}", url.display()))
+            .stack_size(WORKER_STACK_BYTES);
+
+        let handle = unsafe {
+            builder.spawn(move || -> Result<crate::front::Program, BuildError> {
+                let mut p = crate::front::Parser::new(&code_arc);
+                let prog = p.program().map_err(|e| BuildError::Parse {
+                    url: url_for_err.clone(),
+                    msg: e.msg,
+                    span: Some((e.span.start, e.span.end)),
+                })?;
+                Ok(prog)
+            })
+        }.map_err(BuildError::Io)?;
+
+        let ast = match handle.join() {
+            Ok(res) => res?,
+            Err(e) => return Err(BuildError::Panic(panic_to_string(e))),
+        };
+
         units.insert(url.clone(), ModuleUnit {
             url: url.clone(),
             code: loaded.code.clone(),
             imports,
             deps: deps.clone(),
+            ast,
             links: crate::front::LinkInfo::default(),
             wir: crate::wir::Module::new(),
         });
     }
 
+    // Topological order over the import graph
     let topo = topo_sort(&edges, &entry);
     let sccs = scc_kosaraju(&edges);
 
-    // Phase B: lower + optimize in topo order so providers are ready for importers.
-    lower_and_optimize_in_topo(loader, &topo, &mut units)?;
+    // ----------------------------
+    // Phase B: lower + optimize (topo order)
+    // ----------------------------
+    for url in &topo {
+        let Some(unit) = units.get(url) else { continue; };
+
+        // Prepare a fresh WIR for this module
+        let mut m = crate::wir::Module::new();
+        let mut lowerer = crate::front::Lowerer::new(&mut m);
+
+        // Seed namespace imports (cheap pre-scan, no need to re-lex entirely)
+        let mut seeded = crate::front::LinkInfo::default();
+        for ns in extract_namespace_import_idents(&unit.code) {
+            seeded.namespace_imports.entry(ns).or_default();
+        }
+        lowerer.set_links(seeded);
+
+        // Seed exports/import declarations from the AST
+        lowerer.seed_links_from_ast(&unit.ast);
+
+        // Resolve *named* imports against providers that are already lowered
+        for imp in &unit.ast.imports {
+            // skip side-effect-only and namespace forms here
+            if imp.items.is_empty() { continue; }
+
+            // resolve "from" URL
+            let prov_url = loader.resolve(&unit.url, &imp.specifier)?;
+            let Some(prov) = units.get(&prov_url) else {
+                return Err(BuildError::Lower(format!(
+                    "Import resolution failed: provider {} not found (needed by {})",
+                    prov_url.display(), unit.url.display()
+                )));
+            };
+
+            // For each named item map local alias -> provider's export BindingId
+            for item in &imp.items {
+                if let crate::front::ImportItem::Named { name, alias } = item {
+                    let local = alias.as_ref().unwrap_or(name);
+                    if let Some(&bid) = prov.links.export_bindings.get(name.as_str()) {
+                        lowerer.links_snapshot().import_bindings.insert(local.clone(), bid);
+                    } else {
+                        return Err(BuildError::Lower(format!(
+                            "Import resolution failed: '{}' not exported by {} (needed by {})",
+                            name, prov_url.display(), unit.url.display()
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Lower with resolved links
+        lowerer.lower_program(&unit.ast)
+            .map_err(|e| BuildError::Lower(format!("{:?}", e)))?;
+
+        // Save links (exports/imports) for downstream modules
+        let links_after = lowerer.links_snapshot();
+
+        // Optimize local module
+        let optimize = optimization_passes();
+        optimize.optimize_module(&mut m);
+
+        // Commit back to the unit
+        let u = units.get_mut(url).unwrap();
+        u.links = links_after;
+        u.wir = m;
+    }
 
     Ok(ModuleGraph { entry, units, edges, topo, sccs })
 }

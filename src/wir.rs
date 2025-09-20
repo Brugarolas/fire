@@ -957,6 +957,38 @@ impl<'m> Builder<'m> {
         );
         res[0]
     }
+
+    /// Allocate a fresh ESM live-binding cell in the *current module*.
+    /// The IR does not store names for bindings; the caller should keep the
+    /// (name -> BindingId) mapping (e.g., in LinkInfo).
+    pub fn define_binding_cell(&mut self) -> BindingId {
+        self.module.fresh_binding()
+    }
+
+    /// Convenience alias used when creating cells for *exports*.
+    /// `name` is only for the caller's bookkeeping/logging.
+    pub fn define_export_cell(&mut self, _name: &str) -> BindingId {
+        self.define_binding_cell()
+    }
+
+    /// Convenience alias used when creating cells to cache namespace objects.
+    /// `name` is only for the caller's bookkeeping/logging.
+    pub fn define_namespace_cell(&mut self, _name: &str) -> BindingId {
+        self.define_binding_cell()
+    }
+
+    pub fn const_bool(&mut self, x: bool) -> ValueId {
+        let (_nid, res) = self.push_node(Inst::Const(Constant::Bool(x)), Some(Type::Bool), 1, false);
+        res[0]
+    }
+    pub fn const_null(&mut self) -> ValueId {
+        let (_nid, res) = self.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
+        res[0]
+    }
+    pub fn const_str(&mut self, s: &str) -> ValueId {
+        let (_nid, res) = self.push_node(Inst::Const(Constant::Str(s.to_string())), Some(Type::Str), 1, false);
+        res[0]
+    }
 }
 
 impl EffectKind {

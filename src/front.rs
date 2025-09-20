@@ -1924,6 +1924,7 @@ pub struct Lowerer<'m> {
     lam_captures: HashMap<String, Vec<String>>,
     classes: HashMap<String, ClassInfo>,
     links: LinkInfo,
+    pending_export_names: Vec<String>,
 }
 
 impl<'m> Lowerer<'m> {
@@ -1934,6 +1935,7 @@ impl<'m> Lowerer<'m> {
             lam_captures: Default::default(),
             classes: Default::default(),
             links: Default::default(),
+            pending_export_names: Vec::new(),
         }
     }
 
@@ -2095,7 +2097,8 @@ impl<'m> Lowerer<'m> {
         }
 
         // -------- Stage 5: __modinit__
-        let _modinit = self.lower_modinit(&prog, &self.links.clone())?;
+        let _modinit = self.lower_modinit(&prog)?;
+        out.push(_modinit);
 
         // Then all class-generated functions in exactly the order matched above
         self.lower_all_classes(&prog)?;
@@ -4897,33 +4900,33 @@ impl<'m> Lowerer<'m> {
         if did_any { Some(self.module.push_function(f)) } else { None }
     }
 
-    fn lower_modinit(&mut self, prog: &Program, links: &LinkInfo) -> LResult<FuncId> {
+    fn lower_modinit(&mut self, _prog: &Program) -> LResult<FuncId> {
         use crate::wir::{Inst, Type};
 
         #[cfg(debug_assertions)]
         {
-            eprintln!("lower_modinit()");
-            eprintln!("[links] exports        : {:?}", links.export_bindings.keys().collect::<Vec<_>>());
-            eprintln!("[links] imports        : {:?}", links.import_bindings.keys().collect::<Vec<_>>());
-            eprintln!("[links] namespace_imps : {:?}", links.namespace_imports.keys().collect::<Vec<_>>());
-            eprintln!("[links] namespace_cells: {:?}", links.namespace_cells);
+            eprintln!("lower_modinit() [pre]");
+            eprintln!("[links] exports        : {:?}", self.links.export_bindings.keys().collect::<Vec<_>>());
+            eprintln!("[links] imports        : {:?}", self.links.import_bindings.keys().collect::<Vec<_>>());
+            eprintln!("[links] namespace_imps : {:?}", self.links.namespace_imports.keys().collect::<Vec<_>>());
+            eprintln!("[links] namespace_cells: {:?}", self.links.namespace_cells);
         }
 
-        // ---- Build the export plan *from the link info* ----
-        // functions: (binding, fid)
-        let mut fn_exports: Vec<(BindingId, FuncId)> = Vec::new();
+        // --- 1) Allocate export cells BEFORE creating the builder (avoids E0499) ---
+        self.ensure_export_cells_in_modinit();
 
-        // classes: (binding, allocator_fid_opt, [(static_name, fid)])
+        // --- 2) Build the export plan using self.* (still no Builder alive) ---
+        let mut fn_exports: Vec<(BindingId, FuncId)> = Vec::new();
         let mut class_exports: Vec<(BindingId, Option<FuncId>, Vec<(String, FuncId)>)> = Vec::new();
 
-        for (name, &bid) in &links.export_bindings {
-            // Is this export a local function?
+        for (name, &bid) in &self.links.export_bindings {
+            // Local function?
             if let Some(&fid) = self.funcs.get(name) {
                 fn_exports.push((bid, fid));
                 continue;
             }
 
-            // Is this export a local class?
+            // Local class?
             if let Some(ci) = self.classes.get(name) {
                 let alloc = self.funcs.get(&format!("__class_new_{}", name)).copied();
 
@@ -4938,25 +4941,20 @@ impl<'m> Lowerer<'m> {
                 continue;
             }
 
-            // Neither a known local function nor class: leave it alone.
-            // (It might be a const/let/var, a re-exported binding, etc.,
-            // which is handled elsewhere by normal lowering.)
+            // Neither function nor class — skip (const/let/re-exports handled elsewhere)
             #[cfg(debug_assertions)]
             eprintln!("[modinit] export {:?} not a local func/class; skipping", name);
         }
 
-        // ---- Build the function body (only mutates self.module here) ----
+        // --- 3) Now create the builder and emit IR ---
         let func = {
             let mut b = Builder::new(self.module, "__modinit__", vec![], vec![Type::Int32]);
 
             // null env for closures
             let (_nid_null, nul) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
 
-            // 1) materialize exported functions
+            // 3.1 publish exported functions
             for (bid, fid) in fn_exports {
-                #[cfg(debug_assertions)]
-                eprintln!("[modinit] store function binding {:?} -> callee {:?}", bid, fid);
-
                 let (_nid, clos) = b.push_node(
                     Inst::MakeClosure { callee: fid, env: nul[0] },
                     Some(Type::Closure(None)), 1, false
@@ -4964,11 +4962,8 @@ impl<'m> Lowerer<'m> {
                 b.store_binding(bid, clos[0]);
             }
 
-            // 2) materialize exported classes: object with 'new' + statics
+            // 3.2 publish exported classes (object with 'new' + statics)
             for (bid, alloc_opt, statics) in class_exports {
-                #[cfg(debug_assertions)]
-                eprintln!("[modinit] build class object into binding {:?}", bid);
-
                 let (_nid, obj) = b.push_node(
                     Inst::CallNative { name: "wir_obj_new".into(), args: vec![], pure: false, can_throw: false },
                     None, 1, true
@@ -4976,9 +4971,6 @@ impl<'m> Lowerer<'m> {
                 let objv = obj[0];
 
                 if let Some(afid) = alloc_opt {
-                    #[cfg(debug_assertions)]
-                    eprintln!("[modinit]   attach 'new' -> {:?}", afid);
-
                     let (_nid, clo) = b.push_node(
                         Inst::MakeClosure { callee: afid, env: nul[0] },
                         Some(Type::Closure(None)), 1, false
@@ -4991,9 +4983,6 @@ impl<'m> Lowerer<'m> {
                 }
 
                 for (mname, sfid) in statics {
-                    #[cfg(debug_assertions)]
-                    eprintln!("[modinit]   attach static {:?} -> {:?}", mname, sfid);
-
                     let (_nid, clo) = b.push_node(
                         Inst::MakeClosure { callee: sfid, env: nul[0] },
                         Some(Type::Closure(None)), 1, false
@@ -5009,14 +4998,9 @@ impl<'m> Lowerer<'m> {
                 b.store_binding(bid, objv);
             }
 
-            // 3) cache de namespaces importados
-            for (ns, exports) in &links.namespace_imports {
-                #[cfg(debug_assertions)]
-                {
-                    eprintln!("[modinit] cache namespace {:?}", ns);
-                }
-
-                if let Some(&cell) = links.namespace_cells.get(ns) {
+            // 3.3 cache imported namespaces
+            for (ns, exports) in &self.links.namespace_imports {
+                if let Some(&cell) = self.links.namespace_cells.get(ns) {
                     let ns_obj = b.make_namespace(exports.clone());
                     b.store_binding(cell, ns_obj);
                 }
@@ -5636,63 +5620,61 @@ impl<'m> Lowerer<'m> {
         }
     }
 
-    /// Seed LinkInfo from the AST only. No WIR allocation here.
-    /// - Fills `links.namespace_imports` with the declared namespace aliases (empty vec for now).
-    /// - Keeps `links.import_bindings` and `links.export_bindings` untouched here (they need real BindingIds).
     pub fn seed_links_from_ast(&mut self, prog: &crate::front::Program) {
-        // 1) Namespace imports: `import * as ns from "..."` → record the alias as a key.
-        //    We cannot populate the value Vec<(String, BindingId)> yet (no provider BindingIds).
-        self.links.namespace_imports.clear();
-        for imp in &prog.imports {
-            for item in &imp.items {
-                if let crate::front::ImportItem::Namespace { alias } = item {
-                    self.links.namespace_imports.entry(alias.clone()).or_default();
+        // Collect namespace imports (already optional; keep whatever you had)
+        // Collect named imports (optional; you already log them)
+
+        // Collect local export names we must materialize as binding cells.
+        self.pending_export_names.clear();
+
+        for e in &prog.exports {
+            match e {
+                crate::front::ExportDecl::Var(name)
+                | crate::front::ExportDecl::Func(name)
+                | crate::front::ExportDecl::Class(name) => {
+                    self.pending_export_names.push(name.clone());
+                }
+
+                crate::front::ExportDecl::Named { items } => {
+                    // export { local as name }
+                    for (local, alias) in items {
+                        let public = alias.clone().unwrap_or_else(|| local.clone());
+                        self.pending_export_names.push(public);
+                    }
+                }
+
+                crate::front::ExportDecl::From { .. } => {
+                    // re-exports are handled through resolver; no local cell needed here.
+                }
+
+                crate::front::ExportDecl::AllFrom { .. } => {
+                    // export * from ... — also resolver-only.
                 }
             }
         }
 
-        // 2) (Optional) Debug print of named imports / exports we *saw* in the AST.
         #[cfg(debug_assertions)]
-        {
-            // Just to help diagnose: list (local_alias, original_name) pairs we found
-            let mut named_imps: Vec<(String, String)> = Vec::new();
-            for imp in &prog.imports {
-                for item in &imp.items {
-                    if let crate::front::ImportItem::Named { name, alias } = item {
-                        let local = alias.clone().unwrap_or_else(|| name.clone());
-                        named_imps.push((local, name.clone()));
-                    }
-                }
-            }
+        eprintln!(
+            "[seed_links_from_ast] will alloc export cells for {:?}",
+            self.pending_export_names
+        );
+    }
 
-            // Simple export headlines (we do not allocate cells here):
-            let mut export_heads: Vec<String> = Vec::new();
-            for e in &prog.exports {
-                use crate::front::ExportDecl::*;
-                match e {
-                    Var(s)   => export_heads.push(format!("var {}", s)),
-                    Func(s)  => export_heads.push(format!("fn {}", s)),
-                    Class(s) => export_heads.push(format!("class {}", s)),
-                    Named { items } => {
-                        for (loc, alias) in items {
-                            export_heads.push(format!("named {} as {}", loc, alias.clone().unwrap_or_else(|| loc.clone())));
-                        }
-                    }
-                    From { specifier, items } => {
-                        export_heads.push(format!("from {}: {}", specifier,
-                            items.iter().map(|(n,a)| format!("{} as {}", n, a.clone().unwrap_or_else(|| n.clone()))).collect::<Vec<_>>().join(", ")));
-                    }
-                    AllFrom { specifier } => export_heads.push(format!("* from {}", specifier)),
-                }
+    fn ensure_export_cells_in_modinit(&mut self) {
+        // Create a live binding cell for each exported name exactly once.
+        for name in std::mem::take(&mut self.pending_export_names) {
+            if self.links.export_bindings.contains_key(&name) {
+                continue;
             }
-
-            eprintln!(
-                "[seed_links_from_ast] ns decls = {:?} | named imports = {:?} | exports = {:?}",
-                self.links.namespace_imports.keys().collect::<Vec<_>>(),
-                named_imps,
-                export_heads
-            );
+            let bid: BindingId = self.module.fresh_binding();
+            self.links.export_bindings.insert(name.clone(), bid);
         }
+
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[lower_modinit] export cells = {:?}",
+            self.links.export_bindings.keys().collect::<Vec<_>>()
+        );
     }
 
     pub fn links_snapshot(&self) -> LinkInfo { self.links.clone() }
