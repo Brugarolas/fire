@@ -5,6 +5,7 @@
 use logos::Logos;
 use std::{collections::BTreeSet, ops::Deref};
 use ahash::{AHashSet as HashSet, AHashMap as HashMap};
+use std::collections::hash_map::Entry;
 use smallbox::SmallBox;
 
 // Bring in the WIR types from your other file/module.
@@ -1938,6 +1939,23 @@ impl<'m> Lowerer<'m> {
         // -------- Stage 1: collect classes & their metadata --------
         self.classes.clear();
 
+        // Build LinkInfo from AST once
+        self.seed_links_from_ast(prog);
+
+        // Make sure namespace cells exist so `Ident(ns)` resolves as a binding load.
+        #[cfg(debug_assertions)]
+        {
+            eprintln!("[lower_program] prealloc ns cells — imports: {:?}", self.links.namespace_imports.keys().collect::<Vec<_>>());
+        }
+        self.ensure_namespace_cells_prealloc();
+
+        #[cfg(debug_assertions)]
+        {
+            eprintln!("[lower_program] links.imports   = {:?}", self.links.import_bindings.keys().collect::<Vec<_>>());
+            eprintln!("[lower_program] links.namespaces= {:?}", self.links.namespace_imports.keys().collect::<Vec<_>>());
+            eprintln!("[lower_program] links.ns_cells  = {:?}", self.links.namespace_cells);
+        }
+
         for c in &prog.classes {
             // gather accessors by name so we can form (getter,setter)
             let mut prop_map: HashMap<String, (Option<Block>, Option<(String, Block)>)> = HashMap::new();
@@ -2005,6 +2023,9 @@ impl<'m> Lowerer<'m> {
 
         // -------- Stage 3: build function table ONCE, post-hoist --------
         self.funcs.clear();
+
+        // Ensure __modinit__ and namespace cells are present if needed
+        self.ensure_namespace_cells_for_this_module();
 
         // 3.1 Free/hoisted functions first (includes __lam_*)
         for (i, f) in prog.functions.iter().enumerate() {
@@ -3275,125 +3296,84 @@ fn lower_expr_free<'m>(
 
         // locals first, else known function -> a closure with null env
         Expr::Ident(name) => {
-            // 1) capturas boxeadas
+            // 1) Captured/boxed local (read box[0])
+            //    If you use a specific key format for boxed locals, keep it here.
             if locals.get(&boxed_key(name)).is_some() {
-                #[cfg(debug_assertions)]
-                { eprintln!("[ident] {:?} -> BOXED local (read box[0])", name); }
-
-                let box_arr = *locals.get(name).ok_or_else(|| LowerError::UnknownVar(name.clone()))?;
+                let box_arr = *locals
+                    .get(name)
+                    .ok_or_else(|| LowerError::UnknownVar(name.clone()))?;
                 let zero = b.const_i32(0);
                 let (_nid, res) = b.push_node(
-                    Inst::CallNative { name: "wir_array_get".into(), args: vec![box_arr, zero], pure: false, can_throw: false },
-                    None, 1, true,
+                    Inst::CallNative {
+                        name: "wir_array_get".into(),
+                        args: vec![box_arr, zero],
+                        pure: false,
+                        can_throw: false,
+                    },
+                    None,
+                    1,
+                    true,
                 );
                 return Ok(res[0]);
             }
 
-            // 2) locals normales
+            // 2) Plain local
             if let Some(&v) = locals.get(name) {
-                #[cfg(debug_assertions)]
-                { eprintln!("[ident] {:?} -> local %{:?}", name, v); }
                 return Ok(v);
             }
 
-            // 3) función global conocida → closure(env=null)
+            // 3) Known global function name → make a closure with null env
             if let Some(&fid) = funcs.get(name) {
-                #[cfg(debug_assertions)]
-                { eprintln!("[ident] {:?} -> global function {:?} (closure null)", name, fid); }
-
                 let (_nid, env_null) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
                 let (_nid, clos) = b.push_node(
                     Inst::MakeClosure { callee: fid, env: env_null[0] },
-                    Some(Type::Closure(None)), 1, false,
+                    Some(Type::Closure(None)),
+                    1,
+                    false,
                 );
                 return Ok(clos[0]);
             }
 
-            // 4) import nombrado: lee la celda del proveedor
+            // 4) Named import: read provider's live binding (must be linked beforehand).
+            //    `links.import_bindings` maps local name -> provider BindingId.
             if let Some(&bid) = links.import_bindings.get(name) {
-                #[cfg(debug_assertions)]
-                {
-                    eprintln!("[ident] {:?} -> IMPORT binding {:?}", name, bid);
-                    eprintln!("lower_expr_free() links.import_bindings.get({})", name);
-                    eprintln!("[links] exports        : {:?}", links.export_bindings.keys().collect::<Vec<_>>());
-                    eprintln!("[links] imports        : {:?}", links.import_bindings.keys().collect::<Vec<_>>());
-                    eprintln!("[links] namespace_imps : {:?}", links.namespace_imports.keys().collect::<Vec<_>>());
-                    eprintln!("[links] namespace_cells: {:?}", links.namespace_cells);
-                }
                 let v = b.load_binding(bid, None);
                 return Ok(v);
             }
 
-            // 5) export propio: también se puede leer desde su celda (live binding)
+            // 5) Own export: read our own live binding cell.
+            //    `links.export_bindings` maps our local export name -> our BindingId.
             if let Some(&bid) = links.export_bindings.get(name) {
-                    #[cfg(debug_assertions)]
-                {
-                    eprintln!("[ident] {:?} -> EXPORT binding {:?}", name, bid);
-                    eprintln!("lower_expr_free() links.export_bindings.get({})", name);
-                    eprintln!("[links] exports        : {:?}", links.export_bindings.keys().collect::<Vec<_>>());
-                    eprintln!("[links] imports        : {:?}", links.import_bindings.keys().collect::<Vec<_>>());
-                    eprintln!("[links] namespace_imps : {:?}", links.namespace_imports.keys().collect::<Vec<_>>());
-                    eprintln!("[links] namespace_cells: {:?}", links.namespace_cells);
-                }
                 let v = b.load_binding(bid, None);
                 return Ok(v);
             }
 
-            // 6) namespace import cacheado en __modinit__: ns es una celda local
-            if let Some(&bid) = links.namespace_cells.get(name) {
-                #[cfg(debug_assertions)]
-                {
-                    eprintln!("[ident] {:?} -> NAMESPACE CELLS cell", name);
-                    eprintln!("lower_expr_free() links.namespace_cells.get({})", name);
-                    eprintln!("[links] exports        : {:?}", links.export_bindings.keys().collect::<Vec<_>>());
-                    eprintln!("[links] imports        : {:?}", links.import_bindings.keys().collect::<Vec<_>>());
-                    eprintln!("[links] namespace_imps : {:?}", links.namespace_imports.keys().collect::<Vec<_>>());
-                    eprintln!("[links] namespace_cells: {:?}", links.namespace_cells);
-                }
-                let ns = b.load_binding(bid, Some(Type::AnyRef));
-                return Ok(ns);
+            // 6) Namespace import cached in `__modinit__` (fast path).
+            //    If `seed_links_from_ast` detected a namespace alias and `__modinit__`
+            //    cached it into a local binding, we can read it directly.
+            if let Some(&cell) = links.namespace_cells.get(name) {
+                let ns_obj = b.load_binding(cell, None);
+                return Ok(ns_obj);
             }
 
-            // 7) (compat MVP) si aún no hay cache (single-file o resolver no lo puso), construye on-demand
-            if let Some(exports) = links.namespace_imports.get(name) {
-                #[cfg(debug_assertions)]
-                {
-                    eprintln!("[ident] {:?} -> NAMESPACE IMPORTS cell", name);
-                    eprintln!("lower_expr_free() links.namespace_imports.get({})", name);
-                    eprintln!("[links] exports        : {:?}", links.export_bindings.keys().collect::<Vec<_>>());
-                    eprintln!("[links] imports        : {:?}", links.import_bindings.keys().collect::<Vec<_>>());
-                    eprintln!("[links] namespace_imps : {:?}", links.namespace_imports.keys().collect::<Vec<_>>());
-                    eprintln!("[links] namespace_cells: {:?}", links.namespace_cells);
-                }
-
-                // idem: memoriza en locals para no recrearlo en el mismo bloque/función
+            // 7) Compatibility path: declared namespace import but not cached yet.
+            //    If the namespace alias is known, we can synthesize/return a namespace
+            //    object lazily and memoize it into `locals` to avoid rebuilding it.
+            if links.namespace_imports.contains_key(name) {
                 if let Some(&cached) = locals.get(name) {
                     return Ok(cached);
                 }
-                let ns = b.make_namespace(exports.clone());
-                locals.insert(name.clone(), ns);
-                return Ok(ns);
-            } else {
-                #[cfg(debug_assertions)]
-                { eprintln!("[ident] {:?} -> NAMESPACE IMPORTS declared but NO CELL", name); }
+                // NOTE: We only have the alias here (no member BindingIds).
+                //       `make_namespace` should create an object that reads provider
+                //       bindings on demand (implementation-specific). If your current
+                //       `make_namespace` needs the (name, BindingId) list, you'll want
+                //       to run a linking pass that populates `namespace_imports[alias]`.
+                let ns_obj = b.make_namespace(Vec::new());
+                locals.insert(name.clone(), ns_obj);
+                return Ok(ns_obj);
             }
 
-            #[cfg(debug_assertions)]
-            {
-                let locals_keys: Vec<_> = locals.keys().cloned().collect();
-                let funcs_keys : Vec<_> = funcs.keys().cloned().collect();
-                let imps       : Vec<_> = links.import_bindings.keys().cloned().collect();
-                let exps       : Vec<_> = links.export_bindings.keys().cloned().collect();
-                let nss        : Vec<_> = links.namespace_imports.keys().cloned().collect();
-
-                eprintln!("[ident-miss] {:?} not found.", name);
-                eprintln!("  locals   = {:?}", locals_keys);
-                eprintln!("  funcs    = {:?}", funcs_keys);
-                eprintln!("  imports  = {:?}", imps);
-                eprintln!("  exports  = {:?}", exps);
-                eprintln!("  namespaces = {:?}", nss);
-            }
-
+            // Miss: unresolved identifier
             Err(LowerError::UnknownVar(name.clone()))
         }
 
@@ -5013,10 +4993,12 @@ impl<'m> Lowerer<'m> {
                 b.store_binding(bid, objv);
             }
 
-            // 3) cache imported namespaces (unchanged)
+            // 3) cache de namespaces importados
             for (ns, exports) in &links.namespace_imports {
                 #[cfg(debug_assertions)]
-                eprintln!("[modinit] cache namespace {:?}", ns);
+                {
+                    eprintln!("[modinit] cache namespace {:?}", ns);
+                }
 
                 if let Some(&cell) = links.namespace_cells.get(ns) {
                     let ns_obj = b.make_namespace(exports.clone());
@@ -5609,6 +5591,92 @@ impl<'m> Lowerer<'m> {
 
         let _ = self.module.push_function(f);
         Ok(())
+    }
+
+    /// Ensure a BindingId exists for every imported namespace (ns in `import * as ns from ...`).
+    /// This must run before lowering any function body so identifiers like `ns` never hit UnknownVar.
+    fn ensure_namespace_cells_prealloc(&mut self) {
+        // Collect keys first to avoid borrow conflicts
+        let keys: Vec<String> = self.links.namespace_imports.keys().cloned().collect();
+        for ns in keys {
+            self.links.namespace_cells.entry(ns.clone()).or_insert_with(|| {
+                #[cfg(debug_assertions)]
+                eprintln!("[links] prealloc namespace cell for {:?}", ns);
+
+                self.module.fresh_binding()
+            });
+        }
+    }
+
+    fn ensure_namespace_cells_for_this_module(&mut self) {
+        let ns_names: Vec<String> = self.links.namespace_imports.keys().cloned().collect();
+        for ns in ns_names {
+            #[cfg(debug_assertions)]
+            eprintln!("[links] ensure namespace cell for {}", ns);
+
+            self.links.namespace_cells.entry(ns.clone()).or_insert_with(|| {
+                self.module.fresh_binding()
+            });
+        }
+    }
+
+    /// Seed LinkInfo from the AST only. No WIR allocation here.
+    /// - Fills `links.namespace_imports` with the declared namespace aliases (empty vec for now).
+    /// - Keeps `links.import_bindings` and `links.export_bindings` untouched here (they need real BindingIds).
+    pub fn seed_links_from_ast(&mut self, prog: &crate::front::Program) {
+        // 1) Namespace imports: `import * as ns from "..."` → record the alias as a key.
+        //    We cannot populate the value Vec<(String, BindingId)> yet (no provider BindingIds).
+        self.links.namespace_imports.clear();
+        for imp in &prog.imports {
+            for item in &imp.items {
+                if let crate::front::ImportItem::Namespace { alias } = item {
+                    self.links.namespace_imports.entry(alias.clone()).or_default();
+                }
+            }
+        }
+
+        // 2) (Optional) Debug print of named imports / exports we *saw* in the AST.
+        #[cfg(debug_assertions)]
+        {
+            // Just to help diagnose: list (local_alias, original_name) pairs we found
+            let mut named_imps: Vec<(String, String)> = Vec::new();
+            for imp in &prog.imports {
+                for item in &imp.items {
+                    if let crate::front::ImportItem::Named { name, alias } = item {
+                        let local = alias.clone().unwrap_or_else(|| name.clone());
+                        named_imps.push((local, name.clone()));
+                    }
+                }
+            }
+
+            // Simple export headlines (we do not allocate cells here):
+            let mut export_heads: Vec<String> = Vec::new();
+            for e in &prog.exports {
+                use crate::front::ExportDecl::*;
+                match e {
+                    Var(s)   => export_heads.push(format!("var {}", s)),
+                    Func(s)  => export_heads.push(format!("fn {}", s)),
+                    Class(s) => export_heads.push(format!("class {}", s)),
+                    Named { items } => {
+                        for (loc, alias) in items {
+                            export_heads.push(format!("named {} as {}", loc, alias.clone().unwrap_or_else(|| loc.clone())));
+                        }
+                    }
+                    From { specifier, items } => {
+                        export_heads.push(format!("from {}: {}", specifier,
+                            items.iter().map(|(n,a)| format!("{} as {}", n, a.clone().unwrap_or_else(|| n.clone()))).collect::<Vec<_>>().join(", ")));
+                    }
+                    AllFrom { specifier } => export_heads.push(format!("* from {}", specifier)),
+                }
+            }
+
+            eprintln!(
+                "[seed_links_from_ast] ns decls = {:?} | named imports = {:?} | exports = {:?}",
+                self.links.namespace_imports.keys().collect::<Vec<_>>(),
+                named_imps,
+                export_heads
+            );
+        }
     }
 }
 

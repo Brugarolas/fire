@@ -6,7 +6,7 @@ use parking_lot::RwLock;
 use hybrid_rc::Arc;
 
 use std::path::{Path, PathBuf};
-use std::collections::{HashMap as StdHashMap, VecDeque};
+use std::collections::{VecDeque};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::{fs, io};
 
@@ -209,18 +209,18 @@ pub enum ExportResolution {
 
 pub struct ModuleResolver<L: ModuleLoader> {
     pub loader: Arc<L>,
-    pub modules: StdHashMap<Url, ModuleId>,
+    pub modules: HashMap<Url, ModuleId>,
     pub records: Vec<ModuleRecord>,
-    pub export_cache: StdHashMap<(ModuleId, String), ExportResolution>,
+    pub export_cache: HashMap<(ModuleId, String), ExportResolution>,
 }
 
 impl<L: ModuleLoader> ModuleResolver<L> {
     pub fn new(loader: Arc<L>) -> Self {
         Self {
             loader,
-            modules: StdHashMap::new(),
+            modules: HashMap::new(),
             records: vec![],
-            export_cache: StdHashMap::new(),
+            export_cache: HashMap::new(),
         }
     }
 
@@ -228,7 +228,7 @@ impl<L: ModuleLoader> ModuleResolver<L> {
         &mut self,
         mid: ModuleId,
         name: &str,
-        seen: &mut StdHashMap<(ModuleId, String), ()>
+        seen: &mut HashMap<(ModuleId, String), ()>
     ) -> ExportResolution {
         let key = (mid, name.to_string());
         if let Some(r) = self.export_cache.get(&key) {
@@ -427,6 +427,19 @@ pub fn build_graph_parallel<L: ModuleLoader + 'static>(
 
         let handle = unsafe {
             builder.spawn(move || -> Result<crate::wir::Module, BuildError> {
+                let mut m = crate::wir::Module::new();
+
+                // Seed LinkInfo with namespace imports found in source.
+                let mut links = crate::front::LinkInfo::default();
+                for ns in extract_namespace_import_idents(&code_arc) {
+                    // We only know the namespace identifier here. Export members will be materialized later if/when resolved.
+                    links.namespace_imports.entry(ns).or_default(); // empty vec is fine for now
+                }
+
+                #[cfg(debug_assertions)]
+                eprintln!("[modules] ns imports in {} => {:?}", url_for_err.display(), extract_namespace_import_idents(&code_arc));
+
+                // Create parsers and lowerers
                 let mut p = crate::front::Parser::new(&code_arc);
                 let prog = p.program().map_err(|e| BuildError::Parse {
                     url: url_for_err.clone(),
@@ -436,9 +449,10 @@ pub fn build_graph_parallel<L: ModuleLoader + 'static>(
 
                 let mut m = crate::wir::Module::new();
                 let mut lowerer = crate::front::Lowerer::new(&mut m);
-                lowerer.lower_program(&prog)
-                    .map_err(|e| BuildError::Lower(format!("{:?}", e)))?;
+                lowerer.set_links(links);
+                lowerer.lower_program(&prog).map_err(|e| BuildError::Lower(format!("{:?}", e)))?;
 
+                // Optimize local module
                 let optimize = optimization_passes();
                 optimize.optimize_module(&mut m);
 
@@ -674,6 +688,54 @@ fn add_program_toplevel(module: &mut crate::wir::Module, inits: &[crate::wir::Fu
     let mut f = b.finish();
 
     module.push_function(f);
+}
+
+/// Very small lexer to extract `import * as <Ident> from "..."` namespace identifiers.
+/// This is intentionally simple and runs before the real parser to seed LinkInfo.
+fn extract_namespace_import_idents(src: &str) -> Vec<String> {
+    let bytes = src.as_bytes();
+    let mut i = 0;
+    let mut out = Vec::new();
+
+    // tiny helpers
+    fn is_ident_start(c: u8) -> bool { c == b'_' || c == b'$' || (c as char).is_ascii_alphabetic() }
+    fn is_ident_continue(c: u8) -> bool { is_ident_start(c) || (c as char).is_ascii_digit() }
+    fn skip_ws(bytes: &[u8], mut j: usize) -> usize {
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() { j += 1; }
+        j
+    }
+
+    while i + 6 <= bytes.len() {
+        // match "import"
+        if &bytes[i..i+6] != b"import" { i += 1; continue; }
+        i += 6;
+        i = skip_ws(bytes, i);
+
+        // expect '*'
+        if i >= bytes.len() || bytes[i] != b'*' { continue; }
+        i += 1;
+        i = skip_ws(bytes, i);
+
+        // expect "as"
+        if i + 2 > bytes.len() || &bytes[i..i+2] != b"as" { continue; }
+        i += 2;
+        i = skip_ws(bytes, i);
+
+        // read identifier
+        if i >= bytes.len() || !is_ident_start(bytes[i]) { continue; }
+        let start = i;
+        i += 1;
+        while i < bytes.len() && is_ident_continue(bytes[i]) { i += 1; }
+        let name = std::str::from_utf8(&bytes[start..i]).unwrap_or("").to_string();
+        if !name.is_empty() {
+            out.push(name);
+        }
+
+        // best-effort; skip to end of this import stmt (look for ';' or newline)
+        while i < bytes.len() && bytes[i] != b';' && bytes[i] != b'\n' { i += 1; }
+    }
+
+    out
 }
 
 // -----------------------------------------------------------------------------
