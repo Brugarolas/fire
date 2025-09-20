@@ -18,6 +18,7 @@ gxhash = "3.5.0" # Fast hash map
 
 logos = "0.15.0"
 chumsky = "0.11.1" # Parser combinators
+ariadne = "0.5.1" # Error reporting
 
 trc = "1.2.4"
 hybrid-rc = "0.6.0"

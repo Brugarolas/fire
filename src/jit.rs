@@ -1544,6 +1544,11 @@ impl JIT {
                 let p = self.alloc_boxed_f64(*f);
                 fb.ins().iconst(types::I64, p)
             }
+
+            Constant::Undefined => {
+                // We don't have a special undefined value, so use null (0).
+                fb.ins().iconst(types::I64, 0)
+            }
         }
     }
 
@@ -1673,6 +1678,7 @@ fn synth_const(values: &Vec<WirValue>, id: ValueId, fb: &mut FunctionBuilder) ->
             Constant::Bool(b)  => Some(fb.ins().iconst(types::I64, if *b { 1 } else { 0 })),
             Constant::Null     => Some(fb.ins().iconst(types::I64, 0)),
             Constant::Str(_)   => None,
+            Constant::Undefined => Some(fb.ins().iconst(types::I64, 0)),
         },
         _ => None,
     }

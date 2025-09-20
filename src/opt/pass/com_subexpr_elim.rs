@@ -132,6 +132,7 @@ impl ConstKey {
             Constant::Bool(b)  => ConstKey::Bool(*b),
             Constant::Null     => ConstKey::Null,
             Constant::Str(s)   => ConstKey::Str(s.clone()),
+            Constant::Undefined => ConstKey::Null, // Treat undefined as null for CSE purposes
         }
     }
 }

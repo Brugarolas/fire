@@ -163,6 +163,7 @@ pub enum Constant {
     Bool(bool),
     Null,
     Str(String),
+    Undefined,
     // Other literals can be added (symbols, interned strings, etc.)
 }
 
@@ -809,6 +810,16 @@ impl<'m> Builder<'m> {
 
     pub fn const_f64(&mut self, x: f64) -> ValueId {
         let (_nid, res) = self.push_node(Inst::Const(Constant::F64(x)), Some(Type::F64), 1, false);
+        res[0]
+    }
+
+    pub fn const_undef(&mut self) -> ValueId {
+        let (_nid, res) = self.push_node(
+            Inst::Const(Constant::Undefined),
+            Some(Type::Top), // o Type::Null si prefieres
+            1,
+            false,
+        );
         res[0]
     }
 
