@@ -6,6 +6,7 @@ mod value;
 mod wir;
 mod front;
 mod lowerer;
+mod hoister;
 mod opt;
 mod gc;
 mod runtime;

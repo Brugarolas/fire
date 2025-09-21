@@ -506,26 +506,29 @@ fn lower_and_optimize_in_topo<L: ModuleLoader + 'static>(
 
 pub fn build_graph_parallel<L: ModuleLoader + 'static>(
     loader: Arc<L>,
-    entry: Url
+    entry: Url,
 ) -> Result<ModuleGraph, BuildError> {
-    let mut units: HashMap<Url, ModuleUnit> = HashMap::new();
-    let mut edges: HashMap<Url, Vec<Url>> = HashMap::new();
-    let mut queue = VecDeque::new();
-    queue.push_back(entry.clone());
-    let mut seen = HashSet::new();
+    use crate::front::Parser;
 
     // ----------------------------
     // Phase A: load + parse (concurrent)
     // ----------------------------
+    let mut units: HashMap<Url, ModuleUnit> = HashMap::new();
+    let mut edges: HashMap<Url, Vec<Url>> = HashMap::new();
+    let mut queue = VecDeque::new();
+    let mut seen = HashSet::new();
+
+    queue.push_back(entry.clone());
+
     while let Some(url) = queue.pop_front() {
-        if !seen.insert(url.clone()) { continue; }
+        if !seen.insert(url.clone()) {
+            continue;
+        }
 
         let loaded = loader.load(&url)?;
-
-        // ensure adjacency list exists
         edges.entry(url.clone()).or_default();
 
-        // discover raw "import ... from '...'" specifiers to expand BFS
+        // Descubre import specifiers "estáticos" para expandir el BFS
         let imports = extract_static_imports(&loaded.code);
         let mut deps = Vec::new();
         for spec in &imports {
@@ -535,17 +538,16 @@ pub fn build_graph_parallel<L: ModuleLoader + 'static>(
             queue.push_back(dep);
         }
 
-        // parse AST in a May coroutine (cheap, parallel)
+        // Parse en una coroutine (barato y paralelo)
         let code_arc = loaded.code.clone();
         let url_for_err = url.clone();
-
         let builder = coroutine::Builder::new()
             .name(format!("parse:{}", url.display()))
             .stack_size(WORKER_STACK_BYTES);
 
         let handle = unsafe {
             builder.spawn(move || -> Result<crate::front::Program, BuildError> {
-                let mut p = crate::front::Parser::new(&code_arc);
+                let mut p = Parser::new(&code_arc);
                 let prog = p.program().map_err(|e| BuildError::Parse {
                     url: url_for_err.clone(),
                     msg: e.msg,
@@ -553,96 +555,144 @@ pub fn build_graph_parallel<L: ModuleLoader + 'static>(
                 })?;
                 Ok(prog)
             })
-        }.map_err(BuildError::Io)?;
+        }
+        .map_err(BuildError::Io)?;
 
         let ast = match handle.join() {
             Ok(res) => res?,
             Err(e) => return Err(BuildError::Panic(panic_to_string(e))),
         };
 
-        units.insert(url.clone(), ModuleUnit {
-            url: url.clone(),
-            code: loaded.code.clone(),
-            imports,
-            deps: deps.clone(),
-            ast,
-            links: crate::lowerer::LinkInfo::default(),
-            wir: crate::wir::Module::new(),
-        });
+        units.insert(
+            url.clone(),
+            ModuleUnit {
+                url: url.clone(),
+                code: loaded.code.clone(),
+                imports,
+                deps: deps.clone(),
+                ast,
+                links: crate::lowerer::LinkInfo::default(),
+                wir: crate::wir::Module::new(),
+            },
+        );
     }
 
-    // Topological order over the import graph
+    // Orden topológico y SCCs
     let topo = topo_sort(&edges, &entry);
     let sccs = scc_kosaraju(&edges);
 
     // ----------------------------
     // Phase B: lower + optimize (topo order)
+    // - Global BindingId allocator (atómico) para evitar rebase
     // ----------------------------
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let next_binding_global = AtomicU32::new(0);
+
     for url in &topo {
-        let Some(unit) = units.get(url) else { continue; };
+        // Copias locales para no mantener préstamos largos
+        let (code, ast) = {
+            let u = units.get(url).expect("unit");
+            (u.code.clone(), u.ast.clone())
+        };
 
-        // Prepare a fresh WIR for this module
+        // Prepara un WIR para este módulo con base de BindingId global
         let mut m = crate::wir::Module::new();
-        let mut lowerer = crate::lowerer::Lowerer::new(&mut m);
+        m.next_binding = next_binding_global.load(Ordering::Relaxed);
 
-        // Seed namespace imports (cheap pre-scan, no need to re-lex entirely)
-        let mut seeded = crate::lowerer::LinkInfo::default();
-        for ns in extract_namespace_import_idents(&unit.code) {
-            seeded.namespace_imports.entry(ns).or_default();
-        }
-        lowerer.set_links(seeded);
+        // Lowerer en scope para soltar el &mut Module antes de leer m.next_binding
+        let links_after = {
+            let mut lowerer = crate::lowerer::Lowerer::new(&mut m);
 
-        // Seed exports/import declarations from the AST
-        lowerer.seed_links_from_ast(&unit.ast);
+            // 0) Pre-semilla namespaces rápidos (lexer minúsculo)
+            let mut seeded = crate::lowerer::LinkInfo::default();
+            for ns in extract_namespace_import_idents(&code) {
+                seeded.namespace_imports.entry(ns).or_default();
+            }
+            lowerer.set_links(seeded);
 
-        // Resolve *named* imports against providers that are already lowered
-        for imp in &unit.ast.imports {
-            // skip side-effect-only and namespace forms here
-            if imp.items.is_empty() { continue; }
+            // 1) Siembra imports/exports *declarados* desde el AST (prealloc de export cells, etc.)
+            lowerer.seed_links_from_ast(&ast);
 
-            // resolve "from" URL
-            let prov_url = loader.resolve(&unit.url, &imp.specifier)?;
-            let Some(prov) = units.get(&prov_url) else {
-                return Err(BuildError::Lower(format!(
-                    "Import resolution failed: provider {} not found (needed by {})",
-                    prov_url.display(), unit.url.display()
-                )));
-            };
+            // 2) Resuelve *named imports* y también *namespace imports* contra proveedores ya lowereados
+            //    OJO: no escribir en el snapshot directamente → get, mutate copia, set().
+            {
+                let mut links = lowerer.links_snapshot();
 
-            // For each named item map local alias -> provider's export BindingId
-            for item in &imp.items {
-                if let crate::front::ImportItem::Named { name, alias } = item {
-                    let local = alias.as_ref().unwrap_or(name);
-                    if let Some(&bid) = prov.links.export_bindings.get(name.as_str()) {
-                        lowerer.links_snapshot().import_bindings.insert(local.clone(), bid);
-                    } else {
-                        return Err(BuildError::Lower(format!(
-                            "Import resolution failed: '{}' not exported by {} (needed by {})",
-                            name, prov_url.display(), unit.url.display()
-                        )));
+                for imp in &ast.imports {
+                    // Si no hay items => side-effect import; ignora
+                    if imp.items.is_empty() {
+                        continue;
+                    }
+
+                    // URL del proveedor
+                    let prov_url = loader.resolve(url, &imp.specifier)?;
+                    let prov = units.get(&prov_url).ok_or_else(|| {
+                        BuildError::Lower(format!(
+                            "Import resolution failed: provider {} not found (needed by {})",
+                            prov_url.display(),
+                            url.display()
+                        ))
+                    })?;
+
+                    for item in &imp.items {
+                        match item {
+                            crate::front::ImportItem::Named { name, alias } => {
+                                let local = alias.as_ref().unwrap_or(name);
+                                if let Some(&bid) = prov.links.export_bindings.get(name.as_str()) {
+                                    links.import_bindings.insert(local.clone(), bid);
+                                } else {
+                                    return Err(BuildError::Lower(format!(
+                                        "Import resolution failed: '{}' not exported by {} (needed by {})",
+                                        name,
+                                        prov_url.display(),
+                                        url.display()
+                                    )));
+                                }
+                            }
+                            crate::front::ImportItem::Namespace { alias } => {
+                                // Materializa el listado de miembros para make_namespace en __modinit__
+                                let mut members = Vec::new();
+                                for (exp_name, &bid) in &prov.links.export_bindings {
+                                    members.push((exp_name.clone(), bid));
+                                }
+                                links.namespace_imports.insert(alias.clone(), members);
+                            }
+                        }
                     }
                 }
+
+                lowerer.set_links(links);
             }
-        }
 
-        // Lower with resolved links
-        lowerer.lower_program(&unit.ast)
-            .map_err(|e| BuildError::Lower(format!("{:?}", e)))?;
+            // 3) Lower del programa de este módulo
+            lowerer
+                .lower_program(&ast)
+                .map_err(|e| BuildError::Lower(format!("{:?}", e)))?;
 
-        // Save links (exports/imports) for downstream modules
-        let links_after = lowerer.links_snapshot();
+            // 4) Snapshot links finales (incluye export_bindings)
+            lowerer.links_snapshot()
+        }; // <-- aquí se dropea `lowerer` y el préstamo &mut m
 
-        // Optimize local module
+        // Actualiza el contador global con lo consumido por este módulo
+        next_binding_global.store(m.next_binding, Ordering::Relaxed);
+
+        // 5) Optimización local (se puede paralelizar por módulo si quieres)
         let optimize = optimization_passes();
         optimize.optimize_module(&mut m);
 
-        // Commit back to the unit
-        let u = units.get_mut(url).unwrap();
+        // 6) Commit de (links, wir) a la unidad
+        let u = units.get_mut(url).expect("unit exists");
         u.links = links_after;
         u.wir = m;
     }
 
-    Ok(ModuleGraph { entry, units, edges, topo, sccs })
+    Ok(ModuleGraph {
+        entry,
+        units,
+        edges,
+        topo,
+        sccs,
+    })
 }
 
 fn topo_sort(edges: &HashMap<Url, Vec<Url>>, entry: &Url) -> Vec<Url> {
@@ -711,6 +761,7 @@ struct Rebase {
     site: u32,
     deopt: u32,
     class: u32,
+    binding: u32,
 }
 
 fn rebase_function_ids(f: &mut crate::wir::Function, rb: &Rebase) {
@@ -718,6 +769,7 @@ fn rebase_function_ids(f: &mut crate::wir::Function, rb: &Rebase) {
 
     for n in &mut f.nodes {
         match &mut n.kind {
+            // ----- llamadas/directos/métodos/clases (ya los tenías) -----
             I::CallDirect { callee, .. } => { callee.0 += rb.func; }
             I::CallDirectMemoized { callee, .. } => { callee.0 += rb.func; }
             I::ArrayMap { func, .. } => { func.0 += rb.func; }
@@ -763,6 +815,18 @@ fn rebase_function_ids(f: &mut crate::wir::Function, rb: &Rebase) {
                 deopt.0 += rb.deopt;
             }
 
+            I::LoadBinding { binding } => {
+                binding.0 += rb.binding;
+            }
+            I::StoreBinding { binding, .. } => {
+                binding.0 += rb.binding;
+            }
+            I::MakeNamespace { exports } => {
+                for (_, bid) in exports {
+                    bid.0 += rb.binding;
+                }
+            }
+
             _ => {}
         }
     }
@@ -792,11 +856,15 @@ pub fn merge_graph_into_single_wir(
         rb.site     = out.next_site;
         rb.deopt    = out.next_deopt;
         rb.class    = out.next_class;
+        rb.binding  = 0;
 
         for mut f in uwir.funcs.clone() {
-            let is_mod_toplevel = f.sig.name == "__toplevel__";
-            if is_mod_toplevel {
+            let is_module_init = f.sig.name == "__toplevel__" || f.sig.name == "__modinit__";
+            if is_module_init {
                 f.sig.name = format!("__mod_init__#{}", prog_inits.len());
+
+                #[cfg(debug_assertions)]
+                eprintln!("[merge] add init {} -> new_id {:?}", f.sig.name, prog_inits.len());
             }
 
             rebase_function_ids(&mut f, &rb);
@@ -805,7 +873,7 @@ pub fn merge_graph_into_single_wir(
             f.id = new_id;
             out.funcs.push(f);
 
-            if is_mod_toplevel {
+            if is_module_init {
                 prog_inits.push(new_id);
             }
         }
@@ -816,6 +884,7 @@ pub fn merge_graph_into_single_wir(
         out.next_site     += uwir.next_site;
         out.next_deopt    += uwir.next_deopt;
         out.next_class    += uwir.next_class;
+        out.next_binding   = out.next_binding.max(uwir.next_binding);
 
         for (k, v) in &uwir.strings { out.strings.entry(k.clone()).or_insert(*v); }
         for (k, v) in &uwir.shapes  { out.shapes.entry(k.clone()).or_insert(crate::wir::ShapeId(v.0 + rb.shape)); }
@@ -837,8 +906,8 @@ fn add_program_toplevel(module: &mut crate::wir::Module, inits: &[crate::wir::Fu
     for &fid in inits {
         let _ = b.push_node(
             Inst::CallDirect { conv: CallConv::Fast, callee: fid, args: vec![] },
-            Some(Type::Int32),
-            1,
+            None,
+            0,
             true,
         );
     }
