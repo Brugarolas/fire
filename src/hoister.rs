@@ -429,5 +429,6 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
         classes:   prog.classes.clone(),
         imports:   prog.imports.clone(),
         exports:   prog.exports.clone(),
+        modules:   prog.modules.clone(),
     }, lam_captures)
 }

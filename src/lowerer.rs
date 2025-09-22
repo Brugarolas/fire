@@ -147,14 +147,9 @@ impl<'m> Lowerer<'m> {
                         }
                     }
                     ClassMember::Accessor { is_static, name, getter, setter_param, setter_body } => {
-                        if *is_static {
-                            // (static accessors ignored in MVP)
-                            continue;
-                        }
+                        if *is_static { continue; }
                         let entry = prop_map.entry(name.clone()).or_insert((None, None));
-                        if let Some(gb) = getter.clone() {
-                            entry.0 = Some(gb);
-                        }
+                        if let Some(gb) = getter.clone() { entry.0 = Some(gb); }
                         if let (Some(p), Some(sb)) = (setter_param.clone(), setter_body.clone()) {
                             entry.1 = Some((p, sb));
                         }
@@ -168,7 +163,6 @@ impl<'m> Lowerer<'m> {
                     }
                     ClassMember::Constructor { params, body, .. } => {
                         ci.has_ctor = true;
-                        // stash ctor body like a pseudo-method
                         ci.methods.insert(0, (String::from("constructor"), params.clone(), body.clone(), false));
                     }
                     ClassMember::Destructor { body } => {
@@ -189,7 +183,7 @@ impl<'m> Lowerer<'m> {
         // -------- Stage 3: build function table ONCE, post-hoist --------
         self.funcs.clear();
 
-        // Ensure __modinit__ and namespace cells are present if needed
+        // Ensure namespace cells exist if needed
         self.ensure_namespace_cells_for_this_module();
 
         // 3.1 Free/hoisted functions first (includes __lam_*)
@@ -197,8 +191,7 @@ impl<'m> Lowerer<'m> {
             self.funcs.insert(f.name.clone(), FuncId(i as u32));
         }
 
-        // 3.2 Class-generated functions in the SAME order lower_one_class emits them:
-        //     Accessors → instance methods (skip ctor/dtor) → static methods → ctor → dtor → allocator
+        // 3.2 Class-generated functions in the SAME order lower_one_class emits them
         let mut extra_names: Vec<String> = Vec::new();
         for c in &prog.classes {
             let cname = &c.name;
@@ -235,20 +228,19 @@ impl<'m> Lowerer<'m> {
             self.funcs.insert(nm, FuncId(base + k as u32));
         }
 
-        // -------- Stage 4: lower everything in the same order --------
-        // Free/hoisted functions first (so outer funcs can reference __lam_* by FuncId)
+        // -------- Stage 4: lower free/hoisted functions --------
         let mut out = Vec::new();
         for f in &prog.functions {
             let id = self.lower_fn(f)?;
             out.push(id);
         }
 
-        // -------- Stage 5: __modinit__
-        let _modinit = self.lower_modinit(&prog, &self.links.clone())?;
-        out.push(_modinit);
-
-        // Then all class-generated functions in exactly the order matched above
+        // -------- Stage 5: lower ALL CLASSES (emiten en el mismo orden predeclarado) --------
         self.lower_all_classes(&prog)?;
+
+        // -------- Stage 6: ahora SÍ, __modinit__ AL FINAL --------
+        let modinit = self.lower_modinit(&prog, &self.links.clone())?;
+        out.push(modinit);
 
         Ok(out)
     }

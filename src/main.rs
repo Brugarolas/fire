@@ -51,53 +51,22 @@ fn main() {
         _gc.bind_current_thread();
     }
 
-    // ------------------------------
-    // A) MODO MULTI-MÓDULO (grafo)
-    // ------------------------------
-    let mut module = if try_multi {
-        #[cfg(debug_assertions)]
-        eprintln!("(Debug build) Building whole-program (modules graph) from {} ...", &args[1]);
-        let b0 = Instant::now();
+    #[cfg(debug_assertions)]
+    eprintln!("(Debug build) Building whole-program (modules graph) from {} ...", &args[1]);
+    let b0 = Instant::now();
 
-        let mut m = match modules::build_whole_program_from_entry(&args[1]) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("Whole-program build failed: {e:?}");
-                eprintln!("Falling back to single-file mode with the file contents...");
-
-                #[cfg(debug_assertions)]
-                {
-                    eprintln!("[fallback] single-file build: LinkInfo de imports probablemente vacío");
-                }
-
-                // Fallback: leemos el archivo y seguimos flujo single-file
-                let src = std::fs::read_to_string(&args[1]).unwrap_or_else(|_| default_script().to_string());
-                build_single_file_module(&src)
-            }
-        };
-
-        let b1 = Instant::now();
-        #[cfg(debug_assertions)]
-        eprintln!("(Debug build) Whole-program build took {:.6} seconds", (b1 - b0).as_secs_f64());
-        m
-    } else {
-        // ------------------------------
-        // B) MODO SINGLE-FILE (tu flujo)
-        // ------------------------------
-        let src = if args.len() > 1 {
-            match std::fs::read_to_string(&args[1]) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Failed to read {}: {e}. Falling back to built-in demo.", args[1]);
-                    default_script().to_string()
-                }
-            }
-        } else {
-            eprintln!("(No file provided) Using built-in demo script:\n\n{}", default_script());
-            default_script().to_string()
-        };
-        build_single_file_module(&src)
+    let m = modules::build_whole_program_from_entry(&args[1]);
+    let module = match m {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Error building whole program: {}", e);
+            return;
+        }
     };
+
+    let b1 = Instant::now();
+    #[cfg(debug_assertions)]
+    eprintln!("(Debug build) Whole-program build took {:.6} seconds", (b1 - b0).as_secs_f64());
 
     // 4.2) JIT compile ALL functions
     let mut jit = jit::JIT::default();
@@ -138,50 +107,6 @@ fn main() {
         "(Debug build) Program returned: {} (0x{:x}) and took {:.6} seconds",
         ret, ret as u64, (t1 - t0).as_secs_f64()
     );
-}
-
-fn build_single_file_module(src: &str) -> wir::Module {
-    #[cfg(debug_assertions)]
-    eprintln!("(Debug build) Parsing and lowering the code...");
-    let p0 = Instant::now();
-
-    // Parse
-    let mut p = front::Parser::new(src);
-    let prog = match p.program() {
-        Ok(pr) => pr,
-        Err(e) => {
-            eprintln!("Parse error: {} at byte range {:?}", e.msg, e.span);
-            std::process::exit(1);
-        }
-    };
-
-    // Lower to WIR
-    let mut module = wir::Module::new();
-    let mut lowerer = lowerer::Lowerer::new(&mut module);
-    if let Err(e) = lowerer.lower_program(&prog) {
-        eprintln!("Lowering error: {:?}", e);
-        std::process::exit(1);
-    }
-
-    #[cfg(debug_assertions)]
-    {
-        let p1 = Instant::now();
-        eprintln!("(Debug build) Parsing and lowering the code took {:.6} seconds", (p1 - p0).as_secs_f64());
-        eprintln!("(Debug build) Optimizing the code...");
-    }
-    let o0 = Instant::now();
-
-    // Optimize WIR (pipeline single-file)
-    let optimize = optimization_passes();
-    optimize.optimize_module(&mut module);
-
-    #[cfg(debug_assertions)]
-    {
-        let o1 = Instant::now();
-        eprintln!("(Debug build) Optimizing the code took {:.6} seconds", (o1 - o0).as_secs_f64());
-    }
-
-    module
 }
 
 fn pick_entrypoint(module: &wir::Module) -> Option<String> {

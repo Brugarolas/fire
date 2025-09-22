@@ -7,12 +7,15 @@ use std::{collections::BTreeSet, ops::Deref};
 use ahash::{AHashSet as HashSet, AHashMap as HashMap};
 use std::collections::hash_map::Entry;
 use smallbox::SmallBox;
+use std::{path::PathBuf};
+use hybrid_rc::Arc;
 
 // Bring in the WIR types from your other file/module.
 use crate::wir::{
     Builder, Constant, FieldId, FuncId, Inst, IntBinOp, Module, Type, ValueId,
-    MethodInfo, AccessorInfo, BindingId,
+    MethodInfo, AccessorInfo, BindingId, next_id,
 };
+use crate::modules::{ModuleId, ModulesCTX, ProgramBuilder, FSLoader, ModuleLoader};
 
 /// -------------------------
 /// LEXER (Logos)
@@ -155,6 +158,28 @@ pub struct Program {
     pub classes:   Vec<ClassDecl>,
     pub imports:   Vec<ImportDecl>,
     pub exports:   Vec<ExportDecl>,
+    pub modules:   Vec<ModuleAST<'static>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModuleAST<'a> {
+    pub id: ModuleId,
+    pub path: Arc<PathBuf>,
+    pub exports: HashMap<&'a str, ExportItem<'a>>,
+    pub imports: HashMap<Arc<PathBuf>, ImportRequest<'a>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExportItem<'a> {
+    pub name: &'a str,
+    pub binding: BindingId,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportRequest<'a> {
+    pub from_path: Arc<PathBuf>,
+    pub names: Vec<&'a str>,
+    pub resolved: Vec<( &'a str, BindingId )>,
 }
 
 #[derive(Debug, Clone)]
@@ -377,10 +402,17 @@ pub struct Parser<'src> {
     toks: Vec<SpannedTok>,
     i: usize,
     _src: &'src str,
+
+    module_ptr: Option<*mut ModuleAST<'static>>,
+    ctx: Option<*const ModulesCTX>,
+    resolver: Option<*const ProgramBuilder>,
+    referrer: Option<Arc<PathBuf>>,
 }
 
 impl<'src> Parser<'src> {
-    pub fn new(src: &'src str) -> Self {
+    pub fn new(
+        src: &'src str,
+    ) -> Self {
         let mut lex = Tok::lexer(src);
         let mut toks = Vec::new();
 
@@ -398,7 +430,22 @@ impl<'src> Parser<'src> {
             }
         }
 
-        Self { toks, i: 0, _src: src }
+        Self { toks, i: 0, _src: src, module_ptr: None, ctx: None, resolver: None, referrer: None }
+    }
+
+    pub fn with_module<'a>(
+        src: &'src str,
+        ctx: &'a ModulesCTX,
+        resolver: &'a ProgramBuilder,
+        module_ptr: *mut ModuleAST<'a>,
+        referrer: Arc<PathBuf>,
+    ) -> Self {
+        let mut p = Self::new(src);
+        p.module_ptr = Some(module_ptr as *mut ModuleAST<'static>);
+        p.ctx = Some(ctx as *const _);
+        p.resolver = Some(resolver as *const _);
+        p.referrer = Some(referrer);
+        p
     }
 
     #[inline(always)]
@@ -501,7 +548,117 @@ impl<'src> Parser<'src> {
             });
         }
 
-        Ok(Program { functions, classes, imports, exports })
+        #[cfg(debug_assertions)]
+        {
+            // 1) Lo que el parser recogió por sintaxis (Program)
+            eprintln!(
+                "[parser:end] prog.syntactic imports={}, exports={}",
+                imports.len(), exports.len()
+            );
+
+            // 2) Si tenemos ModuleAST real, dump de la cajita del módulo
+            if let Some(m_ptr) = self.module_ptr {
+                unsafe {
+                    let m = &*m_ptr;
+                    eprintln!(
+                        "  [module-box] path={:?} imports={} exports={}",
+                        m.path, m.imports.len(), m.exports.len()
+                    );
+                    if m.imports.is_empty() {
+                        eprintln!("    [imports] (none)");
+                    } else {
+                        eprintln!("    [imports]");
+                        for (key_path, req) in &m.imports {
+                            let names = if req.names.is_empty() {
+                                "(side-effect only)".to_string()
+                            } else {
+                                req.names.iter().map(|s| *s).collect::<Vec<_>>().join(", ")
+                            };
+                            eprintln!(
+                                "      - key={:?}\n        from_path={:?}\n        names=[{}]\n        resolved_items={}",
+                                key_path, req.from_path, names, req.resolved.len()
+                            );
+                        }
+                    }
+                    if m.exports.is_empty() {
+                        eprintln!("    [exports] (none)");
+                    } else {
+                        eprintln!("    [exports]");
+                        for (name, item) in &m.exports {
+                            eprintln!("      - {} -> binding {:?}", name, item.binding);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let (Some(res_ptr), Some(ctx_ptr)) = (self.resolver, self.ctx) {
+            unsafe {
+                let _ = (&*res_ptr).parse_next(&*ctx_ptr);
+            }
+        }
+
+        Ok(Program { functions, classes, imports, exports, modules: Vec::new() })
+    }
+
+    fn record_export(&mut self, name: &str) {
+        // Solo si estamos en modo "con módulo"
+        if let (Some(m_ptr), Some(ctx_ptr)) = (self.module_ptr, self.ctx) {
+            unsafe {
+                let ctx = &*ctx_ptr;
+                // Interna el nombre en la arena de ctx para que viva lo mismo que ModuleAST
+                let name_intern: &'static str = {
+                    // lifehack: vive en arena -> válido mientras viva ctx/ModuleAST
+                    let s = ctx.arena.alloc_str(name);
+                    std::mem::transmute::<&str, &'static str>(s)
+                };
+                let m: &mut ModuleAST<'static> = &mut *m_ptr;
+                m.exports.insert(
+                    name_intern,
+                    ExportItem {
+                        name: name_intern,
+                        binding: BindingId(next_id()),
+                    },
+                );
+            }
+        }
+    }
+
+    fn record_import_and_enqueue(&mut self, spec: &str, item_names_local: &[String]) -> Result<(), ParseError> {
+        if let (Some(m_ptr), Some(ctx_ptr), Some(res_ptr), Some(referrer)) =
+            (self.module_ptr, self.ctx, self.resolver, self.referrer.clone())
+        {
+            // Resolver a ruta absoluta con el loader de FS
+            let loader = FSLoader;
+            let abs = loader
+                .resolve(&referrer, spec)
+                .map_err(|_| self.err_here("cannot resolve import path"))?;
+
+            unsafe {
+                let ctx = &*ctx_ptr;
+                let m: &mut ModuleAST<'static> = &mut *m_ptr;
+
+                // Internar cada nombre en la arena y construir ImportRequest
+                let mut names_bumped: Vec<&'static str> = Vec::with_capacity(item_names_local.len());
+                for n in item_names_local {
+                    let s = ctx.arena.alloc_str(n);
+                    names_bumped.push(std::mem::transmute::<&str, &'static str>(s));
+                }
+
+                let req = ImportRequest {
+                    from_path: Arc::new(abs.clone()),
+                    names: names_bumped,
+                    resolved: Vec::new(),
+                };
+
+                m.imports.insert(Arc::new(abs.clone()), req);
+
+                // Encolar en el resolver para parsearlo cuando toque
+                let resolver = &*res_ptr;
+                resolver.note_pending(Arc::new(abs));
+            }
+        }
+        Ok(())
     }
 
     fn class_decl(&mut self) -> PResult<ClassDecl> {
@@ -646,6 +803,8 @@ impl<'src> Parser<'src> {
         if let Tok::Str(spec) = self.peek().tok.clone() {
             let _ = self.next();
             self.expect(Tok::Semi, "expected ';' after import")?;
+            // side-effect import: sin items → no hay nombres, pero igualmente encolamos
+            self.record_import_and_enqueue(&spec, &[])?;
             return Ok(ImportDecl { specifier: spec, items: vec![] });
         }
 
@@ -662,12 +821,17 @@ impl<'src> Parser<'src> {
                 _ => return Err(self.err_here("expected string literal after 'from'")),
             };
             self.expect(Tok::Semi, "expected ';' after import")?;
+
+            // nombres locales = [alias]
+            self.record_import_and_enqueue(&spec, &[alias.clone()])?;
+
             return Ok(ImportDecl { specifier: spec, items: vec![ImportItem::Namespace { alias }] });
         }
 
         // 3) import { a, b as c } from "path";
         self.expect(Tok::LBrace, "expected '{' after 'import'")?;
         let mut items = Vec::new();
+        let mut locals = Vec::new(); // << para registrar en ModuleAST
         if !self.matches(&Tok::RBrace) {
             loop {
                 let name = match self.next().tok {
@@ -676,10 +840,13 @@ impl<'src> Parser<'src> {
                 };
                 let alias = if self.matches(&Tok::As) {
                     match self.next().tok {
-                        Tok::Ident(s) => Some(s),
+                        Tok::Ident(s) => { locals.push(s.clone()); Some(s) }
                         _ => return Err(self.err_here("expected alias name after 'as'")),
                     }
-                } else { None };
+                } else {
+                    locals.push(name.clone());
+                    None
+                };
                 items.push(ImportItem::Named { name, alias });
                 if self.matches(&Tok::RBrace) { break; }
                 self.expect(Tok::Comma, "expected ',' in import list")?;
@@ -691,6 +858,10 @@ impl<'src> Parser<'src> {
             _ => return Err(self.err_here("expected string literal after 'from'")),
         };
         self.expect(Tok::Semi, "expected ';' after import")?;
+
+        // Registrar en cajita + encolarlo para parseo posterior
+        self.record_import_and_enqueue(&spec, &locals)?;
+
         Ok(ImportDecl { specifier: spec, items })
     }
 
@@ -711,6 +882,7 @@ impl<'src> Parser<'src> {
                 false
             };
             let f = self.fn_def_with_async(is_async)?;
+            self.record_export(&f.name);
             exports.push(ExportDecl::Func(f.name.clone()));
             functions.push(f);
             return Ok(());
@@ -726,6 +898,7 @@ impl<'src> Parser<'src> {
                 false
             };
             let f = self.fn_def_with_async(is_async)?;
+            self.record_export(&f.name);
             exports.push(ExportDecl::Func(f.name.clone()));
             functions.push(f);
             return Ok(());
@@ -735,6 +908,7 @@ impl<'src> Parser<'src> {
         if self.check(&Tok::Class) {
             let c = self.class_decl()?;
             exports.push(ExportDecl::Class(c.name.clone()));
+            self.record_export(&c.name);
             classes.push(c);
             return Ok(());
         }
@@ -748,6 +922,7 @@ impl<'src> Parser<'src> {
             let init = if self.matches(&Tok::Eq) { Some(self.expr()?) } else { None };
             self.expect(Tok::Semi, "expected ';' after export var/let")?;
             toplevel.push(Stmt::Var { name: name.clone(), init });
+            self.record_export(&name);
             exports.push(ExportDecl::Var(name));
             return Ok(());
         }
@@ -780,6 +955,7 @@ impl<'src> Parser<'src> {
                         }
                     } else { None };
                     items.push((name, alias));
+                    // TODO Record export with the alias
                     if self.matches(&Tok::RBrace) { break; }
                     self.expect(Tok::Comma, "expected ',' in export list")?;
                 }
@@ -790,9 +966,15 @@ impl<'src> Parser<'src> {
                     _ => return Err(self.err_here("expected string literal after 'from'")),
                 };
                 self.expect(Tok::Semi, "expected ';' after export")?;
+                for (exp_name, _) in &items {
+                    self.record_export(exp_name);
+                }
                 exports.push(ExportDecl::From { specifier: spec, items });
             } else {
                 self.expect(Tok::Semi, "expected ';' after export list")?;
+                for (exp_name, _) in &items {
+                    self.record_export(exp_name);
+                }
                 exports.push(ExportDecl::Named { items });
             }
             return Ok(());

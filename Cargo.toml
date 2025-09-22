@@ -15,6 +15,7 @@ anyhow = "1.0.75"
 hashbrown = "0.16.0" # Fast hash map
 ahash = "0.8.12" # Fast hash map
 gxhash = "3.5.0" # Fast hash map
+dashmap = "6.1.0" # Concurrent hash map
 
 logos = "0.15.0"
 chumsky = "0.11.1" # Parser combinators

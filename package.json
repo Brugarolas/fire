@@ -1,7 +1,7 @@
 {
     "name": "napalm-lang",
     "version": "0.1.0",
-    "description": "Implementation of Napalm scripting programming language with Cranelift JIT and MMTk's StickyImmix garbage collector.",
+    "description": "Implementation of Napalm scripting programming language.",
     "main": "index.js",
     "type": "module",
     "scripts": {

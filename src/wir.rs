@@ -22,6 +22,7 @@
 #![allow(clippy::large_enum_variant)]
 #![allow(clippy::too_many_arguments)]
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::collections::{BTreeMap, BTreeSet};
 use ahash::AHashMap as HashMap;
 use std::fmt;
@@ -38,6 +39,13 @@ macro_rules! id_newtype {
             }
         }
     };
+}
+
+static GLOBAL_ID: AtomicU32 = AtomicU32::new(1);
+
+#[inline]
+pub fn next_id() -> u32 {
+    GLOBAL_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 id_newtype!(ValueId);
@@ -605,51 +613,53 @@ pub struct Module {
     pub next_site: u32,
     pub next_deopt: u32,
     pub next_class: u32,
+    pub next_binding: u32,
+    pub next_func: u32,
     pub strings: BTreeMap<String, ValueId>,
     pub shapes: BTreeMap<String, ShapeId>, // named shapes (for testing)
     pub fields: BTreeMap<String, FieldId>, // named fields (for testing)
-    pub next_binding: u32,
 }
 
 impl Module {
     pub fn new() -> Self { Self::default() }
     pub fn fresh_binding(&mut self) -> BindingId {
+        self.next_binding = next_id();
         let id = BindingId(self.next_binding);
-        self.next_binding += 1;
         id
     }
     pub fn fresh_class(&mut self) -> ClassId {
+        self.next_class = next_id();
         let id = ClassId(self.next_class);
-        self.next_class += 1;
         id
     }
     pub fn fresh_shape(&mut self) -> ShapeId {
+        self.next_shape = next_id();
         let id = ShapeId(self.next_shape);
-        self.next_shape += 1;
         id
     }
     pub fn fresh_field(&mut self) -> FieldId {
+        self.next_field = next_id();
         let id = FieldId(self.next_field);
-        self.next_field += 1;
         id
     }
     pub fn fresh_envshape(&mut self) -> EnvShapeId {
+        self.next_envshape = next_id();
         let id = EnvShapeId(self.next_envshape);
-        self.next_envshape += 1;
         id
     }
     pub fn fresh_site(&mut self) -> SiteId {
+        self.next_site = next_id();
         let id = SiteId(self.next_site);
-        self.next_site += 1;
         id
     }
     pub fn fresh_deopt(&mut self, target_label: impl Into<String>) -> DeoptPoint {
+        self.next_deopt = next_id();
         let id = DeoptId(self.next_deopt);
-        self.next_deopt += 1;
         DeoptPoint { id, target_label: target_label.into(), snapshot: DeoptSnapshot::default() }
     }
     pub fn push_function(&mut self, mut f: Function) -> FuncId {
-        let id = FuncId(self.funcs.len() as u32);
+        self.next_func = next_id();
+        let id = FuncId(self.next_func as u32);
         f.id = id;
         self.funcs.push(f);
         id
