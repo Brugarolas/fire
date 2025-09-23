@@ -23,7 +23,7 @@ pub struct ModuleId(pub u32);
 pub struct ModulesCTX {
     /// Bump arena used by the parser to intern &'static str for import/export names.
     pub arena: Bump,
-    /// Registry of parsed modules (by absolute path) → raw pointer to ModuleAST.
+    /// Registry of parsed modules (by absolute path) → Box<ModuleAST>.
     pub registry: HashMap<Arc<PathBuf>, Box<ModuleAST<'static>>>,
 }
 
@@ -59,9 +59,9 @@ impl ModuleLoader for FSLoader {
 /// -----------------------------------------
 /// ProgramBuilder (single source of truth)
 /// -----------------------------------------
-/// Replaces the former ModuleResolverAST. It owns:
+/// Owns:
 ///  - the global ModulesCTX (arena + registry),
-///  - a queue of pending modules to parse discovered via `import`,
+///  - a queue of pending modules discovered via `import`,
 ///  - the single public entry `build_from_entry`.
 pub struct ProgramBuilder {
     pub ctx: ModulesCTX,
@@ -84,8 +84,8 @@ impl ProgramBuilder {
     }
 
     /// Single public entry point to build the whole program graph from an entry file.
-    /// Resolves the entry to an absolute path, parses it, and keeps draining the queue
-    /// of modules discovered through `import` statements until there are none left.
+    /// Resolves the entry to an absolute path, parses it, drains the queue of modules
+    /// discovered through `import`, and then binds named imports to export bindings.
     pub fn build_from_entry(&mut self, entry: &str) -> Result<crate::wir::Module, String> {
         let abs = std::fs::canonicalize(entry)
             .map_err(|e| format!("canonicalize({entry}): {e}"))?;
@@ -104,9 +104,10 @@ impl ProgramBuilder {
             }
         }
 
-        // At this point, self.ctx.registry contains all ModuleASTs.
-        // Here you can trigger hoisting/lowering/linking across modules.
-        // For now we just return an empty WIR to keep compatibility.
+        // After parsing every module, bind named imports to export BindingIds.
+        self.bind_imports()?;
+
+        // For now just return an empty WIR to keep compatibility with your pipeline.
         let wir = crate::wir::Module::new();
         Ok(wir)
     }
@@ -154,15 +155,14 @@ impl ProgramBuilder {
             imports: HashMap::default(),
         });
 
-        // SAFETY: At this point, ModuleAST contains no borrowed data.
-        // The parser will only store &'static str coming from self.ctx.arena
-        // and treated as program-long for this process.
+        // SAFETY: ModuleAST contains no borrowed data at construction time.
+        // The parser will only store &'static str coming from self.ctx.arena.
         let ast_box_static: Box<ModuleAST<'static>> = unsafe {
             std::mem::transmute::<Box<ModuleAST<'_>>, Box<ModuleAST<'static>>>(ast_box_nonstatic)
         };
 
         // Insert the Box into the registry (we keep ownership there).
-        // Then borrow a temporary raw pointer to pass into the parser.
+        // Then take a temporary raw pointer to pass into the parser.
         let ast_ptr: *mut ModuleAST<'_> = {
             let entry: &mut Box<ModuleAST<'static>> = self.ctx.registry.entry(abs.clone()).or_insert(ast_box_static);
             &mut **entry as *mut ModuleAST<'static> as *mut ModuleAST<'_>
@@ -181,7 +181,7 @@ impl ProgramBuilder {
             format!("Parse error in {:?}: {} at {:?}", abs, e.msg, e.span)
         })?;
 
-        // 4) Debug logs (idéntico a tu código)
+        // 4) Debug logs: what the parser stored in the module’s boxes
         #[cfg(debug_assertions)]
         unsafe {
             let m = &*ast_ptr;
@@ -216,6 +216,84 @@ impl ProgramBuilder {
                 eprintln!("  [exports]");
                 for (name, item) in &m.exports {
                     eprintln!("    - {} -> binding {:?}", name, item.binding);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Bind named imports to the exporter modules' BindingIds, writing into each
+    /// `ImportRequest.resolved`. Namespace imports and re-exports are left for later.
+    fn bind_imports(&mut self) -> Result<(), String> {
+        // 1) Snapshot all “jobs” so we don’t fight the borrow checker:
+        //    (target_path, from_path, names[])
+        let mut jobs: Vec<(Arc<PathBuf>, Arc<PathBuf>, Vec<&'static str>)> = Vec::new();
+
+        for (tgt_path, tgt_box) in &self.ctx.registry {
+            // SAFETY: read-only
+            let tgt: &ModuleAST<'static> = &**tgt_box;
+            for (_k, req) in &tgt.imports {
+                jobs.push((
+                    tgt_path.clone(),
+                    req.from_path.clone(),
+                    req.names.clone(), // Vec<&'static str>
+                ));
+            }
+        }
+
+        // 2) Resolve each name and push into target's `resolved`.
+        for (tgt_path, from_path, names) in jobs {
+            for name in names {
+                // get export binding from source (immutable access)
+                let binding_opt = {
+                    let src_box = self
+                        .ctx
+                        .registry
+                        .get(&from_path)
+                        .ok_or_else(|| format!("bind: source module not found: {:?}", from_path))?;
+                    let src = &**src_box;
+                    src.exports.get(name).map(|ei| ei.binding)
+                };
+
+                match binding_opt {
+                    Some(binding) => {
+                        // push into target's resolved (mutable access)
+                        let tgt_box_mut = self
+                            .ctx
+                            .registry
+                            .get_mut(&tgt_path)
+                            .ok_or_else(|| format!("bind: target module not found: {:?}", tgt_path))?;
+                        let tgt: &mut ModuleAST<'static> = &mut **tgt_box_mut;
+                        if let Some(req_mut) = tgt.imports.get_mut(&from_path) {
+                            req_mut.resolved.push((name, binding));
+                        }
+                    }
+                    None => {
+                        #[cfg(debug_assertions)]
+                        eprintln!(
+                            "[bind] WARNING: {:?} imports '{}' from {:?}, but it's not exported there.",
+                            tgt_path, name, from_path
+                        );
+                    }
+                }
+            }
+        }
+
+        // 3) Debug summary
+        #[cfg(debug_assertions)]
+        {
+            for (p, mbox) in &self.ctx.registry {
+                let m: &ModuleAST<'static> = &**mbox;
+                eprintln!("[bind:summary] module={:?}", p);
+                for (fp, req) in &m.imports {
+                    let summary = req
+                        .resolved
+                        .iter()
+                        .map(|(n, b)| format!("{}->{:?}", n, b))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    eprintln!("  from {:?}: [{}]", fp, summary);
                 }
             }
         }
