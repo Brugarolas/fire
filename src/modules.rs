@@ -10,6 +10,8 @@ use std::{
     cell::RefCell,
     path::{Path, PathBuf},
 };
+use std::thread;
+use std::num::NonZeroUsize;
 
 use crate::front::{ModuleAST, Parser, Program};
 use crate::lowerer::{Lowerer, LinkInfo};
@@ -21,6 +23,8 @@ use crate::opt::optimization::optimization_passes;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ModuleId(pub u32);
+
+const WORKER_STACK_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Default)]
 pub struct ModulesCTX {
@@ -79,6 +83,11 @@ pub struct ProgramBuilder {
     programs: HashMap<Arc<PathBuf>, Program>,
 }
 
+pub struct BuiltBundle {
+    pub shards: HashMap<Arc<PathBuf>, crate::wir::Module>,
+    pub init_order: Vec<Arc<PathBuf>>,
+}
+
 impl ProgramBuilder {
     pub fn new(loader: FSLoader) -> Self {
         Self {
@@ -130,6 +139,9 @@ impl ProgramBuilder {
         &self,
     ) -> Result<HashMap<Arc<PathBuf>, crate::wir::Module>, String> {
         use may::coroutine::Builder as CoBuilder;
+        let num_cpus: usize = thread::available_parallelism().unwrap_or(NonZeroUsize::new(1).unwrap()).get();
+        may::config().set_workers(num_cpus).set_worker_pin(true);
+        may::config().set_stack_size(WORKER_STACK_BYTES);
 
         // 1) Materialize the worklist with all immutable data a fiber needs.
         //    (path, program, links)
@@ -219,21 +231,74 @@ impl ProgramBuilder {
         Ok(out)
     }
 
-    /// (Optional) If you later add a `merge_modules(dst, src)` in WIR, you can use:
-    ///
-    /// pub fn lower_all_modules_parallel(&self) -> Result<crate::wir::Module, String> {
-    ///     let shards = self.lower_all_modules_parallel_sharded()?;
-    ///     let mut out = crate::wir::Module::new();
-    ///     // Deterministic merge by path
-    ///     let mut keys: Vec<_> = shards.keys().cloned().collect();
-    ///     keys.sort_by(|a,b| a.as_path().cmp(b.as_path()));
-    ///     for k in keys {
-    ///         let m = shards.get(&k).unwrap();
-    ///         merge_modules(&mut out, m)?; // ← implement in wir::linker
-    ///     }
-    ///     Ok(out)
-    /// }
-    ///
+    fn topo_order(&self) -> Result<Vec<Arc<PathBuf>>, String> {
+        // 1) provider -> {importers}
+        let mut incoming: HashMap<Arc<PathBuf>, usize> = HashMap::default(); // indegree
+        let mut outgoing: HashMap<Arc<PathBuf>, Vec<Arc<PathBuf>>> = HashMap::default();
+
+        for k in self.ctx.registry.keys() {
+            incoming.entry(k.clone()).or_insert(0);
+            outgoing.entry(k.clone()).or_insert_with(Vec::new);
+        }
+
+        // tgt imports from src  =>  src -> tgt
+        for (tgt_path, tgt_box) in &self.ctx.registry {
+            let tgt = &**tgt_box;
+            for (_k, req) in &tgt.imports {
+                let src = req.from_path.clone();
+                outgoing.entry(src.clone()).or_default().push(tgt_path.clone());
+                *incoming.entry(tgt_path.clone()).or_insert(0) += 1;
+                // aseguros de tener src en incoming
+                incoming.entry(src).or_insert(0);
+            }
+        }
+
+        // 2) Kahn
+        use std::collections::VecDeque;
+        let mut q: VecDeque<Arc<PathBuf>> = incoming
+            .iter()
+            .filter_map(|(k, &deg)| if deg == 0 { Some(k.clone()) } else { None })
+            .collect();
+
+        // deterministic order
+        let mut qv: Vec<_> = q.into_iter().collect();
+        qv.sort_by(|a, b| a.as_path().cmp(b.as_path()));
+        let mut q: VecDeque<_> = qv.into_iter().collect();
+
+        let mut out = Vec::new();
+        while let Some(n) = q.pop_front() {
+            out.push(n.clone());
+            if let Some(children) = outgoing.get(&n) {
+                for ch in children {
+                    if let Some(d) = incoming.get_mut(ch) {
+                        *d -= 1;
+                        if *d == 0 {
+                            q.push_back(ch.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // If we didn't output every node, there's a cycle
+        if out.len() != self.ctx.registry.len() {
+            return Err("cycle detected in module imports".into());
+        }
+        Ok(out)
+    }
+
+    pub fn build_bundle(&mut self, entry: &str) -> Result<BuiltBundle, String> {
+        // 1) parser + bind imports
+        self.build_from_entry(entry)?;        // ya parsea cola y hace `bind_imports()`
+
+        // 2) lowering and optimization (parallel)
+        let shards = self.lower_all_modules_parallel_sharded()?;
+
+        // 3) init order (topological sort)
+        let init_order = self.topo_order()?;
+
+        Ok(BuiltBundle { shards, init_order })
+    }
 
     // ------------------------
     // API called by the Parser
