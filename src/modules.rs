@@ -16,6 +16,7 @@ use std::num::NonZeroUsize;
 use crate::front::{ModuleAST, Parser, Program};
 use crate::lowerer::{Lowerer, LinkInfo};
 use crate::opt::optimization::optimization_passes;
+use crate::wir::IdRemap;
 
 /// -----------------------------------------
 /// Minimal infra
@@ -97,6 +98,71 @@ impl ProgramBuilder {
             visited: RefCell::new(HashSet::new()),
             programs: HashMap::default(),
         }
+    }
+
+    pub fn build_whole_program(&mut self, entry: &str) -> Result<crate::wir::Module, String> {
+        // 1) parse + bind
+        self.build_from_entry(entry)?;
+
+        // 2) lower + optimize en paralelo
+        let shards = self.lower_all_modules_parallel_sharded()?;
+
+        // 3) orden de inicialización (proveedores → consumidores)
+        let order = self.topo_order()?;
+
+        // 4) merge a un único WIR
+        self.merge_wir_shards(shards, &order)
+    }
+
+    fn merge_wir_shards(
+        &self,
+        mut shards: HashMap<Arc<PathBuf>, crate::wir::Module>,
+        order: &[Arc<PathBuf>],
+    ) -> Result<crate::wir::Module, String> {
+        use crate::wir::Module as WirModule;
+
+        // Módulo destino
+        let mut dst = WirModule::new();
+
+        // Offset acumulado de funciones en `dst`
+        let mut func_count: u32 = 0;
+
+        for path in order {
+            let mut src = match shards.remove(path) {
+                Some(m) => m,
+                None => continue,
+            };
+
+            // === API mínima necesaria del WIR (ver sección 3):
+            // - enumerate functions
+            // - clone function with remap
+            // - append constants/strings if aplica
+            // - número de funciones actuales en dst (para offset)
+            //
+            // Suponemos:
+            //  * Los BindingId ya son **globales** (vienen del AST enlazado), así que no hay que remapearlos.
+            //  * Las llamadas **directas** dentro del shard apuntan a FuncId locales → hay que sumarle `func_count`.
+            //  * Las llamadas entre módulos se hacen vía closures en `BindingId` → no requieren remap de FuncId.
+
+            // 1) copiar (y remapear) constantes/tablas si tu WIR las expone (opcional).
+            // Si tu WIR no tiene pools globales, puedes omitir esta sección.
+
+            // 2) clonar y remapear las funciones del shard
+            let src_func_num = src.func_len(); // <-- API mínima
+            for fid_local in 0..src_func_num {
+                // Clona la función `fid_local` reescribiendo todos los `FuncId`
+                // sumando `func_count`. Los `BindingId` se dejan tal cual (globales).
+                let remap = IdRemap { func_ofs: func_count, bind_base: 0 };
+                let cloned = src.clone_function_with_remap(fid_local, remap)  // <-- API mínima
+                    .map_err(|e| format!("linker: cloning {:?} f#{}: {}", path, fid_local, e))?;
+                dst.push_cloned_function(cloned);                              // <-- API mínima
+            }
+
+            // 3) actualizar el offset acumulado
+            func_count += src_func_num as u32;
+        }
+
+        Ok(dst)
     }
 
     /// Single public entry point to build the whole program graph from an entry file.
@@ -474,20 +540,5 @@ impl ProgramBuilder {
 /// -----------------------------------------
 pub fn build_whole_program_from_entry(entry: &str) -> Result<crate::wir::Module, String> {
     let mut builder = ProgramBuilder::new(FSLoader);
-    let _ = builder.build_from_entry(entry)?;
-
-    // Parallel lower into shards
-    let _shards = builder.lower_all_modules_parallel_sharded()?;
-
-    // TODO: merge shards into one Module when a WIR merger exists.
-    // For now, return an empty module to keep the previous contract.
-    Ok(crate::wir::Module::new())
-}
-
-/// Dummy facade type to avoid compile errors if optimizer isn't wired yet.
-/// Implement `optimize_module` to call your real passes.
-struct OptimizerFacade;
-impl OptimizerFacade {
-    #[allow(dead_code)]
-    fn optimize_module(&self, _m: &mut crate::wir::Module) {}
+    builder.build_whole_program(entry)
 }

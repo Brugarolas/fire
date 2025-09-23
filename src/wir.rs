@@ -27,6 +27,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use ahash::AHashMap as HashMap;
 use std::fmt;
 
+#[derive(Default, Clone, Copy)]
+pub struct IdRemap {
+    pub func_ofs: u32,
+    pub bind_base: u32,
+}
+
 /// -------- Newtyped IDs for stable handles (indices into Vecs) --------
 
 macro_rules! id_newtype {
@@ -663,6 +669,95 @@ impl Module {
         f.id = id;
         self.funcs.push(f);
         id
+    }
+
+        /// Número de funciones en este módulo.
+    pub fn func_len(&self) -> usize {
+        self.funcs.len()
+    }
+
+    /// Clona una función aplicando un remapeo de IDs.
+    ///
+    /// Actualmente solo remapeamos `FuncId` (sumando `remap.func_ofs`) en
+    /// todas las instrucciones que los contienen:
+    ///  - CallDirect, CallDirectMemoized
+    ///  - MakeClosure, AllocClosure
+    ///  - ArrayMap/Reduce/ForEach/Find/FindIndex/Filter
+    ///  - CallIC.seed_pic[i].callee
+    ///  - RegisterClass.{methods[*].1, accessors[*].(1,2), ctor}
+    pub fn clone_function_with_remap(
+        &self,
+        local_findex: usize,
+        remap: IdRemap,
+    ) -> Result<Function, String> {
+        let mut f = self
+            .funcs
+            .get(local_findex)
+            .ok_or_else(|| format!("clone_function_with_remap: función inválida #{local_findex}"))?
+            .clone();
+
+        if remap.func_ofs != 0 {
+            for n in &mut f.nodes {
+                use crate::wir::Inst::*;
+                match &mut n.kind {
+                    CallDirect { callee, .. } => {
+                        callee.0 = callee.0.saturating_add(remap.func_ofs);
+                    }
+                    CallDirectMemoized { callee, .. } => {
+                        callee.0 = callee.0.saturating_add(remap.func_ofs);
+                    }
+                    MakeClosure { callee, .. } => {
+                        callee.0 = callee.0.saturating_add(remap.func_ofs);
+                    }
+                    AllocClosure { func, .. } => {
+                        func.0 = func.0.saturating_add(remap.func_ofs);
+                    }
+                    ArrayMap { func, .. }
+                    | ArrayReduce { func, .. }
+                    | ArrayForEach { func, .. }
+                    | ArrayFind { func, .. }
+                    | ArrayFindIndex { func, .. }
+                    | ArrayFilter { func, .. } => {
+                        func.0 = func.0.saturating_add(remap.func_ofs);
+                    }
+                    CallIC { seed_pic, .. } => {
+                        for pic in seed_pic {
+                            pic.callee.0 = pic.callee.0.saturating_add(remap.func_ofs);
+                        }
+                    }
+                    RegisterClass {
+                        methods,
+                        accessors,
+                        ctor,
+                        ..
+                    } => {
+                        for (_field, fid, _is_static) in methods {
+                            fid.0 = fid.0.saturating_add(remap.func_ofs);
+                        }
+                        if let Some(c) = ctor {
+                            c.0 = c.0.saturating_add(remap.func_ofs);
+                        }
+                        for (_field, get, set, _is_static) in accessors {
+                            if let Some(g) = get {
+                                g.0 = g.0.saturating_add(remap.func_ofs);
+                            }
+                            if let Some(s) = set {
+                                s.0 = s.0.saturating_add(remap.func_ofs);
+                            }
+                        }
+                    }
+                    _ => { /* no FuncId adentro */ }
+                }
+            }
+        }
+
+        // Nota: ValueId/BlockId/InstId se mantienen tal cual (son locales a la función).
+        Ok(f)
+    }
+
+    /// Inserta una función ya clonada en el módulo y devuelve su nuevo `FuncId`.
+    pub fn push_cloned_function(&mut self, f: Function) -> FuncId {
+        self.push_function(f)
     }
 }
 
