@@ -121,11 +121,7 @@ impl ProgramBuilder {
     ) -> Result<crate::wir::Module, String> {
         use crate::wir::Module as WirModule;
 
-        // Módulo destino
         let mut dst = WirModule::new();
-
-        // Offset acumulado de funciones en `dst`
-        let mut func_count: u32 = 0;
 
         for path in order {
             let mut src = match shards.remove(path) {
@@ -133,33 +129,21 @@ impl ProgramBuilder {
                 None => continue,
             };
 
-            // === API mínima necesaria del WIR (ver sección 3):
-            // - enumerate functions
-            // - clone function with remap
-            // - append constants/strings if aplica
-            // - número de funciones actuales en dst (para offset)
-            //
-            // Suponemos:
-            //  * Los BindingId ya son **globales** (vienen del AST enlazado), así que no hay que remapearlos.
-            //  * Las llamadas **directas** dentro del shard apuntan a FuncId locales → hay que sumarle `func_count`.
-            //  * Las llamadas entre módulos se hacen vía closures en `BindingId` → no requieren remap de FuncId.
+            // Merge global pools/metadata here; at least bump counters
+            // so future fresh_*() keep monotonicity:
+            dst.next_shape    = dst.next_shape.max(src.next_shape);
+            dst.next_field    = dst.next_field.max(src.next_field);
+            dst.next_envshape = dst.next_envshape.max(src.next_envshape);
+            dst.next_site     = dst.next_site.max(src.next_site);
+            dst.next_deopt    = dst.next_deopt.max(src.next_deopt);
+            dst.next_class    = dst.next_class.max(src.next_class);
+            dst.next_binding  = dst.next_binding.max(src.next_binding);
+            dst.next_func     = dst.next_func.max(src.next_func);
 
-            // 1) copiar (y remapear) constantes/tablas si tu WIR las expone (opcional).
-            // Si tu WIR no tiene pools globales, puedes omitir esta sección.
-
-            // 2) clonar y remapear las funciones del shard
-            let src_func_num = src.func_len(); // <-- API mínima
-            for fid_local in 0..src_func_num {
-                // Clona la función `fid_local` reescribiendo todos los `FuncId`
-                // sumando `func_count`. Los `BindingId` se dejan tal cual (globales).
-                let remap = IdRemap { func_ofs: func_count, bind_base: 0 };
-                let cloned = src.clone_function_with_remap(fid_local, remap)  // <-- API mínima
-                    .map_err(|e| format!("linker: cloning {:?} f#{}: {}", path, fid_local, e))?;
-                dst.push_cloned_function(cloned);                              // <-- API mínima
+            // Move functions verbatim, preserving Function.id
+            for f in src.funcs.drain(..) {
+                let _ = dst.push_function_preserve_id(f);
             }
-
-            // 3) actualizar el offset acumulado
-            func_count += src_func_num as u32;
         }
 
         Ok(dst)
@@ -541,4 +525,25 @@ impl ProgramBuilder {
 pub fn build_whole_program_from_entry(entry: &str) -> Result<crate::wir::Module, String> {
     let mut builder = ProgramBuilder::new(FSLoader);
     builder.build_whole_program(entry)
+}
+
+pub fn build_simple_program_from_entry(entry: &str) -> Result<crate::wir::Module, String> {
+    let abs = std::fs::canonicalize(entry).map_err(|e| format!("canonicalize({entry}): {e}"))?;
+
+    let src = std::fs::read_to_string(&abs).map_err(|e| format!("read_to_string({}): {e}", entry))?;
+
+    let mut parser: Parser = Parser::new(&src);
+
+    let prog = parser.program().map_err(|e| {
+        format!("Parse error in {:?}: {} at {:?}", abs, e.msg, e.span)
+    })?;
+
+    let mut m = crate::wir::Module::new();
+
+    let mut lowerer = Lowerer::new(&mut m);
+    lowerer.lower_program(&prog).map_err(|e| format!("lower error in {:?}: {:?}", &abs, e))?;
+
+    let optimize = optimization_passes();
+    optimize.optimize_module(&mut m);
+    Ok(m)
 }

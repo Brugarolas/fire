@@ -232,6 +232,7 @@ pub enum ClassMember {
 
 #[derive(Debug, Clone)]
 pub struct FuncDecl {
+    pub fid: FuncId,
     pub name: String,
     pub params: Vec<String>,
     pub body: Block,
@@ -541,6 +542,7 @@ impl<'src> Parser<'src> {
 
         if !toplevel_stmts.is_empty() {
             functions.push(FuncDecl {
+                fid: FuncId(next_id()),
                 name: "__toplevel__".to_string(),
                 params: Vec::new(),
                 body: Block { stmts: toplevel_stmts },
@@ -602,6 +604,10 @@ impl<'src> Parser<'src> {
     }
 
     fn record_export(&mut self, name: &str) {
+        self.record_export_with_binding(name, None)
+    }
+
+    fn record_export_with_binding(&mut self, name: &str, bind_opt: Option<BindingId>) {
         // Solo si estamos en modo "con módulo"
         if let (Some(m_ptr), Some(ctx_ptr)) = (self.module_ptr, self.ctx) {
             unsafe {
@@ -613,12 +619,11 @@ impl<'src> Parser<'src> {
                     std::mem::transmute::<&str, &'static str>(s)
                 };
                 let m: &mut ModuleAST<'static> = &mut *m_ptr;
+
+                let binding = bind_opt.unwrap_or_else(|| BindingId(next_id()));
                 m.exports.insert(
                     name_intern,
-                    ExportItem {
-                        name: name_intern,
-                        binding: BindingId(next_id()),
-                    },
+                    ExportItem { name: name_intern, binding },
                 );
             }
         }
@@ -882,7 +887,7 @@ impl<'src> Parser<'src> {
                 false
             };
             let f = self.fn_def_with_async(is_async)?;
-            self.record_export(&f.name);
+            self.record_export_with_binding(&f.name, Some(BindingId(f.fid.0)));
             exports.push(ExportDecl::Func(f.name.clone()));
             functions.push(f);
             return Ok(());
@@ -898,7 +903,7 @@ impl<'src> Parser<'src> {
                 false
             };
             let f = self.fn_def_with_async(is_async)?;
-            self.record_export(&f.name);
+            self.record_export_with_binding(&f.name, Some(BindingId(f.fid.0)));
             exports.push(ExportDecl::Func(f.name.clone()));
             functions.push(f);
             return Ok(());
@@ -1018,7 +1023,7 @@ impl<'src> Parser<'src> {
             }
         }
         let body = self.block()?;
-        Ok(FuncDecl { name, params, body, is_async })
+        Ok(FuncDecl { fid: FuncId(next_id()), name, params, body, is_async })
     }
 
     fn block(&mut self) -> PResult<Block> {

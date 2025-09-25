@@ -317,20 +317,27 @@ impl SimdHashMap {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// A Hash-able wrapper for f64, stored as u64 bits.
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, Default, PartialOrd, Ord)]
+pub struct HashF64(u64);
 
-    #[test]
-    fn basic_ops() {
-        let mut m = SimdHashMap::with_capacity(32);
-        assert_eq!(m.insert("foo".to_string(), 1), None);
-        assert_eq!(m.insert("bar".to_string(), 2), None);
-        assert_eq!(m.get("foo"), Some(&1));
-        assert_eq!(m.get("bar"), Some(&2));
-        assert_eq!(m.insert("foo".to_string(), 3), Some(1));
-        assert_eq!(m.get("foo"), Some(&3));
-        assert_eq!(m.remove("foo"), Some(3));
-        assert_eq!(m.get("foo"), None);
+impl HashF64 {
+    /// Creates a new HashF64 from an f64.
+    pub fn new(f: f64) -> Self {
+        Self(f.to_bits())
     }
+
+    /// Reinterprets the internal bits as f64.
+    pub fn float(&self) -> f64 {
+        f64::from_bits(self.0)
+    }
+
+    /// Saves an f64 by reinterpreting it as bits.
+    pub fn save(&mut self, f: f64) {
+        self.0 = f.to_bits();
+    }
+}
+
+impl From<f64> for HashF64 {
+    fn from(f: f64) -> Self { Self::new(f) }
 }

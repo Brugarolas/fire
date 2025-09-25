@@ -78,6 +78,31 @@ fn register_funptr(fid: u32, ptr: *const u8) {
     m.insert(fid, ptr as usize);
 }
 
+// --- Live bindings (ESM) ----------------------------------------------------
+static WIR_BINDINGS: OnceLock<Mutex<HashMap<u32, i64>>> = OnceLock::new();
+fn bindings() -> &'static Mutex<HashMap<u32, i64>> {
+    WIR_BINDINGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_binding_load(binding_id_smi: i64) -> i64 {
+    // binding_id viene como SMI o raw? Aquí esperamos RAW (como en Store/MakeNamespace).
+    // Para máxima compatibilidad, acepta ambos: si es impar, decodifica SMI.
+    let raw = if (binding_id_smi & 1) == 1 { binding_id_smi >> 1 } else { binding_id_smi };
+    let id = raw as u32;
+    let m = bindings().lock();
+    *m.get(&id).unwrap_or(&0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_binding_store(binding_id_smi: i64, val: i64) -> i64 {
+    let raw = if (binding_id_smi & 1) == 1 { binding_id_smi >> 1 } else { binding_id_smi };
+    let id = raw as u32;
+    let mut m = bindings().lock();
+    m.insert(id, val);
+    0
+}
+
 pub struct JIT {
     module: JITModule,
     fctx: FunctionBuilderContext,
@@ -212,6 +237,11 @@ impl Default for JIT {
             fn wir_http_start_stream_from_req(req_obj: i64, status_smi: i64, headers_arr: i64) -> i64;
             fn wir_json_parse(str_ptr: i64) -> i64;
             fn wir_http_send_json(status_smi: i64, body_val: i64, headers_arr: i64) -> i64;
+        }
+
+        unsafe extern "C" {
+            fn wir_binding_load(binding_id_smi: i64) -> i64;
+            fn wir_binding_store(binding_id_smi: i64, val: i64) -> i64;
         }
 
         unsafe {
@@ -356,6 +386,15 @@ impl Default for JIT {
             jb.symbol("wir_obj_get_str_deep",  wir_obj_get_str_deep  as *const extern "C" fn(i64,i64)->i64 as *const u8);
             jb.symbol("wir_obj_get_method",    wir_obj_get_method    as *const extern "C" fn(i64,i64)->i64 as *const u8);
             jb.symbol("wir_super_get_method",  wir_super_get_method  as *const extern "C" fn(i64,i64)->i64 as *const u8);
+
+            jb.symbol(
+                "wir_binding_load",
+                wir_binding_load as *const extern "C" fn(i64) -> i64 as *const u8
+            );
+            jb.symbol(
+                "wir_binding_store",
+                wir_binding_store as *const extern "C" fn(i64, i64) -> i64 as *const u8
+            );
         }
 
         let module = cranelift_jit::JITModule::new(jb);
@@ -1410,6 +1449,87 @@ impl JIT {
                                 &[o, fid, v],
                             )?;
                             if res_count == 1 { vmap.bind(node.results[0], out); }
+                        }
+
+                        // ---------------- ESM live bindings ----------------
+                        Inst::LoadBinding { binding } => {
+                            use cranelift::prelude::{AbiParam, types};
+                            // binding id como RAW i64 (no SMI): emitimos constante con el id
+                            let bid = fb.ins().iconst(types::I64, binding.0 as i64);
+                            let out = self.call_import(
+                                &mut fb,
+                                "wir_binding_load",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64)); // binding id
+                                    s.returns.push(AbiParam::new(types::I64)); // valor
+                                },
+                                &[bid],
+                            )?;
+                            if res_count == 1 { vmap.bind(node.results[0], out); }
+                        }
+
+                        Inst::StoreBinding { binding, val } => {
+                            use cranelift::prelude::{AbiParam, types};
+                            let bid = fb.ins().iconst(types::I64, binding.0 as i64);
+                            let vv  = vmap.get_or_emit(*val, &mut fb, args_base, fun_ir);
+                            let _   = self.call_import(
+                                &mut fb,
+                                "wir_binding_store",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64)); // binding id
+                                    s.params.push(AbiParam::new(types::I64)); // val
+                                    s.returns.push(AbiParam::new(types::I64)); // 0
+                                },
+                                &[bid, vv],
+                            )?;
+                            // sin resultados
+                        }
+
+                        Inst::MakeNamespace { exports } => {
+                            use cranelift::prelude::{AbiParam, types, MemFlags};
+
+                            // MVP: construye un objeto normal y copia *snapshot* de los valores actuales
+                            // de cada binding como campos por nombre (string). Más adelante podemos
+                            // sustituir esto por getters enlazados a celdas.
+                            let obj = self.call_import(
+                                &mut fb,
+                                "wir_obj_new",
+                                |s| { s.returns.push(AbiParam::new(types::I64)); },
+                                &[],
+                            )?;
+
+                            for (name, binding) in exports {
+                                // Materializa el nombre como BoxedStr* (i64)
+                                let name_ptr = self.alloc_boxed_str(name);
+                                let name_val = fb.ins().iconst(types::I64, name_ptr);
+
+                                // Carga valor de la celda
+                                let bid = fb.ins().iconst(types::I64, binding.0 as i64);
+                                let cur = self.call_import(
+                                    &mut fb,
+                                    "wir_binding_load",
+                                    |s| {
+                                        s.params.push(AbiParam::new(types::I64));
+                                        s.returns.push(AbiParam::new(types::I64));
+                                    },
+                                    &[bid],
+                                )?;
+
+                                // obj[name] = cur
+                                let _ = self.call_import(
+                                    &mut fb,
+                                    "wir_obj_set_str",
+                                    |s| {
+                                        s.params.push(AbiParam::new(types::I64)); // obj
+                                        s.params.push(AbiParam::new(types::I64)); // key (boxed str*)
+                                        s.params.push(AbiParam::new(types::I64)); // val
+                                        s.returns.push(AbiParam::new(types::I64)); // 0
+                                    },
+                                    &[obj, name_val, cur],
+                                )?;
+                            }
+
+                            if res_count == 1 { vmap.bind(node.results[0], obj); }
                         }
 
                         // ---------------- Effects / markers ----------------

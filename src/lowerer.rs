@@ -61,6 +61,9 @@ pub struct LinkInfo {
     pub namespace_cells: HashMap<String, BindingId>,
     /// nombres locales que corresponden a `export class` del proveedor (para saber que son clase)
     pub imported_class_bindings: HashSet<BindingId>,
+    /// Imports that the linker resolved to FuncId: local name → provider's FuncId.
+    /// In __modinit__ they are materialized as closures (trampolines) with env = null.
+    pub import_funcids: HashMap<String, FuncId>,
 }
 
 pub struct Lowerer<'m> {
@@ -182,9 +185,6 @@ impl<'m> Lowerer<'m> {
 
         // -------- Stage 3: build function table ONCE, post-hoist --------
         self.funcs.clear();
-
-        // Ensure namespace cells exist if needed
-        self.ensure_namespace_cells_for_this_module();
 
         // 3.1 Free/hoisted functions first (includes __lam_*)
         for (i, f) in prog.functions.iter().enumerate() {
@@ -3024,18 +3024,24 @@ impl<'m> Lowerer<'m> {
 
             // 0) Inicializa TODAS las celdas a `undefined` para evitar TDZ
             let undef = b.const_undef();
-            for &bid in links.import_bindings.values() {
-                b.store_binding(bid, undef);
-            }
-            for &bid in links.export_bindings.values() {
-                b.store_binding(bid, undef);
-            }
-            // (el resto de stores sobrescribirá cuando aplique)
+            for &bid in links.import_bindings.values() { b.store_binding(bid, undef); }
+            for &bid in links.export_bindings.values() { b.store_binding(bid, undef); }
 
             // null env para closures
             let (_nid_null, nul) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
 
-            // 1) Materializa funciones exportadas como closures sin entorno
+            // 1a) Importaciones conocidas como FuncId (trampolines): local → cierre(env=null, callee=fid)
+            for (local, &fid) in &links.import_funcids {
+                if let Some(&bid) = links.import_bindings.get(local) {
+                    let (_nid, clos) = b.push_node(
+                        Inst::MakeClosure { callee: fid, env: nul[0] },
+                        Some(Type::Closure(None)), 1, false
+                    );
+                    b.store_binding(bid, clos[0]);
+                }
+            }
+
+            // 1b) Materializa funciones exportadas como closures sin entorno
             for (bid, fid) in fn_exports {
                 let (_nid, clos) = b.push_node(
                     Inst::MakeClosure { callee: fid, env: nul[0] },
@@ -3578,37 +3584,6 @@ impl<'m> Lowerer<'m> {
         Ok(())
     }
 
-    fn lower_expr_maybe_ident_to_closure(
-        b: &mut Builder<'m>,
-        locals: &mut HashMap<String, ValueId>,
-        fields: &mut HashMap<String, FieldId>,
-        next_field: &mut u32,
-        e: &Expr,
-        funcs: &HashMap<String, FuncId>,
-        lam_caps: &HashMap<String, Vec<String>>,
-        links: &LinkInfo
-    ) -> LResult<ValueId> {
-        match e {
-            // Turn a bare function name into a closure with null env,
-            // so call sites can uniformly do CallClosure.
-            Expr::Ident(name) => {
-                if let Some(&fid) = funcs.get(name) {
-                    let (_nid, env_null) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
-                    let (_nid, clos) = b.push_node(
-                        Inst::MakeClosure { callee: fid, env: env_null[0] },
-                        Some(Type::Closure(None)),
-                        1,
-                        false,
-                    );
-                    Ok(clos[0])
-                } else {
-                    lower_expr_free(b, locals, fields, next_field, e, funcs, lam_caps, links)
-                }
-            }
-            _ => lower_expr_free(b, locals, fields, next_field, e, funcs, lam_caps, links),
-        }
-    }
-
     fn lower_free_like_fun(
         &mut self,
         fname: &str,
@@ -3704,18 +3679,6 @@ impl<'m> Lowerer<'m> {
         );
     }
 
-    fn ensure_namespace_cells_for_this_module(&mut self) {
-        let ns_names: Vec<String> = self.links.namespace_imports.keys().cloned().collect();
-        for ns in ns_names {
-            #[cfg(debug_assertions)]
-            eprintln!("[links] ensure namespace cell for {}", ns);
-
-            self.links.namespace_cells.entry(ns.clone()).or_insert_with(|| {
-                self.module.fresh_binding()
-            });
-        }
-    }
-
     pub fn seed_links_from_ast(&mut self, prog: &Program) {
         // --- EXPORTS: sólo registramos los nombres que queremos prealocar luego ---
         self.pending_export_names.clear();
@@ -3777,23 +3740,6 @@ impl<'m> Lowerer<'m> {
         eprintln!(
             "[seed_links_from_ast] will alloc export cells for {:?}",
             self.pending_export_names
-        );
-    }
-
-    fn ensure_export_cells_in_modinit(&mut self) {
-        // Create a live binding cell for each exported name exactly once.
-        for name in std::mem::take(&mut self.pending_export_names) {
-            if self.links.export_bindings.contains_key(&name) {
-                continue;
-            }
-            let bid: BindingId = self.module.fresh_binding();
-            self.links.export_bindings.insert(name.clone(), bid);
-        }
-
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[lower_modinit] export cells = {:?}",
-            self.links.export_bindings.keys().collect::<Vec<_>>()
         );
     }
 

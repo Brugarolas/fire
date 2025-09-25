@@ -55,7 +55,7 @@ fn main() {
     eprintln!("(Debug build) Building whole-program (modules graph) from {} ...", &args[1]);
     let b0 = Instant::now();
 
-    let m = modules::build_whole_program_from_entry(&args[1]);
+    let m = modules::build_simple_program_from_entry(&args[1]);
     let module = match m {
         Ok(m) => m,
         Err(e) => {

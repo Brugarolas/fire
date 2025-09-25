@@ -23,8 +23,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::collections::{BTreeMap, BTreeSet};
-use ahash::AHashMap as HashMap;
+// use std::collections::{BTreeMap, BTreeSet};
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use std::fmt;
 
 #[derive(Default, Clone, Copy)]
@@ -70,7 +70,7 @@ id_newtype!(BindingId); // ESM live binding cell
 
 /// -------- Type lattice --------
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Type {
     Bottom,
     Top,
@@ -139,9 +139,9 @@ impl fmt::Debug for Type {
 }
 
 /// A compact set of shape IDs (hidden classes), kept small to encourage monomorphism.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct ShapeSet {
-    pub shapes: BTreeSet<ShapeId>,
+    pub shapes: HashSet<ShapeId>,
 }
 
 impl fmt::Debug for ShapeSet {
@@ -162,7 +162,7 @@ impl fmt::Debug for ShapeSet {
 
 impl ShapeSet {
     pub fn singleton(s: ShapeId) -> Self {
-        let mut set = BTreeSet::new();
+        let mut set = HashSet::new();
         set.insert(s);
         ShapeSet { shapes: set }
     }
@@ -621,9 +621,9 @@ pub struct Module {
     pub next_class: u32,
     pub next_binding: u32,
     pub next_func: u32,
-    pub strings: BTreeMap<String, ValueId>,
-    pub shapes: BTreeMap<String, ShapeId>, // named shapes (for testing)
-    pub fields: BTreeMap<String, FieldId>, // named fields (for testing)
+    pub strings: HashMap<String, ValueId>,
+    pub shapes: HashMap<String, ShapeId>, // named shapes (for testing)
+    pub fields: HashMap<String, FieldId>, // named fields (for testing)
 }
 
 impl Module {
@@ -665,99 +665,33 @@ impl Module {
     }
     pub fn push_function(&mut self, mut f: Function) -> FuncId {
         self.next_func = next_id();
-        let id = FuncId(self.next_func as u32);
-        f.id = id;
+        let id = FuncId(self.next_func);
+        if f.id.0 == 0 {
+            f.id = id;
+        }
         self.funcs.push(f);
         id
     }
-
-        /// Número de funciones en este módulo.
+    pub fn reserve_func_id(&mut self) -> FuncId {
+        self.next_func = crate::wir::next_id();
+        FuncId(self.next_func)
+    }
+    pub fn push_function_preserve_id(&mut self, mut f: Function) -> FuncId {
+        let mut id = f.id;
+        if id.0 == 0 {
+            // por si acaso alguien se olvidó de reservar
+            self.next_func = crate::wir::next_id();
+            f.id = FuncId(self.next_func);
+            id = f.id;
+        }
+        self.funcs.push(f);
+        id
+    }
     pub fn func_len(&self) -> usize {
         self.funcs.len()
     }
-
-    /// Clona una función aplicando un remapeo de IDs.
-    ///
-    /// Actualmente solo remapeamos `FuncId` (sumando `remap.func_ofs`) en
-    /// todas las instrucciones que los contienen:
-    ///  - CallDirect, CallDirectMemoized
-    ///  - MakeClosure, AllocClosure
-    ///  - ArrayMap/Reduce/ForEach/Find/FindIndex/Filter
-    ///  - CallIC.seed_pic[i].callee
-    ///  - RegisterClass.{methods[*].1, accessors[*].(1,2), ctor}
-    pub fn clone_function_with_remap(
-        &self,
-        local_findex: usize,
-        remap: IdRemap,
-    ) -> Result<Function, String> {
-        let mut f = self
-            .funcs
-            .get(local_findex)
-            .ok_or_else(|| format!("clone_function_with_remap: función inválida #{local_findex}"))?
-            .clone();
-
-        if remap.func_ofs != 0 {
-            for n in &mut f.nodes {
-                use crate::wir::Inst::*;
-                match &mut n.kind {
-                    CallDirect { callee, .. } => {
-                        callee.0 = callee.0.saturating_add(remap.func_ofs);
-                    }
-                    CallDirectMemoized { callee, .. } => {
-                        callee.0 = callee.0.saturating_add(remap.func_ofs);
-                    }
-                    MakeClosure { callee, .. } => {
-                        callee.0 = callee.0.saturating_add(remap.func_ofs);
-                    }
-                    AllocClosure { func, .. } => {
-                        func.0 = func.0.saturating_add(remap.func_ofs);
-                    }
-                    ArrayMap { func, .. }
-                    | ArrayReduce { func, .. }
-                    | ArrayForEach { func, .. }
-                    | ArrayFind { func, .. }
-                    | ArrayFindIndex { func, .. }
-                    | ArrayFilter { func, .. } => {
-                        func.0 = func.0.saturating_add(remap.func_ofs);
-                    }
-                    CallIC { seed_pic, .. } => {
-                        for pic in seed_pic {
-                            pic.callee.0 = pic.callee.0.saturating_add(remap.func_ofs);
-                        }
-                    }
-                    RegisterClass {
-                        methods,
-                        accessors,
-                        ctor,
-                        ..
-                    } => {
-                        for (_field, fid, _is_static) in methods {
-                            fid.0 = fid.0.saturating_add(remap.func_ofs);
-                        }
-                        if let Some(c) = ctor {
-                            c.0 = c.0.saturating_add(remap.func_ofs);
-                        }
-                        for (_field, get, set, _is_static) in accessors {
-                            if let Some(g) = get {
-                                g.0 = g.0.saturating_add(remap.func_ofs);
-                            }
-                            if let Some(s) = set {
-                                s.0 = s.0.saturating_add(remap.func_ofs);
-                            }
-                        }
-                    }
-                    _ => { /* no FuncId adentro */ }
-                }
-            }
-        }
-
-        // Nota: ValueId/BlockId/InstId se mantienen tal cual (son locales a la función).
-        Ok(f)
-    }
-
-    /// Inserta una función ya clonada en el módulo y devuelve su nuevo `FuncId`.
-    pub fn push_cloned_function(&mut self, f: Function) -> FuncId {
-        self.push_function(f)
+    pub fn find_function(&self, local_findex: usize) -> Option<&Function> {
+        self.funcs.get(local_findex)
     }
 }
 

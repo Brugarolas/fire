@@ -11,7 +11,7 @@ use smallbox::SmallBox;
 // Bring in the WIR types from your other file/module.
 use crate::wir::{
     Builder, Constant, FieldId, FuncId, Inst, IntBinOp, Module, Type, ValueId,
-    MethodInfo, AccessorInfo, BindingId,
+    MethodInfo, AccessorInfo, BindingId, next_id,
 };
 
 use crate::front::{
@@ -329,6 +329,7 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                 );
 
                 out_funcs.push(FuncDecl {
+                    fid: FuncId(next_id()),
                     name: lam_name.clone(),
                     params: lam_params,
                     body: body_rewritten,
@@ -421,7 +422,7 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
         // at top-level of a function, enclosing locals = its params (can be captured by nested lambdas)
         let enclosing: BTreeSet<String> = f.params.iter().cloned().collect();
         let rew_body = rw_block(&f.body, &mut used, &mut counter, &enclosing, &mut out_funcs, &mut lam_captures);
-        out_funcs.push(FuncDecl { name: f.name.clone(), params: f.params.clone(), body: rew_body, is_async: f.is_async });
+        out_funcs.push(FuncDecl { fid: FuncId(next_id()), name: f.name.clone(), params: f.params.clone(), body: rew_body, is_async: f.is_async });
     }
 
     (Program {
