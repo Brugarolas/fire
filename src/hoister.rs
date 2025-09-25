@@ -392,6 +392,13 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                 }
             }
 
+            Expr::DeleteIndex { obj, index } => {
+                Expr::DeleteIndex {
+                    obj: SmallBox::new(rw_expr(obj, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                    index: SmallBox::new(rw_expr(index, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                }
+            }
+
             Expr::This => Expr::This,
 
             Expr::SuperProp(name) => Expr::SuperProp(name.clone()),

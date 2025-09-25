@@ -9,6 +9,7 @@ use std::collections::hash_map::Entry;
 use smallbox::SmallBox;
 use std::{path::PathBuf};
 use hybrid_rc::Arc;
+use ariadne::{Report, ReportKind, Label, Color, Source, FileCache, FnCache};
 
 // Bring in the WIR types from your other file/module.
 use crate::wir::{
@@ -292,6 +293,7 @@ pub enum Expr {
     SetPropObj { obj: SmallBox<Expr, u8>, key: PropKey, value: SmallBox<Expr, u8> }, // obj.x = value   or   obj["x"] = value
     In { key: SmallBox<Expr, u8>, obj: SmallBox<Expr, u8> },                         // "<key>" in obj
     DeleteProp { obj: SmallBox<Expr, u8>, key: PropKey },                            // delete obj.x / delete obj["x"]
+    DeleteIndex { obj: SmallBox<Expr, u8>, index: SmallBox<Expr, u8> },              // delete obj[expr]
 
     Await(SmallBox<Expr, u8>) // await <expression>
 }
@@ -385,10 +387,16 @@ pub struct RouteDecl {
 /// PARSER (Pratt + RD)
 /// -------------------------
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ParseError {
     pub msg: String,
     pub span: std::ops::Range<usize>,
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{} at {}", self.msg, self.span.start)
+    }
 }
 
 pub type PResult<T> = Result<T, ParseError>;
@@ -399,10 +407,37 @@ struct SpannedTok {
     span: std::ops::Range<usize>,
 }
 
+impl ParseError {
+    pub fn print(&self, src: &str, filename: Option<&str>) {
+        let filename_str = filename.unwrap_or("<unknown>");
+        let id = filename_str.to_string();
+        let span_id = (id.clone(), self.span.clone());
+        let report = Report::build(ReportKind::Error, span_id.clone())
+            .with_message(&self.msg)
+            .with_label(
+                Label::new(span_id)
+                    .with_message("error occurred here")
+                    .with_color(Color::Red),
+            )
+            .finish();
+
+        let mut cache = FnCache::new(move |file_id: &String| -> Result<String, &'static str> {
+            if file_id == &id {
+                Ok(src.to_string())
+            } else {
+                Err("Unknown file")
+            }
+        });
+        let _ = report.eprint(&mut cache);
+    }
+}
+
 pub struct Parser<'src> {
     toks: Vec<SpannedTok>,
     i: usize,
     _src: &'src str,
+
+    lexer_errors: Vec<ParseError>,
 
     module_ptr: Option<*mut ModuleAST<'static>>,
     ctx: Option<*const ModulesCTX>,
@@ -416,6 +451,7 @@ impl<'src> Parser<'src> {
     ) -> Self {
         let mut lex = Tok::lexer(src);
         let mut toks = Vec::new();
+        let mut lexer_errors = Vec::new();
 
         while let Some(item) = lex.next() {
             match item {
@@ -424,14 +460,14 @@ impl<'src> Parser<'src> {
                     toks.push(SpannedTok { tok: t, span });
                 }
                 Err(_) => {
-                    // Unknown/invalid sequence: log and keep scanning; DO NOT fabricate a token.
-                    // (Optionally enable if you use `log`.)  e.g.:
-                    // log::error!("[lexer] unrecognized sequence {:?} at {:?}", lex.slice(), lex.span());
+                    let span = lex.span();
+                    let msg = format!("unrecognized sequence: {}", lex.slice());
+                    lexer_errors.push(ParseError { msg, span });
                 }
             }
         }
 
-        Self { toks, i: 0, _src: src, module_ptr: None, ctx: None, resolver: None, referrer: None }
+        Self { toks, i: 0, _src: src, lexer_errors, module_ptr: None, ctx: None, resolver: None, referrer: None }
     }
 
     pub fn with_module<'a>(
@@ -450,21 +486,39 @@ impl<'src> Parser<'src> {
     }
 
     #[inline(always)]
-    fn peek(&self) -> &SpannedTok {
-        // Caller only uses this when self.i < toks.len(); we keep it simple.
-        &self.toks[self.i]
+    fn peek(&self) -> Option<&SpannedTok> {
+        if self.i < self.toks.len() {
+            Some(&self.toks[self.i])
+        } else {
+            None
+        }
     }
 
-    #[inline(always)]
-    fn next(&mut self) -> SpannedTok {
-        let t = self.toks[self.i].clone();
-        self.i += 1;
-        t
+    fn next(&mut self) -> PResult<SpannedTok> {
+        if self.is_eof() {
+            let span = if let Some(last) = self.toks.last() {
+                last.span.end..self._src.len()
+            } else {
+                0..0
+            };
+            Err(ParseError {
+                msg: "unexpected end of file".to_string(),
+                span,
+            })
+        } else {
+            let t = self.toks[self.i].clone();
+            self.i += 1;
+            Ok(t)
+        }
     }
 
     #[inline(always)]
     fn check(&self, t: &Tok) -> bool {
-        &self.peek().tok == t
+        if let Some(p) = self.peek() {
+            &p.tok == t
+        } else {
+            false
+        }
     }
 
     #[inline(always)]
@@ -479,17 +533,46 @@ impl<'src> Parser<'src> {
 
     #[inline(always)]
     fn expect(&mut self, t: Tok, msg: &str) -> PResult<()> {
-        if self.peek().tok == t {
+        if self.check(&t) {
             self.i += 1;
             Ok(())
+        } else if self.is_eof() {
+            let span = if let Some(last) = self.toks.last() {
+                last.span.end..self._src.len()
+            } else {
+                0..0
+            };
+            Err(ParseError {
+                msg: format!("unexpected end of file, {}", msg),
+                span,
+            })
         } else {
-            Err(self.err_here(msg))
+            let found = if let Some(p) = self.peek() {
+                format!("found {:?}", p.tok)
+            } else {
+                "reached end of file".to_string()
+            };
+            Err(ParseError {
+                msg: format!("{}; {}", msg, found),
+                span: self.peek().map(|p| p.span.clone()).unwrap_or(0..0),
+            })
         }
     }
 
-    #[inline(always)]
     fn err_here(&self, msg: &str) -> ParseError {
-        ParseError { msg: msg.into(), span: self.peek().span.clone() }
+        let span = if let Some(p) = self.peek() {
+            p.span.clone()
+        } else {
+            if let Some(last) = self.toks.last() {
+                last.span.end..self._src.len()
+            } else {
+                0..0
+            }
+        };
+        ParseError {
+            msg: msg.to_string(),
+            span,
+        }
     }
 
     #[inline(always)]
@@ -499,15 +582,29 @@ impl<'src> Parser<'src> {
 
     #[inline(always)]
     fn check_ident(&self, s: &str) -> bool {
-        matches!(&self.peek().tok, Tok::Ident(name) if name == s)
+        if let Some(p) = self.peek() {
+            matches!(&p.tok, Tok::Ident(name) if name == s)
+        } else {
+            false
+        }
     }
 
     #[inline(always)]
     fn matches_ident(&mut self, s: &str) -> bool {
-        if self.check_ident(s) { self.i += 1; true } else { false }
+        if self.check_ident(s) {
+            self.i += 1;
+            true
+        } else {
+            false
+        }
     }
 
     pub fn program(&mut self) -> PResult<Program> {
+        if !self.lexer_errors.is_empty() {
+            // Return the first lexer error as representative
+            return Err(self.lexer_errors[0].clone());
+        }
+
         let mut functions  = Vec::new();
         let mut classes   = Vec::new();
         let mut toplevel_stmts: Vec<Stmt> = Vec::new();
@@ -515,13 +612,13 @@ impl<'src> Parser<'src> {
         let mut imports = Vec::new();
         let mut exports = Vec::new();
 
-        while self.i < self.toks.len() {
+        while !self.is_eof() {
             if self.matches(&Tok::Semi) { continue; }
 
             if self.check(&Tok::Import) {
                 imports.push(self.parse_import_decl()?);
             } else if self.check(&Tok::Export) {
-                self.next(); // consume 'export'
+                self.next()?; // consume 'export'
                 self.parse_export_decl(&mut functions, &mut classes, &mut toplevel_stmts, &mut exports)?;
             } else if self.check(&Tok::Class) {
                 classes.push(self.class_decl()?);
@@ -667,22 +764,38 @@ impl<'src> Parser<'src> {
     }
 
     fn class_decl(&mut self) -> PResult<ClassDecl> {
-        self.expect(Tok::Class, "expected 'class'")?;
-        let name = match self.next().tok {
+        self.expect(Tok::Class, "expected 'class' keyword")?;
+        let t = self.next()?;
+        let name = match t.tok {
             Tok::Ident(s) => s,
-            _ => return Err(self.err_here("expected class name")),
+            ref tok => return Err(ParseError {
+                msg: format!("expected class name (identifier), found {:?}", tok),
+                span: t.span,
+            }),
         };
 
         let base = if self.matches(&Tok::Extends) {
-            match self.next().tok {
+            let t = self.next()?;
+            match t.tok {
                 Tok::Ident(s) => Some(s),
-                _ => return Err(self.err_here("expected base class name after 'extends'")),
+                ref tok => return Err(ParseError {
+                    msg: format!("expected base class name after 'extends', found {:?}", tok),
+                    span: t.span,
+                }),
             }
         } else { None };
 
-        self.expect(Tok::LBrace, "expected '{' after class header")?;
+        self.expect(Tok::LBrace, "expected opening brace after class declaration")?;
+
         let mut members = Vec::new();
-        while !self.matches(&Tok::RBrace) {
+        loop {
+            if self.check(&Tok::RBrace) {
+                let _ = self.next()?; // consume RBrace
+                break;
+            }
+            if self.is_eof() {
+                return Err(self.err_here("unexpected end of file in class body"));
+            }
             members.push(self.class_member()?);
         }
 
@@ -693,31 +806,44 @@ impl<'src> Parser<'src> {
         // optional `static`
         let is_static = self.matches(&Tok::Static);
 
+        // optional `async` for methods and constructor
+        let is_async = self.matches(&Tok::Async);
+
         // constructor
         if self.matches(&Tok::Constructor) {
             let params = self.parse_fn_param_names()?;
             let body   = self.block()?;
-            return Ok(ClassMember::Constructor { params, body, is_async: false });
+            return Ok(ClassMember::Constructor { params, body, is_async });
         }
 
         // destructor
         if self.matches(&Tok::Destructor) {
+            if is_async {
+                return Err(self.err_here("'async' not allowed for destructor"));
+            }
             let body = self.block()?;
             return Ok(ClassMember::Destructor { body });
         }
 
         // stored field: var name [: Type]? (= expr)? ;
         if self.matches(&Tok::Var) {
-            let name = match self.next().tok {
+            if is_async {
+                return Err(self.err_here("'async' not allowed for stored fields"));
+            }
+            let t = self.next()?;
+            let name = match t.tok {
                 Tok::Ident(s) => s,
-                _ => return Err(self.err_here("expected field name after 'var'")),
+                ref tok => return Err(ParseError {
+                    msg: format!("expected field name after 'var', found {:?}", tok),
+                    span: t.span,
+                }),
             };
 
             // ignore optional type annotation for now
             let _ = self.maybe_skip_type_annot()?;
 
             let init = if self.matches(&Tok::Eq) { Some(self.expr()?) } else { None };
-            self.expect(Tok::Semi, "expected ';' after field")?;
+            self.expect(Tok::Semi, "expected ';' after field declaration")?;
             return Ok(ClassMember::Stored {
                 is_static,
                 name,
@@ -728,9 +854,16 @@ impl<'src> Parser<'src> {
 
         // accessors: get name() { ... }  |  set name(param) { ... }
         if self.matches(&Tok::Get) {
-            let name = match self.next().tok {
+            if is_async {
+                return Err(self.err_here("'async' not allowed for getters"));
+            }
+            let t = self.next()?;
+            let name = match t.tok {
                 Tok::Ident(s) => s,
-                _ => return Err(self.err_here("expected property name after 'get'")),
+                ref tok => return Err(ParseError {
+                    msg: format!("expected property name after 'get', found {:?}", tok),
+                    span: t.span,
+                }),
             };
             self.expect(Tok::LParen, "expected '(' after getter name")?;
             self.expect(Tok::RParen, "expected ')' after getter params")?;
@@ -744,14 +877,25 @@ impl<'src> Parser<'src> {
             });
         }
         if self.matches(&Tok::Set) {
-            let name = match self.next().tok {
+            if is_async {
+                return Err(self.err_here("'async' not allowed for setters"));
+            }
+            let t = self.next()?;
+            let name = match t.tok {
                 Tok::Ident(s) => s,
-                _ => return Err(self.err_here("expected property name after 'set'")),
+                ref tok => return Err(ParseError {
+                    msg: format!("expected property name after 'set', found {:?}", tok),
+                    span: t.span,
+                }),
             };
             self.expect(Tok::LParen, "expected '(' after setter name")?;
-            let param = match self.next().tok {
+            let t = self.next()?;
+            let param = match t.tok {
                 Tok::Ident(s) => s,
-                _ => return Err(self.err_here("expected setter parameter name")),
+                ref tok => return Err(ParseError {
+                    msg: format!("expected setter parameter name, found {:?}", tok),
+                    span: t.span,
+                }),
             };
             self.expect(Tok::RParen, "expected ')' after setter parameter")?;
             let body = self.block()?;
@@ -766,15 +910,17 @@ impl<'src> Parser<'src> {
 
         // methods: [static] [async] [fn|function]? Ident(params) { block }
         // Accept JS-style methods without the `fn` keyword.
-        let is_async = if self.matches(&Tok::Async) { true } else { false };
-
         // Optional `fn` / `function` keyword (ignored if present)
         let _ = self.matches(&Tok::Fn) || self.matches(&Tok::Function);
 
         // Method name
-        let name = match self.next().tok {
+        let t = self.next()?;
+        let name = match t.tok {
             Tok::Ident(s) => s,
-            _ => return Err(self.err_here("expected method name")),
+            ref tok => return Err(ParseError {
+                msg: format!("expected method name (identifier), found {:?}", tok),
+                span: t.span,
+            }),
         };
 
         self.expect(Tok::LParen, "expected '(' after method name")?;
@@ -788,26 +934,45 @@ impl<'src> Parser<'src> {
         // Allow and ignore: : Ident [.<Ident>]*  (super minimal)
         if self.matches(&Tok::Colon) {
             // eat at least one token of the type
-            match &self.peek().tok {
-                Tok::Ident(_) => { self.i += 1; }
-                _ => {}
+            if let Some(p) = self.peek() {
+                if matches!(&p.tok, Tok::Ident(_)) {
+                    let _ = self.next()?;
+                } else {
+                    return Err(self.err_here("expected type identifier after ':'"));
+                }
+            } else {
+                return Err(self.err_here("unexpected end of file after ':' in type annotation"));
             }
             // consume any dotted qualifiers (rough)
             while self.matches(&Tok::Dot) {
-                if matches!(&self.peek().tok, Tok::Ident(_)) { self.i += 1; }
-                else { break; }
+                if let Some(p) = self.peek() {
+                    if matches!(&p.tok, Tok::Ident(_)) {
+                        let _ = self.next()?;
+                    } else {
+                        return Err(self.err_here("expected identifier after '.' in type"));
+                    }
+                } else {
+                    return Err(self.err_here("unexpected end of file after '.' in type"));
+                }
             }
         }
         Ok(())
     }
 
     fn parse_import_decl(&mut self) -> PResult<ImportDecl> {
-        self.expect(Tok::Import, "expected 'import'")?;
+        self.expect(Tok::Import, "expected 'import' keyword")?;
 
         // 1) import "path";
-        if let Tok::Str(spec) = self.peek().tok.clone() {
-            let _ = self.next();
-            self.expect(Tok::Semi, "expected ';' after import")?;
+        if matches!(self.peek(), Some(SpannedTok { tok: Tok::Str(_), .. })) {
+            let t = self.next()?;
+            let spec = match t.tok {
+                Tok::Str(s) => s,
+                ref tok => return Err(ParseError {
+                    msg: format!("expected string literal for import specifier, found {:?}", tok),
+                    span: t.span,
+                }),
+            };
+            self.expect(Tok::Semi, "expected ';' after import specifier")?;
             // side-effect import: sin items → no hay nombres, pero igualmente encolamos
             self.record_import_and_enqueue(&spec, &[])?;
             return Ok(ImportDecl { specifier: spec, items: vec![] });
@@ -816,14 +981,22 @@ impl<'src> Parser<'src> {
         // 2) import * as ns from "path";
         if self.matches(&Tok::Star) {
             self.expect(Tok::As, "expected 'as' after '*'")?;
-            let alias = match self.next().tok {
+            let t = self.next()?;
+            let alias = match t.tok {
                 Tok::Ident(s) => s,
-                _ => return Err(self.err_here("expected identifier after 'as'")),
+                ref tok => return Err(ParseError {
+                    msg: format!("expected identifier after 'as', found {:?}", tok),
+                    span: t.span,
+                }),
             };
             self.expect(Tok::From, "expected 'from'")?;
-            let spec = match self.next().tok {
+            let t = self.next()?;
+            let spec = match t.tok {
                 Tok::Str(s) => s,
-                _ => return Err(self.err_here("expected string literal after 'from'")),
+                ref tok => return Err(ParseError {
+                    msg: format!("expected string literal after 'from', found {:?}", tok),
+                    span: t.span,
+                }),
             };
             self.expect(Tok::Semi, "expected ';' after import")?;
 
@@ -837,30 +1010,50 @@ impl<'src> Parser<'src> {
         self.expect(Tok::LBrace, "expected '{' after 'import'")?;
         let mut items = Vec::new();
         let mut locals = Vec::new(); // << para registrar en ModuleAST
-        if !self.matches(&Tok::RBrace) {
-            loop {
-                let name = match self.next().tok {
-                    Tok::Ident(s) => s,
-                    _ => return Err(self.err_here("expected imported name")),
-                };
-                let alias = if self.matches(&Tok::As) {
-                    match self.next().tok {
-                        Tok::Ident(s) => { locals.push(s.clone()); Some(s) }
-                        _ => return Err(self.err_here("expected alias name after 'as'")),
-                    }
-                } else {
-                    locals.push(name.clone());
-                    None
-                };
-                items.push(ImportItem::Named { name, alias });
-                if self.matches(&Tok::RBrace) { break; }
-                self.expect(Tok::Comma, "expected ',' in import list")?;
+        loop {
+            if self.check(&Tok::RBrace) {
+                let _ = self.next()?; // consume RBrace
+                break;
             }
+            if self.is_eof() {
+                return Err(self.err_here("unexpected end of file in import list"));
+            }
+            let t = self.next()?;
+            let name = match t.tok {
+                Tok::Ident(s) => s,
+                ref tok => return Err(ParseError {
+                    msg: format!("expected imported name (identifier), found {:?}", tok),
+                    span: t.span,
+                }),
+            };
+            let alias = if self.matches(&Tok::As) {
+                let t = self.next()?;
+                match t.tok {
+                    Tok::Ident(s) => { locals.push(s.clone()); Some(s) }
+                    ref tok => return Err(ParseError {
+                        msg: format!("expected alias name (identifier) after 'as', found {:?}", tok),
+                        span: t.span,
+                    }),
+                }
+            } else {
+                locals.push(name.clone());
+                None
+            };
+            items.push(ImportItem::Named { name, alias });
+            if self.check(&Tok::RBrace) {
+                let _ = self.next()?; // consume RBrace
+                break;
+            }
+            self.expect(Tok::Comma, "expected ',' or '}' in import list")?;
         }
         self.expect(Tok::From, "expected 'from' after import list")?;
-        let spec = match self.next().tok {
+        let t = self.next()?;
+        let spec = match t.tok {
             Tok::Str(s) => s,
-            _ => return Err(self.err_here("expected string literal after 'from'")),
+            ref tok => return Err(ParseError {
+                msg: format!("expected string literal after 'from', found {:?}", tok),
+                span: t.span,
+            }),
         };
         self.expect(Tok::Semi, "expected ';' after import")?;
 
@@ -920,12 +1113,16 @@ impl<'src> Parser<'src> {
 
         // export var/let X = ... ;
         if self.matches(&Tok::Var) || self.matches(&Tok::Let) || self.matches(&Tok::Const) {
-            let name = match self.next().tok {
+            let t = self.next()?;
+            let name = match t.tok {
                 Tok::Ident(s) => s,
-                _ => return Err(self.err_here("expected identifier after 'export var/let'")),
+                ref tok => return Err(ParseError {
+                    msg: format!("expected identifier after 'export var/let/const', found {:?}", tok),
+                    span: t.span,
+                }),
             };
             let init = if self.matches(&Tok::Eq) { Some(self.expr()?) } else { None };
-            self.expect(Tok::Semi, "expected ';' after export var/let")?;
+            self.expect(Tok::Semi, "expected ';' after export var/let/const")?;
             toplevel.push(Stmt::Var { name: name.clone(), init });
             self.record_export(&name);
             exports.push(ExportDecl::Var(name));
@@ -934,10 +1131,14 @@ impl<'src> Parser<'src> {
 
         // export * from "path";
         if self.matches(&Tok::Star) {
-            self.expect(Tok::From, "expected 'from'")?;
-            let spec = match self.next().tok {
+            self.expect(Tok::From, "expected 'from' after '*'")?;
+            let t = self.next()?;
+            let spec = match t.tok {
                 Tok::Str(s) => s,
-                _ => return Err(self.err_here("expected string literal after 'from'")),
+                ref tok => return Err(ParseError {
+                    msg: format!("expected string literal after 'from', found {:?}", tok),
+                    span: t.span,
+                }),
             };
             self.expect(Tok::Semi, "expected ';' after export")?;
             exports.push(ExportDecl::AllFrom { specifier: spec });
@@ -947,28 +1148,48 @@ impl<'src> Parser<'src> {
         // export { a, b as c } [from "path"] ;
         if self.matches(&Tok::LBrace) {
             let mut items: Vec<(String, Option<String>)> = Vec::new();
-            if !self.matches(&Tok::RBrace) {
-                loop {
-                    let name = match self.next().tok {
-                        Tok::Ident(s) => s,
-                        _ => return Err(self.err_here("expected exported name")),
-                    };
-                    let alias = if self.matches(&Tok::As) {
-                        match self.next().tok {
-                            Tok::Ident(s) => Some(s),
-                            _ => return Err(self.err_here("expected alias name after 'as'")),
-                        }
-                    } else { None };
-                    items.push((name, alias));
-                    // TODO Record export with the alias
-                    if self.matches(&Tok::RBrace) { break; }
-                    self.expect(Tok::Comma, "expected ',' in export list")?;
+            loop {
+                if self.check(&Tok::RBrace) {
+                    let _ = self.next()?; // consume RBrace
+                    break;
                 }
+                if self.is_eof() {
+                    return Err(self.err_here("unexpected end of file in export list"));
+                }
+                let t = self.next()?;
+                let name = match t.tok {
+                    Tok::Ident(s) => s,
+                    ref tok => return Err(ParseError {
+                        msg: format!("expected exported name (identifier), found {:?}", tok),
+                        span: t.span,
+                    }),
+                };
+                let alias = if self.matches(&Tok::As) {
+                    let t = self.next()?;
+                    match t.tok {
+                        Tok::Ident(s) => Some(s),
+                        ref tok => return Err(ParseError {
+                            msg: format!("expected alias name (identifier) after 'as', found {:?}", tok),
+                            span: t.span,
+                        }),
+                    }
+                } else { None };
+                items.push((name, alias));
+                // TODO Record export with the alias
+                if self.check(&Tok::RBrace) {
+                    let _ = self.next()?; // consume RBrace
+                    break;
+                }
+                self.expect(Tok::Comma, "expected ',' or '}' in export list")?;
             }
             if self.matches(&Tok::From) {
-                let spec = match self.next().tok {
+                let t = self.next()?;
+                let spec = match t.tok {
                     Tok::Str(s) => s,
-                    _ => return Err(self.err_here("expected string literal after 'from'")),
+                    ref tok => return Err(ParseError {
+                        msg: format!("expected string literal after 'from', found {:?}", tok),
+                        span: t.span,
+                    }),
                 };
                 self.expect(Tok::Semi, "expected ';' after export")?;
                 for (exp_name, _) in &items {
@@ -985,18 +1206,22 @@ impl<'src> Parser<'src> {
             return Ok(());
         }
 
-        Err(self.err_here("invalid export form"))
+        Err(self.err_here("invalid export syntax; expected 'async', 'fn', 'function', 'class', 'var', 'let', 'const', '*', or '{'"))
     }
 
     fn parse_fn_param_names(&mut self) -> PResult<Vec<String>> {
-        self.expect(Tok::LParen, "expected '('")?;
+        self.expect(Tok::LParen, "expected '(' for parameters")?;
         self.parse_param_list()
     }
 
     fn parse_method_tail(&mut self) -> PResult<(String, Vec<String>, Block)> {
-        let name = match self.next().tok {
+        let t = self.next()?;
+        let name = match t.tok {
             Tok::Ident(s) => s,
-            _ => return Err(self.err_here("expected method name")),
+            ref tok => return Err(ParseError {
+                msg: format!("expected method name, found {:?}", tok),
+                span: t.span,
+            }),
         };
         self.expect(Tok::LParen, "expected '(' after method name")?;
         let params = self.parse_param_list()?;
@@ -1005,32 +1230,54 @@ impl<'src> Parser<'src> {
     }
 
     fn fn_def_with_async(&mut self, is_async: bool) -> PResult<FuncDecl> {
-        let name = match self.next().tok {
+        let t = self.next()?;
+        let name = match t.tok {
             Tok::Ident(s) => s,
-            _ => return Err(self.err_here("expected function name")),
+            ref tok => return Err(ParseError {
+                msg: format!("expected function name (identifier), found {:?}", tok),
+                span: t.span,
+            }),
         };
         self.expect(Tok::LParen, "expected '(' after function name")?;
         let mut params = Vec::new();
-        if !self.matches(&Tok::RParen) {
-            loop {
-                let ident = match self.next().tok {
-                    Tok::Ident(s) => s,
-                    _ => return Err(self.err_here("expected parameter name")),
-                };
-                params.push(ident);
-                if self.matches(&Tok::RParen) { break; }
-                self.expect(Tok::Comma, "expected ','")?;
+        loop {
+            if self.check(&Tok::RParen) {
+                let _ = self.next()?; // consume RParen
+                break;
             }
+            if self.is_eof() {
+                return Err(self.err_here("unexpected end of file in parameter list"));
+            }
+            let t = self.next()?;
+            let ident = match t.tok {
+                Tok::Ident(s) => s,
+                ref tok => return Err(ParseError {
+                    msg: format!("expected parameter name (identifier), found {:?}", tok),
+                    span: t.span,
+                }),
+            };
+            params.push(ident);
+            if self.check(&Tok::RParen) {
+                let _ = self.next()?; // consume RParen
+                break;
+            }
+            self.expect(Tok::Comma, "expected ',' between parameters")?;
         }
         let body = self.block()?;
         Ok(FuncDecl { fid: FuncId(next_id()), name, params, body, is_async })
     }
 
     fn block(&mut self) -> PResult<Block> {
-        self.expect(Tok::LBrace, "expected '{'")?;
+        self.expect(Tok::LBrace, "expected opening brace for block")?;
         let mut stmts = Vec::new();
-        while !self.matches(&Tok::RBrace) {
-            if self.i >= self.toks.len() { return Err(self.err_here("unclosed block")); }
+        loop {
+            if self.check(&Tok::RBrace) {
+                let _ = self.next()?; // consume RBrace
+                break;
+            }
+            if self.is_eof() {
+                return Err(self.err_here("unexpected end of file; expected closing brace for block"));
+            }
             stmts.push(self.stmt()?);
         }
         Ok(Block { stmts })
@@ -1038,16 +1285,28 @@ impl<'src> Parser<'src> {
 
     fn parse_param_list(&mut self) -> PResult<Vec<String>> {
         let mut params = Vec::new();
-        if !self.matches(&Tok::RParen) {
-            loop {
-                let name = match self.next().tok {
-                    Tok::Ident(s) => s,
-                    _ => return Err(self.err_here("expected parameter name")),
-                };
-                params.push(name);
-                if self.matches(&Tok::RParen) { break; }
-                self.expect(Tok::Comma, "expected ',' in parameter list")?;
+        loop {
+            if self.check(&Tok::RParen) {
+                let _ = self.next()?; // consume RParen
+                break;
             }
+            if self.is_eof() {
+                return Err(self.err_here("unexpected end of file in parameter list"));
+            }
+            let t = self.next()?;
+            let name = match t.tok {
+                Tok::Ident(s) => s,
+                ref tok => return Err(ParseError {
+                    msg: format!("expected parameter name (identifier), found {:?}", tok),
+                    span: t.span,
+                }),
+            };
+            params.push(name);
+            if self.check(&Tok::RParen) {
+                let _ = self.next()?; // consume RParen
+                break;
+            }
+            self.expect(Tok::Comma, "expected ',' in parameter list")?;
         }
         Ok(params)
     }
@@ -1064,28 +1323,32 @@ impl<'src> Parser<'src> {
         }
 
         if self.matches(&Tok::Var) || self.matches(&Tok::Let) || self.matches(&Tok::Const) {
-            let name = match self.next().tok {
+            let t = self.next()?;
+            let name = match t.tok {
                 Tok::Ident(s) => s,
-                _ => return Err(self.err_here("expected identifier after 'var'")),
+                ref tok => return Err(ParseError {
+                    msg: format!("expected identifier after 'var'/'let'/'const', found {:?}", tok),
+                    span: t.span,
+                }),
             };
             let init = if self.matches(&Tok::Eq) { Some(self.expr()?) } else { None };
-            self.expect(Tok::Semi, "expected ';' after var decl")?;
+            self.expect(Tok::Semi, "expected ';' after variable declaration")?;
             Ok(Stmt::Var { name, init })
         } else if self.matches(&Tok::If) {
-            self.expect(Tok::LParen, "expected '('")?;
+            self.expect(Tok::LParen, "expected '(' after 'if'")?;
             let cond = self.expr()?;
-            self.expect(Tok::RParen, "expected ')'")?;
+            self.expect(Tok::RParen, "expected ')' after 'if' condition")?;
             let then_b = self.block()?;
 
             // else { … } | else if (…) { … } | else unless (…) { … }
             let else_b = if self.matches(&Tok::Else) {
                 if self.matches(&Tok::If) || self.matches(&Tok::Unless) {
                     // Was it "else unless"?
-                    let negated = if self.toks[self.i - 1].tok == Tok::Unless { true } else { false };
+                    let negated = if self.toks.get(self.i.saturating_sub(1)).map(|tt| tt.tok == Tok::Unless).unwrap_or(false) { true } else { false };
 
-                    self.expect(Tok::LParen, "expected '('")?;
+                    self.expect(Tok::LParen, "expected '(' after 'else if'/'else unless'")?;
                     let mut cond2 = self.expr()?;
-                    self.expect(Tok::RParen, "expected ')'")?;
+                    self.expect(Tok::RParen, "expected ')' after condition")?;
                     if negated {
                         cond2 = Expr::Unary { op: UnOp::Not, e: SmallBox::new(cond2) };
                     }
@@ -1113,9 +1376,9 @@ impl<'src> Parser<'src> {
             Ok(Stmt::If { cond, then_b, else_b })
         } else if self.matches(&Tok::Unless) {
             // unless (cond) { then } [ else { ... } | else if (...) { ... } | else unless (...) { ... } ]
-            self.expect(Tok::LParen, "expected '('")?;
+            self.expect(Tok::LParen, "expected '(' after 'unless'")?;
             let cond0 = self.expr()?;
-            self.expect(Tok::RParen, "expected ')'")?;
+            self.expect(Tok::RParen, "expected ')' after 'unless' condition")?;
             let cond = Expr::Unary { op: UnOp::Not, e: SmallBox::new(cond0) };
             let then_b = self.block()?;
 
@@ -1123,10 +1386,10 @@ impl<'src> Parser<'src> {
             let else_b = if self.matches(&Tok::Else) {
                 // “else if …” or “else unless …”
                 if self.matches(&Tok::If) || self.matches(&Tok::Unless) {
-                    let was_unless = matches!(self.toks[self.i - 1].tok, Tok::Unless);
-                    self.expect(Tok::LParen, "expected '('")?;
+                    let was_unless = matches!(self.toks.get(self.i.saturating_sub(1)).map(|tt| &tt.tok), Some(Tok::Unless));
+                    self.expect(Tok::LParen, "expected '(' after 'else if'/'else unless'")?;
                     let mut cond2 = self.expr()?;
-                    self.expect(Tok::RParen, "expected ')'")?;
+                    self.expect(Tok::RParen, "expected ')' after condition")?;
                     if was_unless {
                         cond2 = Expr::Unary { op: UnOp::Not, e: SmallBox::new(cond2) };
                     }
@@ -1153,40 +1416,44 @@ impl<'src> Parser<'src> {
 
             Ok(Stmt::If { cond, then_b, else_b })
         } else if self.matches(&Tok::While) {
-            self.expect(Tok::LParen, "expected '('")?;
+            self.expect(Tok::LParen, "expected '(' after 'while'")?;
             let cond = self.expr()?;
-            self.expect(Tok::RParen, "expected ')'")?;
+            self.expect(Tok::RParen, "expected ')' after 'while' condition")?;
             let body = self.block()?;
             Ok(Stmt::While { cond, body })
         } else if self.matches(&Tok::For) {
-            self.expect(Tok::LParen, "expected '('")?;
+            self.expect(Tok::LParen, "expected '(' after 'for'")?;
             let init = if self.matches(&Tok::Semi) {
                 None
             } else if self.matches(&Tok::Var) {
-                let name = match self.next().tok {
+                let t = self.next()?;
+                let name = match t.tok {
                     Tok::Ident(s) => s,
-                    _ => return Err(self.err_here("expected identifier after 'var'")),
+                    ref tok => return Err(ParseError {
+                        msg: format!("expected identifier after 'var' in for init, found {:?}", tok),
+                        span: t.span,
+                    }),
                 };
                 let init_e = if self.matches(&Tok::Eq) { Some(self.expr()?) } else { None };
-                self.expect(Tok::Semi, "expected ';' after init")?;
+                self.expect(Tok::Semi, "expected ';' after for init")?;
                 Some(SmallBox::new(Stmt::Var { name, init: init_e }))
             } else {
                 let e = self.expr()?;
-                self.expect(Tok::Semi, "expected ';' after init")?;
+                self.expect(Tok::Semi, "expected ';' after for init")?;
                 Some(SmallBox::new(Stmt::Expr(e)))
             };
             let cond = if self.matches(&Tok::Semi) {
                 None
             } else {
                 let e = self.expr()?;
-                self.expect(Tok::Semi, "expected ';' after cond")?;
+                self.expect(Tok::Semi, "expected ';' after for condition")?;
                 Some(e)
             };
             let step = if self.matches(&Tok::RParen) {
                 None
             } else {
                 let e = self.expr()?;
-                self.expect(Tok::RParen, "expected ')' after step")?;
+                self.expect(Tok::RParen, "expected ')' after for step")?;
                 Some(e)
             };
             let body = self.block()?;
@@ -1196,18 +1463,23 @@ impl<'src> Parser<'src> {
                 Ok(Stmt::Return(None))
             } else {
                 let e = self.expr()?;
-                self.expect(Tok::Semi, "expected ';' after return")?;
+                self.expect(Tok::Semi, "expected ';' after return expression")?;
                 Ok(Stmt::Return(Some(e)))
             }
         } else {
             let e = self.expr()?;
-            self.expect(Tok::Semi, "expected ';' after expression")?;
+            self.expect(Tok::Semi, "expected ';' after statement")?;
             Ok(Stmt::Expr(e))
         }
     }
 
     // Pratt parser for expressions
-    pub fn expr(&mut self) -> PResult<Expr> { self.parse_assign() }
+    pub fn expr(&mut self) -> PResult<Expr> { 
+        if self.is_eof() {
+            return Err(self.err_here("expected expression"));
+        }
+        self.parse_assign() 
+    }
 
     fn parse_assign(&mut self) -> PResult<Expr> {
         let mut left = self.parse_or()?;
@@ -1237,7 +1509,7 @@ impl<'src> Parser<'src> {
                     let index_expr = (*index).clone();
                     LValue::Index { recv: recv_expr, index: index_expr }
                 }
-                _ => return Err(self.err_here("invalid assignment target")),
+                _ => return Err(self.err_here("invalid left-hand side in assignment; expected identifier, property access, or index")),
             };
 
             // Parse the RHS (right-associative)
@@ -1366,23 +1638,35 @@ impl<'src> Parser<'src> {
         loop {
             if self.matches(&Tok::LParen) {
                 let mut args = Vec::new();
-                if !self.matches(&Tok::RParen) {
-                    loop {
-                        args.push(self.expr()?);
-                        if self.matches(&Tok::RParen) { break; }
-                        self.expect(Tok::Comma, "expected ',' in argument list")?;
+                loop {
+                    if self.check(&Tok::RParen) {
+                        let _ = self.next()?; // consume RParen
+                        break;
                     }
+                    if self.is_eof() {
+                        return Err(self.err_here("unexpected end of file in argument list"));
+                    }
+                    args.push(self.expr()?);
+                    if self.check(&Tok::RParen) {
+                        let _ = self.next()?; // consume RParen
+                        break;
+                    }
+                    self.expect(Tok::Comma, "expected ',' in argument list")?;
                 }
                 e = Expr::Call { callee: SmallBox::new(e), args };
             } else if self.matches(&Tok::Dot) {
-                let name = match self.next().tok {
+                let t = self.next()?;
+                let name = match t.tok {
                     Tok::Ident(s) => s,
-                    _ => return Err(self.err_here("expected identifier after '.'")),
+                    ref tok => return Err(ParseError {
+                        msg: format!("expected identifier after '.', found {:?}", tok),
+                        span: t.span,
+                    }),
                 };
                 e = Expr::GetProp { recv: SmallBox::new(e), name };
             } else if self.matches(&Tok::LBracket) {
                 let idx = self.expr()?;
-                self.expect(Tok::RBracket, "expected ']'")?;
+                self.expect(Tok::RBracket, "expected ']' after index")?;
                 e = Expr::Index { recv: SmallBox::new(e), index: SmallBox::new(idx) };
             } else {
                 break;
@@ -1390,8 +1674,11 @@ impl<'src> Parser<'src> {
         }
         Ok(e)
     }
-    fn parse_primary(&mut self) -> PResult<Expr> {
-        let t = self.next();
+    fn parse_primary(&mut self) -> PResult<Expr> { 
+        if self.is_eof() {
+            return Err(self.err_here("expected primary expression"));
+        }
+        let t = self.next()?;
         match t.tok {
             Tok::This  => Ok(Expr::This),
 
@@ -1400,40 +1687,64 @@ impl<'src> Parser<'src> {
                     // super(...)
                     self.i += 1; // consume '('
                     let mut args = Vec::new();
-                    if !self.matches(&Tok::RParen) {
-                        loop {
-                            args.push(self.expr()?);
-                            if self.matches(&Tok::RParen) { break; }
-                            self.expect(Tok::Comma, "expected ',' in super(...)")?;
+                    loop {
+                        if self.check(&Tok::RParen) {
+                            let _ = self.next()?; // consume RParen
+                            break;
                         }
+                        if self.is_eof() {
+                            return Err(self.err_here("unexpected end of file in super call"));
+                        }
+                        args.push(self.expr()?);
+                        if self.check(&Tok::RParen) {
+                            let _ = self.next()?; // consume RParen
+                            break;
+                        }
+                        self.expect(Tok::Comma, "expected ',' in super call arguments")?;
                     }
                     Ok(Expr::SuperCall(args))
                 } else if self.matches(&Tok::Dot) {
                     // super.name
-                    let name = match self.next().tok {
+                    let t = self.next()?;
+                    let name = match t.tok {
                         Tok::Ident(s) => s,
-                        _ => return Err(self.err_here("expected identifier after 'super.'")),
+                        ref tok => return Err(ParseError {
+                            msg: format!("expected identifier after 'super.', found {:?}", tok),
+                            span: t.span,
+                        }),
                     };
                     Ok(Expr::SuperProp(name))
                 } else {
-                    Err(self.err_here("`super` must be used as `super(...)` or `super.name`"))
+                    Err(self.err_here("expected '(' for super call or '.' for super property after 'super'"))
                 }
             }
 
             Tok::New => {
                 // new <Ident>(args...)
-                let class = match self.next().tok {
+                let t = self.next()?;
+                let class = match t.tok {
                     Tok::Ident(s) => s,
-                    _ => return Err(self.err_here("expected class name after 'new'")),
+                    ref tok => return Err(ParseError {
+                        msg: format!("expected class name (identifier) after 'new', found {:?}", tok),
+                        span: t.span,
+                    }),
                 };
-                self.expect(Tok::LParen, "expected '(' after class name")?;
+                self.expect(Tok::LParen, "expected '(' after class name in new expression")?;
                 let mut args = Vec::new();
-                if !self.matches(&Tok::RParen) {
-                    loop {
-                        args.push(self.expr()?);
-                        if self.matches(&Tok::RParen) { break; }
-                        self.expect(Tok::Comma, "expected ',' in argument list")?;
+                loop {
+                    if self.check(&Tok::RParen) {
+                        let _ = self.next()?; // consume RParen
+                        break;
                     }
+                    if self.is_eof() {
+                        return Err(self.err_here("unexpected end of file in new arguments"));
+                    }
+                    args.push(self.expr()?);
+                    if self.check(&Tok::RParen) {
+                        let _ = self.next()?; // consume RParen
+                        break;
+                    }
+                    self.expect(Tok::Comma, "expected ',' in new arguments")?;
                 }
                 Ok(Expr::New { class, args })
             }
@@ -1450,19 +1761,30 @@ impl<'src> Parser<'src> {
             Tok::DeferredBuiltin => Ok(Expr::Ident("Deferred".into())),
             Tok::LParen => {
                 let e = self.expr()?;
-                self.expect(Tok::RParen, "expected ')'")?;
+                self.expect(Tok::RParen, "expected ')' to close grouped expression")?;
                 Ok(Expr::Group(SmallBox::new(e)))
             }
             Tok::LBracket => {
                 let mut elems = Vec::new();
-                if !self.matches(&Tok::RBracket) {
-                    loop {
-                        elems.push(self.expr()?);
-                        // ] ends the literal
-                        if self.matches(&Tok::RBracket) { break; }
-                        // expect comma; allow trailing comma
-                        self.expect(Tok::Comma, "expected ',' in array literal")?;
-                        if self.matches(&Tok::RBracket) { break; }
+                loop {
+                    if self.check(&Tok::RBracket) {
+                        let _ = self.next()?; // consume RBracket
+                        break;
+                    }
+                    if self.is_eof() {
+                        return Err(self.err_here("unexpected end of file in array literal"));
+                    }
+                    elems.push(self.expr()?);
+                    // ] ends the literal
+                    if self.check(&Tok::RBracket) {
+                        let _ = self.next()?; // consume RBracket
+                        break;
+                    }
+                    // expect comma; allow trailing comma
+                    self.expect(Tok::Comma, "expected ',' in array literal")?;
+                    if self.check(&Tok::RBracket) {
+                        let _ = self.next()?; // consume RBracket
+                        break;
                     }
                 }
                 Ok(Expr::ArrayLit(elems))
@@ -1478,16 +1800,28 @@ impl<'src> Parser<'src> {
             Tok::Pipe => {
                 // parse `|x, y|`
                 let mut params = Vec::new();
-                if !self.matches(&Tok::Pipe) {
-                    loop {
-                        let name = match self.next().tok {
-                            Tok::Ident(s) => s,
-                            _ => return Err(self.err_here("expected parameter name")),
-                        };
-                        params.push(name);
-                        if self.matches(&Tok::Pipe) { break; }
-                        self.expect(Tok::Comma, "expected ',' in lambda params")?;
+                loop {
+                    if self.check(&Tok::Pipe) {
+                        let _ = self.next()?; // consume closing Pipe
+                        break;
                     }
+                    if self.is_eof() {
+                        return Err(self.err_here("unexpected end of file in lambda parameters"));
+                    }
+                    let t = self.next()?;
+                    let name = match t.tok {
+                        Tok::Ident(s) => s,
+                        ref tok => return Err(ParseError {
+                            msg: format!("expected parameter name (identifier) in lambda, found {:?}", tok),
+                            span: t.span,
+                        }),
+                    };
+                    params.push(name);
+                    if self.check(&Tok::Pipe) {
+                        let _ = self.next()?; // consume closing Pipe
+                        break;
+                    }
+                    self.expect(Tok::Comma, "expected ',' in lambda params")?;
                 }
                 // body: either { block } or a single expression (implicitly returned)
                 if self.check(&Tok::LBrace) {
@@ -1502,22 +1836,36 @@ impl<'src> Parser<'src> {
             }
             Tok::LBrace => self.parse_object_literal(),
             Tok::Delete => self.parse_delete(),
-            _ => Err(ParseError { msg: "unexpected token".into(), span: t.span }),
+            ref tok => Err(ParseError {
+                msg: format!("unexpected token {:?}, expected literal, identifier, 'this', 'super', 'new', '(', '[', '{{', 'fn', 'function', '|', or 'delete'", tok),
+                span: t.span,
+            }),
         }
     }
 
     fn parse_listen_stmt(&mut self) -> PResult<Stmt> {
         // consume 'listen'
-        let _ = self.next(); // Ident("listen")
+        let _ = self.next()?; // Ident("listen")
         // "addr"
-        let addr = match self.next().tok {
+        let t = self.next()?;
+        let addr = match t.tok {
             Tok::Str(s) => s,
-            _ => return Err(self.err_here("expected string address after 'listen'")),
+            ref tok => return Err(ParseError {
+                msg: format!("expected string literal for address after 'listen', found {:?}", tok),
+                span: t.span,
+            }),
         };
         // body
         self.expect(Tok::LBrace, "expected '{' after listen address")?;
         let mut routes = Vec::new();
-        while !self.matches(&Tok::RBrace) {
+        loop {
+            if self.check(&Tok::RBrace) {
+                let _ = self.next()?; // consume RBrace
+                break;
+            }
+            if self.is_eof() {
+                return Err(self.err_here("unexpected end of file in listen block"));
+            }
             routes.push(self.parse_route_decl()?);
         }
         Ok(Stmt::Listen(ListenDecl { addr, routes }))
@@ -1526,26 +1874,38 @@ impl<'src> Parser<'src> {
     fn parse_route_decl(&mut self) -> PResult<RouteDecl> {
         // route "METHOD" [pattern] (params) => { body } ;
         if !self.matches_ident("route") {
-            return Err(self.err_here("expected 'route'"));
+            return Err(self.err_here("expected 'route' keyword"));
         }
 
         // "METHOD" (accept also bare Ident for convenience)
-        let method = match self.next().tok {
+        let t = self.next()?;
+        let method = match t.tok {
             Tok::Str(s) => s,
             Tok::Ident(s) => s, // allow: route GET [...]
-            _ => return Err(self.err_here("expected HTTP method (string or identifier)")),
+            ref tok => return Err(ParseError {
+                msg: format!("expected HTTP method (string literal or identifier), found {:?}", tok),
+                span: t.span,
+            }),
         };
 
         // [ pattern parts ]  -- we parse a general array expression to keep it flexible
-        self.expect(Tok::LBracket, "expected '[' after method")?;
+        self.expect(Tok::LBracket, "expected '[' after route method")?;
         let mut elems = Vec::new();
-        if !self.matches(&Tok::RBracket) {
-            loop {
-                // keep it general: any expression (usually "literal" strings like "/","users",":id")
-                elems.push(self.expr()?);
-                if self.matches(&Tok::RBracket) { break; }
-                self.expect(Tok::Comma, "expected ',' in route pattern")?;
+        loop {
+            if self.check(&Tok::RBracket) {
+                let _ = self.next()?; // consume RBracket
+                break;
             }
+            if self.is_eof() {
+                return Err(self.err_here("unexpected end of file in route pattern"));
+            }
+            // keep it general: any expression (usually "literal" strings like "/","users",":id")
+            elems.push(self.expr()?);
+            if self.check(&Tok::RBracket) {
+                let _ = self.next()?; // consume RBracket
+                break;
+            }
+            self.expect(Tok::Comma, "expected ',' in route pattern")?;
         }
         let pattern_expr = Expr::ArrayLit(elems);
 
@@ -1554,8 +1914,8 @@ impl<'src> Parser<'src> {
         let params = self.parse_param_list()?;
 
         // =>
-        self.expect(Tok::Eq, "expected '=>' after params (first '=')")?;
-        self.expect(Tok::Gt, "expected '=>' after params (second '>')")?;
+        self.expect(Tok::Eq, "expected '=' in '=>' after params")?;
+        self.expect(Tok::Gt, "expected '>' in '=>' after params")?;
 
         // body: block or single expression (we'll allow both; single expr becomes 'return expr;')
         let handler_body = if self.check(&Tok::LBrace) {
@@ -1567,7 +1927,7 @@ impl<'src> Parser<'src> {
         };
 
         // optional ';' after a block is allowed by your grammar, require it for consistency
-        self.expect(Tok::Semi, "expected ';' after route")?;
+        self.expect(Tok::Semi, "expected ';' after route declaration")?;
 
         let handler = Expr::FnLit { params, body: handler_body };
         Ok(RouteDecl { method, pattern: pattern_expr, handler })
@@ -1575,37 +1935,57 @@ impl<'src> Parser<'src> {
 
     // Parse an object literal: { a: 1, "b": 2, c: x+y }
     fn parse_object_literal(&mut self) -> PResult<Expr> {
-        // self.expect(Tok::LBrace, "expected '{'")?; // already consumed
+        // already consumed LBrace
         let mut props = Vec::new();
+        let mut seen_keys = HashSet::new(); // to detect duplicates
 
-        if !self.check(&Tok::RBrace) {
-            loop {
-                // key: Ident | Str
-                let key = match &self.peek().tok {
-                    Tok::Ident(s) => {
-                        let s = if let Tok::Ident(s) = self.next().tok { s } else { unreachable!() };
-                        PropKey::Ident(s)
-                    }
-                    Tok::Str(_) => {
-                        let s = if let Tok::Str(s) = self.next().tok { s } else { unreachable!() };
-                        PropKey::Str(s)
-                    }
-                    _ => return Err(self.err_here("expected property name (identifier or string)")),
-                };
-
-                self.expect(Tok::Colon, "expected ':' after property name")?;
-                let value = self.expr()?;
-                props.push((key, value));
-
-                if self.matches(&Tok::Comma) {
-                    if self.matches(&Tok::RBrace) { break; } // trailing comma
-                    continue;
-                }
+        loop {
+            if self.check(&Tok::RBrace) {
+                let _ = self.next()?; // consume RBrace
                 break;
             }
+            if self.is_eof() {
+                return Err(self.err_here("unexpected end of file in object literal"));
+            }
+
+            // key: Ident | Str
+            let key = {
+                let tok_opt = self.peek().as_ref().map(|p| p.tok.clone());
+                if let Some(tok) = tok_opt {
+                    self.next()?; // consume after borrow ends
+                    match tok {
+                        Tok::Ident(s) => {
+                            if seen_keys.contains(&s) {
+                                return Err(self.err_here(&format!("duplicate key '{}' in object literal", s)));
+                            }
+                            seen_keys.insert(s.clone());
+                            PropKey::Ident(s)
+                        },
+                        Tok::Str(s) => {
+                            if seen_keys.contains(&s) {
+                                return Err(self.err_here(&format!("duplicate key \"{}\" in object literal", s)));
+                            }
+                            seen_keys.insert(s.clone());
+                            PropKey::Str(s)
+                        },
+                        _ => return Err(self.err_here("expected property name (identifier or string literal) in object literal")),
+                    }
+                } else {
+                    return Err(self.err_here("unexpected end of file; expected property name in object literal"));
+                }
+            };
+
+            self.expect(Tok::Colon, "expected ':' after property key")?;
+            let value = self.expr()?;
+            props.push((key, value));
+
+            if self.check(&Tok::RBrace) {
+                let _ = self.next()?; // consume RBrace
+                break;
+            }
+            self.expect(Tok::Comma, "expected ',' after property")?;
         }
 
-        self.expect(Tok::RBrace, "expected '}' to close object literal")?;
         Ok(Expr::ObjLit(props))
     }
 
@@ -1616,39 +1996,38 @@ impl<'src> Parser<'src> {
 
         if self.matches(&Tok::Dot) {
             // delete obj.ident
-            let name = match self.next().tok {
+            let t = self.next()?;
+            let name = match t.tok {
                 Tok::Ident(s) => s,
-                _ => return Err(self.err_here("expected identifier after '.' in delete")),
+                ref tok => return Err(ParseError {
+                    msg: format!("expected identifier after '.' in delete, found {:?}", tok),
+                    span: t.span,
+                }),
             };
             return Ok(Expr::DeleteProp { obj: SmallBox::new(recv), key: PropKey::Ident(name) });
         }
 
         if self.matches(&Tok::LBracket) {
-            match &self.peek().tok {
-                Tok::Str(_) => {
-                    let s = if let Tok::Str(s) = self.next().tok { s } else { unreachable!() };
-                    self.expect(Tok::RBracket, "expected ']'")?;
-                    return Ok(Expr::DeleteProp { obj: SmallBox::new(recv), key: PropKey::Str(s) });
-                }
-                Tok::Ident(_) => {
-                    let name = if let Tok::Ident(s) = self.next().tok { s } else { unreachable!() };
-                    self.expect(Tok::RBracket, "expected ']'")?;
-                    return Ok(Expr::DeleteProp { obj: SmallBox::new(recv), key: PropKey::Ident(name) });
-                }
-                _ => {
-                    // general: delete obj[expr]  (keep MVP behavior per your comment)
-                    let idx = self.expr()?;
-                    self.expect(Tok::RBracket, "expected ']'")?;
-                    return Ok(Expr::Unary {
-                        op: UnOp::Pos,
-                        e: SmallBox::new(Expr::Index { recv: SmallBox::new(recv), index: SmallBox::new(idx) }),
-                    });
-                }
+            let key_opt = self.peek().as_ref().and_then(|p| match &p.tok {
+                Tok::Str(s) => Some(PropKey::Str(s.clone())),
+                Tok::Ident(s) => Some(PropKey::Ident(s.clone())),
+                _ => None,
+            });
+
+            if let Some(key) = key_opt {
+                self.next()?; // consume key
+                self.expect(Tok::RBracket, "expected ']' after key in delete")?;
+                return Ok(Expr::DeleteProp { obj: SmallBox::new(recv), key });
+            } else {
+                // general: delete obj[expr]
+                let index = self.expr()?;
+                self.expect(Tok::RBracket, "expected ']' after index in delete")?;
+                return Ok(Expr::DeleteIndex { obj: SmallBox::new(recv), index: SmallBox::new(index) });
             }
         }
 
         Err(self.err_here("delete expects a property access (obj.x or obj[...])"))
-}
+    }
 }
 
 fn lvalue_to_expr(lv: &LValue) -> Expr {
