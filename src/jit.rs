@@ -1,5 +1,5 @@
 // src/jit.rs
-//! jit.rs — Cranelift JIT for WIR/Napalm (Cranelift 0.123.x compatible)
+//! jit.rs — Cranelift JIT for WIR/Napalm (Cranelift 0.121.x compatible)
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 #![allow(unused_unsafe)]
@@ -1071,141 +1071,56 @@ impl JIT {
                         }
 
                         Inst::CallClosure { fun: fun_val, args, .. } => {
-                            use cranelift::prelude::{types, IntCC, MemFlags, StackSlotKind, StackSlotData};
+                            use cranelift::prelude::{AbiParam, types, MemFlags};
 
                             let ptr_ty = self.ptr_ty();
 
-                            // 1) Signature for the indirect call: (argv*, argc) -> i64
-                            let mut sig = self.module.make_signature();
-                            sig.call_conv = self.module.isa().default_call_conv();
-                            sig.params.push(AbiParam::new(ptr_ty));
-                            sig.params.push(AbiParam::new(types::I64));
-                            sig.returns.push(AbiParam::new(types::I64));
-                            let sigref = fb.import_signature(sig);
-
-                            let clo = vmap.get_or_emit(*fun_val, &mut fb, args_base, fun_ir);
-
-                            let zero = fb.ins().iconst(types::I64, 0);
-                            let one = fb.ins().iconst(types::I64, 1);
-
-                            let is_imm_cond = fb.ins().band_imm(clo, 1);
-
-                            let bb_imm = fb.create_block();
-                            let bb_heap = fb.create_block();
-                            let bb_join = fb.create_block();
-                            let bb_trap = fb.create_block();
-
-                            fb.ins().brif(is_imm_cond, bb_imm, &[], bb_heap, &[]);
-
-                            // Imm case: clo is SMI(fid), no env, code_ptr = resolve(fid)
-                            fb.switch_to_block(bb_imm);
-                            let fid = fb.ins().sshr_imm(clo, 1);
-                            let code_ptr_imm = self.call_import(
+                            // 1) Allocate argv on the heap so it's naturally 8-byte aligned for i64
+                            let n_i64 = fb.ins().iconst(types::I64, args.len() as i64);
+                            let argv  = self.call_import(
                                 &mut fb,
-                                "wir_resolve_funptr",
+                                "wir_alloc_words",
                                 |s| {
-                                    s.params.push(AbiParam::new(types::I64));
-                                    s.returns.push(AbiParam::new(ptr_ty));
+                                    s.params.push (AbiParam::new(types::I64));   // n
+                                    s.returns.push(AbiParam::new(ptr_ty));      // *mut i64
                                 },
-                                &[fid],
+                                &[n_i64],
                             )?;
-                            let prepend_imm = zero;
-                            let env_val_imm = zero; // dummy
-                            fb.ins().jump(bb_join, &[BlockArg::from(code_ptr_imm), BlockArg::from(prepend_imm), BlockArg::from(env_val_imm)]);
 
-                            // Heap case: check tag == TAG_CLOSURE
-                            fb.switch_to_block(bb_heap);
-                            let tag_offset = 0; // assume ObjHeader.tag at offset 0
-                            let tag = fb.ins().load(types::I8, MemFlags::trusted(), clo, tag_offset as i32);
-                            let expected_tag = fb.ins().iconst(types::I8, crate::value::TAG_CLOSURE as i64);
-                            let is_clo = fb.ins().icmp(IntCC::Equal, tag, expected_tag);
-                            let bb_clo_cont = fb.create_block();
-                            fb.ins().brif(is_clo, bb_clo_cont, &[], bb_trap, &[]);
-
-                            fb.switch_to_block(bb_trap);
-                            fb.ins().trap(TrapCode::unwrap_user(0xE2)); // custom trap for not closure
-
-                            fb.switch_to_block(bb_clo_cont);
-
-                            // Load code_ptr
-                            let code_offset = 8; // assume after hdr (8 bytes aligned?)
-                            let code_ptr_heap = fb.ins().load(ptr_ty, MemFlags::trusted(), clo, code_offset as i32);
-
-                            // Load env_len
-                            let env_len_offset = 16; // after hdr + code_ptr
-                            let env_len = fb.ins().load(types::I64, MemFlags::trusted(), clo, env_len_offset as i32);
-
-                            // Check env_len == 0 or 1
-                            let is_one = fb.ins().icmp(IntCC::Equal, env_len, one);
-                            let is_zero = fb.ins().icmp(IntCC::Equal, env_len, zero);
-                            let is_valid = fb.ins().bor(is_one, is_zero);
-
-                            let bb_valid = fb.create_block();
-                            fb.ins().brif(is_valid, bb_valid, &[], bb_trap, &[]);
-
-                            fb.switch_to_block(bb_valid);
-
-                            // Branch on is_one for loading env
-                            let bb_one = fb.create_block();
-                            let bb_zero = fb.create_block();
-                            let bb_env_join = fb.create_block();
-                            fb.ins().brif(is_one, bb_one, &[], bb_zero, &[]);
-
-                            fb.switch_to_block(bb_one);
-                            let env_offset = 24; // after hdr + code + env_len
-                            let env_val_loaded = fb.ins().load(types::I64, MemFlags::trusted(), clo, env_offset as i32);
-                            fb.ins().jump(bb_env_join, &[BlockArg::from(one), BlockArg::from(env_val_loaded)]);
-
-                            fb.switch_to_block(bb_zero);
-                            fb.ins().jump(bb_env_join, &[BlockArg::from(zero), BlockArg::from(zero)]);
-
-                            fb.switch_to_block(bb_env_join);
-                            let prepend_heap = fb.block_params(bb_env_join)[0];
-                            let env_val_heap = fb.block_params(bb_env_join)[1];
-
-                            fb.ins().jump(bb_join, &[BlockArg::from(code_ptr_heap), BlockArg::from(prepend_heap), BlockArg::from(env_val_heap)]);
-
-                            // Join: phi code_ptr, prepend, env_val
-                            fb.switch_to_block(bb_join);
-                            let code_ptr = fb.block_params(bb_join)[0];
-                            let prepend = fb.block_params(bb_join)[1];
-                            let env_val = fb.block_params(bb_join)[2];
-
-                            // Allocate argv on stack: total = prepend + args.len(), but fixed max size
-                            let arg_count = args.len();
-                            let max_slots = arg_count + 1;
-                            let slot_size = (max_slots * 8) as u32;
-                            let ss_data = StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 3); // align_shift 3 for 8-byte
-                            let ss = fb.create_sized_stack_slot(ss_data);
-                            let base = fb.ins().stack_addr(ptr_ty, ss, 0);
-
-                            // Store prepend env if needed
-                            let bb_prepend = fb.create_block();
-                            let bb_after = fb.create_block();
-                            fb.ins().brif(prepend, bb_prepend, &[], bb_after, &[]);
-
-                            fb.switch_to_block(bb_prepend);
-                            fb.ins().store(MemFlags::trusted(), env_val, base, 0);
-                            fb.ins().jump(bb_after, &[]);
-
-                            fb.switch_to_block(bb_after);
-
-                            // Store user args at offset prepend * 8 + i*8
-                            let prepend_bytes = fb.ins().imul_imm(prepend, 8);
-                            for (i, &a) in args.iter().enumerate() {
-                                let v = vmap.get_or_emit(a, &mut fb, args_base, fun_ir);
-                                let off = fb.ins().iconst(types::I64, (i as i64) * 8);
-                                let user_off = fb.ins().iadd(prepend_bytes, off);
-                                let addr = fb.ins().iadd(base, user_off);
+                            // 2) Store each argument at argv + i*8
+                            for (i, a) in args.iter().enumerate() {
+                                let v    = vmap.get_or_emit(*a, &mut fb, args_base, fun_ir);
+                                let addr = fb.ins().iadd_imm(argv, (i as i64) * 8);
                                 fb.ins().store(MemFlags::trusted(), v, addr, 0);
                             }
 
-                            let iconst = fb.ins().iconst(types::I64, arg_count as i64);
-                            let total_count = fb.ins().iadd(prepend, iconst);
+                            // 3) Call the runtime trampoline (it will prepend env internally)
+                            let clo_ptr = vmap.get_or_emit(*fun_val, &mut fb, args_base, fun_ir);
+                            let argc    = n_i64; // same as args.len()
 
-                            // Call indirect
-                            let call = fb.ins().call_indirect(sigref, code_ptr, &[base, total_count]);
-                            let out = fb.inst_results(call)[0];
+                            let out = self.call_import(
+                                &mut fb,
+                                "wir_call_closure",
+                                |s| {
+                                    s.params.push (AbiParam::new(types::I64));   // closure pointer (i64)
+                                    s.params.push (AbiParam::new(ptr_ty));       // argv*
+                                    s.params.push (AbiParam::new(types::I64));   // argc
+                                    s.returns.push(AbiParam::new(types::I64));  // result
+                                },
+                                &[clo_ptr, argv, argc],
+                            )?;
+
+                            // Free argv (no-op under GC build; real free in non-GC build).
+                            let _ = self.call_import(
+                                &mut fb,
+                                "wir_free_words",
+                                |s| {
+                                    s.params.push (AbiParam::new(ptr_ty));
+                                    s.params.push (AbiParam::new(types::I64));
+                                    s.returns.push(AbiParam::new(types::I64));
+                                },
+                                &[argv, argc],
+                            )?;
 
                             if res_count >= 1 {
                                 vmap.bind(node.results[0], out);
@@ -1243,12 +1158,12 @@ impl JIT {
                         }
 
                         // ---------------- Direct calls ----------------
-                        Inst::CallDirect { callee, args: args, .. } => {
-                            use cranelift::prelude::{types, MemFlags, StackSlotKind, StackSlotData};
+                        Inst::CallDirect { callee, args, .. } => {
+                            use cranelift::prelude::{AbiParam, types, MemFlags};
 
                             let ptr_ty = self.ptr_ty();
 
-                            // Signature for indirect call
+                            // Build (argv*, argc) -> i64 signature
                             let mut sig = self.module.make_signature();
                             sig.call_conv = self.module.isa().default_call_conv();
                             sig.params.push(AbiParam::new(ptr_ty));
@@ -1256,34 +1171,39 @@ impl JIT {
                             sig.returns.push(AbiParam::new(types::I64));
                             let sigref = fb.import_signature(sig);
 
-                            // Allocate argv on stack
-                            let arg_count = args.len();
-                            let slot_size = (arg_count * 8) as u32;
-                            let ss_data = StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 3);
-                            let ss = fb.create_sized_stack_slot(ss_data);
-                            let base = fb.ins().stack_addr(ptr_ty, ss, 0);
-
-                            // Store args
-                            for (i, &a) in args.iter().enumerate() {
-                                let v = vmap.get_or_emit(a, &mut fb, args_base, fun_ir);
-                                let off = fb.ins().iconst(types::I64, (i as i64) * 8);
-                                let addr = fb.ins().iadd(base, off);
+                            // argv on heap
+                            let argc_i64 = fb.ins().iconst(types::I64, args.len() as i64);
+                            let argv_ptr = self.call_import(&mut fb, "wir_alloc_words",
+                                |s| { s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(ptr_ty)); },
+                                &[argc_i64],
+                            )?;
+                            for (i, a) in args.iter().enumerate() {
+                                let v    = vmap.get_or_emit(*a, &mut fb, args_base, fun_ir);
+                                let addr = fb.ins().iadd_imm(argv_ptr, (i as i64) * 8);
                                 fb.ins().store(MemFlags::trusted(), v, addr, 0);
                             }
 
-                            let argc = fb.ins().iconst(types::I64, arg_count as i64);
+                            // resolve -> call_indirect
+                            let fid_v  = fb.ins().iconst(types::I64, callee.0 as i64);
+                            let fptr   = self.call_import(&mut fb, "wir_resolve_funptr",
+                                |s| { s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(ptr_ty)); },
+                                &[fid_v],
+                            )?;
+                            let call   = fb.ins().call_indirect(sigref, fptr, &[argv_ptr, argc_i64]);
+                            let outs   = fb.inst_results(call).to_vec();
 
-                            // Resolve and call indirect
-                            let fptr = self.funptr_ptr(&mut fb, *callee);
-                            let call = fb.ins().call_indirect(sigref, fptr, &[base, argc]);
-                            let outs = fb.inst_results(call).to_vec();
+                            // free argv
+                            let _ = self.call_import(&mut fb, "wir_free_words",
+                                |s| { s.params.push(AbiParam::new(ptr_ty)); s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(types::I64)); },
+                                &[argv_ptr, argc_i64],
+                            )?;
 
                             if res_count >= 1 { vmap.bind(node.results[0], outs[0]); }
                         }
 
                         // Engine has the ability to memoize functions, it is implemented natively
-                        Inst::CallDirectMemoized { callee, args: args } => {
-                            use cranelift::prelude::{AbiParam, types, IntCC, MemFlags, StackSlotKind, StackSlotData};
+                        Inst::CallDirectMemoized { callee, args } => {
+                            use cranelift::prelude::{AbiParam, types, IntCC, MemFlags};
                             use cranelift_module::Linkage;
 
                             let arity = args.len();
@@ -1355,10 +1275,11 @@ impl JIT {
                             let res_phi = fb.append_block_param(bb_join, types::I64);
 
                             let is_hit = fb.ins().icmp(IntCC::NotEqual, found, zero);
+                            use cranelift::codegen::ir::instructions::BlockArg;
                             fb.ins().brif(
                                 is_hit,
-                                bb_hit,  &[],
-                                bb_miss, &[],
+                                bb_hit,  &[] as &[BlockArg],
+                                bb_miss, &[] as &[BlockArg],
                             );
 
                             // HIT: load cached, free temp buffer, jump join
@@ -1369,21 +1290,21 @@ impl JIT {
                                 s.params.push(AbiParam::new(types::I64)); // n
                                 s.returns.push(AbiParam::new(types::I64));
                             }, &[out_ptr, one])?;
-                            fb.ins().jump(bb_join, &[BlockArg::from(cached)]);
+                            let hit_args = [BlockArg::from(cached)];
+                            fb.ins().jump(bb_join, &hit_args);
 
-                            // MISS: normal CallDirect via stack argv, memoize, free, jump join
+                            // MISS: normal CallDirect via heap argv, memoize, free, jump join
                             fb.switch_to_block(bb_miss);
 
-                            // Marshal argv on STACK
+                            // Marshal argv on HEAP (aligned)
                             let argc_i64 = fb.ins().iconst(types::I64, arity as i64);
-                            let slot_size = (arity * 8) as u32;
-                            let ss_data = StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 3);
-                            let ss = fb.create_sized_stack_slot(ss_data);
-                            let base = fb.ins().stack_addr(ptr_ty, ss, 0);
-
+                            let argv_ptr = self.call_import(
+                                &mut fb, "wir_alloc_words",
+                                |s| { s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(ptr_ty)); },
+                                &[argc_i64],
+                            )?;
                             for (i, &kv) in keys.iter().enumerate() {
-                                let off = fb.ins().iconst(types::I64, (i as i64) * 8);
-                                let addr = fb.ins().iadd(base, off);
+                                let addr = fb.ins().iadd_imm(argv_ptr, (i as i64) * 8);
                                 fb.ins().store(MemFlags::trusted(), kv, addr, 0);
                             }
 
@@ -1399,8 +1320,15 @@ impl JIT {
                                 s.params.push(AbiParam::new(ptr_ty));
                                 s.params.push(AbiParam::new(types::I64));
                                 s.returns.push(AbiParam::new(types::I64));
-                            }, &[base, argc_i64])?;
+                            }, &[argv_ptr, argc_i64])?;
                             let retv = outs[0];
+
+                            // free argv
+                            let _ = self.call_import(&mut fb, "wir_free_words", |s| {
+                                s.params.push(AbiParam::new(ptr_ty));
+                                s.params.push(AbiParam::new(types::I64));
+                                s.returns.push(AbiParam::new(types::I64));
+                            }, &[argv_ptr, argc_i64])?;
 
                             // memo put
                             let fid2 = fb.ins().iconst(types::I64, callee.0 as i64);
@@ -1430,7 +1358,8 @@ impl JIT {
                             }
 
                             // return path
-                            fb.ins().jump(bb_join, &[BlockArg::from(retv)]);
+                            let miss_args = [BlockArg::from(retv)];
+                            fb.ins().jump(bb_join, &miss_args);
 
                             fb.switch_to_block(bb_join);
                             if res_count >= 1 { vmap.bind(node.results[0], res_phi); }
@@ -1454,10 +1383,11 @@ impl JIT {
                             let ci64 = vmap.get_or_emit(*cond, &mut fb, args_base, fun);
                             let z    = fb.ins().iconst(types::I64, 0);
                             let cb1  = fb.ins().icmp(IntCC::NotEqual, ci64, z);
+                            use cranelift::codegen::ir::instructions::BlockArg;
                             fb.ins().brif(
                                 cb1,
-                                clif_of[then_b.0 as usize], &[],
-                                clif_of[else_b.0 as usize], &[],
+                                clif_of[then_b.0 as usize], &[] as &[BlockArg],
+                                clif_of[else_b.0 as usize], &[] as &[BlockArg],
                             );
                             block_terminated = true;
                         }
@@ -1644,7 +1574,7 @@ impl JIT {
 
                             let cont = fb.create_block();
                             let bad  = fb.create_block();
-                            fb.ins().brif(ok, cont, &[], bad, &[]);
+                            fb.ins().brif(ok, cont, &[] as &[BlockArg], bad, &[] as &[BlockArg]);
 
                             fb.switch_to_block(bad);
                             fb.ins().trap(TrapCode::unwrap_user(0xE1));

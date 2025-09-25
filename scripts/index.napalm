@@ -3,9 +3,205 @@
 print("===== Hello World =====");
 print("Hello, World!"); // expect Hello, World!
 
+// Timer (2)
+setTimeout(fn () { print("Timer (2)"); }, 1000);
+
 print("===== Simple function =====");
 fn add2(a, b) {
     return a + b;
 }
 
 print(add2(2, 3)); // expect 5
+
+print("===== Recursive function =====");
+fn fibonacci(n) {
+    if (n <= 1) {
+        return n;
+    }
+    return fibonacci(n - 1) + fibonacci(n - 2);
+}
+print(fibonacci(5)); // expect 5
+
+print("===== While loop =====");
+var x = 0;
+while (x < 10) {
+    x += 1;
+}
+print(x); // expect 10
+
+print("===== For loop =====");
+var y = 0;
+for (var i = 0; i < 5; i += 1) {
+    y += i;
+}
+print(y); // expect 10
+
+print("===== If-else with else unless =====");
+var x = 3;
+if (x == 0) {
+    x = x + 0;
+} else unless (x < 0) {
+    x = x + 1;
+} else {
+    x = x - 1;
+}
+print(x); // expect 4
+
+print("===== Lambda functions =====");
+print((fn (a, b) { return a + b; })(2, 3));      // 5
+print((|x| x + 1)(41));                  // 42
+print((|a, b| { return a*b; })(6, 7));   // 42
+
+print("===== Objects =====");
+var o = { a: 10, "b": 20 };
+print(o.a);          // 10
+o.a = o.a + 1;
+print(o["a"]);       // 11
+print(o["b"]);       // 20
+print("a" in o);     // 1
+delete o.a;
+print("a" in o);     // 0
+var key_b = "b";
+print(o[key_b]);     // 20
+
+// ===========================
+// Arrays
+// ===========================
+
+print("===== Arrays: create & index =====");
+var array = [10, 20, 30];
+print(array[0] + array[1] + array[2]); // expect 60
+print(array);
+
+var a = Array(3);        // [0,0,0]
+a[0] = 10;
+a[1] = 20;
+a[2] = 30;
+print(a[0] + a[1] + a[2]); // expect 60
+
+print("===== Arrays: length & setLength =====");
+print(a.length());      // expect 3
+a.setLength(5);         // grow to 5
+a[3] = 40;
+a[4] = 50;
+print(a.length());      // expect 5
+print(a[3] + a[4]);     // expect 90
+
+print("===== Arrays: length property =====");
+var arr = [1, 2, 3, 4, 5, 6, 7, 8];
+print(arr.length);      // expect 8
+arr.length = 5;
+print(arr.length);      // expect 5
+arr.setLength(2);       // legacy method still works
+print(arr.length);      // expect 2
+print(arr.length());    // method form still works → expect 2
+
+print("===== Arrays: push/pop/shift/unshift =====");
+var b = Array(0);        // start empty-length array (implementation may allow 0)
+b.setLength(0);
+b.push(1);
+b.push(2);
+b.push(3);              // b = [1,2,3]
+print(b.length());      // expect 3
+print(b.pop());         // expect 3, b = [1,2]
+print(b.shift());       // expect 1, b = [2]
+b.unshift(9);           // b = [9,2]
+print(b.length());      // expect 2
+print(b[0] + b[1]);     // expect 11
+
+print("===== Arrays: map/filter/forEach/reduce/find/findIndex =====");
+var n = 6;
+var c = Array(n);
+var i = 0;
+while (i < n) {
+    c[i] = i;   // c = [0,1,2,3,4,5]
+    i += 1;
+}
+
+// map: x -> x*2  => [0,2,4,6,8,10]
+var d = c.map(|x| x * 2);
+print(d[0] + d[1] + d[2]);       // expect 6
+
+// filter: keep >= 4  => [4,5]
+var e = c.filter(|x| x >= 4);
+print(e.length());               // expect 2
+print(e[0] + e[1]);              // expect 9
+
+// forEach: accumulate into outer var
+var acc = 0;
+c.forEach(|x| { acc = acc + x; });
+print(acc);                      // expect 15  (0+1+2+3+4+5)
+
+// reduce: sum with init 100 -> 115
+var sum = c.reduce(|s, x| s + x, 100);
+print(sum);                      // expect 115
+
+// find: first even >= 4 -> 4
+print(c.find(|x| (x % 2) == 0 && x >= 4));   // expect 4
+
+// findIndex: index of 4 -> 4
+var find_index = 4;
+print(c.findIndex(|x| x == 4));              // expect 4
+
+print("===== Closures =====");
+fn make_adder(x) {
+    return |y| x + y;
+}
+
+var add42 = make_adder(42);
+print(add42(0));  // expect 42
+print(add42(100)); // expect 142
+
+print("===== Promises =====");
+print("(async)");
+
+// sync resolve
+var p = Promise(|resolve, reject| { resolve(42); });
+p.then(|v| print(v));        // expect: 42
+
+// rejection + catch
+var q = Promise(|resolve, reject| { reject(7); });
+q.catch(|e| print(e));       // expect: 7
+
+// chaining should keep returning the public object now:
+p.then(|v| print(v+1)).catch(|e| print(-1));    // expect: 43
+
+print("===== Deferreds =====");
+print("(async)");
+var d = Deferred();
+d.then(|x| { print(x); });
+
+setTimeout(| | { d.resolve(123); }, 0);
+
+// Rejection path
+var e = Deferred();
+e.catch(|r| { print(999 + r); });
+setTimeout(| | { e.reject(1); }, 0);
+
+print("===== Timers =====");
+print("(async)");
+setTimeout(fn () { print("Timer"); }, 500);
+
+print("===== Async/Await =====");
+print("(async)");
+async fn delay(ms, v) {
+    var d = Deferred();
+    setTimeout(| | { d.resolve(v); }, ms);
+    return await d;
+}
+
+// await inside top-level (top-level is async)
+var aa = await delay(0, 21);
+print(aa + 21);                // expect 42
+
+// await a plain Promise
+var bb = await Promise(|resolve, reject| {
+    setTimeout(| | { resolve(7); }, 0);
+});
+print(bb);                     // expect 7
+
+// multiple awaits in sequence
+var a1 = await delay(0, 10);
+var a2 = await delay(0, 32);
+print(a1 + a2);                // expect 42
+
