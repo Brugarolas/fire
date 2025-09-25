@@ -64,6 +64,7 @@ pub struct LinkInfo {
     /// Imports that the linker resolved to FuncId: local name → provider's FuncId.
     /// In __modinit__ they are materialized as closures (trampolines) with env = null.
     pub import_funcids: HashMap<String, FuncId>,
+    pub import_classes: HashMap<String, (Option<FuncId>, Vec<(String, FuncId)>)>
 }
 
 pub struct Lowerer<'m> {
@@ -183,15 +184,16 @@ impl<'m> Lowerer<'m> {
         let (prog, lam_caps) = hoist_fn_lits_program(prog);
         self.lam_captures = lam_caps;
 
-        // -------- Stage 3: build function table ONCE, post-hoist --------
+        // -------- Stage 3: RESERVE FuncId for ALL functions post-hoist --------
         self.funcs.clear();
 
-        // 3.1 Free/hoisted functions first (includes __lam_*)
-        for (i, f) in prog.functions.iter().enumerate() {
-            self.funcs.insert(f.name.clone(), FuncId(i as u32));
+        // 3.1 Reserve for free/hoisted functions first (includes __lam_* and __toplevel__)
+        for f in &prog.functions {
+            let fid = self.module.reserve_func_id();
+            self.funcs.insert(f.name.clone(), fid);
         }
 
-        // 3.2 Class-generated functions in the SAME order lower_one_class emits them
+        // 3.2 Reserve for class-generated functions in the SAME order lower_one_class emits them
         let mut extra_names: Vec<String> = Vec::new();
         for c in &prog.classes {
             let cname = &c.name;
@@ -223,9 +225,9 @@ impl<'m> Lowerer<'m> {
             extra_names.push(format!("__class_new_{}", cname));
         }
 
-        let base = prog.functions.len() as u32;
-        for (k, nm) in extra_names.into_iter().enumerate() {
-            self.funcs.insert(nm, FuncId(base + k as u32));
+        for nm in extra_names {
+            let fid = self.module.reserve_func_id();
+            self.funcs.insert(nm, fid);
         }
 
         // -------- Stage 4: lower free/hoisted functions --------
@@ -371,8 +373,13 @@ impl<'m> Lowerer<'m> {
             b.finish()
         };
 
-        // Publish into the module with the expected ID (sequential, matching predecl order).
-        let fid = self.module.push_function(func);
+        // Set the reserved ID before pushing
+        let reserved_fid = *self.funcs.get(&fdecl.name).expect("reserved");
+        func.id = reserved_fid;
+
+        // Publish into the module preserving the reserved ID
+        let fid = self.module.push_function_preserve_id(func);
+        assert_eq!(fid, reserved_fid, "push preserved ID");
         Ok(fid)
     }
 }
@@ -1056,7 +1063,6 @@ fn lower_array_method_call<'m>(
             let body = b.block();
             let exit = b.block();
 
-            // loop var phi
             let i_phi = b.add_block_param(head, Type::Int32);
 
             b.jump(head, &[zero]);
@@ -1683,7 +1689,7 @@ fn lower_expr_free<'m>(
 
                     let (_nid_is, is_str) = b.push_node(
                         Inst::CallNative { name: "wir_is_str".into(), args: vec![idxv], pure: false, can_throw: false },
-                        Some(Type::Bool), 1, true,
+                        Some(Type::Bool), 1, true
                     );
 
                     let str_b = b.block();
@@ -2253,7 +2259,7 @@ fn lower_expr_free<'m>(
                 // Is the key a string? -> method call (inject `this`)
                 let (_nid_is, is_str) = b.push_node(
                     Inst::CallNative { name: "wir_is_str".into(), args: vec![idxv], pure: false, can_throw: false },
-                    Some(Type::Bool), 1, true
+                    Some(Type::Bool), 1, true,
                 );
 
                 let str_b = b.block();
@@ -2389,7 +2395,7 @@ fn lower_expr_free<'m>(
                     }
                     let url  = lower_expr_free(b, locals, fields, next_field, &args[0], funcs, lam_caps, links)?;
                     let body = lower_expr_free(b, locals, fields, next_field, &args[1], funcs, lam_caps, links)?;
-                    let (_nid_null, nul) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
+                    let (_nid, nul) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
                     let headers = if args.len() == 3 {
                         lower_expr_free(b, locals, fields, next_field, &args[2], funcs, lam_caps, links)?
                     } else { nul[0] };
@@ -2723,8 +2729,7 @@ fn lower_expr_free<'m>(
                     let zero = b.const_i32(0);
                     let _ = b.push_node(
                         Inst::CallNative { name: "wir_array_set".into(), args: vec![box_arr, zero, cur], pure: false, can_throw: false },
-                        Some(Type::Int32),
-                        1, true);
+                        Some(Type::Int32), 1, true);
                     locals.insert(cap.clone(), box_arr);
                     locals.insert(boxed_key(cap), box_arr);
                 }
@@ -2980,7 +2985,7 @@ fn lower_expr_free<'m>(
 }
 
 impl<'m> Lowerer<'m> {
-    fn lower_modinit(&mut self, prog: &Program, links: &LinkInfo) -> LResult<FuncId> {
+    fn lower_modinit(&mut self, _prog: &Program, links: &LinkInfo) -> LResult<FuncId> {
         use crate::wir::{Inst, Type};
 
         #[cfg(debug_assertions)]
@@ -3022,26 +3027,17 @@ impl<'m> Lowerer<'m> {
         let func = {
             let mut b = Builder::new(self.module, "__modinit__", vec![], vec![Type::Int32]);
 
-            // 0) Inicializa TODAS las celdas a `undefined` para evitar TDZ
+            // 0) Inicializa SOLO las celdas de export de este módulo a `undefined` (TDZ-safe).
+            //    NO tocar import_bindings: son celdas del proveedor.
             let undef = b.const_undef();
-            for &bid in links.import_bindings.values() { b.store_binding(bid, undef); }
-            for &bid in links.export_bindings.values() { b.store_binding(bid, undef); }
-
-            // null env para closures
-            let (_nid_null, nul) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
-
-            // 1a) Importaciones conocidas como FuncId (trampolines): local → cierre(env=null, callee=fid)
-            for (local, &fid) in &links.import_funcids {
-                if let Some(&bid) = links.import_bindings.get(local) {
-                    let (_nid, clos) = b.push_node(
-                        Inst::MakeClosure { callee: fid, env: nul[0] },
-                        Some(Type::Closure(None)), 1, false
-                    );
-                    b.store_binding(bid, clos[0]);
-                }
+            for &bid in links.export_bindings.values() {
+                b.store_binding(bid, undef);
             }
 
-            // 1b) Materializa funciones exportadas como closures sin entorno
+            // null env para closures
+            let (_nid, nul) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
+
+            // 1) Materializa funciones exportadas como closures sin entorno
             for (bid, fid) in fn_exports {
                 let (_nid, clos) = b.push_node(
                     Inst::MakeClosure { callee: fid, env: nul[0] },
@@ -3050,7 +3046,7 @@ impl<'m> Lowerer<'m> {
                 b.store_binding(bid, clos[0]);
             }
 
-            // 2) Materializa clases: objeto con 'new' + estáticos; luego publícalo
+            // 2) Materializa clases exportadas: objeto con 'new' + estáticos; luego publícalo
             for (bid, alloc_opt, statics) in class_exports {
                 let (_nid, obj) = b.push_node(
                     Inst::CallNative { name: "wir_obj_new".into(), args: vec![], pure: false, can_throw: false },
@@ -3086,7 +3082,8 @@ impl<'m> Lowerer<'m> {
                 b.store_binding(bid, objv);
             }
 
-            // 3) Cachea namespaces importados (si existen celdas para ellos)
+            // 3) Cachea namespaces importados (si existen celdas locales para ellos)
+            //    Esto sólo escribe en nuestras celdas de namespace (locales), no en el proveedor.
             for (ns, exports) in &links.namespace_imports {
                 if let Some(&cell) = links.namespace_cells.get(ns) {
                     let ns_obj = b.make_namespace(exports.clone());
@@ -3199,14 +3196,9 @@ impl<'m> Lowerer<'m> {
             }
 
             if is_async {
-                // --- Async prologue: create Deferred and expose it to the async lowerer
+                // --- Async prologue: d = Deferred()
                 let (_nid, d_res) = b.push_node(
-                    Inst::CallNative {
-                        name: "wir_deferred_new".into(),
-                        args: vec![],
-                        pure: false,
-                        can_throw: false,
-                    },
+                    Inst::CallNative { name: "wir_deferred_new".into(), args: vec![], pure: false, can_throw: false },
                     None,
                     1,
                     true,
@@ -3214,7 +3206,7 @@ impl<'m> Lowerer<'m> {
                 let d = d_res[0];
                 locals.insert("__deferred".to_string(), d);
 
-                // Lower the body in async mode, sharing the CLASS field-id map
+                // Lower body with async-aware lowering.
                 lower_block_free_async(
                     &mut b,
                     &mut locals,
@@ -3227,7 +3219,7 @@ impl<'m> Lowerer<'m> {
                     &self.links
                 )?;
 
-                // If the body didn’t return, resolve(0) and return the Deferred
+                // Fallthrough: if the body didn’t explicitly return, resolve with 0 and return d.
                 if !b.current_block_terminated() {
                     let zero = b.const_i32(0);
                     let (_nid, _) = b.push_node(
@@ -3264,8 +3256,13 @@ impl<'m> Lowerer<'m> {
             b.finish()
         };
 
-        // Register function in module
-        let _fid = self.module.push_function(f);
+        // Set the reserved ID before pushing
+        let reserved_fid = *self.funcs.get(fname).expect("reserved");
+        f.id = reserved_fid;
+
+        // Publish into the module preserving the reserved ID
+        let fid = self.module.push_function_preserve_id(f);
+        assert_eq!(fid, reserved_fid, "push preserved ID");
         Ok(())
     }
 
@@ -3580,7 +3577,13 @@ impl<'m> Lowerer<'m> {
             b.finish()
         };
 
-        let _ = self.module.push_function(f);
+        // Set the reserved ID before pushing
+        let reserved_fid = *self.funcs.get(&fname).expect("reserved");
+        f.id = reserved_fid;
+
+        // Publish into the module preserving the reserved ID
+        let fid = self.module.push_function_preserve_id(f);
+        assert_eq!(fid, reserved_fid, "push preserved ID");
         Ok(())
     }
 
@@ -3646,7 +3649,13 @@ impl<'m> Lowerer<'m> {
             b.finish()
         };
 
-        let _ = self.module.push_function(f);
+        // Set the reserved ID before pushing
+        let reserved_fid = *self.funcs.get(fname).expect("reserved");
+        f.id = reserved_fid;
+
+        // Publish into the module preserving the reserved ID
+        let fid = self.module.push_function_preserve_id(f);
+        assert_eq!(fid, reserved_fid, "push preserved ID");
         Ok(())
     }
 
