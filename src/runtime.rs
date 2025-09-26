@@ -8,8 +8,8 @@ use crate::jit::wir_make_method_closure;
 use crate::value as v;
 use crate::value::{
     BoxedArray, BoxedClosure, BoxedF64, BoxedObj, BoxedStr, NULL, ObjHeader, TAG_ARRAY,
-    TAG_BOXED_F64, TAG_CLOSURE, TAG_OBJECT, TAG_STRING, is_bool, is_imm, obj_get_field_deep,
-    obj_get_proto, obj_get_str_deep, obj_set_proto, to_bool,
+    TAG_BOXED_F64, TAG_CLOSURE, TAG_OBJECT, TAG_STRING, is_bool, is_imm, obj_assign,
+    obj_clone_shallow, obj_get_field_deep, obj_get_proto, obj_get_str_deep, obj_set_proto, to_bool,
 };
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
@@ -225,6 +225,16 @@ pub extern "C" fn wir_obj_del_str(obj: i64, key_ptr: i64) -> i64 {
         return 0;
     };
     unsafe { v::obj_del_str(obj, &k) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_obj_assign(dst: i64, src: i64) -> i64 {
+    unsafe { obj_assign(dst, src) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_obj_clone(obj: i64) -> i64 {
+    unsafe { obj_clone_shallow(obj) }
 }
 
 // Global: func_id -> (key -> value)

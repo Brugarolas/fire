@@ -16,7 +16,7 @@ use crate::wir::{
 
 use crate::front::{
     BinOp, Block, ClassDecl, ClassMember, ExportDecl, Expr, FuncDecl, ImportDecl, ImportItem,
-    LValue, ListenDecl, Program, PropKey, RouteDecl, Stmt, UnOp,
+    LValue, ListenDecl, ObjItem, ObjPattern, Program, PropKey, RouteDecl, Stmt, UnOp,
 };
 
 use crate::hoister::hoist_fn_lits_program;
@@ -512,6 +512,99 @@ fn lower_stmt_free<'m>(
                 b.store_binding(bid, val);
             }
         }
+        Stmt::VarDestruct { pattern, init } => {
+            let obj_val =
+                lower_expr_free(b, locals, fields, next_field, init, funcs, lam_caps, links)?;
+
+            for field in &pattern.fields {
+                let prop_name = match &field.key {
+                    PropKey::Ident(name) => name.as_str(),
+                    PropKey::Str(name) => name.as_str(),
+                };
+                let value = lower_general_getprop(b, obj_val, prop_name, fields, next_field);
+                locals.insert(field.binding.clone(), value);
+                if let Some(&bid) = links.export_bindings.get(&field.binding) {
+                    b.store_binding(bid, value);
+                }
+            }
+
+            if let Some(rest_name) = &pattern.rest {
+                let (_nid_clone, clone_res) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_obj_clone".into(),
+                        args: vec![obj_val],
+                        pure: false,
+                        can_throw: false,
+                    },
+                    None,
+                    1,
+                    true,
+                );
+                let rest_obj = clone_res[0];
+
+                for field in &pattern.fields {
+                    match &field.key {
+                        PropKey::Ident(name) => {
+                            let field_id = intern_field_local(fields, next_field, name);
+                            let fid_smi = b.const_i32(field_id.0 as i32);
+                            let _ = b.push_node(
+                                Inst::CallNative {
+                                    name: "wir_obj_del_field".into(),
+                                    args: vec![rest_obj, fid_smi],
+                                    pure: false,
+                                    can_throw: false,
+                                },
+                                Some(Type::Bool),
+                                1,
+                                true,
+                            );
+
+                            let (_nid_sc, ks) = b.push_node(
+                                Inst::Const(Constant::Str(name.clone())),
+                                Some(Type::Str),
+                                1,
+                                false,
+                            );
+                            let _ = b.push_node(
+                                Inst::CallNative {
+                                    name: "wir_obj_del_str".into(),
+                                    args: vec![rest_obj, ks[0]],
+                                    pure: false,
+                                    can_throw: false,
+                                },
+                                Some(Type::Bool),
+                                1,
+                                true,
+                            );
+                        }
+                        PropKey::Str(name) => {
+                            let (_nid_sc, ks) = b.push_node(
+                                Inst::Const(Constant::Str(name.clone())),
+                                Some(Type::Str),
+                                1,
+                                false,
+                            );
+                            let _ = b.push_node(
+                                Inst::CallNative {
+                                    name: "wir_obj_del_str".into(),
+                                    args: vec![rest_obj, ks[0]],
+                                    pure: false,
+                                    can_throw: false,
+                                },
+                                Some(Type::Bool),
+                                1,
+                                true,
+                            );
+                        }
+                    }
+                }
+
+                locals.insert(rest_name.clone(), rest_obj);
+                if let Some(&bid) = links.export_bindings.get(rest_name) {
+                    b.store_binding(bid, rest_obj);
+                }
+            }
+        }
         Stmt::If {
             cond,
             then_b,
@@ -796,6 +889,142 @@ fn lower_stmt_free<'m>(
     Ok(())
 }
 
+fn lower_general_getprop<'m>(
+    b: &mut Builder<'m>,
+    obj: ValueId,
+    name: &str,
+    fields: &mut HashMap<String, FieldId>,
+    next_field: &mut u32,
+) -> ValueId {
+    let name_string = name.to_string();
+
+    let (_nid_sc, ks) = b.push_node(
+        Inst::Const(Constant::Str(name_string.clone())),
+        Some(Type::Str),
+        1,
+        false,
+    );
+    let (_nid_hs, has_str) = b.push_node(
+        Inst::CallNative {
+            name: "wir_obj_has_str".into(),
+            args: vec![obj, ks[0]],
+            pure: false,
+            can_throw: false,
+        },
+        Some(Type::Bool),
+        1,
+        true,
+    );
+
+    let str_hit = b.block();
+    let try_fast = b.block();
+    let cont = b.block();
+    let out_val = b.add_block_param(cont, Type::Int32);
+
+    b.branch(has_str[0], str_hit, try_fast);
+
+    b.position_at(str_hit);
+    let (_nid_gs, sv) = b.push_node(
+        Inst::CallNative {
+            name: "wir_obj_get_str".into(),
+            args: vec![obj, ks[0]],
+            pure: false,
+            can_throw: false,
+        },
+        None,
+        1,
+        true,
+    );
+    b.jump(cont, &[sv[0]]);
+
+    b.position_at(try_fast);
+    let field = intern_field_local(fields, next_field, &name_string);
+    let fid_smi = b.const_i32(field.0 as i32);
+    let (_nid_hf, hasf) = b.push_node(
+        Inst::CallNative {
+            name: "wir_obj_has_field".into(),
+            args: vec![obj, fid_smi],
+            pure: false,
+            can_throw: false,
+        },
+        Some(Type::Bool),
+        1,
+        true,
+    );
+
+    let fast_b = b.block();
+    let try_gettr = b.block();
+    b.branch(hasf[0], fast_b, try_gettr);
+
+    b.position_at(fast_b);
+    let (_nid_f, fv) = b.push_node(
+        Inst::LoadField {
+            obj,
+            field,
+            expected: None,
+        },
+        None,
+        1,
+        false,
+    );
+    b.jump(cont, &[fv[0]]);
+
+    b.position_at(try_gettr);
+    let getter_key = format!("__get__{}", name);
+    let (_nid_gk, gk) = b.push_node(
+        Inst::Const(Constant::Str(getter_key)),
+        Some(Type::Str),
+        1,
+        false,
+    );
+    let (_nid_hg, has_g) = b.push_node(
+        Inst::CallNative {
+            name: "wir_obj_has_str".into(),
+            args: vec![obj, gk[0]],
+            pure: false,
+            can_throw: false,
+        },
+        Some(Type::Bool),
+        1,
+        true,
+    );
+
+    let call_g = b.block();
+    let miss = b.block();
+    b.branch(has_g[0], call_g, miss);
+
+    b.position_at(call_g);
+    let (_nid_gv, gv) = b.push_node(
+        Inst::CallNative {
+            name: "wir_obj_get_str".into(),
+            args: vec![obj, gk[0]],
+            pure: false,
+            can_throw: false,
+        },
+        None,
+        1,
+        true,
+    );
+    let (_nid_call, gres) = b.push_node(
+        Inst::CallClosure {
+            conv: crate::wir::CallConv::Fast,
+            fun: gv[0],
+            args: vec![obj],
+        },
+        Some(Type::Int32),
+        1,
+        true,
+    );
+    b.jump(cont, &[gres[0]]);
+
+    b.position_at(miss);
+    let z = b.const_i32(0);
+    b.jump(cont, &[z]);
+
+    b.position_at(cont);
+    out_val
+}
+
 fn collect_mut_locals_in_expr(e: &Expr, out: &mut BTreeSet<String>) {
     match e {
         Expr::Assign(lv, rhs) => {
@@ -821,6 +1050,14 @@ fn collect_mut_locals_in_expr(e: &Expr, out: &mut BTreeSet<String>) {
             collect_mut_locals_in_expr(index, out);
         }
         Expr::Group(e) => collect_mut_locals_in_expr(e, out),
+        Expr::ObjLit(items) => {
+            for item in items {
+                match item {
+                    ObjItem::Prop(_, value) => collect_mut_locals_in_expr(value, out),
+                    ObjItem::Spread(expr) => collect_mut_locals_in_expr(expr, out),
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -829,6 +1066,7 @@ fn collect_mut_locals_in_stmt(s: &Stmt, out: &mut BTreeSet<String>) {
     match s {
         Stmt::Expr(e) => collect_mut_locals_in_expr(e, out),
         Stmt::Var { .. } => {} // vars declared inside the loop are not loop-carried
+        Stmt::VarDestruct { .. } => {}
         Stmt::If {
             cond,
             then_b,
@@ -1038,6 +1276,102 @@ fn lower_stmt_free_async<'m>(
                         b.const_i32(0)
                     };
                     locals.insert(name.clone(), val);
+                    Ok(())
+                }
+                Stmt::VarDestruct { pattern, init } => {
+                    let obj_val = lower_expr_free_async(
+                        b, locals, fields, next_field, init, funcs, lam_caps, in_async, links,
+                    )?;
+
+                    for field in &pattern.fields {
+                        let prop_name = match &field.key {
+                            PropKey::Ident(name) => name.as_str(),
+                            PropKey::Str(name) => name.as_str(),
+                        };
+                        let value =
+                            lower_general_getprop(b, obj_val, prop_name, fields, next_field);
+                        locals.insert(field.binding.clone(), value);
+                        if let Some(&bid) = links.export_bindings.get(&field.binding) {
+                            b.store_binding(bid, value);
+                        }
+                    }
+
+                    if let Some(rest_name) = &pattern.rest {
+                        let (_nid_clone, clone_res) = b.push_node(
+                            Inst::CallNative {
+                                name: "wir_obj_clone".into(),
+                                args: vec![obj_val],
+                                pure: false,
+                                can_throw: false,
+                            },
+                            None,
+                            1,
+                            true,
+                        );
+                        let rest_obj = clone_res[0];
+
+                        for field in &pattern.fields {
+                            match &field.key {
+                                PropKey::Ident(name) => {
+                                    let field_id = intern_field_local(fields, next_field, name);
+                                    let fid_smi = b.const_i32(field_id.0 as i32);
+                                    let _ = b.push_node(
+                                        Inst::CallNative {
+                                            name: "wir_obj_del_field".into(),
+                                            args: vec![rest_obj, fid_smi],
+                                            pure: false,
+                                            can_throw: false,
+                                        },
+                                        Some(Type::Bool),
+                                        1,
+                                        true,
+                                    );
+
+                                    let (_nid_sc, ks) = b.push_node(
+                                        Inst::Const(Constant::Str(name.clone())),
+                                        Some(Type::Str),
+                                        1,
+                                        false,
+                                    );
+                                    let _ = b.push_node(
+                                        Inst::CallNative {
+                                            name: "wir_obj_del_str".into(),
+                                            args: vec![rest_obj, ks[0]],
+                                            pure: false,
+                                            can_throw: false,
+                                        },
+                                        Some(Type::Bool),
+                                        1,
+                                        true,
+                                    );
+                                }
+                                PropKey::Str(name) => {
+                                    let (_nid_sc, ks) = b.push_node(
+                                        Inst::Const(Constant::Str(name.clone())),
+                                        Some(Type::Str),
+                                        1,
+                                        false,
+                                    );
+                                    let _ = b.push_node(
+                                        Inst::CallNative {
+                                            name: "wir_obj_del_str".into(),
+                                            args: vec![rest_obj, ks[0]],
+                                            pure: false,
+                                            can_throw: false,
+                                        },
+                                        Some(Type::Bool),
+                                        1,
+                                        true,
+                                    );
+                                }
+                            }
+                        }
+
+                        locals.insert(rest_name.clone(), rest_obj);
+                        if let Some(&bid) = links.export_bindings.get(rest_name) {
+                            b.store_binding(bid, rest_obj);
+                        }
+                    }
                     Ok(())
                 }
                 Stmt::If {
@@ -2619,144 +2953,9 @@ fn lower_expr_free<'m>(
                 return Ok(res[0]);
             }
 
-            // General property read:
-            // 1) string-table lookup (authoritative)
-            // 2) if missing, try fast field (good for same-function object-literals)
-            // 3) if still missing, try getter "__get__<name>"
-            // 4) else return 0/null
             let obj = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps, links)?;
-
-            // --- string-table check FIRST ---
-            let (_nid_sc, ks) = b.push_node(
-                Inst::Const(Constant::Str(name.clone())),
-                Some(Type::Str),
-                1,
-                false,
-            );
-            let (_nid_hs, has_str) = b.push_node(
-                Inst::CallNative {
-                    name: "wir_obj_has_str".into(),
-                    args: vec![obj, ks[0]],
-                    pure: false,
-                    can_throw: false,
-                },
-                Some(Type::Bool),
-                1,
-                true,
-            );
-
-            let str_hit = b.block();
-            let try_fast = b.block();
-            let cont = b.block();
-            let out_val = b.add_block_param(cont, Type::Int32);
-
-            b.branch(has_str[0], str_hit, try_fast);
-
-            // Found in string table → return it
-            b.position_at(str_hit);
-            let (_nid_gs, sv) = b.push_node(
-                Inst::CallNative {
-                    name: "wir_obj_get_str".into(),
-                    args: vec![obj, ks[0]],
-                    pure: false,
-                    can_throw: false,
-                },
-                None,
-                1,
-                true,
-            );
-            b.jump(cont, &[sv[0]]);
-
-            // Not in string table → try fast field next
-            b.position_at(try_fast);
-            let field = intern_field_local(fields, next_field, name);
-            let fid_smi = b.const_i32(field.0 as i32);
-            let (_nid_hf, hasf) = b.push_node(
-                Inst::CallNative {
-                    name: "wir_obj_has_field".into(),
-                    args: vec![obj, fid_smi],
-                    pure: false,
-                    can_throw: false,
-                },
-                Some(Type::Bool),
-                1,
-                true,
-            );
-
-            let fast_b = b.block();
-            let try_gettr = b.block();
-            b.branch(hasf[0], fast_b, try_gettr);
-
-            // fast slot
-            b.position_at(fast_b);
-            let (_nid_f, fv) = b.push_node(
-                Inst::LoadField {
-                    obj,
-                    field,
-                    expected: None,
-                },
-                None,
-                1,
-                false,
-            );
-            b.jump(cont, &[fv[0]]);
-
-            // fallback: "__get__<name>" getter
-            b.position_at(try_gettr);
-            let getter_key = format!("__get__{}", name);
-            let (_nid_gk, gk) = b.push_node(
-                Inst::Const(Constant::Str(getter_key)),
-                Some(Type::Str),
-                1,
-                false,
-            );
-            let (_nid_hg, has_g) = b.push_node(
-                Inst::CallNative {
-                    name: "wir_obj_has_str".into(),
-                    args: vec![obj, gk[0]],
-                    pure: false,
-                    can_throw: false,
-                },
-                Some(Type::Bool),
-                1,
-                true,
-            );
-
-            let call_g = b.block();
-            let miss = b.block();
-            b.branch(has_g[0], call_g, miss);
-
-            b.position_at(call_g);
-            let (_nid_gv, gv) = b.push_node(
-                Inst::CallNative {
-                    name: "wir_obj_get_str".into(),
-                    args: vec![obj, gk[0]],
-                    pure: false,
-                    can_throw: false,
-                },
-                None,
-                1,
-                true,
-            );
-            let (_nid_call, gres) = b.push_node(
-                Inst::CallClosure {
-                    conv: crate::wir::CallConv::Fast,
-                    fun: gv[0],
-                    args: vec![obj],
-                },
-                Some(Type::Int32),
-                1,
-                true,
-            );
-            b.jump(cont, &[gres[0]]);
-
-            b.position_at(miss);
-            let z = b.const_i32(0);
-            b.jump(cont, &[z]);
-
-            // merge
-            b.position_at(cont);
-            Ok(out_val)
+            let value = lower_general_getprop(b, obj, name, fields, next_field);
+            Ok(value)
         }
 
         // obj.<propKey> = value   (identifier or string propKey)
@@ -4043,7 +4242,7 @@ fn lower_expr_free<'m>(
             Ok(clos[0])
         }
 
-        Expr::ObjLit(props) => {
+        Expr::ObjLit(items) => {
             // obj = wir_obj_new()
             let (_nid, obj_res) = b.push_node(
                 Inst::CallNative {
@@ -4058,41 +4257,60 @@ fn lower_expr_free<'m>(
             );
             let obj = obj_res[0];
 
-            for (key, val_e) in props {
-                let v =
-                    lower_expr_free(b, locals, fields, next_field, val_e, funcs, lam_caps, links)?;
-                match key {
-                    PropKey::Ident(name) => {
-                        // Use your fast slot path (stable, same as obj.x)
-                        let field = intern_field_local(fields, next_field, name);
-                        let _ = b.push_node(
-                            Inst::StoreField {
-                                obj,
-                                field,
-                                val: v,
-                                expected: None,
-                            },
-                            Some(Type::Top),
-                            1,
-                            true,
-                        );
+            for item in items {
+                match item {
+                    ObjItem::Prop(key, val_e) => {
+                        let v = lower_expr_free(
+                            b, locals, fields, next_field, val_e, funcs, lam_caps, links,
+                        )?;
+                        match key {
+                            PropKey::Ident(name) => {
+                                let field = intern_field_local(fields, next_field, &name);
+                                let _ = b.push_node(
+                                    Inst::StoreField {
+                                        obj,
+                                        field,
+                                        val: v,
+                                        expected: None,
+                                    },
+                                    Some(Type::Top),
+                                    1,
+                                    true,
+                                );
+                            }
+                            PropKey::Str(s) => {
+                                let (_nid, ks) = b.push_node(
+                                    Inst::Const(Constant::Str(s.clone())),
+                                    Some(Type::Str),
+                                    1,
+                                    false,
+                                );
+                                let _ = b.push_node(
+                                    Inst::CallNative {
+                                        name: "wir_obj_set_str".into(),
+                                        args: vec![obj, ks[0], v],
+                                        pure: false,
+                                        can_throw: false,
+                                    },
+                                    Some(Type::Int32),
+                                    1,
+                                    true,
+                                );
+                            }
+                        }
                     }
-                    PropKey::Str(s) => {
-                        // General string key → native set(obj, "k", v)
-                        let (_nid, ks) = b.push_node(
-                            Inst::Const(Constant::Str(s.clone())),
-                            Some(Type::Str),
-                            1,
-                            false,
-                        );
+                    ObjItem::Spread(expr) => {
+                        let spread_obj = lower_expr_free(
+                            b, locals, fields, next_field, expr, funcs, lam_caps, links,
+                        )?;
                         let _ = b.push_node(
                             Inst::CallNative {
-                                name: "wir_obj_set_str".into(),
-                                args: vec![obj, ks[0], v],
+                                name: "wir_obj_assign".into(),
+                                args: vec![obj, spread_obj],
                                 pure: false,
                                 can_throw: false,
                             },
-                            Some(Type::Int32), // ignore result
+                            Some(Type::Int32),
                             1,
                             true,
                         );
@@ -4682,6 +4900,10 @@ impl<'m> Lowerer<'m> {
                     name: name.clone(),
                     init: init.as_ref().map(|e| rw_expr(e, f)),
                 },
+                Stmt::VarDestruct { pattern, init } => Stmt::VarDestruct {
+                    pattern: pattern.clone(),
+                    init: rw_expr(init, f),
+                },
                 Stmt::If {
                     cond,
                     then_b,
@@ -4763,9 +4985,13 @@ impl<'m> Lowerer<'m> {
                 },
                 Group(ref g) => Expr::Group(SmallBox::new(rw_expr(g, f))),
                 ArrayLit(ref es) => Expr::ArrayLit(es.iter().map(|x| rw_expr(x, f)).collect()),
-                ObjLit(ref kvs) => Expr::ObjLit(
-                    kvs.iter()
-                        .map(|(k, v)| (k.clone(), rw_expr(v, f)))
+                ObjLit(ref items) => Expr::ObjLit(
+                    items
+                        .iter()
+                        .map(|item| match item {
+                            ObjItem::Prop(k, v) => ObjItem::Prop(k.clone(), rw_expr(v, f)),
+                            ObjItem::Spread(expr) => ObjItem::Spread(rw_expr(expr, f)),
+                        })
                         .collect(),
                 ),
                 GetPropObj { ref obj, ref key } => Expr::GetPropObj {

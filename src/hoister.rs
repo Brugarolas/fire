@@ -16,7 +16,7 @@ use crate::wir::{
 
 use crate::front::{
     BinOp, Block, ClassDecl, ClassMember, ExportDecl, Expr, FuncDecl, ImportDecl, ImportItem,
-    LValue, ListenDecl, Program, PropKey, RouteDecl, Stmt, UnOp,
+    LValue, ListenDecl, ObjItem, ObjPattern, Program, PropKey, RouteDecl, Stmt, UnOp,
 };
 
 /// Hoist all function literals to top-level functions, replacing them with
@@ -37,6 +37,15 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
         }
     }
 
+    fn insert_pattern_bindings(set: &mut BTreeSet<String>, pattern: &ObjPattern) {
+        for field in &pattern.fields {
+            set.insert(field.binding.clone());
+        }
+        if let Some(rest) = &pattern.rest {
+            set.insert(rest.clone());
+        }
+    }
+
     // Collect {defs, uses} inside a block
     fn collect_defs_uses_block(
         b: &Block,
@@ -54,6 +63,10 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                 if let Some(e) = init {
                     collect_uses_expr(e, uses);
                 }
+            }
+            Stmt::VarDestruct { pattern, init } => {
+                insert_pattern_bindings(defs, pattern);
+                collect_uses_expr(init, uses);
             }
             Stmt::If {
                 cond,
@@ -149,9 +162,12 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                 }
             }
 
-            Expr::ObjLit(props) => {
-                for (_, v) in props {
-                    collect_uses_expr(v, uses);
+            Expr::ObjLit(items) => {
+                for item in items {
+                    match item {
+                        ObjItem::Prop(_, value) => collect_uses_expr(value, uses),
+                        ObjItem::Spread(expr) => collect_uses_expr(expr, uses),
+                    }
                 }
             }
 
@@ -211,6 +227,14 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                     });
                     scope.insert(name.clone());
                 }
+                Stmt::VarDestruct { pattern, init } => {
+                    let init_rw = rw_expr(init, used, counter, &scope, out_funcs, lam_caps_out);
+                    out_stmts.push(Stmt::VarDestruct {
+                        pattern: pattern.clone(),
+                        init: init_rw,
+                    });
+                    insert_pattern_bindings(&mut scope, pattern);
+                }
 
                 // `for` init can introduce a name that is visible to cond/step/body.
                 Stmt::For {
@@ -234,8 +258,14 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                             lam_caps_out,
                         ));
                         // If the init is `var id = ...;`, extend for_scope for the rest.
-                        if let Stmt::Var { name, .. } = i0 {
-                            for_scope.insert(name.clone());
+                        match i0 {
+                            Stmt::Var { name, .. } => {
+                                for_scope.insert(name.clone());
+                            }
+                            Stmt::VarDestruct { pattern, .. } => {
+                                insert_pattern_bindings(&mut for_scope, pattern);
+                            }
+                            _ => {}
                         }
                         Some(rewritten)
                     } else {
@@ -284,6 +314,17 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                 init: init
                     .as_ref()
                     .map(|e| rw_expr(e, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+            },
+            Stmt::VarDestruct { pattern, init } => Stmt::VarDestruct {
+                pattern: pattern.clone(),
+                init: rw_expr(
+                    init,
+                    used,
+                    counter,
+                    enclosing_locals,
+                    out_funcs,
+                    lam_caps_out,
+                ),
             },
             Stmt::If {
                 cond,
@@ -622,14 +663,22 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                     .collect(),
             ),
 
-            Expr::ObjLit(props) => Expr::ObjLit(
-                props
+            Expr::ObjLit(items) => Expr::ObjLit(
+                items
                     .iter()
-                    .map(|(k, v)| {
-                        (
+                    .map(|item| match item {
+                        ObjItem::Prop(k, v) => ObjItem::Prop(
                             k.clone(),
                             rw_expr(v, used, counter, enclosing_locals, out_funcs, lam_caps_out),
-                        )
+                        ),
+                        ObjItem::Spread(expr) => ObjItem::Spread(rw_expr(
+                            expr,
+                            used,
+                            counter,
+                            enclosing_locals,
+                            out_funcs,
+                            lam_caps_out,
+                        )),
                     })
                     .collect(),
             ),

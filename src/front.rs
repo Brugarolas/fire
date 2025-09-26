@@ -169,6 +169,8 @@ pub enum Tok {
     Percent,
     #[token("!")]
     Bang,
+    #[token("...")]
+    Spread,
     #[token(".")]
     Dot,
     #[token(",")]
@@ -314,10 +316,38 @@ pub struct Block {
 }
 
 #[derive(Debug, Clone)]
+pub enum PropKey {
+    Ident(String),
+    Str(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjPatternField {
+    pub key: PropKey,
+    pub binding: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjPattern {
+    pub fields: Vec<ObjPatternField>,
+    pub rest: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ObjItem {
+    Prop(PropKey, Expr),
+    Spread(Expr),
+}
+
+#[derive(Debug, Clone)]
 pub enum Stmt {
     Var {
         name: String,
         init: Option<Expr>,
+    },
+    VarDestruct {
+        pattern: ObjPattern,
+        init: Expr,
     },
     If {
         cond: Expr,
@@ -337,12 +367,6 @@ pub enum Stmt {
     Return(Option<Expr>),
     Expr(Expr),
     Listen(ListenDecl),
-}
-
-#[derive(Debug, Clone)]
-pub enum PropKey {
-    Ident(String), // identifier property name (interned later)
-    Str(String),   // string-literal property name
 }
 
 #[derive(Debug, Clone)]
@@ -395,7 +419,7 @@ pub enum Expr {
         args: Vec<Expr>,
     }, // `new ClassName(args...)`
 
-    ObjLit(Vec<(PropKey, Expr)>), // { a: 1, "b": 2, c: x+y }
+    ObjLit(Vec<ObjItem>), // { a: 1, "b": 2, c: x+y, ...other }
     GetPropObj {
         obj: SmallBox<Expr, u8>,
         key: PropKey,
@@ -1367,7 +1391,13 @@ impl<'src> Parser<'src> {
         }
 
         // export var/let X = ... ;
-        if self.matches(&Tok::Var) || self.matches(&Tok::Let) || self.matches(&Tok::Const) {
+        if self.check(&Tok::Var) || self.check(&Tok::Let) || self.check(&Tok::Const) {
+            let _ = self.next()?; // consume keyword
+
+            if self.check(&Tok::LBrace) {
+                return Err(self.err_here("exporting destructured bindings is not supported yet"));
+            }
+
             let t = self.next()?;
             let name = match t.tok {
                 Tok::Ident(s) => s,
@@ -1621,7 +1651,20 @@ impl<'src> Parser<'src> {
             return self.parse_listen_stmt();
         }
 
-        if self.matches(&Tok::Var) || self.matches(&Tok::Let) || self.matches(&Tok::Const) {
+        if self.check(&Tok::Var) || self.check(&Tok::Let) || self.check(&Tok::Const) {
+            let _ = self.next()?; // consume var/let/const
+
+            if self.check(&Tok::LBrace) {
+                let pattern = self.parse_obj_pattern()?;
+                self.expect(
+                    Tok::Eq,
+                    "object destructuring requires an initializer (expected '=')",
+                )?;
+                let init = self.expr()?;
+                self.expect(Tok::Semi, "expected ';' after destructuring declaration")?;
+                return Ok(Stmt::VarDestruct { pattern, init });
+            }
+
             let t = self.next()?;
             let name = match t.tok {
                 Tok::Ident(s) => s,
@@ -1770,27 +1813,40 @@ impl<'src> Parser<'src> {
             self.expect(Tok::LParen, "expected '(' after 'for'")?;
             let init = if self.matches(&Tok::Semi) {
                 None
-            } else if self.matches(&Tok::Var) {
-                let t = self.next()?;
-                let name = match t.tok {
-                    Tok::Ident(s) => s,
-                    ref tok => {
-                        return Err(ParseError {
-                            msg: format!(
-                                "expected identifier after 'var' in for init, found {:?}",
-                                tok
-                            ),
-                            span: t.span,
-                        });
-                    }
-                };
-                let init_e = if self.matches(&Tok::Eq) {
-                    Some(self.expr()?)
+            } else if self.check(&Tok::Var) || self.check(&Tok::Let) || self.check(&Tok::Const) {
+                let _ = self.next()?; // consume keyword
+
+                if self.check(&Tok::LBrace) {
+                    let pattern = self.parse_obj_pattern()?;
+                    self.expect(Tok::Eq, "destructuring initializer required in for loop")?;
+                    let init_expr = self.expr()?;
+                    self.expect(Tok::Semi, "expected ';' after for init")?;
+                    Some(SmallBox::new(Stmt::VarDestruct {
+                        pattern,
+                        init: init_expr,
+                    }))
                 } else {
-                    None
-                };
-                self.expect(Tok::Semi, "expected ';' after for init")?;
-                Some(SmallBox::new(Stmt::Var { name, init: init_e }))
+                    let t = self.next()?;
+                    let name = match t.tok {
+                        Tok::Ident(s) => s,
+                        ref tok => {
+                            return Err(ParseError {
+                                msg: format!(
+                                    "expected identifier after 'var' in for init, found {:?}",
+                                    tok
+                                ),
+                                span: t.span,
+                            });
+                        }
+                    };
+                    let init_e = if self.matches(&Tok::Eq) {
+                        Some(self.expr()?)
+                    } else {
+                        None
+                    };
+                    self.expect(Tok::Semi, "expected ';' after for init")?;
+                    Some(SmallBox::new(Stmt::Var { name, init: init_e }))
+                }
             } else {
                 let e = self.expr()?;
                 self.expect(Tok::Semi, "expected ';' after for init")?;
@@ -2428,11 +2484,11 @@ impl<'src> Parser<'src> {
         })
     }
 
-    // Parse an object literal: { a: 1, "b": 2, c: x+y }
+    // Parse an object literal: { a: 1, "b": 2, c: x+y, ...other }
     fn parse_object_literal(&mut self) -> PResult<Expr> {
         // already consumed LBrace
-        let mut props = Vec::new();
-        let mut seen_keys = HashSet::new(); // to detect duplicates
+        let mut items = Vec::new();
+        let mut seen_keys = HashSet::new(); // to detect duplicate explicit keys
 
         loop {
             if self.check(&Tok::RBrace) {
@@ -2443,38 +2499,54 @@ impl<'src> Parser<'src> {
                 return Err(self.err_here("unexpected end of file in object literal"));
             }
 
-            // key: Ident | Str
-            let key = {
-                let tok_opt = self.peek().as_ref().map(|p| p.tok.clone());
-                if let Some(tok) = tok_opt {
-                    self.next()?; // consume after borrow ends
-                    match tok {
-                        Tok::Ident(s) => {
-                            if seen_keys.contains(&s) {
-                                return Err(self.err_here(&format!("duplicate key '{}' in object literal", s)));
+            if self.matches(&Tok::Spread) {
+                // spread element: ...expr
+                let spread_expr = self.expr()?;
+                items.push(ObjItem::Spread(spread_expr));
+            } else {
+                // key: Ident | Str
+                let key = {
+                    let tok_opt = self.peek().as_ref().map(|p| p.tok.clone());
+                    if let Some(tok) = tok_opt {
+                        self.next()?; // consume after borrow ends
+                        match tok {
+                            Tok::Ident(s) => {
+                                if seen_keys.contains(&s) {
+                                    return Err(self.err_here(&format!(
+                                        "duplicate key '{}' in object literal",
+                                        s
+                                    )));
+                                }
+                                seen_keys.insert(s.clone());
+                                PropKey::Ident(s)
                             }
-                            seen_keys.insert(s.clone());
-                            PropKey::Ident(s)
-                        },
-                        Tok::Str(s) => {
-                            if seen_keys.contains(&s) {
-                                return Err(self.err_here(&format!("duplicate key \"{}\" in object literal", s)));
+                            Tok::Str(s) => {
+                                if seen_keys.contains(&s) {
+                                    return Err(self.err_here(&format!(
+                                        "duplicate key \"{}\" in object literal",
+                                        s
+                                    )));
+                                }
+                                seen_keys.insert(s.clone());
+                                PropKey::Str(s)
                             }
-                            seen_keys.insert(s.clone());
-                            PropKey::Str(s)
-                        },
-                        _ => return Err(self.err_here("expected property name (identifier or string literal) in object literal")),
+                            _ => {
+                                return Err(self.err_here(
+                                    "expected property name (identifier or string literal) in object literal",
+                                ))
+                            }
+                        }
+                    } else {
+                        return Err(self.err_here(
+                            "unexpected end of file; expected property name in object literal",
+                        ));
                     }
-                } else {
-                    return Err(self.err_here(
-                        "unexpected end of file; expected property name in object literal",
-                    ));
-                }
-            };
+                };
 
-            self.expect(Tok::Colon, "expected ':' after property key")?;
-            let value = self.expr()?;
-            props.push((key, value));
+                self.expect(Tok::Colon, "expected ':' after property key")?;
+                let value = self.expr()?;
+                items.push(ObjItem::Prop(key, value));
+            }
 
             if self.check(&Tok::RBrace) {
                 let _ = self.next()?; // consume RBrace
@@ -2483,7 +2555,130 @@ impl<'src> Parser<'src> {
             self.expect(Tok::Comma, "expected ',' after property")?;
         }
 
-        Ok(Expr::ObjLit(props))
+        Ok(Expr::ObjLit(items))
+    }
+
+    // Parse an object destructuring pattern: { a, b: alias, "c": cAlias, ...rest }
+    fn parse_obj_pattern(&mut self) -> PResult<ObjPattern> {
+        self.expect(Tok::LBrace, "expected '{' to start object pattern")?;
+
+        let mut fields = Vec::new();
+        let mut rest = None;
+        let mut seen_keys = HashSet::new();
+
+        loop {
+            if self.check(&Tok::RBrace) {
+                let _ = self.next()?; // consume }
+                break;
+            }
+            if self.is_eof() {
+                return Err(self.err_here("unexpected end of file in object pattern"));
+            }
+
+            if self.matches(&Tok::Spread) {
+                if rest.is_some() {
+                    return Err(
+                        self.err_here("object pattern may only contain a single '...rest' binding")
+                    );
+                }
+                let t = self.next()?;
+                let name = match t.tok {
+                    Tok::Ident(s) => s,
+                    ref tok => {
+                        return Err(ParseError {
+                            msg: format!(
+                                "expected identifier after '...' in object pattern, found {:?}",
+                                tok
+                            ),
+                            span: t.span,
+                        });
+                    }
+                };
+                rest = Some(name);
+
+                // Rest must be the last element
+                self.expect(Tok::RBrace, "expected '}' after object pattern rest")?;
+                break;
+            }
+
+            let tok_opt = self.peek().as_ref().map(|p| p.tok.clone());
+            let (key, binding) = if let Some(tok) = tok_opt {
+                self.next()?; // consume key token
+                match tok {
+                    Tok::Ident(s) => {
+                        if seen_keys.contains(&s) {
+                            return Err(
+                                self.err_here(&format!("duplicate key '{}' in object pattern", s))
+                            );
+                        }
+                        seen_keys.insert(s.clone());
+
+                        if self.matches(&Tok::Colon) {
+                            let alias_tok = self.next()?;
+                            let alias = match alias_tok.tok {
+                                Tok::Ident(a) => a,
+                                ref tok => {
+                                    return Err(ParseError {
+                                        msg: format!(
+                                            "expected identifier after ':' in object pattern, found {:?}",
+                                            tok
+                                        ),
+                                        span: alias_tok.span,
+                                    });
+                                }
+                            };
+                            (PropKey::Ident(s), alias)
+                        } else {
+                            (PropKey::Ident(s.clone()), s)
+                        }
+                    }
+                    Tok::Str(s) => {
+                        if seen_keys.contains(&s) {
+                            return Err(self
+                                .err_here(&format!("duplicate key \"{}\" in object pattern", s)));
+                        }
+                        seen_keys.insert(s.clone());
+
+                        self.expect(
+                            Tok::Colon,
+                            "expected ':' after string key in object pattern",
+                        )?;
+                        let alias_tok = self.next()?;
+                        let alias = match alias_tok.tok {
+                            Tok::Ident(a) => a,
+                            ref tok => {
+                                return Err(ParseError {
+                                    msg: format!(
+                                        "expected identifier after ':' in object pattern, found {:?}",
+                                        tok
+                                    ),
+                                    span: alias_tok.span,
+                                });
+                            }
+                        };
+                        (PropKey::Str(s), alias)
+                    }
+                    _ => {
+                        return Err(self.err_here(
+                            "expected property name (identifier or string) in object pattern",
+                        ));
+                    }
+                }
+            } else {
+                return Err(self
+                    .err_here("unexpected end of file; expected property name in object pattern"));
+            };
+
+            fields.push(ObjPatternField { key, binding });
+
+            if self.check(&Tok::RBrace) {
+                let _ = self.next()?; // consume }
+                break;
+            }
+            self.expect(Tok::Comma, "expected ',' in object pattern")?;
+        }
+
+        Ok(ObjPattern { fields, rest })
     }
 
     // delete obj.x   |   delete obj["x"]

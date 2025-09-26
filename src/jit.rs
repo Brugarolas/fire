@@ -37,10 +37,11 @@ use crate::native_timers::{
 };
 #[allow(unused_imports)]
 use crate::runtime::{
-    napalm_yieldpoint, wir_is_str, wir_memo_get, wir_memo_put, wir_obj_del_field, wir_obj_del_str,
-    wir_obj_get_field, wir_obj_get_field_deep, wir_obj_get_method, wir_obj_get_proto,
-    wir_obj_get_str, wir_obj_get_str_deep, wir_obj_has_field, wir_obj_has_str, wir_obj_new,
-    wir_obj_set_field, wir_obj_set_proto, wir_obj_set_str, wir_super_get_method,
+    napalm_yieldpoint, wir_is_str, wir_memo_get, wir_memo_put, wir_obj_assign, wir_obj_clone,
+    wir_obj_del_field, wir_obj_del_str, wir_obj_get_field, wir_obj_get_field_deep,
+    wir_obj_get_method, wir_obj_get_proto, wir_obj_get_str, wir_obj_get_str_deep,
+    wir_obj_has_field, wir_obj_has_str, wir_obj_new, wir_obj_set_field, wir_obj_set_proto,
+    wir_obj_set_str, wir_super_get_method,
 };
 #[allow(unused_imports)]
 use crate::value::{
@@ -318,6 +319,8 @@ impl Default for JIT {
             fn wir_obj_set_str(obj: i64, key: i64, val: i64) -> i64;
             fn wir_obj_has_str(obj: i64, key: i64) -> i64;
             fn wir_obj_del_str(obj: i64, key: i64) -> i64;
+            fn wir_obj_assign(dst: i64, src: i64) -> i64;
+            fn wir_obj_clone(obj: i64) -> i64;
         }
 
         unsafe extern "C" {
@@ -586,6 +589,14 @@ impl Default for JIT {
             jb.symbol(
                 "wir_obj_del_str",
                 wir_obj_del_str as *const extern "C" fn(i64, i64) -> i64 as *const u8,
+            );
+            jb.symbol(
+                "wir_obj_assign",
+                wir_obj_assign as *const extern "C" fn(i64, i64) -> i64 as *const u8,
+            );
+            jb.symbol(
+                "wir_obj_clone",
+                wir_obj_clone as *const extern "C" fn(i64) -> i64 as *const u8,
             );
 
             jb.symbol(

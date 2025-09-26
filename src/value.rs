@@ -1031,6 +1031,61 @@ pub unsafe fn obj_get_str_deep(mut obj_v: ValueRepr, key: &str) -> ValueRepr {
     NULL
 }
 
+#[inline(always)]
+pub unsafe fn obj_assign(dst_v: ValueRepr, src_v: ValueRepr) -> ValueRepr {
+    if dst_v == NULL || src_v == NULL || (dst_v & 1) == 1 || (src_v & 1) == 1 {
+        return 0;
+    }
+
+    let dst = &mut *as_obj_mut(dst_v);
+    let src = &*as_obj_mut(src_v);
+
+    for (&fid, &val) in &src.by_id {
+        let entry = dst.by_id.entry(fid).or_insert(NULL);
+        *entry = val;
+
+        #[cfg(feature = "gc")]
+        {
+            let slot: *mut ValueRepr = entry as *mut ValueRepr;
+            NAPALM_GC.post_write_barrier(dst_v as *mut u8, slot, val);
+        }
+    }
+
+    for (key, &val) in &src.by_str {
+        let entry = dst.by_str.entry(key.clone()).or_insert(NULL);
+        *entry = val;
+
+        #[cfg(feature = "gc")]
+        {
+            let slot: *mut ValueRepr = entry as *mut ValueRepr;
+            NAPALM_GC.post_write_barrier(dst_v as *mut u8, slot, val);
+        }
+    }
+
+    0
+}
+
+#[inline(always)]
+pub unsafe fn obj_clone_shallow(src_v: ValueRepr) -> ValueRepr {
+    if src_v == NULL || (src_v & 1) == 1 {
+        return obj_new();
+    }
+
+    let clone_v = obj_new();
+    let clone = &mut *as_obj_mut(clone_v);
+    let src = &*as_obj_mut(src_v);
+
+    clone.proto = src.proto;
+
+    #[cfg(feature = "gc")]
+    {
+        NAPALM_GC.post_write_barrier(clone_v as *mut u8, &mut clone.proto, src.proto);
+    }
+
+    obj_assign(clone_v, src_v);
+    clone_v
+}
+
 // ============================================================================
 // Debug formatting
 // ============================================================================
