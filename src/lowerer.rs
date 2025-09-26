@@ -249,6 +249,8 @@ impl<'m> Lowerer<'m> {
         // 3.1 Reserve for free/hoisted functions first (includes __lam_* and __toplevel__)
         for f in &prog.functions {
             let fid = self.module.reserve_func_id();
+            #[cfg(debug_assertions)]
+            eprintln!("[reserve func] {} -> {:?}", f.name, fid);
             self.funcs.insert(f.name.clone(), fid);
         }
 
@@ -1276,6 +1278,9 @@ fn lower_stmt_free_async<'m>(
                         b.const_i32(0)
                     };
                     locals.insert(name.clone(), val);
+                    if let Some(&bid) = links.export_bindings.get(name) {
+                        b.store_binding(bid, val);
+                    }
                     Ok(())
                 }
                 Stmt::VarDestruct { pattern, init } => {
@@ -4524,6 +4529,8 @@ impl<'m> Lowerer<'m> {
 
         for (name, &bid) in &links.export_bindings {
             if let Some(&fid) = self.funcs.get(name) {
+                #[cfg(debug_assertions)]
+                eprintln!("[modinit] export function {} -> fid {:?} binding {:?}", name, fid, bid);
                 // export function <name>
                 fn_exports.push((bid, fid));
                 continue;

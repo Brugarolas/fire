@@ -953,17 +953,20 @@ impl<'src> Parser<'src> {
                     names_bumped.push(std::mem::transmute::<&str, &'static str>(s));
                 }
 
-                let req = ImportRequest {
-                    from_path: Arc::new(abs.clone()),
-                    names: names_bumped,
-                    resolved: Vec::new(),
-                };
-
-                m.imports.insert(Arc::new(abs.clone()), req);
+                let abs_arc = Arc::new(abs.clone());
+                let req = m
+                    .imports
+                    .entry(abs_arc.clone())
+                    .or_insert_with(|| ImportRequest {
+                        from_path: abs_arc.clone(),
+                        names: Vec::new(),
+                        resolved: Vec::new(),
+                    });
+                req.names.extend(names_bumped);
 
                 // Encolar en el resolver para parsearlo cuando toque
                 let resolver = &*res_ptr;
-                resolver.note_pending(Arc::new(abs));
+                resolver.note_pending(abs_arc);
             }
         }
         Ok(())

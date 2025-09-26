@@ -75,7 +75,7 @@ fn main() {
             "(Debug build) Building whole-program (modules graph) from {} ...",
             input_path
         );
-        match modules::build_simple_program_from_entry(input_path) {
+        match modules::build_whole_program_from_entry(input_path) {
             Ok(m) => (m, input_path.clone()),
             Err(e) => {
                 eprintln!("Error building whole program: {}", e);
@@ -105,6 +105,19 @@ fn main() {
     // 4.2) JIT compile ALL functions
     let mut jit = jit::JIT::default();
     let mut fptrs = HashMap::new();
+
+    #[cfg(debug_assertions)]
+    {
+        for f in &module.funcs {
+            eprintln!("[func] id={:?} name={}", f.id, f.sig.name);
+            if f.sig.name == "__toplevel__" {
+                eprintln!("[func-body {:?}] {:#?}", f.id, f);
+            }
+            if f.sig.name == "__modinit__" {
+                eprintln!("[modinit-body {:?}] {:#?}", f.id, f);
+            }
+        }
+    }
 
     if let Err(e) = jit.predeclare(&module.funcs) {
         eprintln!("JIT predeclare error: {}", e);
@@ -160,6 +173,9 @@ fn main() {
 }
 
 fn pick_entrypoint(module: &wir::Module) -> Option<String> {
+    if module.funcs.iter().any(|f| f.sig.name == "__program__") {
+        return Some("__program__".to_string());
+    }
     if module.funcs.iter().any(|f| f.sig.name == "__toplevel__") {
         return Some("__toplevel__".to_string());
     }

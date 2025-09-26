@@ -13,10 +13,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::front::{ModuleAST, Parser, Program};
+use crate::front::{ExportDecl, ImportItem, ModuleAST, Parser, Program};
 use crate::lowerer::{LinkInfo, Lowerer};
 use crate::opt::optimization::optimization_passes;
-use crate::wir::IdRemap;
+use crate::wir::{Builder as WirBuilder, CallConv, FuncId, IdRemap, Inst, Type};
 
 /// -----------------------------------------
 /// Minimal infra
@@ -33,6 +33,13 @@ pub struct ModulesCTX {
     pub arena: Bump,
     /// Registry of parsed modules (by absolute path) → Box<ModuleAST>.
     pub registry: HashMap<Arc<PathBuf>, Box<ModuleAST<'static>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExportSymbolKind {
+    Function,
+    Class,
+    Other,
 }
 
 pub trait ModuleLoader {
@@ -102,6 +109,10 @@ impl ProgramBuilder {
 
     pub fn build_whole_program(&mut self, entry: &str) -> Result<crate::wir::Module, String> {
         // 1) parse + bind
+        let entry_abs =
+            std::fs::canonicalize(entry).map_err(|e| format!("canonicalize({entry}): {e}"))?;
+        let entry_arc = Arc::new(entry_abs);
+
         self.build_from_entry(entry)?;
 
         // 2) lower + optimize en paralelo
@@ -111,23 +122,39 @@ impl ProgramBuilder {
         let order = self.topo_order()?;
 
         // 4) merge a un único WIR
-        self.merge_wir_shards(shards, &order)
+        self.merge_wir_shards(shards, &order, &entry_arc)
     }
 
     fn merge_wir_shards(
         &self,
         mut shards: HashMap<Arc<PathBuf>, crate::wir::Module>,
         order: &[Arc<PathBuf>],
+        entry: &Arc<PathBuf>,
     ) -> Result<crate::wir::Module, String> {
         use crate::wir::Module as WirModule;
 
         let mut dst = WirModule::new();
+        let mut modinit_funcs: HashMap<Arc<PathBuf>, FuncId> = HashMap::default();
+        let mut toplevel_funcs: HashMap<Arc<PathBuf>, FuncId> = HashMap::default();
 
         for path in order {
             let mut src = match shards.remove(path) {
                 Some(m) => m,
                 None => continue,
             };
+
+            // Record function IDs we care about before moving them into the destination module.
+            for f in &src.funcs {
+                match f.sig.name.as_str() {
+                    "__modinit__" => {
+                        modinit_funcs.insert(path.clone(), f.id);
+                    }
+                    "__toplevel__" => {
+                        toplevel_funcs.insert(path.clone(), f.id);
+                    }
+                    _ => {}
+                }
+            }
 
             // Merge global pools/metadata here; at least bump counters
             // so future fresh_*() keep monotonicity:
@@ -146,7 +173,181 @@ impl ProgramBuilder {
             }
         }
 
+        #[cfg(debug_assertions)]
+        {
+            eprintln!("[merge] module order:");
+            for p in order {
+                eprintln!(
+                    "  {:?} modinit={:?} toplevel={:?}",
+                    p,
+                    modinit_funcs.get(p),
+                    toplevel_funcs.get(p)
+                );
+            }
+        }
+
+        // Build a tiny bootstrap that runs every module's __modinit__ and __toplevel__
+        // following the dependency order, returning the entry module's result.
+        let mut builder = WirBuilder::new(&mut dst, "__program__", vec![], vec![Type::Int32]);
+        let mut last_ret: Option<crate::wir::ValueId> = None;
+        let mut entry_ret: Option<crate::wir::ValueId> = None;
+
+        for path in order {
+            if let Some(fid) = modinit_funcs.get(path) {
+                let _ = builder.push_node(
+                    Inst::CallDirect {
+                        conv: CallConv::Fast,
+                        callee: *fid,
+                        args: Vec::new(),
+                    },
+                    Some(Type::Int32),
+                    1,
+                    true,
+                );
+            }
+
+            if let Some(fid) = toplevel_funcs.get(path) {
+                let (_nid, res) = builder.push_node(
+                    Inst::CallDirect {
+                        conv: CallConv::Fast,
+                        callee: *fid,
+                        args: Vec::new(),
+                    },
+                    Some(Type::Int32),
+                    1,
+                    true,
+                );
+                last_ret = Some(res[0]);
+                if path.as_ref() == entry.as_ref() {
+                    entry_ret = Some(res[0]);
+                }
+            }
+        }
+
+        let ret_val = if let Some(v) = entry_ret {
+            v
+        } else if let Some(v) = last_ret {
+            v
+        } else {
+            builder.const_i32(0)
+        };
+        builder.ret(&[ret_val]);
+        let bootstrap = builder.finish();
+        let _ = dst.push_function(bootstrap);
+
         Ok(dst)
+    }
+
+    fn build_link_info_for_module(
+        &self,
+        path: &Arc<PathBuf>,
+        prog: &Program,
+        export_kind_cache: &mut HashMap<Arc<PathBuf>, HashMap<String, ExportSymbolKind>>,
+    ) -> Result<LinkInfo, String> {
+        let mbox = self
+            .ctx
+            .registry
+            .get(path)
+            .ok_or_else(|| format!("link: missing ModuleAST for {:?}", path))?;
+        let module_ast: &ModuleAST<'static> = &**mbox;
+
+        let mut links = LinkInfo::default();
+
+        // Exports owned by this module.
+        for (name, item) in &module_ast.exports {
+            links
+                .export_bindings
+                .insert((*name).to_string(), item.binding);
+        }
+
+        for imp in &prog.imports {
+            // Resolve specifier just like the parser did so we can locate the provider module.
+            let resolved = self
+                .loader
+                .resolve(path.as_ref(), &imp.specifier)
+                .map_err(|e| format!("resolve({:?}, {}): {e}", path, imp.specifier))?;
+            let resolved_arc = Arc::new(resolved);
+
+            let provider_ast_box = self
+                .ctx
+                .registry
+                .get(&resolved_arc)
+                .ok_or_else(|| format!("link: source module not found: {:?}", resolved_arc))?;
+            let provider_ast: &ModuleAST<'static> = &**provider_ast_box;
+
+            if !export_kind_cache.contains_key(&resolved_arc) {
+                let provider_prog = self
+                    .programs
+                    .get(&resolved_arc)
+                    .ok_or_else(|| format!("link: missing Program for {:?}", resolved_arc))?;
+                let mut kind_map: HashMap<String, ExportSymbolKind> = HashMap::default();
+                for ed in &provider_prog.exports {
+                    match ed {
+                        ExportDecl::Func(name) => {
+                            kind_map.insert(name.clone(), ExportSymbolKind::Function);
+                        }
+                        ExportDecl::Class(name) => {
+                            kind_map.insert(name.clone(), ExportSymbolKind::Class);
+                        }
+                        ExportDecl::Var(name) => {
+                            kind_map.insert(name.clone(), ExportSymbolKind::Other);
+                        }
+                        ExportDecl::Named { items } | ExportDecl::From { items, .. } => {
+                            for (local, alias) in items {
+                                let public = alias.clone().unwrap_or_else(|| local.clone());
+                                kind_map.entry(public).or_insert(ExportSymbolKind::Other);
+                            }
+                        }
+                        ExportDecl::AllFrom { .. } => {
+                            // Without resolving the re-export chain we can't classify; leave empty.
+                        }
+                    }
+                }
+                export_kind_cache.insert(resolved_arc.clone(), kind_map);
+            }
+
+            let export_kinds = export_kind_cache
+                .get(&resolved_arc)
+                .expect("export kind cache entry");
+
+            let mut provider_exports: Vec<(String, crate::wir::BindingId)> = provider_ast
+                .exports
+                .iter()
+                .map(|(name, item)| ((*name).to_string(), item.binding))
+                .collect();
+            provider_exports.sort_by(|a, b| a.0.cmp(&b.0));
+
+            for item in &imp.items {
+                match item {
+                    ImportItem::Named { name, alias } => {
+                        let local = alias.as_ref().unwrap_or(name).clone();
+                        if let Some(export_item) = provider_ast.exports.get(name.as_str()) {
+                            links.import_bindings.insert(local, export_item.binding);
+
+                            if matches!(export_kinds.get(name), Some(ExportSymbolKind::Class)) {
+                                links.imported_class_bindings.insert(export_item.binding);
+                            }
+                        } else {
+                            #[cfg(debug_assertions)]
+                            {
+                                eprintln!(
+                                    "[bind] WARNING: {:?} imports '{}' from {:?}, but it's not exported there.",
+                                    path, name, resolved_arc
+                                );
+                            }
+                        }
+                    }
+                    ImportItem::Namespace { alias } => {
+                        links
+                            .namespace_imports
+                            .entry(alias.clone())
+                            .or_insert_with(|| provider_exports.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(links)
     }
 
     /// Single public entry point to build the whole program graph from an entry file.
@@ -205,6 +406,8 @@ impl ProgramBuilder {
         }
 
         let mut jobs: Vec<Job> = Vec::new();
+        let mut export_kind_cache: HashMap<Arc<PathBuf>, HashMap<String, ExportSymbolKind>> =
+            HashMap::default();
 
         // Stable order for determinism
         let mut paths: Vec<Arc<PathBuf>> = self.ctx.registry.keys().cloned().collect();
@@ -218,28 +421,8 @@ impl ProgramBuilder {
                 .ok_or_else(|| format!("lower(parallel): missing Program for {:?}", path))?
                 .clone();
 
-            // Build LinkInfo **from AST boxes** (imports resolved + own exports)
-            let links = {
-                let mut links = LinkInfo::default();
-                let mbox =
-                    self.ctx.registry.get(&path).ok_or_else(|| {
-                        format!("lower(parallel): missing ModuleAST for {:?}", path)
-                    })?;
-                let m: &ModuleAST<'static> = &**mbox;
-
-                // imports: local name -> provider BindingId
-                for (_from, req) in &m.imports {
-                    for (local, bid) in &req.resolved {
-                        links.import_bindings.insert((*local).to_string(), *bid);
-                    }
-                }
-                // exports: local export name -> our BindingId
-                for (name, item) in &m.exports {
-                    links.export_bindings.insert(name.to_string(), item.binding);
-                }
-
-                links
-            };
+            // Build LinkInfo (imports resolved, exports, namespaces, class metadata)
+            let links = self.build_link_info_for_module(&path, &prog, &mut export_kind_cache)?;
 
             jobs.push(Job { path, prog, links });
         }

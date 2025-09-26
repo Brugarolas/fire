@@ -210,6 +210,8 @@ pub extern "C" fn wir_binding_store(binding_id_smi: i64, val: i64) -> i64 {
         binding_id_smi
     };
     let id = raw as u32;
+    #[cfg(debug_assertions)]
+    eprintln!("[binding-store] id={} val={:#x}", id, val as u64);
     let mut m = bindings().lock();
     m.insert(id, val);
     0
@@ -1575,6 +1577,14 @@ impl JIT {
                         Inst::MakeClosure { callee, env } => {
                             use cranelift::prelude::{AbiParam, types};
 
+                            #[cfg(debug_assertions)]
+                            {
+                                eprintln!(
+                                    "[jit] MakeClosure start callee={:?} results={:?}",
+                                    callee, node.results
+                                );
+                            }
+
                             // JIT function code ptr for wir_f_<id> (direct within code heap).
                             let ptr_ty = self.module.target_config().pointer_type();
                             let mut jsig = self.module.make_signature();
@@ -1607,6 +1617,13 @@ impl JIT {
                                 &[code_ptr, env_v],
                             )?;
                             if res_count == 1 {
+                                #[cfg(debug_assertions)]
+                                {
+                                    eprintln!(
+                                        "[jit] MakeClosure results={:?} env_val={:?}",
+                                        node.results, env
+                                    );
+                                }
                                 vmap.bind(node.results[0], out);
                             }
                         }
@@ -2045,7 +2062,26 @@ impl JIT {
                         Inst::StoreBinding { binding, val } => {
                             use cranelift::prelude::{AbiParam, types};
                             let bid = fb.ins().iconst(types::I64, binding.0 as i64);
-                            let vv = vmap.get_or_emit(*val, &mut fb, fun_ir);
+                            let vv = if let ValueDef::InstResult(inst_id, _) =
+                                &fun_ir.values[val.0 as usize].def
+                            {
+                                if let Inst::Const(c) = &fun_ir.nodes[inst_id.0 as usize].kind {
+                                    #[cfg(debug_assertions)]
+                                    {
+                                        eprintln!(
+                                            "[jit] StoreBinding const {:?} -> {:?}",
+                                            binding, c
+                                        );
+                                    }
+                                    let v = self.emit_const(&mut fb, c);
+                                    vmap.bind(*val, v);
+                                    v
+                                } else {
+                                    vmap.get_or_emit(*val, &mut fb, fun_ir)
+                                }
+                            } else {
+                                vmap.get_or_emit(*val, &mut fb, fun_ir)
+                            };
                             let _ = self.call_import(
                                 &mut fb,
                                 "wir_binding_store",
