@@ -5,11 +5,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::opt::{OptimizationWIR, WirEditQueue, InstCursor};
 use crate::opt::helpers::value_as_i32;
-use crate::wir::{
-    Function, BlockId, Inst, InstId, ValueId, ValueDef, FieldId, Constant, Type,
-};
+use crate::opt::{InstCursor, OptimizationWIR, WirEditQueue};
+use crate::wir::{BlockId, Constant, FieldId, Function, Inst, InstId, Type, ValueDef, ValueId};
 
 /// Redundant Load Elimination + Load–Store Forwarding (intra-block)
 ///
@@ -43,9 +41,15 @@ pub struct RedundantLoadElim {
 }
 
 impl Default for RedundantLoadElim {
-    fn default() -> Self { Self { ran: false } }
+    fn default() -> Self {
+        Self { ran: false }
+    }
 }
-impl RedundantLoadElim { pub fn new() -> Self { Self::default() } }
+impl RedundantLoadElim {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 impl OptimizationWIR for RedundantLoadElim {
     fn optimize_node(&mut self, cur: &mut InstCursor, _q: &mut WirEditQueue) -> bool {
@@ -56,7 +60,9 @@ impl OptimizationWIR for RedundantLoadElim {
 
 impl RedundantLoadElim {
     pub fn run(&mut self, func: &mut Function) {
-        if self.ran { return; }
+        if self.ran {
+            return;
+        }
         self.ran = true;
 
         loop {
@@ -66,9 +72,9 @@ impl RedundantLoadElim {
             for b in &func.blocks {
                 // Per-block “available values” for precise locations
                 let mut last_field: HashMap<(ValueId, FieldId), ValueId> = HashMap::new();
-                let mut last_elem:  HashMap<(ValueId, i32),     ValueId> = HashMap::new();
-                let mut last_len:   HashMap<ValueId,            ValueId> = HashMap::new();
-                let mut last_env:   HashMap<(ValueId, u32),     ValueId> = HashMap::new();
+                let mut last_elem: HashMap<(ValueId, i32), ValueId> = HashMap::new();
+                let mut last_len: HashMap<ValueId, ValueId> = HashMap::new();
+                let mut last_env: HashMap<(ValueId, u32), ValueId> = HashMap::new();
 
                 // -------- helpers ----------
                 #[inline]
@@ -78,7 +84,8 @@ impl RedundantLoadElim {
                         match &func.values[v.0 as usize].def {
                             ValueDef::InstResult(iid, _ix) => {
                                 if let Inst::Mov(src) = func.nodes[iid.0 as usize].kind {
-                                    v = src; continue;
+                                    v = src;
+                                    continue;
                                 }
                             }
                             _ => {}
@@ -91,9 +98,9 @@ impl RedundantLoadElim {
                 #[inline]
                 fn flush_all(
                     last_field: &mut HashMap<(ValueId, FieldId), ValueId>,
-                    last_elem:  &mut HashMap<(ValueId, i32),     ValueId>,
-                    last_len:   &mut HashMap<ValueId,            ValueId>,
-                    last_env:   &mut HashMap<(ValueId, u32),     ValueId>,
+                    last_elem: &mut HashMap<(ValueId, i32), ValueId>,
+                    last_len: &mut HashMap<ValueId, ValueId>,
+                    last_env: &mut HashMap<(ValueId, u32), ValueId>,
                 ) {
                     last_field.clear();
                     last_elem.clear();
@@ -272,7 +279,9 @@ impl RedundantLoadElim {
             }
 
             if !changed {
-                if !q.is_empty() { q.apply(func); }
+                if !q.is_empty() {
+                    q.apply(func);
+                }
                 break;
             }
             q.apply(func);

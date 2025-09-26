@@ -3,9 +3,6 @@
 print("===== Hello World =====");
 print("Hello, World!"); // expect Hello, World!
 
-// Timer (2)
-setTimeout(fn () { print("Timer (2)"); }, 1000);
-
 print("===== Simple function =====");
 fn add2(a, b) {
     return a + b;
@@ -180,7 +177,10 @@ setTimeout(| | { e.reject(1); }, 0);
 
 print("===== Timers =====");
 print("(async)");
-setTimeout(fn () { print("Timer"); }, 500);
+setTimeout(fn () { print("Timer"); }, 50);
+
+// Timer (2)
+setTimeout(fn () { print("Timer (2)"); }, 100);
 
 print("===== Async/Await =====");
 print("(async)");

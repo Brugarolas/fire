@@ -5,11 +5,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::opt::{OptimizationWIR, WirEditQueue};
 use crate::opt::helpers::value_as_i32;
-use crate::wir::{
-    BlockId, Constant, FieldId, Function, Inst, InstId, Type, ValueDef, ValueId,
-};
+use crate::opt::{OptimizationWIR, WirEditQueue};
+use crate::wir::{BlockId, Constant, FieldId, Function, Inst, InstId, Type, ValueDef, ValueId};
 
 #[derive(Default)]
 pub struct SROA {
@@ -17,10 +15,14 @@ pub struct SROA {
 }
 
 impl SROA {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn run(&mut self, func: &mut Function) {
-        if self.ran { return; }
+        if self.ran {
+            return;
+        }
         self.ran = true;
 
         loop {
@@ -32,7 +34,9 @@ impl SROA {
 
             // -------- Objects: scalarize AllocObj when safe (single block, no escape) --------
             for (nid, obj_v) in alloc_objs(func) {
-                let Some((bid, alloc_pos)) = inst_block_pos.get(&nid).copied() else { continue; };
+                let Some((bid, alloc_pos)) = inst_block_pos.get(&nid).copied() else {
+                    continue;
+                };
 
                 // collect the whole mov-closure of the object value
                 let aliases = mov_closure(func, obj_v);
@@ -50,8 +54,14 @@ impl SROA {
                 }
 
                 for uid in &all_use_inst_ids {
-                    let Some((ubid, _upos)) = inst_block_pos.get(uid) else { ok = false; break; };
-                    if *ubid != bid { ok = false; break; }
+                    let Some((ubid, _upos)) = inst_block_pos.get(uid) else {
+                        ok = false;
+                        break;
+                    };
+                    if *ubid != bid {
+                        ok = false;
+                        break;
+                    }
                     // Only allow: Mov(obj), LoadField{obj}, StoreField{obj}, PostWriteBarrier{obj, _}
                     match &func.nodes[uid.0 as usize].kind {
                         Inst::Mov(v) if aliases.contains(v) => {}
@@ -62,13 +72,21 @@ impl SROA {
                         k => {
                             // Disallow TransitionShape / MethodLookup / calls / compares / array ops / etc.
                             match k {
-                                Inst::TransitionShape { obj, .. } if aliases.contains(obj) => { ok = false; break; }
-                                _ => { ok = false; break; }
+                                Inst::TransitionShape { obj, .. } if aliases.contains(obj) => {
+                                    ok = false;
+                                    break;
+                                }
+                                _ => {
+                                    ok = false;
+                                    break;
+                                }
                             }
                         }
                     }
                 }
-                if !ok { continue; }
+                if !ok {
+                    continue;
+                }
 
                 // Single-block linear scalar replacement
                 // Walk block from alloc to end, track last stored value per field, rewrite loads, remember stores/barriers to erase.
@@ -81,17 +99,27 @@ impl SROA {
                     let k = &func.nodes[cur_id.0 as usize].kind;
 
                     match k {
-                        Inst::StoreField { obj, field, val, expected: _ } if aliases.contains(obj) => {
+                        Inst::StoreField {
+                            obj,
+                            field,
+                            val,
+                            expected: _,
+                        } if aliases.contains(obj) => {
                             last.insert(*field, *val);
                             to_erase_positions.push(i);
                         }
-                        Inst::LoadField { obj, field, expected: _ } if aliases.contains(obj) => {
+                        Inst::LoadField {
+                            obj,
+                            field,
+                            expected: _,
+                        } if aliases.contains(obj) => {
                             if let Some(&v) = last.get(field) {
                                 q.replace_kind(cur_id, Inst::Mov(v));
                                 changed = true;
                             } else {
                                 // load-before-store: cannot prove initialization
-                                failed = true; break;
+                                failed = true;
+                                break;
                             }
                         }
                         Inst::PostWriteBarrier { obj, .. } if aliases.contains(obj) => {
@@ -102,7 +130,9 @@ impl SROA {
                     }
                 }
 
-                if failed { continue; }
+                if failed {
+                    continue;
+                }
 
                 // If we actually rewrote at least one load/store, remove the stores/barriers and the alloc itself
                 if !to_erase_positions.is_empty() || changed {
@@ -120,7 +150,9 @@ impl SROA {
 
             // -------- Arrays: scalarize small fixed-size arrays with const index uses --------
             for (nid, arr_v, len_n) in alloc_arrays_with_const_len(func) {
-                let Some((bid, alloc_pos)) = inst_block_pos.get(&nid).copied() else { continue; };
+                let Some((bid, alloc_pos)) = inst_block_pos.get(&nid).copied() else {
+                    continue;
+                };
 
                 let aliases = mov_closure(func, arr_v);
 
@@ -130,27 +162,46 @@ impl SROA {
 
                 for &v in &aliases {
                     if let Some(us) = uses.get(&v) {
-                        for &uid in us { all_use_inst_ids.insert(uid); }
+                        for &uid in us {
+                            all_use_inst_ids.insert(uid);
+                        }
                     }
                 }
 
                 for uid in &all_use_inst_ids {
-                    let Some((ubid, _upos)) = inst_block_pos.get(uid) else { ok = false; break; };
-                    if *ubid != bid { ok = false; break; }
+                    let Some((ubid, _upos)) = inst_block_pos.get(uid) else {
+                        ok = false;
+                        break;
+                    };
+                    if *ubid != bid {
+                        ok = false;
+                        break;
+                    }
                     match &func.nodes[uid.0 as usize].kind {
                         Inst::Mov(v) if aliases.contains(v) => {}
                         Inst::LoadElem { arr, idx } if aliases.contains(arr) => {
-                            if value_as_i32(func, *idx).is_none() { ok = false; break; }
+                            if value_as_i32(func, *idx).is_none() {
+                                ok = false;
+                                break;
+                            }
                         }
                         Inst::StoreElem { arr, idx, val: _ } if aliases.contains(arr) => {
-                            if value_as_i32(func, *idx).is_none() { ok = false; break; }
+                            if value_as_i32(func, *idx).is_none() {
+                                ok = false;
+                                break;
+                            }
                         }
                         Inst::ArrayLen(v) if aliases.contains(v) => {}
                         // any other use => escape / unknown
-                        _ => { ok = false; break; }
+                        _ => {
+                            ok = false;
+                            break;
+                        }
                     }
                 }
-                if !ok { continue; }
+                if !ok {
+                    continue;
+                }
 
                 // linear scalarization in the block
                 let block = func.blocks.iter().find(|b| b.id == bid).unwrap();
@@ -165,8 +216,14 @@ impl SROA {
                                 if 0 <= ix && ix < len_n {
                                     elems.insert(ix, *val);
                                     to_erase_positions.push(i);
-                                } else { failed = true; break; }
-                            } else { failed = true; break; }
+                                } else {
+                                    failed = true;
+                                    break;
+                                }
+                            } else {
+                                failed = true;
+                                break;
+                            }
                         }
                         Inst::LoadElem { arr, idx } if aliases.contains(arr) => {
                             if let Some(ix) = value_as_i32(func, *idx) {
@@ -174,9 +231,13 @@ impl SROA {
                                     q.replace_kind(cur_id, Inst::Mov(v));
                                     changed = true;
                                 } else {
-                                    failed = true; break; // read-before-write or unknown
+                                    failed = true;
+                                    break; // read-before-write or unknown
                                 }
-                            } else { failed = true; break; }
+                            } else {
+                                failed = true;
+                                break;
+                            }
                         }
                         Inst::ArrayLen(v) if aliases.contains(v) => {
                             q.replace_kind(cur_id, Inst::Const(Constant::Int32(len_n)));
@@ -186,7 +247,9 @@ impl SROA {
                     }
                 }
 
-                if failed { continue; }
+                if failed {
+                    continue;
+                }
 
                 if !to_erase_positions.is_empty() || changed {
                     for pos in to_erase_positions.into_iter().rev() {
@@ -200,7 +263,9 @@ impl SROA {
             }
 
             if !changed {
-                if !q.is_empty() { q.apply(func); }
+                if !q.is_empty() {
+                    q.apply(func);
+                }
                 break;
             }
             q.apply(func);
@@ -217,7 +282,12 @@ impl OptimizationWIR for SROA {
 
 /* ===================== helpers ===================== */
 
-fn index_func(func: &Function) -> (HashMap<InstId, (BlockId, usize)>, HashMap<ValueId, Vec<InstId>>) {
+fn index_func(
+    func: &Function,
+) -> (
+    HashMap<InstId, (BlockId, usize)>,
+    HashMap<ValueId, Vec<InstId>>,
+) {
     let mut map_inst: HashMap<InstId, (BlockId, usize)> = HashMap::new();
     let mut uses: HashMap<ValueId, Vec<InstId>> = HashMap::new();
 
@@ -238,88 +308,94 @@ fn index_func(func: &Function) -> (HashMap<InstId, (BlockId, usize)>, HashMap<Va
 fn inst_operands(k: &Inst) -> Vec<ValueId> {
     use Inst::*;
     match k {
-        Phi(vs)                           => vs.clone(),
-        Jump(_, args)                     => args.clone(),
-        Branch { cond, .. }               => vec![*cond],
-        Switch { tag, .. }                => vec![*tag],
-        Return(vals)                      => vals.clone(),
-        Throw(v)                          => vec![*v],
+        Phi(vs) => vs.clone(),
+        Jump(_, args) => args.clone(),
+        Branch { cond, .. } => vec![*cond],
+        Switch { tag, .. } => vec![*tag],
+        Return(vals) => vals.clone(),
+        Throw(v) => vec![*v],
 
-        Mov(v)                            => vec![*v],
-        Const(_)                          => vec![],
+        Mov(v) => vec![*v],
+        Const(_) => vec![],
 
-        GuardType { val, .. }             => vec![*val],
-        GuardShape { obj, .. }            => vec![*obj],
-        GuardBounds { idx, len, .. }      => vec![*idx, *len],
-        GuardNotNull { val, .. }          => vec![*val],
-        GuardIsInt { val, .. }            => vec![*val],
-        GuardIsF64 { val, .. }            => vec![*val],
+        GuardType { val, .. } => vec![*val],
+        GuardShape { obj, .. } => vec![*obj],
+        GuardBounds { idx, len, .. } => vec![*idx, *len],
+        GuardNotNull { val, .. } => vec![*val],
+        GuardIsInt { val, .. } => vec![*val],
+        GuardIsF64 { val, .. } => vec![*val],
 
-        AllocObj { .. }                   => vec![],
-        LoadField { obj, .. }             => vec![*obj],
-        StoreField { obj, val, .. }       => vec![*obj, *val],
-        TransitionShape { obj, .. }       => vec![*obj],
+        AllocObj { .. } => vec![],
+        LoadField { obj, .. } => vec![*obj],
+        StoreField { obj, val, .. } => vec![*obj, *val],
+        TransitionShape { obj, .. } => vec![*obj],
 
-        AllocArray { len, .. }            => vec![*len],
-        ArrayLen(v)                       => vec![*v],
-        ArraySetLen { arr, new_len }      => vec![*arr, *new_len],
-        LoadElem { arr, idx }             => vec![*arr, *idx],
-        StoreElem { arr, idx, val }       => vec![*arr, *idx, *val],
-        ArraySlice { arr, start, end }    => vec![*arr, *start, *end],
+        AllocArray { len, .. } => vec![*len],
+        ArrayLen(v) => vec![*v],
+        ArraySetLen { arr, new_len } => vec![*arr, *new_len],
+        LoadElem { arr, idx } => vec![*arr, *idx],
+        StoreElem { arr, idx, val } => vec![*arr, *idx, *val],
+        ArraySlice { arr, start, end } => vec![*arr, *start, *end],
 
-        ArrayPush { arr, val }            => vec![*arr, *val],
-        ArrayPop(arr)                     => vec![*arr],
-        ArrayShift(arr)                   => vec![*arr],
-        ArrayUnshift { arr, val }         => vec![*arr, *val],
-        ArrayMap { arr, .. }              => vec![*arr],
-        ArrayReduce { init, arr, .. }     => vec![*init, *arr],
-        ArrayFill { arr, val }            => vec![*arr, *val],
-        ArrayCopy { dst, src, len }       => vec![*dst, *src, *len],
-        ArrayForEach { arr, .. }          => vec![*arr],
-        ArrayFind { arr, .. }             => vec![*arr],
-        ArrayFindIndex { arr, .. }        => vec![*arr],
-        ArrayFilter { arr, .. }           => vec![*arr],
+        ArrayPush { arr, val } => vec![*arr, *val],
+        ArrayPop(arr) => vec![*arr],
+        ArrayShift(arr) => vec![*arr],
+        ArrayUnshift { arr, val } => vec![*arr, *val],
+        ArrayMap { arr, .. } => vec![*arr],
+        ArrayReduce { init, arr, .. } => vec![*init, *arr],
+        ArrayFill { arr, val } => vec![*arr, *val],
+        ArrayCopy { dst, src, len } => vec![*dst, *src, *len],
+        ArrayForEach { arr, .. } => vec![*arr],
+        ArrayFind { arr, .. } => vec![*arr],
+        ArrayFindIndex { arr, .. } => vec![*arr],
+        ArrayFilter { arr, .. } => vec![*arr],
 
-        StrLen(v)                         => vec![*v],
-        StrConcat { a, b }                => vec![*a, *b],
-        StrSlice { s, start, end }        => vec![*s, *start, *end],
-        StrCompare { a, b }               => vec![*a, *b],
-        StrContains { s, sub }            => vec![*s, *sub],
-        StrToNumber(v)                    => vec![*v],
+        StrLen(v) => vec![*v],
+        StrConcat { a, b } => vec![*a, *b],
+        StrSlice { s, start, end } => vec![*s, *start, *end],
+        StrCompare { a, b } => vec![*a, *b],
+        StrContains { s, sub } => vec![*s, *sub],
+        StrToNumber(v) => vec![*v],
 
-        IntBin { a, b, .. }               => vec![*a, *b],
-        F64Bin { a, b, .. }               => vec![*a, *b],
-        NumAdd(a,b) | NumSub(a,b)
-        | NumMul(a,b) | NumDiv(a,b)
-        | NumRem(a,b)                    => vec![*a, *b],
-        CmpInt { a, b, .. }              => vec![*a, *b],
-        CmpF64 { a, b, .. }              => vec![*a, *b],
-        CmpRefEq { a, b }                => vec![*a, *b],
+        IntBin { a, b, .. } => vec![*a, *b],
+        F64Bin { a, b, .. } => vec![*a, *b],
+        NumAdd(a, b) | NumSub(a, b) | NumMul(a, b) | NumDiv(a, b) | NumRem(a, b) => vec![*a, *b],
+        CmpInt { a, b, .. } => vec![*a, *b],
+        CmpF64 { a, b, .. } => vec![*a, *b],
+        CmpRefEq { a, b } => vec![*a, *b],
 
-        BoxInt(v) | BoxF64(v) | BoxBool(v)
-        | UnboxToInt(v) | UnboxToF64(v)  => vec![*v],
+        BoxInt(v) | BoxF64(v) | BoxBool(v) | UnboxToInt(v) | UnboxToF64(v) => vec![*v],
 
-        CallDirect { args, .. }          => args.clone(),
-        CallDirectMemoized { args, .. }  => args.clone(),
-        CallIC { recv, args, .. }        => {
-            let mut vs = vec![*recv]; vs.extend_from_slice(args); vs
+        CallDirect { args, .. } => args.clone(),
+        CallDirectMemoized { args, .. } => args.clone(),
+        CallIC { recv, args, .. } => {
+            let mut vs = vec![*recv];
+            vs.extend_from_slice(args);
+            vs
         }
-        MethodLookup { obj, .. }         => vec![*obj],
-        AllocClosure { .. }              => vec![],
-        LoadEnv { clos, .. }             => vec![*clos],
-        StoreEnv { clos, val, .. }       => vec![*clos, *val],
-        MakeClosure { env, .. }          => vec![*env],
-        CallClosure { fun, args, .. }    => {
-            let mut vs = vec![*fun]; vs.extend_from_slice(args); vs
+        MethodLookup { obj, .. } => vec![*obj],
+        AllocClosure { .. } => vec![],
+        LoadEnv { clos, .. } => vec![*clos],
+        StoreEnv { clos, val, .. } => vec![*clos, *val],
+        MakeClosure { env, .. } => vec![*env],
+        CallClosure { fun, args, .. } => {
+            let mut vs = vec![*fun];
+            vs.extend_from_slice(args);
+            vs
         }
 
-        CallNative { args, .. }          => args.clone(),
+        CallNative { args, .. } => args.clone(),
 
-        PostWriteBarrier { obj, val }    => vec![*obj, *val],
-        ReadBarrier { obj }              => vec![*obj],
+        PostWriteBarrier { obj, val } => vec![*obj, *val],
+        ReadBarrier { obj } => vec![*obj],
         EffectEntry | Safepoint | OSRPoint => vec![],
-        RegisterClass { .. } | AllocInstance { .. } | EventLoopPump { .. }
-        | SetTimeout { .. } | SetInterval { .. } | ClearTimeout { .. } | ClearInterval { .. } => vec![],
+        RegisterClass { .. }
+        | AllocInstance { .. }
+        | EventLoopPump { .. }
+        | SetTimeout { .. }
+        | SetInterval { .. }
+        | ClearTimeout { .. }
+        | ClearInterval { .. } => vec![],
 
         _ => vec![],
     }

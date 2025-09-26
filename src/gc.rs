@@ -2,73 +2,60 @@
 #![allow(unused_variables)]
 #![allow(unused_unsafe)]
 
+use ahash::AHashMap as HashMap;
+use core::mem::{self, size_of};
+use core::ptr;
+use likely_stable::{likely, unlikely};
 use once_cell::sync::Lazy;
 use once_cell::sync::OnceCell;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
-use core::mem::{self, size_of};
-use ahash::AHashMap as HashMap;
 use smallvec::SmallVec;
-use std::cell::RefCell;
-use core::{ptr};
-use std::sync::atomic::AtomicUsize;
 use std::cell::Cell;
-use likely_stable::{likely, unlikely};
+use std::cell::RefCell;
+use std::sync::atomic::AtomicUsize;
 
+use mmtk::util::constants::{BYTES_IN_ADDRESS, LOG_BYTES_IN_ADDRESS};
 use mmtk::{
-    util::{
-        copy::{CopySemantics, GCWorkerCopyContext},
-        opaque_pointer::*,
-        Address,
-        ObjectReference,
-        options::{Options, PlanSelector}
-    },
-    vm::{
-        slot::{Slot, MemorySlice},
-        ObjectModel,
-        VMBinding,
-        Scanning,
-        Collection,
-        ActivePlan,
-        ReferenceGlue,
-        GCThreadContext,
-        ObjectTracer
-    },
     AllocationSemantics,
-    memory_manager,
-    Mutator,
-    MMTKBuilder,
     MMTK,
 
+    MMTKBuilder,
+    Mutator,
+    memory_manager,
+    util::{
+        Address, ObjectReference,
+        copy::{CopySemantics, GCWorkerCopyContext},
+        opaque_pointer::*,
+        options::{Options, PlanSelector},
+    },
+    vm::{
+        ActivePlan, Collection, GCThreadContext, ObjectModel, ObjectTracer, ReferenceGlue,
+        Scanning, VMBinding,
+        slot::{MemorySlice, Slot},
+    },
+    // For Scanning impl:
+    vm::{ObjectTracerContext, RootsWorkFactory},
     // For ObjectModel impl:
     vm::{
-        VMGlobalLogBitSpec,
-        VMLocalForwardingBitsSpec,
-        VMLocalForwardingPointerSpec,
-        VMLocalLOSMarkNurserySpec,
-        VMLocalMarkBitSpec,
-        VMLocalPinningBitSpec,
+        VMGlobalLogBitSpec, VMLocalForwardingBitsSpec, VMLocalForwardingPointerSpec,
+        VMLocalLOSMarkNurserySpec, VMLocalMarkBitSpec, VMLocalPinningBitSpec,
     },
-
-    // For Scanning impl:
-    vm::{RootsWorkFactory, ObjectTracerContext},
 };
-use mmtk::util::constants::{BYTES_IN_ADDRESS, LOG_BYTES_IN_ADDRESS};
 
-use std::sync::atomic::{AtomicBool, Ordering::{Acquire, Release}};
-use parking_lot::{Mutex as ParkMutex, Condvar as ParkCondvar};
+use parking_lot::{Condvar as ParkCondvar, Mutex as ParkMutex};
 use std::sync::atomic::Ordering::AcqRel;
+use std::sync::atomic::{
+    AtomicBool,
+    Ordering::{Acquire, Release},
+};
 
 static STW_REQUESTED: AtomicBool = AtomicBool::new(false);
 static STW_LOCK: ParkMutex<()> = ParkMutex::new(());
 static STW_CV: ParkCondvar = ParkCondvar::new();
 
 use crate::value::{
-    ObjHeader,
-    TAG_BOXED_F64, TAG_STRING, TAG_ARRAY, TAG_CLOSURE, TAG_OBJECT,
-    ValueRepr, BoxedF64, BoxedStr, BoxedClosure, BoxedObj,
-    ARRAY_LEN_OFFSET, ARRAY_DATA_OFFSET,
-    is_ptr,
-    NULL,
+    ARRAY_DATA_OFFSET, ARRAY_LEN_OFFSET, BoxedClosure, BoxedF64, BoxedObj, BoxedStr, NULL,
+    ObjHeader, TAG_ARRAY, TAG_BOXED_F64, TAG_CLOSURE, TAG_OBJECT, TAG_STRING, ValueRepr, is_ptr,
 };
 
 static MUTATOR_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -111,10 +98,10 @@ fn size_of_object_from_tag(base: *const u8) -> usize {
             TAG_BOXED_F64 => mem::size_of::<BoxedF64>(),
 
             // BoxedStr stores borrowed data pointer; the object itself is fixed size.
-            TAG_STRING    => mem::size_of::<BoxedStr>(),
+            TAG_STRING => mem::size_of::<BoxedStr>(),
 
             // Flat array layout: | ObjHeader | i64 len | len * i64 elements |
-            TAG_ARRAY     => {
+            TAG_ARRAY => {
                 let len = read_len_unaligned(base);
                 (ARRAY_DATA_OFFSET as usize) + len * mem::size_of::<i64>()
             }
@@ -122,7 +109,7 @@ fn size_of_object_from_tag(base: *const u8) -> usize {
             // Dictionary-like object with Rust HashMaps inside:
             // the GC only owns the outer header+two HashMap structs; the buffers those maps
             // allocate live on the Rust heap and are *not* part of this object’s GC size.
-            TAG_OBJECT    => mem::size_of::<BoxedObj>(),
+            TAG_OBJECT => mem::size_of::<BoxedObj>(),
 
             _ => {
                 debug_assert!(false, "Unknown object tag: {}", hdr.tag);
@@ -131,7 +118,6 @@ fn size_of_object_from_tag(base: *const u8) -> usize {
         }
     }
 }
-
 
 #[inline(always)]
 fn emit_shadow_roots_to_factory<T: RootsWorkFactory<SlotItem>>(factory: &mut T) {
@@ -157,12 +143,19 @@ fn emit_shadow_roots_to_factory<T: RootsWorkFactory<SlotItem>>(factory: &mut T) 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SlotItem(pub Address);
 
-impl From<Address> for SlotItem { fn from(a: Address) -> Self { SlotItem(a) } }
+impl From<Address> for SlotItem {
+    fn from(a: Address) -> Self {
+        SlotItem(a)
+    }
+}
 
 impl Slot for SlotItem {
     #[inline(always)]
     fn load(&self) -> Option<ObjectReference> {
-        use crate::value::{ObjHeader, TAG_BOXED_F64, TAG_STRING, TAG_ARRAY, TAG_OBJECT, TAG_CLOSURE, ValueRepr, NULL, is_ptr};
+        use crate::value::{
+            NULL, ObjHeader, TAG_ARRAY, TAG_BOXED_F64, TAG_CLOSURE, TAG_OBJECT, TAG_STRING,
+            ValueRepr, is_ptr,
+        };
         let v: ValueRepr = unsafe { ptr::read(self.0.to_ptr::<ValueRepr>()) };
 
         if likely(is_ptr(v)) && v != NULL {
@@ -204,11 +197,19 @@ pub struct MemSlice {
 impl MemSlice {
     #[inline(always)]
     pub fn new(start: Address, bytes: usize) -> Self {
-        Self { start, bytes, owner: None }
+        Self {
+            start,
+            bytes,
+            owner: None,
+        }
     }
     #[inline(always)]
     pub fn for_object(owner: ObjectReference, start: Address, bytes: usize) -> Self {
-        Self { start, bytes, owner: Some(owner) }
+        Self {
+            start,
+            bytes,
+            owner: Some(owner),
+        }
     }
 }
 
@@ -241,23 +242,33 @@ impl MemorySlice for MemSlice {
     fn iter_slots(&self) -> Self::SlotIterator {
         MemSliceIter {
             cursor: self.start,
-            limit:  self.start + self.bytes,
+            limit: self.start + self.bytes,
         }
     }
 
     #[inline(always)]
-    fn object(&self) -> Option<ObjectReference> { self.owner }
+    fn object(&self) -> Option<ObjectReference> {
+        self.owner
+    }
 
     #[inline(always)]
-    fn start(&self) -> Address { self.start }
+    fn start(&self) -> Address {
+        self.start
+    }
 
     #[inline(always)]
-    fn bytes(&self) -> usize { self.bytes }
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
 
     #[inline(always)]
     fn copy(src: &Self, tgt: &Self) {
         debug_assert_eq!(src.bytes, tgt.bytes, "memcpy slices must be same size");
-        debug_assert_eq!(src.bytes & ((1 << LOG_BYTES_IN_ADDRESS) - 1), 0, "slice size must be word-aligned");
+        debug_assert_eq!(
+            src.bytes & ((1 << LOG_BYTES_IN_ADDRESS) - 1),
+            0,
+            "slice size must be word-aligned"
+        );
         unsafe {
             let words = tgt.bytes >> LOG_BYTES_IN_ADDRESS;
             let sp = src.start.to_ptr::<usize>();
@@ -270,24 +281,29 @@ impl MemorySlice for MemSlice {
 // =================================================================
 // ==================== MMTk binding for Napalm VM =================
 // =================================================================
-#[derive(Clone, Copy, Debug, Default)] pub struct NapalmVM;
-#[derive(Clone, Copy, Debug, Default)] pub struct VMObjModel;
-#[derive(Clone, Copy, Debug, Default)] pub struct VMScanning;
-#[derive(Clone, Copy, Debug, Default)] pub struct VMCollection;
-#[derive(Clone, Copy, Debug, Default)] pub struct VMActivePlan;
-#[derive(Clone, Copy, Debug, Default)] pub struct VMRefGlue;
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NapalmVM;
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VMObjModel;
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VMScanning;
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VMCollection;
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VMActivePlan;
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VMRefGlue;
 
 impl ObjectModel<NapalmVM> for VMObjModel {
     // ---- Where per-object metadata lives ----
     // Keep it simple: everything (except the forwarding *pointer*) goes to side metadata.
-    const GLOBAL_LOG_BIT_SPEC: VMGlobalLogBitSpec =
-        VMGlobalLogBitSpec::side_first();
+    const GLOBAL_LOG_BIT_SPEC: VMGlobalLogBitSpec = VMGlobalLogBitSpec::side_first();
 
     // Forwarding pointer MUST be in-header. We place it at the first payload word:
     // offset = header_size_in_bits (so it overwrites the first payload word only while dead).
     const LOCAL_FORWARDING_POINTER_SPEC: VMLocalForwardingPointerSpec =
         VMLocalForwardingPointerSpec::in_header(
-            (core::mem::size_of::<crate::value::ObjHeader>() * 8) as isize
+            (core::mem::size_of::<crate::value::ObjHeader>() * 8) as isize,
         );
 
     // Local side-metadata chain (order matters: first -> side_first, then -> side_after(prev))
@@ -313,10 +329,10 @@ impl ObjectModel<NapalmVM> for VMObjModel {
         unsafe {
             match (*hdr).tag {
                 TAG_BOXED_F64 => core::mem::size_of::<BoxedF64>(),
-                TAG_STRING    => core::mem::size_of::<BoxedStr>(),
-                TAG_ARRAY     => core::mem::size_of::<BoxedArray>(),
-                TAG_CLOSURE   => core::mem::size_of::<BoxedClosure>(),
-                TAG_OBJECT    => core::mem::size_of::<BoxedObj>(),
+                TAG_STRING => core::mem::size_of::<BoxedStr>(),
+                TAG_ARRAY => core::mem::size_of::<BoxedArray>(),
+                TAG_CLOSURE => core::mem::size_of::<BoxedClosure>(),
+                TAG_OBJECT => core::mem::size_of::<BoxedObj>(),
                 _ => core::mem::size_of::<ObjHeader>(), // conservative fallback
             }
         }
@@ -335,11 +351,11 @@ impl ObjectModel<NapalmVM> for VMObjModel {
         unsafe {
             match (*hdr).tag {
                 TAG_BOXED_F64 => core::mem::align_of::<BoxedF64>(),
-                TAG_STRING    => core::mem::align_of::<BoxedStr>(),
-                TAG_ARRAY     => core::mem::align_of::<BoxedArray>(),
-                TAG_CLOSURE   => core::mem::align_of::<BoxedClosure>(),
-                TAG_OBJECT    => core::mem::align_of::<BoxedObj>(),
-                _             => core::mem::align_of::<ObjHeader>(),
+                TAG_STRING => core::mem::align_of::<BoxedStr>(),
+                TAG_ARRAY => core::mem::align_of::<BoxedArray>(),
+                TAG_CLOSURE => core::mem::align_of::<BoxedClosure>(),
+                TAG_OBJECT => core::mem::align_of::<BoxedObj>(),
+                _ => core::mem::align_of::<ObjHeader>(),
             }
         }
     }
@@ -384,24 +400,17 @@ impl ObjectModel<NapalmVM> for VMObjModel {
     #[inline(always)]
     fn copy_to(from: ObjectReference, _to: ObjectReference, region: Address) -> Address {
         // Raw byte copy of the whole object.
-        let src   = Self::ref_to_object_start(from);
+        let src = Self::ref_to_object_start(from);
         let bytes = Self::get_size_when_copied(from);
 
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                src.to_ptr::<u8>(),
-                region.to_mut_ptr::<u8>(),
-                bytes,
-            );
+            core::ptr::copy_nonoverlapping(src.to_ptr::<u8>(), region.to_mut_ptr::<u8>(), bytes);
         }
         region.add(bytes)
     }
 
     #[inline(always)]
-    fn get_reference_when_copied_to(
-        _from: ObjectReference,
-        to: Address,
-    ) -> ObjectReference {
+    fn get_reference_when_copied_to(_from: ObjectReference, to: Address) -> ObjectReference {
         // With unified refs, the post-copy reference is exactly the region base.
         ObjectReference::from_raw_address(to).expect("MMTk asked for a null target")
     }
@@ -409,22 +418,30 @@ impl ObjectModel<NapalmVM> for VMObjModel {
     // ---- Type descriptors (debug only; C-style nul-terminated) ----
     fn get_type_descriptor(reference: ObjectReference) -> &'static [i8] {
         use crate::value::*;
-        static TD_F64:     [i8; 4] = [b'f' as i8, b'6' as i8, b'4' as i8, 0];
-        static TD_STR:     [i8; 5] = [b's' as i8, b't' as i8, b'r' as i8, b'\0' as i8, 0];
-        static TD_ARRAY:   [i8; 6] = [b'a' as i8, b'r' as i8, b'r' as i8, b'a' as i8, b'y' as i8, 0];
-        static TD_OBJECT:  [i8; 7] = [b'o' as i8, b'b' as i8, b'j' as i8, b'e' as i8, b'c' as i8, b't' as i8, 0];
-        static TD_CLOSURE: [i8; 8] = [b'c' as i8, b'l' as i8, b'o' as i8, b's' as i8, b'u' as i8, b'r' as i8, b'e' as i8, 0];
-        static TD_UNKNOWN: [i8; 8] = [b'u' as i8, b'n' as i8, b'k' as i8, b'n' as i8, b'o' as i8, b'w' as i8, b'n' as i8, 0];
+        static TD_F64: [i8; 4] = [b'f' as i8, b'6' as i8, b'4' as i8, 0];
+        static TD_STR: [i8; 5] = [b's' as i8, b't' as i8, b'r' as i8, b'\0' as i8, 0];
+        static TD_ARRAY: [i8; 6] = [
+            b'a' as i8, b'r' as i8, b'r' as i8, b'a' as i8, b'y' as i8, 0,
+        ];
+        static TD_OBJECT: [i8; 7] = [
+            b'o' as i8, b'b' as i8, b'j' as i8, b'e' as i8, b'c' as i8, b't' as i8, 0,
+        ];
+        static TD_CLOSURE: [i8; 8] = [
+            b'c' as i8, b'l' as i8, b'o' as i8, b's' as i8, b'u' as i8, b'r' as i8, b'e' as i8, 0,
+        ];
+        static TD_UNKNOWN: [i8; 8] = [
+            b'u' as i8, b'n' as i8, b'k' as i8, b'n' as i8, b'o' as i8, b'w' as i8, b'n' as i8, 0,
+        ];
 
         let hdr = Self::ref_to_object_start(reference).to_ptr::<ObjHeader>();
         unsafe {
             match (*hdr).tag {
                 TAG_BOXED_F64 => &TD_F64,
-                TAG_STRING    => &TD_STR,
-                TAG_ARRAY     => &TD_ARRAY,
-                TAG_OBJECT    => &TD_OBJECT,
-                TAG_CLOSURE   => &TD_CLOSURE,
-                _             => &TD_UNKNOWN,
+                TAG_STRING => &TD_STR,
+                TAG_ARRAY => &TD_ARRAY,
+                TAG_OBJECT => &TD_OBJECT,
+                TAG_CLOSURE => &TD_CLOSURE,
+                _ => &TD_UNKNOWN,
             }
         }
     }
@@ -444,43 +461,61 @@ impl ObjectModel<NapalmVM> for VMObjModel {
             match tag {
                 TAG_BOXED_F64 => {
                     let o = addr.to_ptr::<BoxedF64>();
-                    #[cfg(debug_assertions)] {
+                    #[cfg(debug_assertions)]
+                    {
                         eprintln!("[napalm:mmtk] BoxedF64 @ {addr:?} val={}", (*o).val);
                     }
                 }
                 TAG_STRING => {
                     let s = addr.to_ptr::<BoxedStr>();
-                    #[cfg(debug_assertions)] {
-                        eprintln!("[napalm:mmtk] String @ {addr:?} len={} data={:?}", (*s).len, (*s).data);
+                    #[cfg(debug_assertions)]
+                    {
+                        eprintln!(
+                            "[napalm:mmtk] String @ {addr:?} len={} data={:?}",
+                            (*s).len,
+                            (*s).data
+                        );
                     }
                 }
                 TAG_ARRAY => {
                     let a = addr.to_ptr::<BoxedArray>();
                     // Avoid formatting the whole Vec; print capacity/len.
-                    #[cfg(debug_assertions)] {
+                    #[cfg(debug_assertions)]
+                    {
                         eprintln!(
                             "[napalm:mmtk] Array @ {addr:?} len={} cap={}",
-                            (*a).buf.len(), (*a).buf.capacity()
+                            (*a).buf.len(),
+                            (*a).buf.capacity()
                         );
                     }
                 }
                 TAG_OBJECT => {
                     let o = addr.to_ptr::<BoxedObj>();
-                    #[cfg(debug_assertions)] {
+                    #[cfg(debug_assertions)]
+                    {
                         eprintln!(
                             "[napalm:mmtk] Object @ {addr:?} slots={{by_id: {}, by_str: {}}}",
-                            (*o).by_id.len(), (*o).by_str.len()
+                            (*o).by_id.len(),
+                            (*o).by_str.len()
                         );
                     }
                 }
                 TAG_CLOSURE => {
                     let c = addr.to_ptr::<BoxedClosure>();
                     #[cfg(debug_assertions)]
-                    eprintln!("[napalm:mmtk] Closure @ {addr:?} env_len={} code_ptr=0x{:x}", (*c).env.len(), (*c).code_ptr);
+                    eprintln!(
+                        "[napalm:mmtk] Closure @ {addr:?} env_len={} code_ptr=0x{:x}",
+                        (*c).env.len(),
+                        (*c).code_ptr
+                    );
                 }
                 _ => {
-                    #[cfg(debug_assertions)] {
-                        eprintln!("[napalm:mmtk] <unknown tag={tag}> @ {addr:?} ({} bytes)", size);
+                    #[cfg(debug_assertions)]
+                    {
+                        eprintln!(
+                            "[napalm:mmtk] <unknown tag={tag}> @ {addr:?} ({} bytes)",
+                            size
+                        );
                     }
                 }
             }
@@ -496,14 +531,14 @@ impl Scanning<NapalmVM> for VMScanning {
         slot_visitor: &mut SV,
     ) {
         use crate::value::{
-            ObjHeader, BoxedF64, BoxedStr, BoxedArray, BoxedObj,
-            TAG_BOXED_F64, TAG_STRING, TAG_ARRAY, TAG_OBJECT, is_ptr, NULL,
+            BoxedArray, BoxedF64, BoxedObj, BoxedStr, NULL, ObjHeader, TAG_ARRAY, TAG_BOXED_F64,
+            TAG_OBJECT, TAG_STRING, is_ptr,
         };
         use mmtk::util::Address;
 
         unsafe {
             let base = object.to_raw_address().to_ptr::<u8>();
-            let hdr  = &*(base as *const ObjHeader);
+            let hdr = &*(base as *const ObjHeader);
 
             match hdr.tag {
                 TAG_BOXED_F64 | TAG_STRING => {
@@ -560,24 +595,25 @@ impl Scanning<NapalmVM> for VMScanning {
                         let slot_ptr: *mut i64 = ptr.add(i);
                         let val = *slot_ptr;
                         if is_ptr(val) && val != NULL {
-                            slot_visitor.visit_slot(SlotItem(Address::from_ptr(slot_ptr.cast::<u8>())));
+                            slot_visitor
+                                .visit_slot(SlotItem(Address::from_ptr(slot_ptr.cast::<u8>())));
                         }
                     }
                 }
 
                 _ => {
                     #[cfg(debug_assertions)]
-                    eprintln!("[napalm:mmtk] scan_object: unknown tag={} @{:?}", hdr.tag, base);
+                    eprintln!(
+                        "[napalm:mmtk] scan_object: unknown tag={} @{:?}",
+                        hdr.tag, base
+                    );
                 }
             }
         }
     }
 
     #[inline(always)]
-    fn scan_vm_specific_roots(
-        _tls: VMWorkerThread,
-        mut factory: impl RootsWorkFactory<SlotItem>,
-    ) {
+    fn scan_vm_specific_roots(_tls: VMWorkerThread, mut factory: impl RootsWorkFactory<SlotItem>) {
         // 1) Shadow stack
         emit_shadow_roots_to_factory(&mut factory);
 
@@ -616,9 +652,14 @@ impl Scanning<NapalmVM> for VMScanning {
             let mut edges: SmallVec<[SlotItem; 64]> = SmallVec::new();
             crate::native_promises::promises_with_root_slots(|slot| {
                 edges.push(SlotItem(Address::from_ptr(slot.cast::<u8>())));
-                if edges.len() == 64 { factory.create_process_roots_work(edges.to_vec()); edges.clear(); }
+                if edges.len() == 64 {
+                    factory.create_process_roots_work(edges.to_vec());
+                    edges.clear();
+                }
             });
-            if !edges.is_empty() { factory.create_process_roots_work(edges.to_vec()); }
+            if !edges.is_empty() {
+                factory.create_process_roots_work(edges.to_vec());
+            }
         }
     }
 
@@ -658,7 +699,7 @@ impl Collection<NapalmVM> for VMCollection {
     /// Request a stop-the-world. In cooperative mode we just set a flag;
     /// mutators will park at the next `yieldpoint()`.
     #[inline(always)]
-    fn stop_all_mutators<F>( _tls: VMWorkerThread, mut mutator_visitor: F )
+    fn stop_all_mutators<F>(_tls: VMWorkerThread, mut mutator_visitor: F)
     where
         F: FnMut(&'static mut Mutator<NapalmVM>),
     {
@@ -676,9 +717,7 @@ impl Collection<NapalmVM> for VMCollection {
 
     /// Resume mutators by clearing the flag and waking all parked threads.
     #[inline(always)]
-    fn resume_mutators(
-        _tls: VMWorkerThread,
-    ) {
+    fn resume_mutators(_tls: VMWorkerThread) {
         STW_REQUESTED.store(false, Release);
         STW_CV.notify_all();
     }
@@ -687,10 +726,12 @@ impl Collection<NapalmVM> for VMCollection {
     /// Park until `resume_mutators` clears the flag.
     #[inline(always)]
     fn block_for_gc(_mutator: VMMutatorThread) {
-        if !STW_REQUESTED.load(Acquire) { return; }
-        let mut guard = STW_LOCK.lock();        // <- make it mutable
+        if !STW_REQUESTED.load(Acquire) {
+            return;
+        }
+        let mut guard = STW_LOCK.lock(); // <- make it mutable
         while STW_REQUESTED.load(Acquire) {
-            STW_CV.wait(&mut guard);            // <- pass &mut guard
+            STW_CV.wait(&mut guard); // <- pass &mut guard
         }
     }
 
@@ -703,9 +744,7 @@ impl Collection<NapalmVM> for VMCollection {
             .spawn(move || {
                 let worker_tls: VMWorkerThread = unsafe { std::mem::transmute(tls) };
                 match ctx {
-                    mmtk::vm::GCThreadContext::Worker(worker) => {
-                        worker.run(worker_tls, get_mmtk())
-                    }
+                    mmtk::vm::GCThreadContext::Worker(worker) => worker.run(worker_tls, get_mmtk()),
                 }
             })
             .expect("spawn GC worker");
@@ -733,9 +772,8 @@ impl ActivePlan<NapalmVM> for VMActivePlan {
             let list = ALL_MUTATORS.lock();
             list.as_slice().to_vec()
         };
-        let refs: Vec<&'static mut Mutator<NapalmVM>> = unsafe {
-            ptrs.into_iter().map(|p| &mut *p.0).collect()
-        };
+        let refs: Vec<&'static mut Mutator<NapalmVM>> =
+            unsafe { ptrs.into_iter().map(|p| &mut *p.0).collect() };
         Box::new(refs.into_iter())
     }
 
@@ -776,15 +814,15 @@ impl ReferenceGlue<NapalmVM> for VMRefGlue {
 }
 
 impl VMBinding for NapalmVM {
-    type VMObjectModel   = VMObjModel;
-    type VMScanning      = VMScanning;
-    type VMCollection    = VMCollection;
-    type VMActivePlan    = VMActivePlan;
+    type VMObjectModel = VMObjModel;
+    type VMScanning = VMScanning;
+    type VMCollection = VMCollection;
+    type VMActivePlan = VMActivePlan;
     type VMReferenceGlue = VMRefGlue;
 
     // Your VM’s slot & memory slice types
-    type VMSlot         = SlotItem;
-    type VMMemorySlice  = MemSlice;
+    type VMSlot = SlotItem;
+    type VMMemorySlice = MemSlice;
 }
 
 // ==================================================================
@@ -849,9 +887,9 @@ impl MutatorThread {
     pub fn with_mutator<R>(f: impl FnOnce(&mut Mutator<NapalmVM>) -> R) -> R {
         TLS_MUTATOR.with(|c| {
             let mut guard = c.borrow_mut();
-            let m = guard
-                .as_deref_mut()
-                .expect("MMTk mutator not attached on this thread. Call gc::attach_current_thread().");
+            let m = guard.as_deref_mut().expect(
+                "MMTk mutator not attached on this thread. Call gc::attach_current_thread().",
+            );
             f(m)
         })
     }
@@ -917,7 +955,7 @@ impl NapalmGc {
         NapalmGc {
             mutator: MutatorThread::default(),
             stack_guess: 1 << 20, // 1 MiB
-            gc: get_mmtk()
+            gc: get_mmtk(),
         }
     }
 
@@ -927,7 +965,10 @@ impl NapalmGc {
 
         // Any mutator thread token is fine for the request hint. If you want,
         // plumb a real per-thread VMThread here.
-        handle_user_collection_request::<NapalmVM>(self.gc, VMMutatorThread(VMThread::UNINITIALIZED))
+        handle_user_collection_request::<NapalmVM>(
+            self.gc,
+            VMMutatorThread(VMThread::UNINITIALIZED),
+        )
     }
 
     /// Visit all root slots currently on the shadow stack with a callback.
@@ -964,9 +1005,17 @@ impl NapalmGc {
     pub unsafe fn alloc_raw(&self, bytes: usize, align: usize) -> *mut u8 {
         MutatorThread::with_mutator(|mutator| {
             let addr = memory_manager::alloc::<NapalmVM>(
-                mutator, bytes, align, 0, AllocationSemantics::Default,
+                mutator,
+                bytes,
+                align,
+                0,
+                AllocationSemantics::Default,
             );
-            if addr.is_zero() { ptr::null_mut() } else { addr.to_mut_ptr::<u8>() }
+            if addr.is_zero() {
+                ptr::null_mut()
+            } else {
+                addr.to_mut_ptr::<u8>()
+            }
         })
     }
 
@@ -974,7 +1023,11 @@ impl NapalmGc {
     pub unsafe fn alloc_slow_path(&self, bytes: usize, align: usize) -> *mut u8 {
         MutatorThread::with_mutator(|mutator| {
             let addr = memory_manager::alloc_slow::<NapalmVM>(
-                mutator, bytes, align, 0, AllocationSemantics::Default,
+                mutator,
+                bytes,
+                align,
+                0,
+                AllocationSemantics::Default,
             );
             debug_assert!(!addr.is_zero());
             addr.to_mut_ptr::<u8>()
@@ -987,21 +1040,30 @@ impl NapalmGc {
             let objref = ObjectReference::from_raw_address(Address::from_mut_ptr(obj_ptr))
                 .expect("post_alloc_object: null obj_ptr");
             memory_manager::post_alloc::<NapalmVM>(
-                mutator, objref, bytes, AllocationSemantics::Default,
+                mutator,
+                objref,
+                bytes,
+                AllocationSemantics::Default,
             );
         });
     }
 
     #[inline(always)]
-    pub unsafe fn post_write_barrier(&self, object_base: *mut u8, slot: *mut ValueRepr, new_val: ValueRepr) {
+    pub unsafe fn post_write_barrier(
+        &self,
+        object_base: *mut u8,
+        slot: *mut ValueRepr,
+        new_val: ValueRepr,
+    ) {
         if is_ptr(new_val) && new_val != NULL {
             MutatorThread::with_mutator(|mutator| {
                 let src = ObjectReference::from_raw_address(Address::from_ptr(object_base))
                     .expect("post barrier: null src");
                 let vm_slot = SlotItem::from(Address::from_ptr(slot.cast::<u8>()));
-                let target = ObjectReference::from_raw_address(Address::from_ptr(new_val as *mut u8));
+                let target =
+                    ObjectReference::from_raw_address(Address::from_ptr(new_val as *mut u8));
                 memory_manager::object_reference_write_post::<NapalmVM>(
-                    mutator, src, vm_slot, target
+                    mutator, src, vm_slot, target,
                 );
             });
         }
@@ -1016,9 +1078,7 @@ impl NapalmGc {
                     .expect("pre barrier: null src");
                 let vm_slot = SlotItem::from(Address::from_ptr(slot.cast::<u8>()));
                 let old = ObjectReference::from_raw_address(Address::from_ptr(old_v as *mut u8));
-                memory_manager::object_reference_write_pre::<NapalmVM>(
-                    mutator, src, vm_slot, old
-                );
+                memory_manager::object_reference_write_pre::<NapalmVM>(mutator, src, vm_slot, old);
             });
         }
     }
@@ -1070,7 +1130,7 @@ impl NapalmGc {
 
         unsafe {
             let base = obj.to_raw_address().to_ptr::<u8>();
-            let hdr  = &*(base as *const ObjHeader);
+            let hdr = &*(base as *const ObjHeader);
             match hdr.tag {
                 TAG_BOXED_F64 | TAG_STRING => {}
                 TAG_ARRAY => {
@@ -1156,10 +1216,7 @@ impl NapalmGc {
             if low == 0 || high == 0 || low >= high {
                 return None; // fallback → heuristic
             }
-            Some((
-                Address::from_usize(low),
-                Address::from_usize(high),
-            ))
+            Some((Address::from_usize(low), Address::from_usize(high)))
         }
     }
 
@@ -1172,7 +1229,9 @@ impl NapalmGc {
     #[inline(always)]
     pub fn yieldpoint(&self) {
         // Fast path: nothing to do.
-        if !STW_REQUESTED.load(Acquire) { return; }
+        if !STW_REQUESTED.load(Acquire) {
+            return;
+        }
 
         // Park cooperatively until GC clears the flag.
         let mut guard = STW_LOCK.lock();
@@ -1218,7 +1277,9 @@ impl ShadowStack {
     }
     #[inline(always)]
     pub fn pop_range() {
-        SHADOW.with(|s| { s.borrow_mut().pop(); });
+        SHADOW.with(|s| {
+            s.borrow_mut().pop();
+        });
     }
 
     /// Iterate current roots

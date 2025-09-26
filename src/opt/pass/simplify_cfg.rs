@@ -3,22 +3,28 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
-use std::collections::HashMap;
 use crate::opt::{OptimizationWIR, WirEditQueue};
 use crate::wir::{BlockId, Function, Inst, InstId, ValueId};
+use std::collections::HashMap;
 
 pub struct SimplifyCFG {
     ran: bool,
 }
 
 impl Default for SimplifyCFG {
-    fn default() -> Self { Self { ran: false } }
+    fn default() -> Self {
+        Self { ran: false }
+    }
 }
 impl SimplifyCFG {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn run(&mut self, func: &mut Function) {
-        if self.ran { return; }
+        if self.ran {
+            return;
+        }
         self.ran = true;
 
         loop {
@@ -50,12 +56,15 @@ impl SimplifyCFG {
                 while guard < 64 {
                     guard += 1;
                     let blk = func.blocks.iter().find(|x| x.id == bid).unwrap();
-                    if !blk.params.is_empty() { break; }
+                    if !blk.params.is_empty() {
+                        break;
+                    }
                     // Only follow if block is Jump-only and the jump carries NO args.
                     if let Some(Some(tid)) = term_of.get(&bid) {
                         if let Inst::Jump(t, args) = &func.nodes[tid.0 as usize].kind {
                             if args.is_empty() && is_block_jump_only(func, bid) {
-                                bid = *t; continue;
+                                bid = *t;
+                                continue;
                             }
                         }
                     }
@@ -78,24 +87,49 @@ impl SimplifyCFG {
                                 changed = true;
                             }
                         }
-                        Inst::Branch { cond, then_b, else_b } => {
+                        Inst::Branch {
+                            cond,
+                            then_b,
+                            else_b,
+                        } => {
                             let nthen = resolve_zero_param_trampoline(*then_b, func);
                             let nelse = resolve_zero_param_trampoline(*else_b, func);
                             if nthen != *then_b || nelse != *else_b {
-                                q.replace_kind(tid, Inst::Branch { cond: *cond, then_b: nthen, else_b: nelse });
+                                q.replace_kind(
+                                    tid,
+                                    Inst::Branch {
+                                        cond: *cond,
+                                        then_b: nthen,
+                                        else_b: nelse,
+                                    },
+                                );
                                 changed = true;
                             }
                         }
-                        Inst::Switch { tag, default_b, table } => {
+                        Inst::Switch {
+                            tag,
+                            default_b,
+                            table,
+                        } => {
                             let mut nd = resolve_zero_param_trampoline(*default_b, func);
                             let mut nt = table.clone();
                             let mut any = nd != *default_b;
                             for it in nt.iter_mut() {
                                 let nb = resolve_zero_param_trampoline(it.1, func);
-                                if nb != it.1 { it.1 = nb; any = true; }
+                                if nb != it.1 {
+                                    it.1 = nb;
+                                    any = true;
+                                }
                             }
                             if any {
-                                q.replace_kind(tid, Inst::Switch { tag: *tag, default_b: nd, table: nt });
+                                q.replace_kind(
+                                    tid,
+                                    Inst::Switch {
+                                        tag: *tag,
+                                        default_b: nd,
+                                        table: nt,
+                                    },
+                                );
                                 changed = true;
                             }
                         }
@@ -119,17 +153,25 @@ impl SimplifyCFG {
                 };
 
                 // Quick pred list
-                let ps = match preds.get(&bid) { Some(v) => v, None => continue };
+                let ps = match preds.get(&bid) {
+                    Some(v) => v,
+                    None => continue,
+                };
 
                 // If ANY pred is not a Jump -> we cannot forward args safely (Branches carry no args)
-                if ps.iter().any(|&(pb, _)| !pred_is_jump_to(func, pb, bid, &term_of)) {
+                if ps
+                    .iter()
+                    .any(|&(pb, _)| !pred_is_jump_to(func, pb, bid, &term_of))
+                {
                     continue;
                 }
 
                 // If the trampoline has params, we need them for substitution; allowed.
                 // Build param index lookup: param -> idx
                 let mut pidx: HashMap<ValueId, usize> = HashMap::new();
-                for (i, &pv) in b.params.iter().enumerate() { pidx.insert(pv, i); }
+                for (i, &pv) in b.params.iter().enumerate() {
+                    pidx.insert(pv, i);
+                }
 
                 // For each predecessor Jump(P -> B, Jargs), build new args for succ:
                 // new_arg = if a_args[k] is one of B.params[j] then Jargs[j] else a_args[k]
@@ -138,12 +180,18 @@ impl SimplifyCFG {
                         Some(x) => x,
                         None => continue,
                     };
-                    if !same_target { continue; } // sanity
+                    if !same_target {
+                        continue;
+                    } // sanity
                     let mut new_args: Vec<ValueId> = Vec::with_capacity(a_args.len());
                     for aa in &a_args {
                         if let Some(&jx) = pidx.get(aa) {
                             // Substitute from predecessor's jump args
-                            if jx < jargs.len() { new_args.push(jargs[jx]); } else { new_args.push(*aa); }
+                            if jx < jargs.len() {
+                                new_args.push(jargs[jx]);
+                            } else {
+                                new_args.push(*aa);
+                            }
                         } else {
                             new_args.push(*aa);
                         }
@@ -169,18 +217,35 @@ impl SimplifyCFG {
                 // Collect safe merges first (avoid borrow churn).
                 let mut merges: Vec<(BlockId, BlockId, usize)> = Vec::new(); // (pred, block, pred_jump_pos)
                 for b in &func.blocks {
-                    if b.id == func.entry { continue; }
-                    if !b.params.is_empty() { continue; }
-                    if contains_phi(func, b.id) { continue; }
-                    let ps = match preds2.get(&b.id) { Some(v) => v, None => continue };
-                    if ps.len() != 1 { continue; }
+                    if b.id == func.entry {
+                        continue;
+                    }
+                    if !b.params.is_empty() {
+                        continue;
+                    }
+                    if contains_phi(func, b.id) {
+                        continue;
+                    }
+                    let ps = match preds2.get(&b.id) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    if ps.len() != 1 {
+                        continue;
+                    }
                     let (pred_b, ptid) = ps[0];
                     // pred must end with Jump(pred -> b)
                     if let Some(Some(tid)) = term_of2.get(&pred_b) {
-                        if *tid != ptid { continue; } // sanity
+                        if *tid != ptid {
+                            continue;
+                        } // sanity
                         if let Inst::Jump(tgt, _a) = &func.nodes[ptid.0 as usize].kind {
-                            if *tgt != b.id { continue; }
-                        } else { continue; }
+                            if *tgt != b.id {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
                         // Record the position of pred's terminator and the block id to merge.
                         if let Some(pos) = inst_pos_in_block(func, pred_b, ptid) {
                             merges.push((pred_b, b.id, pos));
@@ -230,7 +295,9 @@ impl SimplifyCFG {
             for b in &func.blocks {
                 for (i, &nid) in b.insts.iter().enumerate() {
                     if let Inst::Phi(ref vs) = func.nodes[nid.0 as usize].kind {
-                        if vs.is_empty() { continue; }
+                        if vs.is_empty() {
+                            continue;
+                        }
                         if vs.len() == 1 {
                             q.replace_kind(nid, Inst::Mov(vs[0]));
                             changed = true;
@@ -246,7 +313,9 @@ impl SimplifyCFG {
             }
 
             if !changed {
-                if !q.is_empty() { q.apply(func); }
+                if !q.is_empty() {
+                    q.apply(func);
+                }
                 break;
             }
             q.apply(func);
@@ -270,9 +339,11 @@ fn collect_terminators(func: &Function) -> HashMap<BlockId, Option<InstId>> {
         let mut t: Option<InstId> = None;
         if let Some(&nid) = b.insts.last() {
             match func.nodes[nid.0 as usize].kind {
-                Inst::Jump(_, _) | Inst::Branch { .. } | Inst::Switch { .. } | Inst::Return(_) | Inst::Throw(_) => {
-                    t = Some(nid)
-                }
+                Inst::Jump(_, _)
+                | Inst::Branch { .. }
+                | Inst::Switch { .. }
+                | Inst::Return(_)
+                | Inst::Throw(_) => t = Some(nid),
                 _ => {}
             }
         }
@@ -284,7 +355,10 @@ fn collect_terminators(func: &Function) -> HashMap<BlockId, Option<InstId>> {
 fn build_cfg(
     func: &Function,
     term_of: &HashMap<BlockId, Option<InstId>>,
-) -> (HashMap<BlockId, Vec<(BlockId, InstId)>>, HashMap<BlockId, Vec<BlockId>>) {
+) -> (
+    HashMap<BlockId, Vec<(BlockId, InstId)>>,
+    HashMap<BlockId, Vec<BlockId>>,
+) {
     // preds: succ -> [(pred_block, pred_term_id)]
     let mut preds: HashMap<BlockId, Vec<(BlockId, InstId)>> = HashMap::new();
     let mut succs: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
@@ -298,11 +372,14 @@ fn build_cfg(
                     preds.entry(*t).or_default().push((b.id, *tid));
                 }
                 Inst::Branch { then_b, else_b, .. } => {
-                    outs.push(*then_b); outs.push(*else_b);
+                    outs.push(*then_b);
+                    outs.push(*else_b);
                     preds.entry(*then_b).or_default().push((b.id, *tid));
                     preds.entry(*else_b).or_default().push((b.id, *tid));
                 }
-                Inst::Switch { default_b, table, .. } => {
+                Inst::Switch {
+                    default_b, table, ..
+                } => {
                     outs.push(*default_b);
                     preds.entry(*default_b).or_default().push((b.id, *tid));
                     for &(_, bb) in table {
@@ -320,14 +397,23 @@ fn build_cfg(
 
 fn is_block_jump_only(func: &Function, bid: BlockId) -> bool {
     let blk = func.blocks.iter().find(|x| x.id == bid).unwrap();
-    if blk.insts.is_empty() { return false; }
+    if blk.insts.is_empty() {
+        return false;
+    }
     // Only last is a terminator jump, and all before are non-terminators? keep it *strict*: exactly one inst
-    if blk.insts.len() != 1 { return false; }
+    if blk.insts.len() != 1 {
+        return false;
+    }
     let nid = blk.insts[0];
     matches!(func.nodes[nid.0 as usize].kind, Inst::Jump(_, _))
 }
 
-fn pred_is_jump_to(func: &Function, pred_b: BlockId, to: BlockId, term_of: &HashMap<BlockId, Option<InstId>>) -> bool {
+fn pred_is_jump_to(
+    func: &Function,
+    pred_b: BlockId,
+    to: BlockId,
+    term_of: &HashMap<BlockId, Option<InstId>>,
+) -> bool {
     if let Some(Some(tid)) = term_of.get(&pred_b) {
         if let Inst::Jump(tgt, _a) = &func.nodes[tid.0 as usize].kind {
             return *tgt == to;
@@ -356,15 +442,20 @@ fn inst_pos_in_block(func: &Function, bid: BlockId, nid: InstId) -> Option<usize
 
 fn contains_phi(func: &Function, bid: BlockId) -> bool {
     let blk = func.blocks.iter().find(|b| b.id == bid).unwrap();
-    blk.insts.iter().any(|&nid| matches!(func.nodes[nid.0 as usize].kind, Inst::Phi(_)))
+    blk.insts
+        .iter()
+        .any(|&nid| matches!(func.nodes[nid.0 as usize].kind, Inst::Phi(_)))
 }
 
 fn is_terminator(k: &Inst) -> bool {
-    matches!(k, Inst::Return(_)
-                | Inst::Branch { .. }
-                | Inst::Jump(_, _)
-                | Inst::Throw(_)
-                | Inst::Switch { .. })
+    matches!(
+        k,
+        Inst::Return(_)
+            | Inst::Branch { .. }
+            | Inst::Jump(_, _)
+            | Inst::Throw(_)
+            | Inst::Switch { .. }
+    )
 }
 
 fn compute_reachable(func: &Function) -> std::collections::HashSet<BlockId> {
@@ -372,17 +463,26 @@ fn compute_reachable(func: &Function) -> std::collections::HashSet<BlockId> {
     let mut stack: Vec<BlockId> = vec![func.entry];
 
     while let Some(bid) = stack.pop() {
-        if !seen.insert(bid) { continue; }
+        if !seen.insert(bid) {
+            continue;
+        }
         if let Some(block) = func.blocks.iter().find(|b| b.id == bid) {
             for &nid in &block.insts {
                 let k = &func.nodes[nid.0 as usize].kind;
                 if is_terminator(k) {
                     match k {
                         Inst::Jump(t, _) => stack.push(*t),
-                        Inst::Branch { then_b, else_b, .. } => { stack.push(*then_b); stack.push(*else_b); }
-                        Inst::Switch { default_b, table, .. } => {
+                        Inst::Branch { then_b, else_b, .. } => {
+                            stack.push(*then_b);
+                            stack.push(*else_b);
+                        }
+                        Inst::Switch {
+                            default_b, table, ..
+                        } => {
                             stack.push(*default_b);
-                            for &(_, blk) in table { stack.push(blk); }
+                            for &(_, blk) in table {
+                                stack.push(blk);
+                            }
                         }
                         Inst::Return(_) | Inst::Throw(_) => {}
                         _ => {}

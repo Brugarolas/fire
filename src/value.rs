@@ -4,10 +4,10 @@
 #![allow(unused_variables)]
 #![allow(unused_unsafe)]
 
-use core::mem;
-use ahash::AHashMap as HashMap;
-use std::ptr;
 use crate::gc::NAPALM_GC;
+use ahash::AHashMap as HashMap;
+use core::mem;
+use std::ptr;
 
 //use crate::gc::api::{alloc_raw, alloc_slow_path, post_alloc_object};
 //use crate::gc::post_write_barrier;
@@ -19,20 +19,38 @@ use crate::gc::NAPALM_GC;
 pub type ValueRepr = i64;
 
 // ---- Pointer / immediate tests ----
-#[inline(always)] pub fn is_ptr(v: ValueRepr) -> bool { (v & 1) == 0 }
-#[inline(always)] pub fn is_imm(v: ValueRepr) -> bool { (v & 1) == 1 }
+#[inline(always)]
+pub fn is_ptr(v: ValueRepr) -> bool {
+    (v & 1) == 0
+}
+#[inline(always)]
+pub fn is_imm(v: ValueRepr) -> bool {
+    (v & 1) == 1
+}
 
 // ---- Small Int (SMI) encoding ----
-#[inline(always)] pub fn make_smi(n: i64) -> ValueRepr { (n << 1) | 1 }
-#[inline(always)] pub fn smi_to_i64(v: ValueRepr) -> i64 { v >> 1 } // arithmetic shift
+#[inline(always)]
+pub fn make_smi(n: i64) -> ValueRepr {
+    (n << 1) | 1
+}
+#[inline(always)]
+pub fn smi_to_i64(v: ValueRepr) -> i64 {
+    v >> 1
+} // arithmetic shift
 
 // ---- Null (boxed-null) ----
 pub const NULL: ValueRepr = 0;
 
 // ---- Booleans: raw 0/1 (not SMIs) ----
 // (Kept for now to match your lowerer’s behavior)
-#[inline(always)] pub fn is_bool(v: i64) -> bool          { v == 0 || v == 1 }
-#[inline(always)] pub fn to_bool(v: i64) -> bool          { v != 0 }
+#[inline(always)]
+pub fn is_bool(v: i64) -> bool {
+    v == 0 || v == 1
+}
+#[inline(always)]
+pub fn to_bool(v: i64) -> bool {
+    v != 0
+}
 
 // ============================================================================
 // Object headers & tags
@@ -47,10 +65,10 @@ pub struct ObjHeader {
 
 // Object tags (grow as we add types)
 pub const TAG_BOXED_F64: u32 = 1;
-pub const TAG_STRING:   u32 = 2;
-pub const TAG_ARRAY:    u32 = 3;
-pub const TAG_CLOSURE:  u32 = 4;
-pub const TAG_OBJECT:   u32 = 5;
+pub const TAG_STRING: u32 = 2;
+pub const TAG_ARRAY: u32 = 3;
+pub const TAG_CLOSURE: u32 = 4;
+pub const TAG_OBJECT: u32 = 5;
 
 // ============================================================================
 // Boxed f64
@@ -68,14 +86,23 @@ pub fn box_f64(x: f64) -> ValueRepr {
         let size = mem::size_of::<BoxedF64>();
         let align = mem::align_of::<BoxedF64>();
 
-        #[cfg(feature = "gc")] {
+        #[cfg(feature = "gc")]
+        {
             let mut p = NAPALM_GC.alloc_raw(size, align);
-            if p.is_null() { p = NAPALM_GC.alloc_slow_path(size, align); }
+            if p.is_null() {
+                p = NAPALM_GC.alloc_slow_path(size, align);
+            }
 
             let obj = p as *mut BoxedF64;
             core::ptr::write(
                 obj,
-                BoxedF64 { hdr: ObjHeader { tag: TAG_BOXED_F64, aux: 0 }, val: x }
+                BoxedF64 {
+                    hdr: ObjHeader {
+                        tag: TAG_BOXED_F64,
+                        aux: 0,
+                    },
+                    val: x,
+                },
             );
 
             NAPALM_GC.post_alloc_object(p, size);
@@ -83,18 +110,27 @@ pub fn box_f64(x: f64) -> ValueRepr {
             return p as ValueRepr;
         }
 
-        #[cfg(not(feature = "gc"))] {
-            use std::alloc::{alloc, Layout};
+        #[cfg(not(feature = "gc"))]
+        {
+            use std::alloc::{Layout, alloc};
 
             let layout = Layout::from_size_align_unchecked(size, align);
 
             let p = alloc(layout);
-            if p.is_null() { std::process::abort(); }
+            if p.is_null() {
+                std::process::abort();
+            }
 
             let obj = p as *mut BoxedF64;
             core::ptr::write(
                 obj,
-                BoxedF64 { hdr: ObjHeader { tag: TAG_BOXED_F64, aux: 0 }, val: x }
+                BoxedF64 {
+                    hdr: ObjHeader {
+                        tag: TAG_BOXED_F64,
+                        aux: 0,
+                    },
+                    val: x,
+                },
             );
 
             return p as ValueRepr;
@@ -120,8 +156,8 @@ pub struct Array {
 }
 
 // Offsets used by the JIT (kept for compatibility with any flat layout users)
-pub const ARRAY_HDR_SIZE:    i32 = core::mem::size_of::<ObjHeader>() as i32; // 8
-pub const ARRAY_LEN_OFFSET:  i32 = ARRAY_HDR_SIZE;                           // 8
+pub const ARRAY_HDR_SIZE: i32 = core::mem::size_of::<ObjHeader>() as i32; // 8
+pub const ARRAY_LEN_OFFSET: i32 = ARRAY_HDR_SIZE; // 8
 pub const ARRAY_DATA_OFFSET: i32 = ARRAY_HDR_SIZE + core::mem::size_of::<i64>() as i32; // 16
 
 #[repr(C)]
@@ -131,33 +167,63 @@ pub struct BoxedArray {
 }
 
 impl BoxedArray {
-    #[inline(always)] pub fn len(&self) -> usize { self.buf.len() }
-    #[inline(always)] pub fn cap(&self) -> usize { self.buf.capacity() }
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+    #[inline(always)]
+    pub fn cap(&self) -> usize {
+        self.buf.capacity()
+    }
 }
 
 #[inline]
 fn alloc_array_from_vec(mut buf: Vec<i64>) -> ValueRepr {
     unsafe {
-        let size  = core::mem::size_of::<BoxedArray>();
+        let size = core::mem::size_of::<BoxedArray>();
         let align = core::mem::align_of::<BoxedArray>();
 
-        #[cfg(feature = "gc")] {
+        #[cfg(feature = "gc")]
+        {
             let mut p = NAPALM_GC.alloc_raw(size, align);
-            if p.is_null() { p = NAPALM_GC.alloc_slow_path(size, align); }
+            if p.is_null() {
+                p = NAPALM_GC.alloc_slow_path(size, align);
+            }
 
             let obj = p as *mut BoxedArray;
-            core::ptr::write(obj, BoxedArray { hdr: ObjHeader { tag: TAG_ARRAY, aux: 0 }, buf });
+            core::ptr::write(
+                obj,
+                BoxedArray {
+                    hdr: ObjHeader {
+                        tag: TAG_ARRAY,
+                        aux: 0,
+                    },
+                    buf,
+                },
+            );
             NAPALM_GC.post_alloc_object(p, size);
             return p as ValueRepr;
         }
 
-        #[cfg(not(feature = "gc"))] {
-            use std::alloc::{alloc, Layout};
+        #[cfg(not(feature = "gc"))]
+        {
+            use std::alloc::{Layout, alloc};
             let layout = Layout::from_size_align_unchecked(size, align);
             let p = alloc(layout);
-            if p.is_null() { std::process::abort(); }
+            if p.is_null() {
+                std::process::abort();
+            }
             let obj = p as *mut BoxedArray;
-            core::ptr::write(obj, BoxedArray { hdr: ObjHeader { tag: TAG_ARRAY, aux: 0 }, buf });
+            core::ptr::write(
+                obj,
+                BoxedArray {
+                    hdr: ObjHeader {
+                        tag: TAG_ARRAY,
+                        aux: 0,
+                    },
+                    buf,
+                },
+            );
             return p as ValueRepr;
         }
     }
@@ -203,7 +269,9 @@ pub unsafe fn array_get(arr_v: ValueRepr, idx: usize) -> ValueRepr {
 #[inline(always)]
 pub unsafe fn array_set(arr_v: ValueRepr, idx: usize, val: ValueRepr) -> ValueRepr {
     let a = &mut *as_boxed_array_mut(arr_v);
-    if idx >= a.buf.len() { a.buf.resize(idx + 1, 0); }
+    if idx >= a.buf.len() {
+        a.buf.resize(idx + 1, 0);
+    }
     let slot: *mut i64 = a.buf.as_mut_ptr().add(idx);
     *slot = val;
 
@@ -242,7 +310,9 @@ pub unsafe fn array_pop(arr_v: ValueRepr) -> ValueRepr {
 #[inline(always)]
 pub unsafe fn array_shift(arr_v: ValueRepr) -> ValueRepr {
     let a = &mut *as_boxed_array_mut(arr_v);
-    if a.buf.is_empty() { return NULL; }
+    if a.buf.is_empty() {
+        return NULL;
+    }
     // Vec::remove will shift elements internally; we don't fire per-slot barriers here.
     a.buf.remove(0)
 }
@@ -313,7 +383,9 @@ pub unsafe fn array_find(arr_v: ValueRepr, clo_ptr: ValueRepr) -> ValueRepr {
     for &x in &a.buf {
         let args = [x];
         let ok = wir_call_closure(clo_ptr, args.as_ptr(), 1);
-        if ok != 0 { return x; }
+        if ok != 0 {
+            return x;
+        }
 
         #[cfg(feature = "gc")]
         NAPALM_GC.maybe_safepoint();
@@ -331,7 +403,9 @@ pub unsafe fn array_find_index(arr_v: ValueRepr, clo_ptr: ValueRepr) -> ValueRep
     for (i, &x) in a.buf.iter().enumerate() {
         let args = [x];
         let ok = wir_call_closure(clo_ptr, args.as_ptr(), 1);
-        if ok != 0 { return make_smi(i as i64); }
+        if ok != 0 {
+            return make_smi(i as i64);
+        }
 
         #[cfg(feature = "gc")]
         NAPALM_GC.maybe_safepoint();
@@ -350,7 +424,9 @@ pub unsafe fn array_filter(arr_v: ValueRepr, clo_ptr: ValueRepr) -> ValueRepr {
     for &x in &a.buf {
         let args = [x];
         let ok = wir_call_closure(clo_ptr, args.as_ptr(), 1);
-        if ok != 0 { out.push(x); }
+        if ok != 0 {
+            out.push(x);
+        }
 
         #[cfg(feature = "gc")]
         NAPALM_GC.maybe_safepoint();
@@ -363,7 +439,7 @@ pub unsafe fn array_reduce(
     arr_v: ValueRepr,
     clo_ptr: ValueRepr,
     has_init: bool,
-    init: ValueRepr
+    init: ValueRepr,
 ) -> ValueRepr {
     unsafe extern "C" {
         fn wir_call_closure(clo_ptr: i64, argv: *const i64, argc: i64) -> i64;
@@ -393,7 +469,8 @@ pub unsafe fn array_fill(arr_v: ValueRepr, val: ValueRepr) -> ValueRepr {
         let slot = base.add(i);
         *slot = val;
 
-        #[cfg(feature = "gc")] {
+        #[cfg(feature = "gc")]
+        {
             NAPALM_GC.post_write_barrier(arr_v as *mut u8, slot, val);
             NAPALM_GC.maybe_safepoint();
         }
@@ -406,7 +483,9 @@ pub unsafe fn array_copy(dst_v: ValueRepr, src_v: ValueRepr, n: usize) -> ValueR
     let d = &mut *as_boxed_array_mut(dst_v);
     let s = &*as_boxed_array_ref(src_v);
 
-    if d.buf.len() < n { d.buf.resize(n, 0); }
+    if d.buf.len() < n {
+        d.buf.resize(n, 0);
+    }
 
     let nn = n.min(s.buf.len());
     let dptr = d.buf.as_mut_ptr();
@@ -426,8 +505,14 @@ pub unsafe fn array_copy(dst_v: ValueRepr, src_v: ValueRepr, n: usize) -> ValueR
     0
 }
 
-#[inline(always)] fn smi(x: i64) -> i64 { (x << 1) | 1 }
-#[inline(always)] fn smi_to_i64_wrapped(v: i64) -> i64 { v >> 1 } // arithmetic shift
+#[inline(always)]
+fn smi(x: i64) -> i64 {
+    (x << 1) | 1
+}
+#[inline(always)]
+fn smi_to_i64_wrapped(v: i64) -> i64 {
+    v >> 1
+} // arithmetic shift
 
 // ---- C exports expected by the JIT ----
 #[unsafe(no_mangle)]
@@ -438,60 +523,82 @@ pub extern "C" fn wir_array_new(len: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_array_len(arr: i64) -> i64 {
-    if arr == 0 { return smi(0); }
+    if arr == 0 {
+        return smi(0);
+    }
     unsafe { smi(array_len(arr) as i64) }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_array_get(arr: i64, idx: i64) -> i64 {
-    if arr == 0 { return 0; }
+    if arr == 0 {
+        return 0;
+    }
     let i = smi_to_i64_wrapped(idx);
-    if i < 0 { return 0; }
+    if i < 0 {
+        return 0;
+    }
     unsafe { array_get(arr, i as usize) }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_array_set(arr: i64, idx: i64, val: i64) -> i64 {
-    if arr == 0 { return 0; }
+    if arr == 0 {
+        return 0;
+    }
     let i = smi_to_i64_wrapped(idx);
-    if i < 0 { return 0; }
+    if i < 0 {
+        return 0;
+    }
     unsafe { array_set(arr, i as usize, val) }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_array_set_len(arr: i64, new_len: i64) -> i64 {
-    if arr == 0 { return 0; }
+    if arr == 0 {
+        return 0;
+    }
     let n = smi_to_i64_wrapped(new_len).max(0) as usize;
     unsafe { array_set_len(arr, n) }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_array_push(arr: i64, val: i64) -> i64 {
-    if arr == 0 { return smi(0); }
+    if arr == 0 {
+        return smi(0);
+    }
     unsafe { array_push(arr, val) }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_array_pop(arr: i64) -> i64 {
-    if arr == 0 { return 0; }
+    if arr == 0 {
+        return 0;
+    }
     unsafe { array_pop(arr) }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_array_shift(arr: i64) -> i64 {
-    if arr == 0 { return 0; }
+    if arr == 0 {
+        return 0;
+    }
     unsafe { array_shift(arr) }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_array_unshift(arr: i64, val: i64) -> i64 {
-    if arr == 0 { return smi(0); }
+    if arr == 0 {
+        return smi(0);
+    }
     unsafe { array_unshift(arr, val) }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_array_slice(arr: i64, start: i64, end: i64) -> i64 {
-    if arr == 0 { return 0; }
+    if arr == 0 {
+        return 0;
+    }
     let s = smi_to_i64_wrapped(start).max(0) as usize;
     let e = smi_to_i64_wrapped(end).max(0) as usize;
     unsafe { array_slice(arr, s, e) }
@@ -499,53 +606,68 @@ pub extern "C" fn wir_array_slice(arr: i64, start: i64, end: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_array_map(arr: i64, clo_ptr: i64) -> i64 {
-    if arr == 0 { return 0; }
+    if arr == 0 {
+        return 0;
+    }
     unsafe { array_map(arr, clo_ptr) }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_array_for_each(arr: i64, clo_ptr: i64) -> i64 {
-    if arr == 0 { return 0; }
+    if arr == 0 {
+        return 0;
+    }
     unsafe { array_for_each(arr, clo_ptr) }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_array_find(arr: i64, clo_ptr: i64) -> i64 {
-    if arr == 0 { return 0; }
+    if arr == 0 {
+        return 0;
+    }
     unsafe { array_find(arr, clo_ptr) }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_array_find_index(arr: i64, clo_ptr: i64) -> i64 {
-    if arr == 0 { return smi(-1); }
+    if arr == 0 {
+        return smi(-1);
+    }
     unsafe { array_find_index(arr, clo_ptr) }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_array_filter(arr: i64, clo_ptr: i64) -> i64 {
-    if arr == 0 { return 0; }
+    if arr == 0 {
+        return 0;
+    }
     unsafe { array_filter(arr, clo_ptr) }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_array_reduce(arr: i64, clo_ptr: i64, has_init: i64, init: i64) -> i64 {
-    if arr == 0 { return 0; }
+    if arr == 0 {
+        return 0;
+    }
     unsafe { array_reduce(arr, clo_ptr, has_init != 0, init) }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_array_fill(arr: i64, val: i64) -> i64 {
-    if arr == 0 { return 0; }
+    if arr == 0 {
+        return 0;
+    }
     unsafe { array_fill(arr, val) }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_array_copy(dst: i64, src: i64, len: i64) -> i64 {
-    if dst == 0 || src == 0 { return 0; }
+    if dst == 0 || src == 0 {
+        return 0;
+    }
     let n = smi_to_i64_wrapped(len).max(0) as usize;
     unsafe { array_copy(dst, src, n) }
 }
-
 
 // ============================================================================
 // Boxed string (placeholder wiring)
@@ -554,24 +676,34 @@ pub extern "C" fn wir_array_copy(dst: i64, src: i64, len: i64) -> i64 {
 #[repr(C)]
 pub struct BoxedStr {
     pub hdr: ObjHeader,
-    pub len: usize,       // byte length (no trailing NUL)
-    pub data: *const u8,  // points to UTF-8 bytes (NUL-terminated OK, not required)
+    pub len: usize,      // byte length (no trailing NUL)
+    pub data: *const u8, // points to UTF-8 bytes (NUL-terminated OK, not required)
 }
 
 #[inline(always)]
 pub fn box_str_borrowed(bytes: &[u8]) -> ValueRepr {
     unsafe {
-        let size  = mem::size_of::<BoxedStr>();
+        let size = mem::size_of::<BoxedStr>();
         let align = mem::align_of::<BoxedStr>();
 
-        #[cfg(feature = "gc")] {
+        #[cfg(feature = "gc")]
+        {
             let mut p = NAPALM_GC.alloc_raw(size, align);
-            if p.is_null() { p = NAPALM_GC.alloc_slow_path(size, align); }
+            if p.is_null() {
+                p = NAPALM_GC.alloc_slow_path(size, align);
+            }
 
             let obj = p as *mut BoxedStr;
             core::ptr::write(
                 obj,
-                BoxedStr { hdr: ObjHeader { tag: TAG_STRING, aux: 0 }, len: bytes.len(), data: bytes.as_ptr() }
+                BoxedStr {
+                    hdr: ObjHeader {
+                        tag: TAG_STRING,
+                        aux: 0,
+                    },
+                    len: bytes.len(),
+                    data: bytes.as_ptr(),
+                },
             );
 
             NAPALM_GC.post_alloc_object(p, size);
@@ -579,18 +711,28 @@ pub fn box_str_borrowed(bytes: &[u8]) -> ValueRepr {
             return p as ValueRepr;
         }
 
-        #[cfg(not(feature = "gc"))] {
-            use std::alloc::{alloc, Layout};
+        #[cfg(not(feature = "gc"))]
+        {
+            use std::alloc::{Layout, alloc};
 
             let layout = Layout::from_size_align_unchecked(size, align);
 
             let p = alloc(layout);
-            if p.is_null() { std::process::abort(); }
+            if p.is_null() {
+                std::process::abort();
+            }
 
             let obj = p as *mut BoxedStr;
             core::ptr::write(
                 obj,
-                BoxedStr { hdr: ObjHeader { tag: TAG_STRING, aux: 0 }, len: bytes.len(), data: bytes.as_ptr() }
+                BoxedStr {
+                    hdr: ObjHeader {
+                        tag: TAG_STRING,
+                        aux: 0,
+                    },
+                    len: bytes.len(),
+                    data: bytes.as_ptr(),
+                },
             );
 
             return p as ValueRepr;
@@ -604,20 +746,23 @@ pub fn box_str_borrowed(bytes: &[u8]) -> ValueRepr {
 
 #[repr(C)]
 pub struct BoxedClosure {
-    pub hdr: ObjHeader,     // tag = TAG_CLOSURE
-    pub code_ptr: usize,    // or a function id/index if you prefer
-    pub env: Vec<i64>,      // captured values
+    pub hdr: ObjHeader,  // tag = TAG_CLOSURE
+    pub code_ptr: usize, // or a function id/index if you prefer
+    pub env: Vec<i64>,   // captured values
 }
 
 #[inline(always)]
 pub fn closure_new(code_ptr: usize, env_len: usize) -> ValueRepr {
     unsafe {
-        let size  = core::mem::size_of::<BoxedClosure>();
+        let size = core::mem::size_of::<BoxedClosure>();
         let align = core::mem::align_of::<BoxedClosure>();
 
-        #[cfg(feature = "gc")] {
+        #[cfg(feature = "gc")]
+        {
             let mut p = NAPALM_GC.alloc_raw(size, align);
-            if p.is_null() { p = NAPALM_GC.alloc_slow_path(size, align); }
+            if p.is_null() {
+                p = NAPALM_GC.alloc_slow_path(size, align);
+            }
 
             let clo = p as *mut BoxedClosure;
 
@@ -626,20 +771,30 @@ pub fn closure_new(code_ptr: usize, env_len: usize) -> ValueRepr {
 
             core::ptr::write(
                 clo,
-                BoxedClosure { hdr: ObjHeader { tag: TAG_CLOSURE, aux: 0 }, code_ptr, env }
+                BoxedClosure {
+                    hdr: ObjHeader {
+                        tag: TAG_CLOSURE,
+                        aux: 0,
+                    },
+                    code_ptr,
+                    env,
+                },
             );
             NAPALM_GC.post_alloc_object(p, size);
 
             return p as ValueRepr;
         }
 
-        #[cfg(not(feature = "gc"))] {
-            use std::alloc::{alloc, Layout};
+        #[cfg(not(feature = "gc"))]
+        {
+            use std::alloc::{Layout, alloc};
 
             let layout = Layout::from_size_align_unchecked(size, align);
 
             let p = alloc(layout);
-            if p.is_null() { std::process::abort(); }
+            if p.is_null() {
+                std::process::abort();
+            }
 
             let clo = p as *mut BoxedClosure;
 
@@ -648,7 +803,14 @@ pub fn closure_new(code_ptr: usize, env_len: usize) -> ValueRepr {
 
             core::ptr::write(
                 clo,
-                BoxedClosure { hdr: ObjHeader { tag: TAG_CLOSURE, aux: 0 }, code_ptr, env }
+                BoxedClosure {
+                    hdr: ObjHeader {
+                        tag: TAG_CLOSURE,
+                        aux: 0,
+                    },
+                    code_ptr,
+                    env,
+                },
             );
 
             return p as ValueRepr;
@@ -690,29 +852,35 @@ pub unsafe fn closure_set_env_slot(v: ValueRepr, idx: usize, val: ValueRepr) {
 pub struct BoxedObj {
     pub hdr: ObjHeader,
     pub proto: ValueRepr,
-    pub by_id:  HashMap<u32, ValueRepr>,   // FieldId fast path
-    pub by_str: HashMap<String, ValueRepr> // string-key path
+    pub by_id: HashMap<u32, ValueRepr>,     // FieldId fast path
+    pub by_str: HashMap<String, ValueRepr>, // string-key path
 }
 
 #[inline(always)]
 pub fn obj_new() -> ValueRepr {
     unsafe {
-        let size  = mem::size_of::<BoxedObj>();
+        let size = mem::size_of::<BoxedObj>();
         let align = mem::align_of::<BoxedObj>();
 
-        #[cfg(feature = "gc")] {
+        #[cfg(feature = "gc")]
+        {
             let mut p = NAPALM_GC.alloc_raw(size, align);
-            if p.is_null() { p = NAPALM_GC.alloc_slow_path(size, align); }
+            if p.is_null() {
+                p = NAPALM_GC.alloc_slow_path(size, align);
+            }
 
             let obj = p as *mut BoxedObj;
-                core::ptr::write(
+            core::ptr::write(
                 obj,
                 BoxedObj {
-                    hdr: ObjHeader { tag: TAG_OBJECT, aux: 0 },
-                    proto: NULL,                  // NEW
-                    by_id:  HashMap::new(),
+                    hdr: ObjHeader {
+                        tag: TAG_OBJECT,
+                        aux: 0,
+                    },
+                    proto: NULL, // NEW
+                    by_id: HashMap::new(),
                     by_str: HashMap::new(),
-                }
+                },
             );
 
             NAPALM_GC.post_alloc_object(p, size);
@@ -720,23 +888,29 @@ pub fn obj_new() -> ValueRepr {
             return p as ValueRepr;
         }
 
-        #[cfg(not(feature = "gc"))] {
-            use std::alloc::{alloc, Layout};
+        #[cfg(not(feature = "gc"))]
+        {
+            use std::alloc::{Layout, alloc};
 
             let layout = Layout::from_size_align_unchecked(size, align);
 
             let p = alloc(layout);
-            if p.is_null() { std::process::abort(); }
+            if p.is_null() {
+                std::process::abort();
+            }
 
             let obj = p as *mut BoxedObj;
             core::ptr::write(
                 obj,
                 BoxedObj {
-                    hdr: ObjHeader { tag: TAG_OBJECT, aux: 0 },
+                    hdr: ObjHeader {
+                        tag: TAG_OBJECT,
+                        aux: 0,
+                    },
                     proto: NULL,
-                    by_id:  HashMap::new(),
+                    by_id: HashMap::new(),
                     by_str: HashMap::new(),
-                }
+                },
             );
 
             return p as ValueRepr;
@@ -804,7 +978,9 @@ pub unsafe fn obj_del_field(obj_v: ValueRepr, fid: u32) -> ValueRepr {
 pub unsafe fn obj_get_field_deep(mut obj_v: ValueRepr, fid: u32) -> ValueRepr {
     while obj_v != NULL {
         let o = &*(obj_v as *const BoxedObj);
-        if let Some(&v) = o.by_id.get(&fid) { return v; }
+        if let Some(&v) = o.by_id.get(&fid) {
+            return v;
+        }
         obj_v = o.proto;
     }
     NULL
@@ -847,7 +1023,9 @@ pub unsafe fn obj_del_str(obj_v: ValueRepr, key: &str) -> ValueRepr {
 pub unsafe fn obj_get_str_deep(mut obj_v: ValueRepr, key: &str) -> ValueRepr {
     while obj_v != NULL {
         let o = &*(obj_v as *const BoxedObj);
-        if let Some(&v) = o.by_str.get(key) { return v; }
+        if let Some(&v) = o.by_str.get(key) {
+            return v;
+        }
         obj_v = o.proto;
     }
     NULL
@@ -862,7 +1040,11 @@ pub unsafe fn obj_get_str_deep(mut obj_v: ValueRepr, key: &str) -> ValueRepr {
 pub fn fmt_value(v: i64) -> String {
     // Booleans are raw 0/1
     if is_bool(v) {
-        return if v != 0 { "1".to_string() } else { "0".to_string() };
+        return if v != 0 {
+            "1".to_string()
+        } else {
+            "0".to_string()
+        };
     }
 
     // Small ints are odd (SMI)
@@ -908,9 +1090,19 @@ pub fn dbg_classify(v: i64) -> &'static str {
     // - "null"      => 0
     // - "smi"       => (v & 1) == 1
     // - "ptr"       => even, nonzero
-    if v == 0 { "null" } else if (v & 1) == 1 { "smi" } else { "ptr" }
+    if v == 0 {
+        "null"
+    } else if (v & 1) == 1 {
+        "smi"
+    } else {
+        "ptr"
+    }
 }
 
 pub fn dbg_addr(v: i64) -> String {
-    if (v & 1) == 1 || v == 0 { format!("{}", v) } else { format!("0x{:x}", v as u64) }
+    if (v & 1) == 1 || v == 0 {
+        format!("{}", v)
+    } else {
+        format!("0x{:x}", v as u64)
+    }
 }

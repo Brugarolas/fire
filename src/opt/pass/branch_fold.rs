@@ -2,18 +2,24 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
+use crate::opt::helpers::{value_as_f64, value_as_i32, value_is_const_bool};
 use crate::opt::{OptimizationWIR, WirEditQueue};
-use crate::opt::helpers::{value_is_const_bool, value_as_i32, value_as_f64};
-use crate::wir::{Function, Inst, CmpKind, ValueId, Constant, BlockId, ValueDef};
+use crate::wir::{BlockId, CmpKind, Constant, Function, Inst, ValueDef, ValueId};
 
 #[derive(Default)]
-pub struct BranchFold { ran: bool }
+pub struct BranchFold {
+    ran: bool,
+}
 
 impl BranchFold {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn run(&mut self, func: &mut Function) {
-        if self.ran { return; }
+        if self.ran {
+            return;
+        }
         self.ran = true;
 
         // Iterate to a fixed point so cascaded folds kick in.
@@ -25,23 +31,38 @@ impl BranchFold {
             #[inline]
             fn flip(kind: CmpKind) -> CmpKind {
                 use CmpKind::*;
-                match kind { Lt => Gt, Le => Ge, Gt => Lt, Ge => Le, Eq => Eq, Ne => Ne }
+                match kind {
+                    Lt => Gt,
+                    Le => Ge,
+                    Gt => Lt,
+                    Ge => Le,
+                    Eq => Eq,
+                    Ne => Ne,
+                }
             }
 
             #[inline]
             fn eval_i32(kind: CmpKind, x: i32, y: i32) -> bool {
                 use CmpKind::*;
                 match kind {
-                    Eq => x == y, Ne => x != y, Lt => x <  y,
-                    Le => x <= y, Gt => x >  y, Ge => x >= y,
+                    Eq => x == y,
+                    Ne => x != y,
+                    Lt => x < y,
+                    Le => x <= y,
+                    Gt => x > y,
+                    Ge => x >= y,
                 }
             }
             #[inline]
             fn eval_f64(kind: CmpKind, x: f64, y: f64) -> bool {
                 use CmpKind::*;
                 match kind {
-                    Eq => x == y, Ne => x != y, Lt => x <  y,
-                    Le => x <= y, Gt => x >  y, Ge => x >= y,
+                    Eq => x == y,
+                    Ne => x != y,
+                    Lt => x < y,
+                    Le => x <= y,
+                    Gt => x > y,
+                    Ge => x >= y,
                 }
             }
 
@@ -51,7 +72,8 @@ impl BranchFold {
                 for _ in 0..4 {
                     if let ValueDef::InstResult(iid, _) = &func.values[v.0 as usize].def {
                         if let Inst::Mov(src) = func.nodes[iid.0 as usize].kind {
-                            v = src; continue;
+                            v = src;
+                            continue;
                         }
                     }
                     break;
@@ -62,10 +84,16 @@ impl BranchFold {
             #[inline]
             fn const_bool(func: &Function, v: ValueId) -> Option<bool> {
                 let v = peel_mov(func, v);
-                if value_is_const_bool(func, v, true)  { return Some(true); }
-                if value_is_const_bool(func, v, false) { return Some(false); }
+                if value_is_const_bool(func, v, true) {
+                    return Some(true);
+                }
+                if value_is_const_bool(func, v, false) {
+                    return Some(false);
+                }
                 if let ValueDef::InstResult(iid, _) = &func.values[v.0 as usize].def {
-                    if let Inst::Const(Constant::Bool(b)) = func.nodes[iid.0 as usize].kind { return Some(b); }
+                    if let Inst::Const(Constant::Bool(b)) = func.nodes[iid.0 as usize].kind {
+                        return Some(b);
+                    }
                 }
                 None
             }
@@ -76,7 +104,11 @@ impl BranchFold {
                 match &func.values[v.0 as usize].def {
                     ValueDef::Const(c) => Some(c.clone()),
                     ValueDef::InstResult(iid, _) => {
-                        if let Inst::Const(ref c) = func.nodes[iid.0 as usize].kind { Some(c.clone()) } else { None }
+                        if let Inst::Const(ref c) = func.nodes[iid.0 as usize].kind {
+                            Some(c.clone())
+                        } else {
+                            None
+                        }
                     }
                     _ => None,
                 }
@@ -84,7 +116,10 @@ impl BranchFold {
 
             #[inline]
             fn const_str(func: &Function, v: ValueId) -> Option<String> {
-                match const_of_value(func, v) { Some(Constant::Str(s)) => Some(s), _ => None }
+                match const_of_value(func, v) {
+                    Some(Constant::Str(s)) => Some(s),
+                    _ => None,
+                }
             }
 
             // --- main scan --------------------------------------------------
@@ -93,7 +128,11 @@ impl BranchFold {
                     let node = &func.nodes[nid.0 as usize];
                     match node.kind {
                         // ---------- Branch folding ----------
-                        Inst::Branch { cond, then_b, else_b } => {
+                        Inst::Branch {
+                            cond,
+                            then_b,
+                            else_b,
+                        } => {
                             // Trivial: both arms identical.
                             if then_b == else_b {
                                 q.replace_kind(nid, Inst::Jump(then_b, vec![]));
@@ -110,8 +149,7 @@ impl BranchFold {
 
                             // Peephole: if cond is a comparison (CmpInt/F64/StrCompare/StrContains) with
                             // constant operands, fold branch immediately.
-                            if let ValueDef::InstResult(cid, _)
-                                = &func.values[cond.0 as usize].def
+                            if let ValueDef::InstResult(cid, _) = &func.values[cond.0 as usize].def
                             {
                                 match func.nodes[cid.0 as usize].kind {
                                     Inst::CmpInt { kind, a, b } => {
@@ -135,7 +173,9 @@ impl BranchFold {
                                         }
                                     }
                                     Inst::StrCompare { a, b } => {
-                                        if let (Some(sa), Some(sb)) = (const_str(func, a), const_str(func, b)) {
+                                        if let (Some(sa), Some(sb)) =
+                                            (const_str(func, a), const_str(func, b))
+                                        {
                                             let res = sa == sb;
                                             let target = if res { then_b } else { else_b };
                                             q.replace_kind(nid, Inst::Jump(target, vec![]));
@@ -143,7 +183,9 @@ impl BranchFold {
                                         }
                                     }
                                     Inst::StrContains { s, sub } => {
-                                        if let (Some(h), Some(n)) = (const_str(func, s), const_str(func, sub)) {
+                                        if let (Some(h), Some(n)) =
+                                            (const_str(func, s), const_str(func, sub))
+                                        {
                                             let res = h.contains(&n);
                                             let target = if res { then_b } else { else_b };
                                             q.replace_kind(nid, Inst::Jump(target, vec![]));
@@ -156,12 +198,21 @@ impl BranchFold {
                         }
 
                         // ---------- Switch folding / cleanup ----------
-                        Inst::Switch { tag, default_b, ref table } => {
+                        Inst::Switch {
+                            tag,
+                            default_b,
+                            ref table,
+                        } => {
                             // 1) Constant tag → Jump(target)
                             if let Some(tag_i32) = value_as_i32(func, tag) {
                                 let tag64 = tag_i32 as i64;
                                 let mut dest = default_b;
-                                for &(key, b) in table { if key == tag64 { dest = b; break; } }
+                                for &(key, b) in table {
+                                    if key == tag64 {
+                                        dest = b;
+                                        break;
+                                    }
+                                }
                                 q.replace_kind(nid, Inst::Jump(dest, vec![]));
                                 changed = true;
                                 continue;
@@ -216,7 +267,14 @@ impl BranchFold {
                                 _ => {
                                     // Normalize by ordering operands; flip predicate if swapped.
                                     if b < a {
-                                        q.replace_kind(nid, Inst::CmpInt { kind: flip(kind), a: b, b: a });
+                                        q.replace_kind(
+                                            nid,
+                                            Inst::CmpInt {
+                                                kind: flip(kind),
+                                                a: b,
+                                                b: a,
+                                            },
+                                        );
                                         changed = true;
                                         continue;
                                     }
@@ -224,7 +282,9 @@ impl BranchFold {
                             }
 
                             // Constant fold when both sides are constants.
-                            if let (Some(x), Some(y)) = (value_as_i32(func, a), value_as_i32(func, b)) {
+                            if let (Some(x), Some(y)) =
+                                (value_as_i32(func, a), value_as_i32(func, b))
+                            {
                                 let res = eval_i32(kind, x, y);
                                 q.replace_kind(nid, Inst::Const(Constant::Bool(res)));
                                 changed = true;
@@ -247,7 +307,14 @@ impl BranchFold {
                                 }
                                 _ => {
                                     if b < a {
-                                        q.replace_kind(nid, Inst::CmpF64 { kind: flip(kind), a: b, b: a });
+                                        q.replace_kind(
+                                            nid,
+                                            Inst::CmpF64 {
+                                                kind: flip(kind),
+                                                a: b,
+                                                b: a,
+                                            },
+                                        );
                                         changed = true;
                                         continue;
                                     }
@@ -255,7 +322,9 @@ impl BranchFold {
                             }
 
                             // Constant fold when both sides are constants.
-                            if let (Some(x), Some(y)) = (value_as_f64(func, a), value_as_f64(func, b)) {
+                            if let (Some(x), Some(y)) =
+                                (value_as_f64(func, a), value_as_f64(func, b))
+                            {
                                 let res = eval_f64(kind, x, y);
                                 q.replace_kind(nid, Inst::Const(Constant::Bool(res)));
                                 changed = true;
@@ -284,8 +353,8 @@ impl BranchFold {
                                     q.replace_kind(nid, Inst::Const(Constant::Bool(true)));
                                     changed = true;
                                 }
-                                (Some(Constant::Null), Some(k)) |
-                                (Some(k), Some(Constant::Null)) => {
+                                (Some(Constant::Null), Some(k))
+                                | (Some(k), Some(Constant::Null)) => {
                                     // For heap references, only Null vs non-Null is safe to decide
                                     if !matches!(k, Constant::Null) {
                                         q.replace_kind(nid, Inst::Const(Constant::Bool(false)));
@@ -321,7 +390,9 @@ impl BranchFold {
                 }
             }
 
-            if !changed { break; }
+            if !changed {
+                break;
+            }
             q.apply(func);
         }
     }

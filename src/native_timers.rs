@@ -72,7 +72,9 @@ pub fn invoke_and_pump(entry: JitFnPtr, args: &[i64]) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn event_loop_yieldpoint() -> i64 {
     unsafe {
-        unsafe extern "C" { fn wir_call_closure(clo_ptr: i64, argv: *const i64, argc: i64) -> i64; }
+        unsafe extern "C" {
+            fn wir_call_closure(clo_ptr: i64, argv: *const i64, argc: i64) -> i64;
+        }
 
         // Drain a chunk of microtasks FIRST
         let _ = EVENT_LOOP.run_microtasks(32, |f, a| {

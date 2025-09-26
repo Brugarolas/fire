@@ -4,8 +4,8 @@
 #![allow(unused_unsafe)]
 
 use crate::event_loop::EVENT_LOOP;
-use crate::value::{ObjHeader, BoxedClosure, closure_new, closure_set_env_slot, TAG_STRING};
 use crate::runtime::{wir_obj_new, wir_obj_set_str};
+use crate::value::{BoxedClosure, ObjHeader, TAG_STRING, closure_new, closure_set_env_slot};
 use std::slice;
 
 use once_cell::sync::Lazy;
@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 // Store promise pointers as integer handles so T: Send holds for the Mutex.
 type PromiseHandle = usize;
 
-static PROMISES: Lazy<Mutex<Vec<PromiseHandle>>> =Lazy::new(|| Mutex::new(Vec::new()));
+static PROMISES: Lazy<Mutex<Vec<PromiseHandle>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 fn register_promise(p: *mut BoxedPromise) {
     PROMISES.lock().push(p as usize);
@@ -34,21 +34,29 @@ pub fn promises_with_root_slots<F: FnMut(*mut i64)>(mut f: F) {
     for &h in v.iter() {
         unsafe {
             let p = &mut *(h as *mut BoxedPromise);
-            for fun in p.on_fulfilled.iter_mut() { f(fun as *mut i64); }
-            for fun in p.on_rejected.iter_mut()  { f(fun as *mut i64); }
+            for fun in p.on_fulfilled.iter_mut() {
+                f(fun as *mut i64);
+            }
+            for fun in p.on_rejected.iter_mut() {
+                f(fun as *mut i64);
+            }
             f(&mut p.value as *mut i64);
         }
     }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
-enum PState { Pending=0, Fulfilled=1, Rejected=2 }
+enum PState {
+    Pending = 0,
+    Fulfilled = 1,
+    Rejected = 2,
+}
 
 #[repr(C)]
 struct BoxedPromise {
-    hdr: ObjHeader,     // use a dedicated tag if you have one; else reuse object-like tag ok if not exposed
-    state: i32,         // PState as i32
-    value: i64,         // fulfillment value or rejection reason
+    hdr: ObjHeader, // use a dedicated tag if you have one; else reuse object-like tag ok if not exposed
+    state: i32,     // PState as i32
+    value: i64,     // fulfillment value or rejection reason
     // queued reactions (closures)
     on_fulfilled: Vec<i64>,
     on_rejected: Vec<i64>,
@@ -57,10 +65,13 @@ struct BoxedPromise {
 // Tiny helper: allocate a BoxedStr for a *static* &str key
 // tiny helper (already present above, keep one copy)
 fn static_str_value(s: &'static str) -> i64 {
-    use crate::value::{BoxedStr, TAG_STRING};
     use crate::value::ObjHeader;
+    use crate::value::{BoxedStr, TAG_STRING};
     let obj = Box::new(BoxedStr {
-        hdr: ObjHeader { tag: TAG_STRING, aux: 0 },
+        hdr: ObjHeader {
+            tag: TAG_STRING,
+            aux: 0,
+        },
         len: s.as_bytes().len(),
         data: s.as_ptr(),
     });
@@ -75,7 +86,11 @@ unsafe fn as_promise(p: i64) -> *mut BoxedPromise {
 
 fn schedule_fulfill(fun: i64, arg: i64) {
     #[cfg(debug_assertions)]
-    eprintln!("[promise] schedule_fulfill(fun={}, arg={})", crate::value::dbg_addr(fun), crate::value::dbg_addr(arg));
+    eprintln!(
+        "[promise] schedule_fulfill(fun={}, arg={})",
+        crate::value::dbg_addr(fun),
+        crate::value::dbg_addr(arg)
+    );
 
     EVENT_LOOP.enqueue_microtask(fun, arg);
 }
@@ -85,13 +100,17 @@ fn schedule_fulfill(fun: i64, arg: i64) {
 pub extern "C" fn wir_promise_resolve(priv_ptr: i64, val: i64) -> i64 {
     unsafe {
         let p = as_promise(priv_ptr);
-        if (*p).state != PState::Pending as i32 { return 0; }
+        if (*p).state != PState::Pending as i32 {
+            return 0;
+        }
         (*p).state = PState::Fulfilled as i32;
         (*p).value = val;
 
         // schedule queued on_fulfilled
         let pending = std::mem::take(&mut (*p).on_fulfilled);
-        for f in pending { schedule_fulfill(f, val); }
+        for f in pending {
+            schedule_fulfill(f, val);
+        }
 
         unregister_promise(p);
     }
@@ -102,12 +121,16 @@ pub extern "C" fn wir_promise_resolve(priv_ptr: i64, val: i64) -> i64 {
 pub extern "C" fn wir_promise_reject(priv_ptr: i64, reason: i64) -> i64 {
     unsafe {
         let p = as_promise(priv_ptr);
-        if (*p).state != PState::Pending as i32 { return 0; }
+        if (*p).state != PState::Pending as i32 {
+            return 0;
+        }
         (*p).state = PState::Rejected as i32;
         (*p).value = reason;
 
         let pending = std::mem::take(&mut (*p).on_rejected);
-        for f in pending { schedule_fulfill(f, reason); } // same microtask path
+        for f in pending {
+            schedule_fulfill(f, reason);
+        } // same microtask path
 
         unregister_promise(p);
     }
@@ -121,14 +144,22 @@ pub extern "C" fn wir_promise_then(priv_ptr: i64, on_f: i64, on_r: i64) -> i64 {
         let p = as_promise(priv_ptr);
         match (*p).state {
             x if x == PState::Pending as i32 => {
-                if on_f != 0 { (*p).on_fulfilled.push(on_f); }
-                if on_r != 0 { (*p).on_rejected.push(on_r); }
+                if on_f != 0 {
+                    (*p).on_fulfilled.push(on_f);
+                }
+                if on_r != 0 {
+                    (*p).on_rejected.push(on_r);
+                }
             }
             x if x == PState::Fulfilled as i32 => {
-                if on_f != 0 { schedule_fulfill(on_f, (*p).value); }
+                if on_f != 0 {
+                    schedule_fulfill(on_f, (*p).value);
+                }
             }
             _ => {
-                if on_r != 0 { schedule_fulfill(on_r, (*p).value); }
+                if on_r != 0 {
+                    schedule_fulfill(on_r, (*p).value);
+                }
             }
         }
     }
@@ -164,7 +195,7 @@ pub extern "C" fn wir_promise_new(executor: i64) -> i64 {
             unsafe {
                 let args = std::slice::from_raw_parts(argv, argc);
                 let priv_p = *args.get(0).unwrap_or(&0);
-                let val    = *args.get(1).unwrap_or(&0);
+                let val = *args.get(1).unwrap_or(&0);
                 wir_promise_resolve(priv_p, val)
             }
         }
@@ -184,7 +215,9 @@ pub extern "C" fn wir_promise_new(executor: i64) -> i64 {
         closure_set_env_slot(rej, 0, priv_p);
 
         // 3) call executor(resolve, reject)
-        unsafe extern "C" { fn wir_call_closure(clo_ptr: i64, argv: *const i64, argc: i64) -> i64; }
+        unsafe extern "C" {
+            fn wir_call_closure(clo_ptr: i64, argv: *const i64, argc: i64) -> i64;
+        }
         let argv = [res, rej];
         let _ = wir_call_closure(executor, argv.as_ptr(), 2);
 
@@ -238,7 +271,9 @@ unsafe extern "C" {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_event_loop_pump_once() -> i32 {
-    unsafe extern "C" { fn wir_call_closure(clo_ptr: i64, argv: *const i64, argc: i64) -> i64; }
+    unsafe extern "C" {
+        fn wir_call_closure(clo_ptr: i64, argv: *const i64, argc: i64) -> i64;
+    }
     let ran = EVENT_LOOP.pump_once(
         // microtask: one arg
         |f, a| unsafe {
@@ -253,15 +288,22 @@ pub extern "C" fn wir_event_loop_pump_once() -> i32 {
     ran as i32
 }
 
-
 // Blocking await: returns fulfillment value; rejection returns 0 for now
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_await(val: i64) -> i64 {
     #[cfg(debug_assertions)]
-    eprintln!("[await] wir_await(val={} {})", crate::value::dbg_addr(val), crate::value::dbg_classify(val));
+    eprintln!(
+        "[await] wir_await(val={} {})",
+        crate::value::dbg_addr(val),
+        crate::value::dbg_classify(val)
+    );
 
     #[repr(C)]
-    struct Cell { ready: bool, ok: bool, v: i64 }
+    struct Cell {
+        ready: bool,
+        ok: bool,
+        v: i64,
+    }
 
     // Immediates (SMIs/booleans) and null resolve synchronously.
     if val == 0 || (val & 1) == 1 {
@@ -272,7 +314,7 @@ pub extern "C" fn wir_await(val: i64) -> i64 {
         unsafe {
             let args = std::slice::from_raw_parts(argv, argc);
             let cell = args.get(0).copied().unwrap_or(0) as *mut Cell;
-            let v    = args.get(1).copied().unwrap_or(0);
+            let v = args.get(1).copied().unwrap_or(0);
             (*cell).v = v;
             (*cell).ok = true;
             (*cell).ready = true;
@@ -283,7 +325,7 @@ pub extern "C" fn wir_await(val: i64) -> i64 {
         unsafe {
             let args = std::slice::from_raw_parts(argv, argc);
             let cell = args.get(0).copied().unwrap_or(0) as *mut Cell;
-            let v    = args.get(1).copied().unwrap_or(0);
+            let v = args.get(1).copied().unwrap_or(0);
             (*cell).v = v;
             (*cell).ok = false;
             (*cell).ready = true;
@@ -291,7 +333,11 @@ pub extern "C" fn wir_await(val: i64) -> i64 {
         0
     }
 
-    let cell = Box::into_raw(Box::new(Cell { ready: false, ok: true, v: 0 }));
+    let cell = Box::into_raw(Box::new(Cell {
+        ready: false,
+        ok: true,
+        v: 0,
+    }));
 
     unsafe {
         let onf = closure_new(on_f as usize, 1);
@@ -309,11 +355,17 @@ pub extern "C" fn wir_await(val: i64) -> i64 {
 
     // Pump until settled.
     loop {
-        unsafe { if (*cell).ready { break; } }
+        unsafe {
+            if (*cell).ready {
+                break;
+            }
+        }
         let _ = wir_event_loop_pump_once();
     }
 
     let out = unsafe { (*cell).v };
-    unsafe { drop(Box::from_raw(cell)); }
+    unsafe {
+        drop(Box::from_raw(cell));
+    }
     out
 }

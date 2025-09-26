@@ -3,19 +3,27 @@
 #![allow(unused_variables)]
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
-use std::mem::{discriminant, Discriminant};
+use std::mem::{Discriminant, discriminant};
 
-use crate::opt::{OptimizationWIR, WirEditQueue, InstCursor};
-use crate::wir::{Function, Inst, BlockId, ValueId, ValueDef, InstId};
+use crate::opt::{InstCursor, OptimizationWIR, WirEditQueue};
+use crate::wir::{BlockId, Function, Inst, InstId, ValueDef, ValueId};
 
 pub struct DCE {
     last_func_ptr: Option<usize>,
 }
 
 impl Default for DCE {
-    fn default() -> Self { Self { last_func_ptr: None } }
+    fn default() -> Self {
+        Self {
+            last_func_ptr: None,
+        }
+    }
 }
-impl DCE { pub fn new() -> Self { Self::default() } }
+impl DCE {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 impl OptimizationWIR for DCE {
     /// Wake up on control-flow-ish things (enough to trigger once per function).
@@ -24,7 +32,11 @@ impl OptimizationWIR for DCE {
         let v0 = ValueId(0);
         let tags = [
             discriminant(&Return(Vec::<ValueId>::new())),
-            discriminant(&Branch { cond: v0, then_b: BlockId(0), else_b: BlockId(0) }),
+            discriminant(&Branch {
+                cond: v0,
+                then_b: BlockId(0),
+                else_b: BlockId(0),
+            }),
             discriminant(&Jump(BlockId(0), Vec::<ValueId>::new())),
             discriminant(&Throw(v0)),
             // Keep Switch construction out (field-shape differences), we’ll still
@@ -48,7 +60,9 @@ impl OptimizationWIR for DCE {
 /* ================= core ================= */
 
 fn run_mega_dce(func: &mut Function) {
-    if func.blocks.is_empty() { return; }
+    if func.blocks.is_empty() {
+        return;
+    }
 
     loop {
         let mut changed_any = false;
@@ -56,7 +70,9 @@ fn run_mega_dce(func: &mut Function) {
 
         // Fast BlockId <-> index
         let mut bix_of: HashMap<BlockId, usize> = HashMap::with_capacity(func.blocks.len());
-        for (i, b) in func.blocks.iter().enumerate() { bix_of.insert(b.id, i); }
+        for (i, b) in func.blocks.iter().enumerate() {
+            bix_of.insert(b.id, i);
+        }
 
         // 1) Reachability (from entry), using first terminator’s edges per block
         let reachable = compute_reachable_vec(func, &bix_of);
@@ -75,7 +91,9 @@ fn run_mega_dce(func: &mut Function) {
 
         // 3) In reachable blocks, remove instructions after the first terminator
         for (bi, b) in func.blocks.iter().enumerate() {
-            if !reachable[bi] { continue; }
+            if !reachable[bi] {
+                continue;
+            }
             let mut first_term: Option<usize> = None;
             for (i, &nid) in b.insts.iter().enumerate() {
                 if first_term.is_none() && is_terminator(&func.nodes[nid.0 as usize].kind) {
@@ -90,17 +108,23 @@ fn run_mega_dce(func: &mut Function) {
         }
 
         // If we changed CFG shape, apply before recomputing reachability/uses.
-        if changed_any { q.apply(func); }
+        if changed_any {
+            q.apply(func);
+        }
 
         // 4) Recompute reachability post-tail-cut (fresh maps)
         let mut bix_of: HashMap<BlockId, usize> = HashMap::with_capacity(func.blocks.len());
-        for (i, b) in func.blocks.iter().enumerate() { bix_of.insert(b.id, i); }
+        for (i, b) in func.blocks.iter().enumerate() {
+            bix_of.insert(b.id, i);
+        }
         let reachable = compute_reachable_vec(func, &bix_of);
 
         // 5) Build use counts for values (only scanning reachable blocks)
         let mut uses = vec![0usize; func.values.len()];
         for (bi, b) in func.blocks.iter().enumerate() {
-            if !reachable[bi] { continue; }
+            if !reachable[bi] {
+                continue;
+            }
             for &nid in &b.insts {
                 let k = &func.nodes[nid.0 as usize].kind;
                 bump_uses_for_inst(&mut uses, k);
@@ -110,13 +134,17 @@ fn run_mega_dce(func: &mut Function) {
         // 6) Aggressive DCE: dead pure value producers and dead Phis
         let mut phase2_changed = false;
         for (bi, b) in func.blocks.iter().enumerate() {
-            if !reachable[bi] { continue; }
+            if !reachable[bi] {
+                continue;
+            }
             for (pos, &nid) in b.insts.iter().enumerate() {
                 let node = &func.nodes[nid.0 as usize];
                 let k = &node.kind;
 
                 // Keep control & effectful ops.
-                if is_terminator(k) || is_effectful(k) { continue; }
+                if is_terminator(k) || is_effectful(k) {
+                    continue;
+                }
 
                 // Dead Phi?
                 let is_phi = matches!(k, Inst::Phi(_));
@@ -132,7 +160,9 @@ fn run_mega_dce(func: &mut Function) {
             }
         }
 
-        if phase2_changed { q.apply(func); }
+        if phase2_changed {
+            q.apply(func);
+        }
 
         if !(changed_any || phase2_changed) {
             // No more progress this iteration — we’re done.
@@ -147,11 +177,10 @@ fn run_mega_dce(func: &mut Function) {
 #[inline]
 fn is_terminator(k: &Inst) -> bool {
     use Inst::*;
-    matches!(k, Return(_)
-                | Branch { .. }
-                | Jump(_, _)
-                | Throw(_)
-                | Switch { .. })
+    matches!(
+        k,
+        Return(_) | Branch { .. } | Jump(_, _) | Throw(_) | Switch { .. }
+    )
 }
 
 #[inline]
@@ -170,10 +199,14 @@ fn compute_reachable_vec(func: &Function, bix_of: &HashMap<BlockId, usize>) -> V
     let n = func.blocks.len();
     let mut reach = vec![false; n];
     let mut stack: Vec<usize> = Vec::new();
-    if let Some(&entry) = bix_of.get(&func.entry) { stack.push(entry); }
+    if let Some(&entry) = bix_of.get(&func.entry) {
+        stack.push(entry);
+    }
 
     while let Some(bi) = stack.pop() {
-        if reach[bi] { continue; }
+        if reach[bi] {
+            continue;
+        }
         reach[bi] = true;
 
         let b = &func.blocks[bi];
@@ -188,9 +221,13 @@ fn compute_reachable_vec(func: &Function, bix_of: &HashMap<BlockId, usize>) -> V
                         stack.push(bix_of[then_b]);
                         stack.push(bix_of[else_b]);
                     }
-                    Switch { default_b, table, .. } => {
+                    Switch {
+                        default_b, table, ..
+                    } => {
                         stack.push(bix_of[default_b]);
-                        for &(_, blk) in table { stack.push(bix_of[&blk]); }
+                        for &(_, blk) in table {
+                            stack.push(bix_of[&blk]);
+                        }
                     }
                     Return(_) | Throw(_) => {}
                     _ => {}
@@ -208,107 +245,220 @@ fn bump_uses_for_inst(uses: &mut [usize], k: &Inst) {
     #[inline]
     fn bump(uses: &mut [usize], v: ValueId) {
         let i = v.0 as usize;
-        if i < uses.len() { uses[i] += 1; }
+        if i < uses.len() {
+            uses[i] += 1;
+        }
     }
 
     match k {
         // ---- Control ----
-        Inst::Phi(vals)                           => for &v in vals { bump(uses, v); }
-        Inst::Jump(_b, args)                      => for &v in args { bump(uses, v); }
-        Inst::Branch { cond, .. }                 => bump(uses, *cond),
-        Inst::Switch { tag, .. }                  => bump(uses, *tag),
-        Inst::Return(vals)                        => for &v in vals { bump(uses, v); }
-        Inst::Throw(v)                            => bump(uses, *v),
+        Inst::Phi(vals) => {
+            for &v in vals {
+                bump(uses, v);
+            }
+        }
+        Inst::Jump(_b, args) => {
+            for &v in args {
+                bump(uses, v);
+            }
+        }
+        Inst::Branch { cond, .. } => bump(uses, *cond),
+        Inst::Switch { tag, .. } => bump(uses, *tag),
+        Inst::Return(vals) => {
+            for &v in vals {
+                bump(uses, v);
+            }
+        }
+        Inst::Throw(v) => bump(uses, *v),
 
         // ---- Effect / bookkeeping ----
-        Inst::EffectEntry | Inst::Safepoint       => {},
+        Inst::EffectEntry | Inst::Safepoint => {}
 
         // ---- Constants / moves ----
-        Inst::Const(_)                            => {},
-        Inst::Mov(v)                              => bump(uses, *v),
+        Inst::Const(_) => {}
+        Inst::Mov(v) => bump(uses, *v),
 
         // ---- Guards ----
-        Inst::GuardType { val, .. }               => bump(uses, *val),
-        Inst::GuardShape { obj, .. }              => bump(uses, *obj),
-        Inst::GuardBounds { idx, len, .. }        => { bump(uses, *idx); bump(uses, *len); }
-        Inst::GuardNotNull { val, .. }            => bump(uses, *val),
-        Inst::GuardIsInt { val, .. }              => bump(uses, *val),
-        Inst::GuardIsF64 { val, .. }              => bump(uses, *val),
-        Inst::Bailout { .. }                      => {},
+        Inst::GuardType { val, .. } => bump(uses, *val),
+        Inst::GuardShape { obj, .. } => bump(uses, *obj),
+        Inst::GuardBounds { idx, len, .. } => {
+            bump(uses, *idx);
+            bump(uses, *len);
+        }
+        Inst::GuardNotNull { val, .. } => bump(uses, *val),
+        Inst::GuardIsInt { val, .. } => bump(uses, *val),
+        Inst::GuardIsF64 { val, .. } => bump(uses, *val),
+        Inst::Bailout { .. } => {}
 
         // ---- Objects ----
-        Inst::AllocObj { .. }                     => {},
-        Inst::LoadField { obj, .. }               => bump(uses, *obj),
-        Inst::StoreField { obj, val, .. }         => { bump(uses, *obj); bump(uses, *val); }
-        Inst::TransitionShape { obj, .. }         => bump(uses, *obj),
+        Inst::AllocObj { .. } => {}
+        Inst::LoadField { obj, .. } => bump(uses, *obj),
+        Inst::StoreField { obj, val, .. } => {
+            bump(uses, *obj);
+            bump(uses, *val);
+        }
+        Inst::TransitionShape { obj, .. } => bump(uses, *obj),
 
         // ---- Arrays ----
-        Inst::AllocArray { len, .. }              => bump(uses, *len),
-        Inst::ArrayLen(v)                         => bump(uses, *v),
-        Inst::ArraySetLen { arr, new_len }        => { bump(uses, *arr); bump(uses, *new_len); }
-        Inst::LoadElem { arr, idx }               => { bump(uses, *arr); bump(uses, *idx); }
-        Inst::StoreElem { arr, idx, val }         => { bump(uses, *arr); bump(uses, *idx); bump(uses, *val); }
-        Inst::ArraySlice { arr, start, end }      => { bump(uses, *arr); bump(uses, *start); bump(uses, *end); }
+        Inst::AllocArray { len, .. } => bump(uses, *len),
+        Inst::ArrayLen(v) => bump(uses, *v),
+        Inst::ArraySetLen { arr, new_len } => {
+            bump(uses, *arr);
+            bump(uses, *new_len);
+        }
+        Inst::LoadElem { arr, idx } => {
+            bump(uses, *arr);
+            bump(uses, *idx);
+        }
+        Inst::StoreElem { arr, idx, val } => {
+            bump(uses, *arr);
+            bump(uses, *idx);
+            bump(uses, *val);
+        }
+        Inst::ArraySlice { arr, start, end } => {
+            bump(uses, *arr);
+            bump(uses, *start);
+            bump(uses, *end);
+        }
 
         // Array methods / higher-level ops
-        Inst::ArrayPush { arr, val }              => { bump(uses, *arr); bump(uses, *val); }
-        Inst::ArrayPop(arr)                       => bump(uses, *arr),
-        Inst::ArrayShift(arr)                     => bump(uses, *arr),
-        Inst::ArrayUnshift { arr, val }           => { bump(uses, *arr); bump(uses, *val); }
+        Inst::ArrayPush { arr, val } => {
+            bump(uses, *arr);
+            bump(uses, *val);
+        }
+        Inst::ArrayPop(arr) => bump(uses, *arr),
+        Inst::ArrayShift(arr) => bump(uses, *arr),
+        Inst::ArrayUnshift { arr, val } => {
+            bump(uses, *arr);
+            bump(uses, *val);
+        }
 
-        Inst::ArrayMap { arr, .. }                => bump(uses, *arr),
-        Inst::ArrayReduce { init, arr, .. }       => { bump(uses, *init); bump(uses, *arr); }
-        Inst::ArrayFill { arr, val }              => { bump(uses, *arr); bump(uses, *val); }
-        Inst::ArrayCopy { dst, src, len }         => { bump(uses, *dst); bump(uses, *src); bump(uses, *len); }
+        Inst::ArrayMap { arr, .. } => bump(uses, *arr),
+        Inst::ArrayReduce { init, arr, .. } => {
+            bump(uses, *init);
+            bump(uses, *arr);
+        }
+        Inst::ArrayFill { arr, val } => {
+            bump(uses, *arr);
+            bump(uses, *val);
+        }
+        Inst::ArrayCopy { dst, src, len } => {
+            bump(uses, *dst);
+            bump(uses, *src);
+            bump(uses, *len);
+        }
 
-        Inst::ArrayForEach { arr, .. }            => bump(uses, *arr),
-        Inst::ArrayFind { arr, .. }               => bump(uses, *arr),
-        Inst::ArrayFindIndex { arr, .. }          => bump(uses, *arr),
-        Inst::ArrayFilter { arr, .. }             => bump(uses, *arr),
+        Inst::ArrayForEach { arr, .. } => bump(uses, *arr),
+        Inst::ArrayFind { arr, .. } => bump(uses, *arr),
+        Inst::ArrayFindIndex { arr, .. } => bump(uses, *arr),
+        Inst::ArrayFilter { arr, .. } => bump(uses, *arr),
 
         // ---- Strings ----
-        Inst::StrLen(s)                           => bump(uses, *s),
-        Inst::StrConcat { a, b }                  => { bump(uses, *a); bump(uses, *b); }
-        Inst::StrSlice { s, start, end }          => { bump(uses, *s); bump(uses, *start); bump(uses, *end); }
-        Inst::StrCompare { a, b }                 => { bump(uses, *a); bump(uses, *b); }
-        Inst::StrContains { s, sub }              => { bump(uses, *s); bump(uses, *sub); }
-        Inst::StrToNumber(s)                      => bump(uses, *s),
+        Inst::StrLen(s) => bump(uses, *s),
+        Inst::StrConcat { a, b } => {
+            bump(uses, *a);
+            bump(uses, *b);
+        }
+        Inst::StrSlice { s, start, end } => {
+            bump(uses, *s);
+            bump(uses, *start);
+            bump(uses, *end);
+        }
+        Inst::StrCompare { a, b } => {
+            bump(uses, *a);
+            bump(uses, *b);
+        }
+        Inst::StrContains { s, sub } => {
+            bump(uses, *s);
+            bump(uses, *sub);
+        }
+        Inst::StrToNumber(s) => bump(uses, *s),
 
         // ---- Numerics ----
-        Inst::IntBin { a, b, .. }                 => { bump(uses, *a); bump(uses, *b); }
-        Inst::F64Bin { a, b, .. }                 => { bump(uses, *a); bump(uses, *b); }
-        Inst::NumAdd(a, b) | Inst::NumSub(a, b)
-        | Inst::NumMul(a, b) | Inst::NumDiv(a, b)
-        | Inst::NumRem(a, b)                      => { bump(uses, *a); bump(uses, *b); }
-        Inst::CmpInt { a, b, .. }                 => { bump(uses, *a); bump(uses, *b); }
-        Inst::CmpF64 { a, b, .. }                 => { bump(uses, *a); bump(uses, *b); }
-        Inst::CmpRefEq { a, b }                   => { bump(uses, *a); bump(uses, *b); }
+        Inst::IntBin { a, b, .. } => {
+            bump(uses, *a);
+            bump(uses, *b);
+        }
+        Inst::F64Bin { a, b, .. } => {
+            bump(uses, *a);
+            bump(uses, *b);
+        }
+        Inst::NumAdd(a, b)
+        | Inst::NumSub(a, b)
+        | Inst::NumMul(a, b)
+        | Inst::NumDiv(a, b)
+        | Inst::NumRem(a, b) => {
+            bump(uses, *a);
+            bump(uses, *b);
+        }
+        Inst::CmpInt { a, b, .. } => {
+            bump(uses, *a);
+            bump(uses, *b);
+        }
+        Inst::CmpF64 { a, b, .. } => {
+            bump(uses, *a);
+            bump(uses, *b);
+        }
+        Inst::CmpRefEq { a, b } => {
+            bump(uses, *a);
+            bump(uses, *b);
+        }
 
         // ---- Boxing / tagging ----
-        Inst::BoxInt(v) | Inst::BoxF64(v)
-        | Inst::BoxBool(v) | Inst::UnboxToInt(v)
-        | Inst::UnboxToF64(v)                     => bump(uses, *v),
+        Inst::BoxInt(v)
+        | Inst::BoxF64(v)
+        | Inst::BoxBool(v)
+        | Inst::UnboxToInt(v)
+        | Inst::UnboxToF64(v) => bump(uses, *v),
 
         // ---- Calls / closures ----
-        Inst::CallDirect { args, .. }             => for &v in args { bump(uses, v); }
-        Inst::CallDirectMemoized { args, .. }     => for &v in args { bump(uses, v); }
-        Inst::CallIC { recv, args, .. }           => { bump(uses, *recv); for &v in args { bump(uses, v); } }
-        Inst::MethodLookup { obj, .. }            => bump(uses, *obj),
-        Inst::AllocClosure { .. }                 => {}
-        Inst::LoadEnv { clos, .. }                => bump(uses, *clos),
-        Inst::StoreEnv { clos, val, .. }          => { bump(uses, *clos); bump(uses, *val); }
-        Inst::MakeClosure { env, .. }             => bump(uses, *env),
-        Inst::CallClosure { fun, args, .. }       => { bump(uses, *fun); for &v in args { bump(uses, v); } }
+        Inst::CallDirect { args, .. } => {
+            for &v in args {
+                bump(uses, v);
+            }
+        }
+        Inst::CallDirectMemoized { args, .. } => {
+            for &v in args {
+                bump(uses, v);
+            }
+        }
+        Inst::CallIC { recv, args, .. } => {
+            bump(uses, *recv);
+            for &v in args {
+                bump(uses, v);
+            }
+        }
+        Inst::MethodLookup { obj, .. } => bump(uses, *obj),
+        Inst::AllocClosure { .. } => {}
+        Inst::LoadEnv { clos, .. } => bump(uses, *clos),
+        Inst::StoreEnv { clos, val, .. } => {
+            bump(uses, *clos);
+            bump(uses, *val);
+        }
+        Inst::MakeClosure { env, .. } => bump(uses, *env),
+        Inst::CallClosure { fun, args, .. } => {
+            bump(uses, *fun);
+            for &v in args {
+                bump(uses, v);
+            }
+        }
 
         // ---- Native / intrinsics ----
-        Inst::CallNative { args, .. }             => for &v in args { bump(uses, v); }
+        Inst::CallNative { args, .. } => {
+            for &v in args {
+                bump(uses, v);
+            }
+        }
 
         // ---- GC barriers ----
-        Inst::PostWriteBarrier { obj, val }       => { bump(uses, *obj); bump(uses, *val); }
-        Inst::ReadBarrier { obj }                 => bump(uses, *obj),
+        Inst::PostWriteBarrier { obj, val } => {
+            bump(uses, *obj);
+            bump(uses, *val);
+        }
+        Inst::ReadBarrier { obj } => bump(uses, *obj),
 
         // ---- OSR ----
-        Inst::OSRPoint                            => {},
+        Inst::OSRPoint => {}
 
         _ => { /* other instructions: ignore or add as needed */ }
     }

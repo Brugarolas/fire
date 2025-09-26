@@ -5,11 +5,9 @@
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 
-use crate::opt::{OptimizationWIR, WirEditQueue, InstCursor};
 use crate::opt::helpers::value_as_i32;
-use crate::wir::{
-    Function, BlockId, Inst, InstId, ValueId, ValueDef, FieldId, Constant, Type,
-};
+use crate::opt::{InstCursor, OptimizationWIR, WirEditQueue};
+use crate::wir::{BlockId, Constant, FieldId, Function, Inst, InstId, Type, ValueDef, ValueId};
 
 /// Dead Store Elimination:
 ///  * Intra-block, backwards pass.
@@ -29,14 +27,20 @@ pub struct DeadStoreElim {
 }
 
 impl Default for DeadStoreElim {
-    fn default() -> Self { Self { ran: false } }
+    fn default() -> Self {
+        Self { ran: false }
+    }
 }
 
 impl DeadStoreElim {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn run(&mut self, func: &mut Function) {
-        if self.ran { return; }
+        if self.ran {
+            return;
+        }
         self.ran = true;
 
         loop {
@@ -46,9 +50,9 @@ impl DeadStoreElim {
             for b in &func.blocks {
                 // Backward scan state
                 let mut last_field_store: HashSet<(ValueId, FieldId)> = HashSet::new();
-                let mut last_elem_store:  HashSet<(ValueId, i32)>     = HashSet::new();
-                let mut last_len_store:   HashSet<ValueId>            = HashSet::new();
-                let mut last_env_store:   HashSet<(ValueId, u32)>     = HashSet::new();
+                let mut last_elem_store: HashSet<(ValueId, i32)> = HashSet::new();
+                let mut last_len_store: HashSet<ValueId> = HashSet::new();
+                let mut last_env_store: HashSet<(ValueId, u32)> = HashSet::new();
 
                 // To also drop immediate barriers after dead stores
                 let mut to_erase_positions: Vec<usize> = Vec::new();
@@ -60,7 +64,8 @@ impl DeadStoreElim {
                         match &func.values[v.0 as usize].def {
                             ValueDef::InstResult(iid, _ix) => {
                                 if let Inst::Mov(src) = func.nodes[iid.0 as usize].kind {
-                                    v = src; continue;
+                                    v = src;
+                                    continue;
                                 }
                             }
                             _ => {}
@@ -113,7 +118,9 @@ impl DeadStoreElim {
                         }
 
                         // ================= WRITES =================
-                        Inst::StoreField { obj, field, val, .. } => {
+                        Inst::StoreField {
+                            obj, field, val, ..
+                        } => {
                             let o = rep(func, *obj);
                             let loc = (o, *field);
                             if last_field_store.contains(&loc) {
@@ -190,18 +197,36 @@ impl DeadStoreElim {
                         }
                         Inst::EffectEntry | Inst::Safepoint => {
                             // Be conservative around safepoints; they may observe memory via GC.
-                            flush_all(&mut last_field_store, &mut last_elem_store, &mut last_len_store, &mut last_env_store);
+                            flush_all(
+                                &mut last_field_store,
+                                &mut last_elem_store,
+                                &mut last_len_store,
+                                &mut last_env_store,
+                            );
                         }
 
                         // ================= CONTROL / PURE =================
-                        Inst::Phi(_) | Inst::Const(_) | Inst::Mov(_)
-                        | Inst::CmpInt { .. } | Inst::CmpF64 { .. } | Inst::CmpRefEq { .. }
-                        | Inst::IntBin { .. } | Inst::F64Bin { .. }
-                        | Inst::NumAdd(_,_) | Inst::NumSub(_,_) | Inst::NumMul(_,_) | Inst::NumDiv(_,_) | Inst::NumRem(_,_)
-                        | Inst::StrLen(_) | Inst::StrConcat { .. } | Inst::StrSlice { .. }
-                        | Inst::StrCompare { .. } | Inst::StrContains { .. } | Inst::StrToNumber(_)
-                        | Inst::ArrayLen(_) | Inst::ArraySlice { .. }
-                        => {
+                        Inst::Phi(_)
+                        | Inst::Const(_)
+                        | Inst::Mov(_)
+                        | Inst::CmpInt { .. }
+                        | Inst::CmpF64 { .. }
+                        | Inst::CmpRefEq { .. }
+                        | Inst::IntBin { .. }
+                        | Inst::F64Bin { .. }
+                        | Inst::NumAdd(_, _)
+                        | Inst::NumSub(_, _)
+                        | Inst::NumMul(_, _)
+                        | Inst::NumDiv(_, _)
+                        | Inst::NumRem(_, _)
+                        | Inst::StrLen(_)
+                        | Inst::StrConcat { .. }
+                        | Inst::StrSlice { .. }
+                        | Inst::StrCompare { .. }
+                        | Inst::StrContains { .. }
+                        | Inst::StrToNumber(_)
+                        | Inst::ArrayLen(_)
+                        | Inst::ArraySlice { .. } => {
                             // Pure or modeled loads handled above; nothing to do.
                         }
 
@@ -211,7 +236,12 @@ impl DeadStoreElim {
                             // could read memory we track (or make it observable), so flush conservatively.
                             if func.nodes[nid.0 as usize].kind.needs_effect_in() {
                                 // NOTE: we keep `PostWriteBarrier` out of this branch above.
-                                flush_all(&mut last_field_store, &mut last_elem_store, &mut last_len_store, &mut last_env_store);
+                                flush_all(
+                                    &mut last_field_store,
+                                    &mut last_elem_store,
+                                    &mut last_len_store,
+                                    &mut last_env_store,
+                                );
                             }
                         }
                     }
@@ -219,13 +249,18 @@ impl DeadStoreElim {
 
                 if !to_erase_positions.is_empty() {
                     to_erase_positions.sort_unstable();
-                    to_erase_positions.drain(..).rev().for_each(|p| q.erase(b.id, p));
+                    to_erase_positions
+                        .drain(..)
+                        .rev()
+                        .for_each(|p| q.erase(b.id, p));
                     changed = true;
                 }
             }
 
             if !changed {
-                if !q.is_empty() { q.apply(func); }
+                if !q.is_empty() {
+                    q.apply(func);
+                }
                 break;
             }
             q.apply(func);

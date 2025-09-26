@@ -4,12 +4,10 @@
 use ahash::AHashMap as HashMap;
 use ahash::AHashSet as HashSet;
 use smallvec::SmallVec;
-use std::mem::{discriminant, Discriminant};
+use std::mem::{Discriminant, discriminant};
 
 use crate::opt::{InstCursor, OptimizationWIR, WirEditQueue};
-use crate::wir::{
-    BlockId, Function, Inst, InstId, ValueDef, ValueId, IntBinOp, F64BinOp, CmpKind,
-};
+use crate::wir::{BlockId, CmpKind, F64BinOp, Function, Inst, InstId, IntBinOp, ValueDef, ValueId};
 
 /// Loop-Invariant Code Motion (function pass; emits edits via WirEditQueue).
 pub struct Licm {
@@ -17,7 +15,11 @@ pub struct Licm {
 }
 
 impl Default for Licm {
-    fn default() -> Self { Self { last_func_ptr: None } }
+    fn default() -> Self {
+        Self {
+            last_func_ptr: None,
+        }
+    }
 }
 
 impl OptimizationWIR for Licm {
@@ -28,20 +30,40 @@ impl OptimizationWIR for Licm {
         let tags = [
             // Terminators (for CFG/loop discovery)
             discriminant(&Jump(BlockId(0), Vec::<ValueId>::new())),
-            discriminant(&Branch { cond: v0, then_b: BlockId(0), else_b: BlockId(0) }),
+            discriminant(&Branch {
+                cond: v0,
+                then_b: BlockId(0),
+                else_b: BlockId(0),
+            }),
             // NOTE: we intentionally skip Switch's discriminant construction to avoid depending
             // on exact fields; LICM will still be woken by arithmetic/comparison ops below.
 
             // Hoistable pure ops (also wake the pass inside loops)
-            discriminant(&IntBin { op: IntBinOp::Add, a: v0, b: v0 }),
-            discriminant(&F64Bin { op: F64BinOp::Add, a: v0, b: v0 }),
+            discriminant(&IntBin {
+                op: IntBinOp::Add,
+                a: v0,
+                b: v0,
+            }),
+            discriminant(&F64Bin {
+                op: F64BinOp::Add,
+                a: v0,
+                b: v0,
+            }),
             discriminant(&NumAdd(v0, v0)),
             discriminant(&NumSub(v0, v0)),
             discriminant(&NumMul(v0, v0)),
             discriminant(&NumDiv(v0, v0)),
             discriminant(&NumRem(v0, v0)),
-            discriminant(&CmpInt { kind: CmpKind::Eq, a: v0, b: v0 }),
-            discriminant(&CmpF64 { kind: CmpKind::Eq, a: v0, b: v0 }),
+            discriminant(&CmpInt {
+                kind: CmpKind::Eq,
+                a: v0,
+                b: v0,
+            }),
+            discriminant(&CmpF64 {
+                kind: CmpKind::Eq,
+                a: v0,
+                b: v0,
+            }),
             discriminant(&StrLen(v0)),
             discriminant(&StrCompare { a: v0, b: v0 }),
         ];
@@ -65,7 +87,9 @@ impl OptimizationWIR for Licm {
 // ------------------------------------------------------------
 
 fn run_licm_once(func: &Function, q: &mut WirEditQueue) {
-    if func.blocks.is_empty() { return; }
+    if func.blocks.is_empty() {
+        return;
+    }
 
     // -------- indices / fast lookups --------
     let mut bix_of: HashMap<BlockId, usize> = HashMap::with_capacity(func.blocks.len());
@@ -88,7 +112,9 @@ fn run_licm_once(func: &Function, q: &mut WirEditQueue) {
     let (succs, preds) = build_cfg(func, &bix_of);
     let doms = compute_dominators_bitset(func, &succs, &preds, &bix_of); // doms[b] is bitset of dominators of b
     let backedges = collect_backedges(&succs, &doms); // (tail_idx, header_idx)
-    if backedges.is_empty() { return; }
+    if backedges.is_empty() {
+        return;
+    }
 
     // Build natural loops and unique preheaders
     let loops = build_loops(&preds, &bid_of, &backedges);
@@ -98,7 +124,9 @@ fn run_licm_once(func: &Function, q: &mut WirEditQueue) {
             header_to_preheader.insert(lp.header, pre);
         }
     }
-    if header_to_preheader.is_empty() { return; }
+    if header_to_preheader.is_empty() {
+        return;
+    }
 
     // -------- Hoisting: per-loop --------
     // We'll accumulate per-block edits using IX-based APIs.
@@ -110,49 +138,63 @@ fn run_licm_once(func: &Function, q: &mut WirEditQueue) {
     loops_sorted.sort_by_key(|lp| lp.members.len());
 
     for lp in loops_sorted {
-        let Some(pre_bid) = header_to_preheader.get(&lp.header).copied() else { continue; };
+        let Some(pre_bid) = header_to_preheader.get(&lp.header).copied() else {
+            continue;
+        };
         let pre_bix = bix_of[&pre_bid];
 
         // Build fast membership bitset
         let mut in_loop = vec![false; func.blocks.len()];
-        for &bid in &lp.members { in_loop[bix_of[&bid]] = true; }
+        for &bid in &lp.members {
+            in_loop[bix_of[&bid]] = true;
+        }
 
         // Track values proven invariant inside this run
         let mut locally_invariant: HashSet<ValueId> = HashSet::default();
-        let is_invariant = |v: ValueId, in_loop: &Vec<bool>, pos_of_inst: &Vec<Option<(usize, usize)>>| -> bool {
-            match &func.values[v.0 as usize].def {
-                ValueDef::Const(_) => true,
-                ValueDef::EffectToken(_) => false, // don't hoist anything depending on effects
-                ValueDef::BlockParam(bid, _) => !in_loop[bix_of[bid]],
-                ValueDef::InstResult(iid, _) => {
-                    if let Some((bi, _)) = pos_of_inst[iid.0 as usize] {
-                        !in_loop[bi]
-                    } else {
-                        false
+        let is_invariant =
+            |v: ValueId, in_loop: &Vec<bool>, pos_of_inst: &Vec<Option<(usize, usize)>>| -> bool {
+                match &func.values[v.0 as usize].def {
+                    ValueDef::Const(_) => true,
+                    ValueDef::EffectToken(_) => false, // don't hoist anything depending on effects
+                    ValueDef::BlockParam(bid, _) => !in_loop[bix_of[bid]],
+                    ValueDef::InstResult(iid, _) => {
+                        if let Some((bi, _)) = pos_of_inst[iid.0 as usize] {
+                            !in_loop[bi]
+                        } else {
+                            false
+                        }
                     }
                 }
-            }
-        };
+            };
 
         // Preheader insertion anchor (before terminator, or append)
         let pre_blk = &func.blocks[pre_bix];
-        let insert_anchor = pre_blk.insts.iter().rposition(|&iid| !is_terminator(&func.nodes[iid.0 as usize].kind))
+        let insert_anchor = pre_blk
+            .insts
+            .iter()
+            .rposition(|&iid| !is_terminator(&func.nodes[iid.0 as usize].kind))
             .map(|i| i + 1)
             .unwrap_or(0);
 
         // Gather hoistable instructions in stable order (by block, then position)
         for (bi, bb) in func.blocks.iter().enumerate() {
-            if !in_loop[bi] || bi == pre_bix { continue; }
+            if !in_loop[bi] || bi == pre_bix {
+                continue;
+            }
             for (i, &iid) in bb.insts.iter().enumerate() {
                 let node = &func.nodes[iid.0 as usize];
-                if !is_hoistable_pure(&node.kind) { continue; }
+                if !is_hoistable_pure(&node.kind) {
+                    continue;
+                }
 
-                if inst_operands_small(&node.kind).iter().all(|&op|
+                if inst_operands_small(&node.kind).iter().all(|&op| {
                     locally_invariant.contains(&op) || is_invariant(op, &in_loop, &pos_of_inst)
-                ) {
+                }) {
                     erases_for_block.entry(bi).or_default().push(i);
                     inserts_for_pre.entry(pre_bix).or_default().push(iid);
-                    for &r in &node.results { locally_invariant.insert(r); }
+                    for &r in &node.results {
+                        locally_invariant.insert(r);
+                    }
                 }
             }
         }
@@ -169,7 +211,9 @@ fn run_licm_once(func: &Function, q: &mut WirEditQueue) {
             let _ = poss;
         }
         for (bi, poss) in erases_for_block.iter_mut() {
-            if poss.is_empty() { continue; }
+            if poss.is_empty() {
+                continue;
+            }
             poss.sort_unstable();
             poss.dedup();
             for &p in poss.iter().rev() {
@@ -211,15 +255,21 @@ fn build_cfg(
                 Branch { then_b, else_b, .. } => {
                     let j1 = bix_of[then_b];
                     let j2 = bix_of[else_b];
-                    succs[i].push(j1); preds[j1].push(i);
-                    succs[i].push(j2); preds[j2].push(i);
+                    succs[i].push(j1);
+                    preds[j1].push(i);
+                    succs[i].push(j2);
+                    preds[j2].push(i);
                 }
-                Switch { default_b, table, .. } => {
+                Switch {
+                    default_b, table, ..
+                } => {
                     let jd = bix_of[default_b];
-                    succs[i].push(jd); preds[jd].push(i);
+                    succs[i].push(jd);
+                    preds[jd].push(i);
                     for &(_, bid) in table {
                         let j = bix_of[&bid];
-                        succs[i].push(j); preds[j].push(i);
+                        succs[i].push(j);
+                        preds[j].push(i);
                     }
                 }
                 _ => { /* Return/Throw or unterminated: no succs */ }
@@ -252,7 +302,9 @@ fn compute_dominators_bitset(
     while changed {
         changed = false;
         for b in 0..n {
-            if b == entry { continue; }
+            if b == entry {
+                continue;
+            }
             let mut new_row = vec![true; n];
             if preds[b].is_empty() {
                 new_row.fill(false);
@@ -273,14 +325,13 @@ fn compute_dominators_bitset(
     dom
 }
 
-fn collect_backedges(
-    succs: &[Vec<usize>],
-    doms: &[Vec<bool>],
-) -> SmallVec<[(usize, usize); 16]> {
+fn collect_backedges(succs: &[Vec<usize>], doms: &[Vec<bool>]) -> SmallVec<[(usize, usize); 16]> {
     let mut out = SmallVec::new();
     for (u, outs) in succs.iter().enumerate() {
         for &v in outs {
-            if doms[u][v] { out.push((u, v)); }
+            if doms[u][v] {
+                out.push((u, v));
+            }
         }
     }
     out
@@ -299,8 +350,10 @@ fn build_loops(
 
         let mut members: SmallVec<[BlockId; 16]> = SmallVec::new();
         let mut in_set: HashSet<BlockId> = HashSet::default();
-        members.push(header_bid); in_set.insert(header_bid);
-        members.push(tail_bid);   in_set.insert(tail_bid);
+        members.push(header_bid);
+        in_set.insert(header_bid);
+        members.push(tail_bid);
+        in_set.insert(tail_bid);
 
         // Worklist: backward from tail through preds to gather loop.
         let mut stack = SmallVec::<[usize; 32]>::new();
@@ -311,23 +364,36 @@ fn build_loops(
                 if !in_set.contains(&pb) {
                     in_set.insert(pb);
                     members.push(pb);
-                    if p != header { stack.push(p); }
+                    if p != header {
+                        stack.push(p);
+                    }
                 }
             }
         }
 
-        loops.push(NaturalLoop { header: header_bid, tail: tail_bid, members });
+        loops.push(NaturalLoop {
+            header: header_bid,
+            tail: tail_bid,
+            members,
+        });
     }
     loops
 }
 
 /// Unique preheader = only one predecessor of header that is outside the loop.
-fn find_preheader(lp: &NaturalLoop, preds_full: &[Vec<usize>], bix_of: &HashMap<BlockId, usize>, idx_to_bid: &[BlockId]) -> Option<BlockId> {
+fn find_preheader(
+    lp: &NaturalLoop,
+    preds_full: &[Vec<usize>],
+    bix_of: &HashMap<BlockId, usize>,
+    idx_to_bid: &[BlockId],
+) -> Option<BlockId> {
     let h_idx = bix_of[&lp.header];
     let mut outside: SmallVec<[BlockId; 4]> = SmallVec::new();
     // Build quick membership test
     let mut in_loop = HashSet::default();
-    for &bid in &lp.members { in_loop.insert(bid); }
+    for &bid in &lp.members {
+        in_loop.insert(bid);
+    }
 
     for &p_idx in &preds_full[h_idx] {
         let pb = idx_to_bid[p_idx];
@@ -335,12 +401,19 @@ fn find_preheader(lp: &NaturalLoop, preds_full: &[Vec<usize>], bix_of: &HashMap<
             outside.push(pb);
         }
     }
-    if outside.len() == 1 { Some(outside[0]) } else { None }
+    if outside.len() == 1 {
+        Some(outside[0])
+    } else {
+        None
+    }
 }
 
 fn is_terminator(k: &Inst) -> bool {
     use Inst::*;
-    matches!(k, Return(_) | Throw(_) | Jump(_, _) | Branch { .. } | Switch { .. })
+    matches!(
+        k,
+        Return(_) | Throw(_) | Jump(_, _) | Branch { .. } | Switch { .. }
+    )
 }
 
 fn is_hoistable_pure(k: &Inst) -> bool {
@@ -368,13 +441,33 @@ fn inst_operands_small(k: &Inst) -> SmallVec<[ValueId; 4]> {
     use Inst::*;
     let mut out = SmallVec::<[ValueId; 4]>::new();
     match k {
-        IntBin { a, b, .. } => { out.push(*a); out.push(*b); }
-        F64Bin { a, b, .. } => { out.push(*a); out.push(*b); }
-        NumAdd(a,b) | NumSub(a,b) | NumMul(a,b) | NumDiv(a,b) | NumRem(a,b) => { out.push(*a); out.push(*b); }
-        CmpInt { a, b, .. } => { out.push(*a); out.push(*b); }
-        CmpF64 { a, b, .. } => { out.push(*a); out.push(*b); }
-        StrLen(v) => { out.push(*v); }
-        StrCompare { a, b } => { out.push(*a); out.push(*b); }
+        IntBin { a, b, .. } => {
+            out.push(*a);
+            out.push(*b);
+        }
+        F64Bin { a, b, .. } => {
+            out.push(*a);
+            out.push(*b);
+        }
+        NumAdd(a, b) | NumSub(a, b) | NumMul(a, b) | NumDiv(a, b) | NumRem(a, b) => {
+            out.push(*a);
+            out.push(*b);
+        }
+        CmpInt { a, b, .. } => {
+            out.push(*a);
+            out.push(*b);
+        }
+        CmpF64 { a, b, .. } => {
+            out.push(*a);
+            out.push(*b);
+        }
+        StrLen(v) => {
+            out.push(*v);
+        }
+        StrCompare { a, b } => {
+            out.push(*a);
+            out.push(*b);
+        }
         _ => {}
     }
     out

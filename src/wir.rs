@@ -82,13 +82,13 @@ pub enum Type {
     Null,
 
     // Boxed numeric (heap ref) & generic tagged numeric union
-    NumRef,    // boxed number on heap (object/reference)
-    Num,       // union of Int32|F64 (unboxed in registers unless boxed demanded)
+    NumRef, // boxed number on heap (object/reference)
+    Num,    // union of Int32|F64 (unboxed in registers unless boxed demanded)
 
     // References
     AnyRef,
-    Obj(ShapeSet),              // hidden-class object; possibly union of shapes
-    Array(Box<Option<Type>>),   // optional element type info (None = unknown)
+    Obj(ShapeSet),            // hidden-class object; possibly union of shapes
+    Array(Box<Option<Type>>), // optional element type info (None = unknown)
     Str,
     Closure(Option<EnvShapeId>),
     Foreign, // host/FFI box (opaque)
@@ -196,8 +196,8 @@ pub struct DeoptSnapshot {
 #[derive(Clone, Debug)]
 pub struct DeoptPoint {
     pub id: DeoptId,
-    pub target_label: String,     // runtime label / baseline PC key
-    pub snapshot: DeoptSnapshot,  // reconstruction info
+    pub target_label: String,    // runtime label / baseline PC key
+    pub snapshot: DeoptSnapshot, // reconstruction info
 }
 
 /// -------- Effects & purity model --------
@@ -220,14 +220,43 @@ pub enum EffectKind {
 
 /// Arithmetic kinds for convenience.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum IntBinOp { Add, Sub, Mul, DivS, RemS, And, Or, Xor, Shl, ShrU, Sar }
+pub enum IntBinOp {
+    Add,
+    Sub,
+    Mul,
+    DivS,
+    RemS,
+    And,
+    Or,
+    Xor,
+    Shl,
+    ShrU,
+    Sar,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum F64BinOp { Add, Sub, Mul, Div, Rem }
+pub enum F64BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum CmpKind { Eq, Ne, Lt, Le, Gt, Ge }
+pub enum CmpKind {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NumKind { Int32, F64, Num } // helper for mixed-num ops
+pub enum NumKind {
+    Int32,
+    F64,
+    Num,
+} // helper for mixed-num ops
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CallConv {
@@ -241,10 +270,10 @@ pub enum CallConv {
 #[derive(Clone, Debug)]
 pub struct PicEntry {
     pub recv_shapes: ShapeSet,
-    pub callee: FuncId,          // known target
+    pub callee: FuncId, // known target
     pub inlineable: bool,
     pub env_shape: Option<EnvShapeId>,
-    pub arg_spec: Vec<Type>,     // observed arg types (narrowed)
+    pub arg_spec: Vec<Type>, // observed arg types (narrowed)
 }
 
 #[derive(Clone, Debug)]
@@ -261,89 +290,216 @@ pub struct ClassMeta {
 #[derive(Clone, Debug)]
 pub enum Inst {
     // ---- Control ----
-    Phi(Vec<ValueId>),                    // type is resolved by the type engine
+    Phi(Vec<ValueId>), // type is resolved by the type engine
     Jump(BlockId, Vec<ValueId>),
-    Branch { cond: ValueId, then_b: BlockId, else_b: BlockId },
-    Switch { tag: ValueId, default_b: BlockId, table: Vec<(i64, BlockId)> },
+    Branch {
+        cond: ValueId,
+        then_b: BlockId,
+        else_b: BlockId,
+    },
+    Switch {
+        tag: ValueId,
+        default_b: BlockId,
+        table: Vec<(i64, BlockId)>,
+    },
     Return(Vec<ValueId>),
     Throw(ValueId),
 
     // ---- Effect / bookkeeping ----
-    EffectEntry,                          // E0 entry token
-    Safepoint,                            // explicit safepoint (typically at backedges/calls)
+    EffectEntry, // E0 entry token
+    Safepoint,   // explicit safepoint (typically at backedges/calls)
 
     // ---- Constants / moves ----
     Const(Constant),
     Mov(ValueId),
 
     // ---- Guards (speculation) ----
-    GuardType { val: ValueId, ty: Type, deopt: DeoptId },
-    GuardShape { obj: ValueId, shapes: ShapeSet, deopt: DeoptId },
-    GuardBounds { idx: ValueId, len: ValueId, deopt: DeoptId },
-    GuardNotNull { val: ValueId, deopt: DeoptId },
-    GuardIsInt { val: ValueId, deopt: DeoptId },   // returns unboxed Int32
-    GuardIsF64 { val: ValueId, deopt: DeoptId },   // returns unboxed F64
-    Bailout { reason: String, deopt: DeoptId },
+    GuardType {
+        val: ValueId,
+        ty: Type,
+        deopt: DeoptId,
+    },
+    GuardShape {
+        obj: ValueId,
+        shapes: ShapeSet,
+        deopt: DeoptId,
+    },
+    GuardBounds {
+        idx: ValueId,
+        len: ValueId,
+        deopt: DeoptId,
+    },
+    GuardNotNull {
+        val: ValueId,
+        deopt: DeoptId,
+    },
+    GuardIsInt {
+        val: ValueId,
+        deopt: DeoptId,
+    }, // returns unboxed Int32
+    GuardIsF64 {
+        val: ValueId,
+        deopt: DeoptId,
+    }, // returns unboxed F64
+    Bailout {
+        reason: String,
+        deopt: DeoptId,
+    },
 
     // ---- Objects (shape-based) ----
-    AllocObj { shape: ShapeId },                     // returns Obj<shape>
-    LoadField { obj: ValueId, field: FieldId, expected: Option<ShapeId> },
-    StoreField { obj: ValueId, field: FieldId, val: ValueId, expected: Option<ShapeId> },
-    TransitionShape { obj: ValueId, to: ShapeId },   // rare add/remove property
+    AllocObj {
+        shape: ShapeId,
+    }, // returns Obj<shape>
+    LoadField {
+        obj: ValueId,
+        field: FieldId,
+        expected: Option<ShapeId>,
+    },
+    StoreField {
+        obj: ValueId,
+        field: FieldId,
+        val: ValueId,
+        expected: Option<ShapeId>,
+    },
+    TransitionShape {
+        obj: ValueId,
+        to: ShapeId,
+    }, // rare add/remove property
 
     // ---- Arrays ----
-    AllocArray { elem_hint: Option<Type>, len: ValueId },
-    ArrayLen (ValueId),
-    ArraySetLen { arr: ValueId, new_len: ValueId },
-    LoadElem { arr: ValueId, idx: ValueId },
-    StoreElem { arr: ValueId, idx: ValueId, val: ValueId },
-    ArraySlice { arr: ValueId, start: ValueId, end: ValueId },
+    AllocArray {
+        elem_hint: Option<Type>,
+        len: ValueId,
+    },
+    ArrayLen(ValueId),
+    ArraySetLen {
+        arr: ValueId,
+        new_len: ValueId,
+    },
+    LoadElem {
+        arr: ValueId,
+        idx: ValueId,
+    },
+    StoreElem {
+        arr: ValueId,
+        idx: ValueId,
+        val: ValueId,
+    },
+    ArraySlice {
+        arr: ValueId,
+        start: ValueId,
+        end: ValueId,
+    },
 
     // Array methods
-    ArrayPush { arr: ValueId, val: ValueId }, // returns new length
-    ArrayPop  (ValueId),                    // returns popped value or Null
-    ArrayShift  (ValueId),                  // returns shifted value or Null
-    ArrayUnshift { arr: ValueId, val: ValueId }, // returns new length
+    ArrayPush {
+        arr: ValueId,
+        val: ValueId,
+    }, // returns new length
+    ArrayPop(ValueId),   // returns popped value or Null
+    ArrayShift(ValueId), // returns shifted value or Null
+    ArrayUnshift {
+        arr: ValueId,
+        val: ValueId,
+    }, // returns new length
 
     // High-level array intrinsics (vectorizable lowering)
-    ArrayMap { func: FuncId, arr: ValueId },
-    ArrayReduce { func: FuncId, init: ValueId, arr: ValueId },
-    ArrayFill { arr: ValueId, val: ValueId },
-    ArrayCopy { dst: ValueId, src: ValueId, len: ValueId },
+    ArrayMap {
+        func: FuncId,
+        arr: ValueId,
+    },
+    ArrayReduce {
+        func: FuncId,
+        init: ValueId,
+        arr: ValueId,
+    },
+    ArrayFill {
+        arr: ValueId,
+        val: ValueId,
+    },
+    ArrayCopy {
+        dst: ValueId,
+        src: ValueId,
+        len: ValueId,
+    },
 
     // Extra high-level methods
-    ArrayForEach   { func: FuncId, arr: ValueId }, // returns Null
-    ArrayFind      { func: FuncId, arr: ValueId }, // returns element or Null
-    ArrayFindIndex { func: FuncId, arr: ValueId }, // returns i32 (-1 if not found)
-    ArrayFilter    { func: FuncId, arr: ValueId }, // returns Array<?>
+    ArrayForEach {
+        func: FuncId,
+        arr: ValueId,
+    }, // returns Null
+    ArrayFind {
+        func: FuncId,
+        arr: ValueId,
+    }, // returns element or Null
+    ArrayFindIndex {
+        func: FuncId,
+        arr: ValueId,
+    }, // returns i32 (-1 if not found)
+    ArrayFilter {
+        func: FuncId,
+        arr: ValueId,
+    }, // returns Array<?>
 
     // ---- Strings ----
     StrLen(ValueId),
-    StrConcat { a: ValueId, b: ValueId },
-    StrSlice { s: ValueId, start: ValueId, end: ValueId },
-    StrCompare { a: ValueId, b: ValueId },
-    StrContains { s: ValueId, sub: ValueId },
+    StrConcat {
+        a: ValueId,
+        b: ValueId,
+    },
+    StrSlice {
+        s: ValueId,
+        start: ValueId,
+        end: ValueId,
+    },
+    StrCompare {
+        a: ValueId,
+        b: ValueId,
+    },
+    StrContains {
+        s: ValueId,
+        sub: ValueId,
+    },
     StrToNumber(ValueId), // may deopt on failure (lowered with guard+bailout)
 
     // ---- Numerics ----
-    IntBin { op: IntBinOp, a: ValueId, b: ValueId },
-    F64Bin { op: F64BinOp, a: ValueId, b: ValueId },
+    IntBin {
+        op: IntBinOp,
+        a: ValueId,
+        b: ValueId,
+    },
+    F64Bin {
+        op: F64BinOp,
+        a: ValueId,
+        b: ValueId,
+    },
     NumAdd(ValueId, ValueId), // generic numeric add (specialize via guards)
     NumSub(ValueId, ValueId),
     NumMul(ValueId, ValueId),
     NumDiv(ValueId, ValueId),
     NumRem(ValueId, ValueId),
 
-    CmpInt { kind: CmpKind, a: ValueId, b: ValueId },
-    CmpF64 { kind: CmpKind, a: ValueId, b: ValueId },
-    CmpRefEq { a: ValueId, b: ValueId },
+    CmpInt {
+        kind: CmpKind,
+        a: ValueId,
+        b: ValueId,
+    },
+    CmpF64 {
+        kind: CmpKind,
+        a: ValueId,
+        b: ValueId,
+    },
+    CmpRefEq {
+        a: ValueId,
+        b: ValueId,
+    },
 
     // ---- Boxing / tagging ----
-    BoxInt(ValueId),            // i32 -> NumRef
-    BoxF64(ValueId),            // f64 -> NumRef
-    BoxBool(ValueId),           // bool -> AnyRef (or a well-known singleton)
-    UnboxToInt(ValueId),        // Num|Int32 -> Int32 (guard if needed)
-    UnboxToF64(ValueId),        // Num|F64 -> F64 (guard if needed)
+    BoxInt(ValueId),     // i32 -> NumRef
+    BoxF64(ValueId),     // f64 -> NumRef
+    BoxBool(ValueId),    // bool -> AnyRef (or a well-known singleton)
+    UnboxToInt(ValueId), // Num|Int32 -> Int32 (guard if needed)
+    UnboxToF64(ValueId), // Num|F64 -> F64 (guard if needed)
 
     // ---- Calls / closures ----
     CallDirect {
@@ -352,8 +508,8 @@ pub enum Inst {
         args: Vec<ValueId>,
     },
     CallDirectMemoized {
-        callee: FuncId,         // target function
-        args: Vec<ValueId>,     // MUST be 1 arg to benefit, but we keep Vec for parity
+        callee: FuncId,     // target function
+        args: Vec<ValueId>, // MUST be 1 arg to benefit, but we keep Vec for parity
     },
     // Dynamic/method call that lowers into PIC checks + direct calls.
     CallIC {
@@ -363,29 +519,56 @@ pub enum Inst {
         // Optional pre-seeded PIC entries from profile
         seed_pic: Vec<PicEntry>,
     },
-    MethodLookup { obj: ValueId, name: String }, // lowered away if shape is known
+    MethodLookup {
+        obj: ValueId,
+        name: String,
+    }, // lowered away if shape is known
 
-    AllocClosure { func: FuncId, env_shape: Option<EnvShapeId> },
-    LoadEnv { clos: ValueId, index: u32 },
-    StoreEnv { clos: ValueId, index: u32, val: ValueId },
+    AllocClosure {
+        func: FuncId,
+        env_shape: Option<EnvShapeId>,
+    },
+    LoadEnv {
+        clos: ValueId,
+        index: u32,
+    },
+    StoreEnv {
+        clos: ValueId,
+        index: u32,
+        val: ValueId,
+    },
 
-    MakeClosure { callee: FuncId, env: ValueId },
-    CallClosure { conv: CallConv, fun: ValueId, args: Vec<ValueId> },
+    MakeClosure {
+        callee: FuncId,
+        env: ValueId,
+    },
+    CallClosure {
+        conv: CallConv,
+        fun: ValueId,
+        args: Vec<ValueId>,
+    },
 
     /// Register a class with the runtime. Prefer ids to strings for stability.
     RegisterClass {
         meta: ClassMeta,
         // Pre-resolved field ids (avoid string lookups at runtime)
-        fields: Vec<FieldId>,                                  // instance fields
-        statics: Vec<FieldId>,                                 // static fields
-        methods: Vec<(FieldId, FuncId, /*is_static*/ bool)>,   // name, target, static?
-        accessors: Vec<(FieldId, Option<FuncId>, Option<FuncId>, /*is_static*/ bool)>,
+        fields: Vec<FieldId>,                                // instance fields
+        statics: Vec<FieldId>,                               // static fields
+        methods: Vec<(FieldId, FuncId, /*is_static*/ bool)>, // name, target, static?
+        accessors: Vec<(
+            FieldId,
+            Option<FuncId>,
+            Option<FuncId>,
+            /*is_static*/ bool,
+        )>,
         // Optional known constructor (instance). If None, default ctor.
         ctor: Option<FuncId>,
     },
 
     /// Allocate a zeroed instance (does NOT run the constructor).
-    AllocInstance { class: ClassId },
+    AllocInstance {
+        class: ClassId,
+    },
 
     /// Resolve a method by name on the receiver’s shape (non-super).
     /// Returns a callable value (lowered to closure or direct target).
@@ -408,7 +591,7 @@ pub enum Inst {
     CallMethodIC {
         site: SiteId,
         recv: ValueId,
-        method: FieldId,           // the name at this callsite
+        method: FieldId, // the name at this callsite
         args: Vec<ValueId>,
         seed_pic: Vec<PicEntry>,
     },
@@ -436,33 +619,59 @@ pub enum Inst {
     },
 
     // ---- Timers / event loop (JS-like) ----
-    SetTimeout   { fun: ValueId, delay_ms: ValueId },   // -> Int32 (timer id)
-    SetInterval  { fun: ValueId, period_ms: ValueId },  // -> Int32 (timer id)
-    ClearTimeout { id: ValueId },                        // void
-    ClearInterval{ id: ValueId },                        // void
+    SetTimeout {
+        fun: ValueId,
+        delay_ms: ValueId,
+    }, // -> Int32 (timer id)
+    SetInterval {
+        fun: ValueId,
+        period_ms: ValueId,
+    }, // -> Int32 (timer id)
+    ClearTimeout {
+        id: ValueId,
+    }, // void
+    ClearInterval {
+        id: ValueId,
+    }, // void
 
     // Optional (tiny helper to run N ready tasks; useful for strategic pumping)
-    EventLoopPump { budget: u32 },                       // -> Int32 (ran count)
+    EventLoopPump {
+        budget: u32,
+    }, // -> Int32 (ran count)
 
     // ---- GC barriers (abstract) ----
-    PostWriteBarrier { obj: ValueId, val: ValueId },
-    ReadBarrier { obj: ValueId },
+    PostWriteBarrier {
+        obj: ValueId,
+        val: ValueId,
+    },
+    ReadBarrier {
+        obj: ValueId,
+    },
 
     // ---- OSR points ----
     OSRPoint, // mark loop header for on-stack replacement
 
     // ---- Modules / ESM live bindings ----
     /// Read from an ESM live binding cell. Throws on TDZ (uninitialized).
-    LoadBinding { binding: BindingId },
+    LoadBinding {
+        binding: BindingId,
+    },
 
     /// Write to an ESM live binding cell (used by the *owning* module for its exports).
-    StoreBinding { binding: BindingId, val: ValueId },
+    StoreBinding {
+        binding: BindingId,
+        val: ValueId,
+    },
 
     /// Build a frozen ESM namespace object with getters wired to live bindings.
-    MakeNamespace { exports: Vec<(String, BindingId)> },
+    MakeNamespace {
+        exports: Vec<(String, BindingId)>,
+    },
 
     /// Dynamic `import(spec)`: resolves/links/evaluates and returns a Promise for the namespace.
-    ImportDynamic { spec: ValueId },
+    ImportDynamic {
+        spec: ValueId,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -532,7 +741,7 @@ impl Inst {
                 | LoadBinding { .. }     // may throw TDZ → model as effectful guard
                 | StoreBinding { .. }    // writes a live cell
                 | MakeNamespace { .. }   // allocates a namespace object
-                | ImportDynamic { .. }   // schedules async load/eval (calls runtime)
+                | ImportDynamic { .. } // schedules async load/eval (calls runtime)
         )
     }
 
@@ -542,25 +751,24 @@ impl Inst {
     }
 }
 
-
 /// One IR node (instruction) with type/effect annotations.
 #[derive(Clone, Debug)]
 pub struct Node {
     pub id: InstId,
     pub kind: Inst,
-    pub ty: Option<Type>,                 // result type (None for void)
-    pub effect_in: Option<ValueId>,       // SSA effect token input
-    pub effect_out: Option<ValueId>,      // SSA effect token output (if any)
-    pub results: Vec<ValueId>,            // primary SSA result(s) (usually 0 or 1)
+    pub ty: Option<Type>,            // result type (None for void)
+    pub effect_in: Option<ValueId>,  // SSA effect token input
+    pub effect_out: Option<ValueId>, // SSA effect token output (if any)
+    pub results: Vec<ValueId>,       // primary SSA result(s) (usually 0 or 1)
 }
 
 /// A basic block with parameter values (including optional effect token as first param).
 #[derive(Clone, Debug)]
 pub struct Block {
     pub id: BlockId,
-    pub params: Vec<ValueId>,       // SSA block params (data + optional effect)
+    pub params: Vec<ValueId>, // SSA block params (data + optional effect)
     pub insts: Vec<InstId>,
-    pub sealed: bool,               // for SSA construction
+    pub sealed: bool, // for SSA construction
 }
 
 /// Function signature metadata.
@@ -578,7 +786,7 @@ pub struct Function {
     pub sig: Signature,
     pub blocks: Vec<Block>,
     pub nodes: Vec<Node>,
-    pub values: Vec<Value>,             // SSA value table
+    pub values: Vec<Value>, // SSA value table
     pub entry: BlockId,
     pub deopts: Vec<DeoptPoint>,
     pub block_params: HashMap<BlockId, Vec<Type>>,
@@ -627,7 +835,9 @@ pub struct Module {
 }
 
 impl Module {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
     pub fn fresh_binding(&mut self) -> BindingId {
         self.next_binding = next_id();
         let id = BindingId(self.next_binding);
@@ -661,7 +871,11 @@ impl Module {
     pub fn fresh_deopt(&mut self, target_label: impl Into<String>) -> DeoptPoint {
         self.next_deopt = next_id();
         let id = DeoptId(self.next_deopt);
-        DeoptPoint { id, target_label: target_label.into(), snapshot: DeoptSnapshot::default() }
+        DeoptPoint {
+            id,
+            target_label: target_label.into(),
+            snapshot: DeoptSnapshot::default(),
+        }
     }
     pub fn push_function(&mut self, mut f: Function) -> FuncId {
         self.next_func = next_id();
@@ -708,8 +922,17 @@ impl<'m> Builder<'m> {
         let entry_block = BlockId(0);
         let mut func = Function {
             id: FuncId(0),
-            sig: Signature { params: params.clone(), returns, name: name.into() },
-            blocks: vec![Block { id: entry_block, params: Vec::new(), insts: Vec::new(), sealed: false }],
+            sig: Signature {
+                params: params.clone(),
+                returns,
+                name: name.into(),
+            },
+            blocks: vec![Block {
+                id: entry_block,
+                params: Vec::new(),
+                insts: Vec::new(),
+                sealed: false,
+            }],
             nodes: Vec::new(),
             values: Vec::new(),
             entry: entry_block,
@@ -729,7 +952,11 @@ impl<'m> Builder<'m> {
             block_params.push(v);
         }
         func.blocks[0].params = block_params;
-        Self { module, func, cur_block: entry_block }
+        Self {
+            module,
+            func,
+            cur_block: entry_block,
+        }
     }
 
     pub fn finish(mut self) -> Function {
@@ -743,11 +970,23 @@ impl<'m> Builder<'m> {
         self.func
     }
 
-    pub fn push_node(&mut self, kind: Inst, ty: Option<Type>, res_count: u8, effect_in: bool) -> (InstId, Vec<ValueId>) {
-        let effect_in_val = if effect_in { Some(self.ensure_effect_in()) } else { None };
+    pub fn push_node(
+        &mut self,
+        kind: Inst,
+        ty: Option<Type>,
+        res_count: u8,
+        effect_in: bool,
+    ) -> (InstId, Vec<ValueId>) {
+        let effect_in_val = if effect_in {
+            Some(self.ensure_effect_in())
+        } else {
+            None
+        };
         let effect_out_val = if kind.produces_effect_out() {
             Some(self.new_effect_value(EffectKind::from_inst(&kind)))
-        } else { None };
+        } else {
+            None
+        };
 
         // Now it’s safe to allocate this node’s ID
         let id = InstId(self.func.nodes.len() as u32);
@@ -769,7 +1008,13 @@ impl<'m> Builder<'m> {
             results: results.clone(),
         };
         self.func.nodes.push(node);
-        self.func.blocks.iter_mut().find(|b| b.id == self.cur_block).unwrap().insts.push(id);
+        self.func
+            .blocks
+            .iter_mut()
+            .find(|b| b.id == self.cur_block)
+            .unwrap()
+            .insts
+            .push(id);
 
         for (i, _) in results.iter().enumerate() {
             self.func.values.push(Value {
@@ -805,15 +1050,17 @@ impl<'m> Builder<'m> {
     }
 
     pub fn current_block_terminated(&self) -> bool {
-        let blk = self.func.blocks.iter().find(|b| b.id == self.cur_block).unwrap();
+        let blk = self
+            .func
+            .blocks
+            .iter()
+            .find(|b| b.id == self.cur_block)
+            .unwrap();
         if let Some(&last) = blk.insts.last() {
             use crate::wir::Inst;
             matches!(
                 self.func.nodes[last.0 as usize].kind,
-                Inst::Return(_)
-                    | Inst::Branch { .. }
-                    | Inst::Jump(_, _)
-                    | Inst::Throw(_)
+                Inst::Return(_) | Inst::Branch { .. } | Inst::Jump(_, _) | Inst::Throw(_)
             )
         } else {
             false
@@ -832,18 +1079,26 @@ impl<'m> Builder<'m> {
 
     pub fn block(&mut self) -> BlockId {
         let id = BlockId(self.func.blocks.len() as u32);
-        self.func.blocks.push(Block { id, params: Vec::new(), insts: Vec::new(), sealed: false });
+        self.func.blocks.push(Block {
+            id,
+            params: Vec::new(),
+            insts: Vec::new(),
+            sealed: false,
+        });
         id
     }
 
-    pub fn position_at(&mut self, b: BlockId) { self.cur_block = b; }
+    pub fn position_at(&mut self, b: BlockId) {
+        self.cur_block = b;
+    }
 
     pub fn param(&self, idx: usize) -> ValueId {
         self.func.blocks[0].params[idx]
     }
 
     pub fn const_i32(&mut self, x: i32) -> ValueId {
-        let (_nid, res) = self.push_node(Inst::Const(Constant::Int32(x)), Some(Type::Int32), 1, false);
+        let (_nid, res) =
+            self.push_node(Inst::Const(Constant::Int32(x)), Some(Type::Int32), 1, false);
         res[0]
     }
 
@@ -878,7 +1133,12 @@ impl<'m> Builder<'m> {
     }
 
     pub fn guard_bounds(&mut self, idx: ValueId, len: ValueId, deopt: DeoptId) {
-        let _ = self.push_node(Inst::GuardBounds { idx, len, deopt }, Some(Type::Top), 1, true);
+        let _ = self.push_node(
+            Inst::GuardBounds { idx, len, deopt },
+            Some(Type::Top),
+            1,
+            true,
+        );
     }
 
     pub fn load_elem(&mut self, arr: ValueId, idx: ValueId, elem_ty: Option<Type>) -> ValueId {
@@ -899,7 +1159,16 @@ impl<'m> Builder<'m> {
     }
 
     pub fn branch(&mut self, cond: ValueId, then_b: BlockId, else_b: BlockId) {
-        let _ = self.push_node(Inst::Branch { cond, then_b, else_b }, None, 0, false);
+        let _ = self.push_node(
+            Inst::Branch {
+                cond,
+                then_b,
+                else_b,
+            },
+            None,
+            0,
+            false,
+        );
     }
 
     pub fn jump(&mut self, to: BlockId, args: &[ValueId]) {
@@ -928,7 +1197,14 @@ impl<'m> Builder<'m> {
         ctor: Option<FuncId>,
     ) {
         let _ = self.push_node(
-            Inst::RegisterClass { meta, fields, statics, methods, accessors, ctor },
+            Inst::RegisterClass {
+                meta,
+                fields,
+                statics,
+                methods,
+                accessors,
+                ctor,
+            },
             Some(Type::Top),
             0,
             true,
@@ -945,9 +1221,18 @@ impl<'m> Builder<'m> {
         res[0]
     }
 
-    pub fn load_method(&mut self, obj: ValueId, method: FieldId, expected: Option<ShapeId>) -> ValueId {
+    pub fn load_method(
+        &mut self,
+        obj: ValueId,
+        method: FieldId,
+        expected: Option<ShapeId>,
+    ) -> ValueId {
         let (_nid, res) = self.push_node(
-            Inst::LoadMethod { obj, method, expected },
+            Inst::LoadMethod {
+                obj,
+                method,
+                expected,
+            },
             Some(Type::Closure(None)),
             1,
             false,
@@ -955,9 +1240,18 @@ impl<'m> Builder<'m> {
         res[0]
     }
 
-    pub fn load_super_method(&mut self, recv: ValueId, home_class: ClassId, method: FieldId) -> ValueId {
+    pub fn load_super_method(
+        &mut self,
+        recv: ValueId,
+        home_class: ClassId,
+        method: FieldId,
+    ) -> ValueId {
         let (_nid, res) = self.push_node(
-            Inst::LoadSuperMethod { recv, home_class, method },
+            Inst::LoadSuperMethod {
+                recv,
+                home_class,
+                method,
+            },
             Some(Type::Closure(None)),
             1,
             false,
@@ -974,7 +1268,13 @@ impl<'m> Builder<'m> {
         seed_pic: Vec<PicEntry>,
     ) -> ValueId {
         let (_nid, res) = self.push_node(
-            Inst::CallMethodIC { site, recv, method, args, seed_pic },
+            Inst::CallMethodIC {
+                site,
+                recv,
+                method,
+                args,
+                seed_pic,
+            },
             Some(Type::Int32), // adjust per language return typing; keep Top/Union if unknown
             1,
             true,
@@ -990,7 +1290,12 @@ impl<'m> Builder<'m> {
         args: Vec<ValueId>,
     ) -> ValueId {
         let (_nid, res) = self.push_node(
-            Inst::CallSuper { home_class, recv, method, args },
+            Inst::CallSuper {
+                home_class,
+                recv,
+                method,
+                args,
+            },
             Some(Type::Int32),
             1,
             true,
@@ -999,12 +1304,8 @@ impl<'m> Builder<'m> {
     }
 
     pub fn instanceof(&mut self, obj: ValueId, class: ClassId) -> ValueId {
-        let (_nid, res) = self.push_node(
-            Inst::InstanceOf { obj, class },
-            Some(Type::Bool),
-            1,
-            false,
-        );
+        let (_nid, res) =
+            self.push_node(Inst::InstanceOf { obj, class }, Some(Type::Bool), 1, false);
         res[0]
     }
 
@@ -1028,7 +1329,8 @@ impl<'m> Builder<'m> {
     }
 
     pub fn const_bool(&mut self, x: bool) -> ValueId {
-        let (_nid, res) = self.push_node(Inst::Const(Constant::Bool(x)), Some(Type::Bool), 1, false);
+        let (_nid, res) =
+            self.push_node(Inst::Const(Constant::Bool(x)), Some(Type::Bool), 1, false);
         res[0]
     }
     pub fn const_null(&mut self) -> ValueId {
@@ -1036,7 +1338,12 @@ impl<'m> Builder<'m> {
         res[0]
     }
     pub fn const_str(&mut self, s: &str) -> ValueId {
-        let (_nid, res) = self.push_node(Inst::Const(Constant::Str(s.to_string())), Some(Type::Str), 1, false);
+        let (_nid, res) = self.push_node(
+            Inst::Const(Constant::Str(s.to_string())),
+            Some(Type::Str),
+            1,
+            false,
+        );
         res[0]
     }
 }
@@ -1135,12 +1442,22 @@ impl fmt::Display for Function {
             for (i, p) in b.params.iter().enumerate() {
                 let ty = self.values[p.0 as usize].ty.clone().unwrap_or(Type::Top);
                 writeln!(f, "  %{:?} : {:?}", p, ty)?;
-                if i + 1 == b.params.len() { writeln!(f, ")")?; }
+                if i + 1 == b.params.len() {
+                    writeln!(f, ")")?;
+                }
             }
             for nid in &b.insts {
                 let n = &self.nodes[nid.0 as usize];
-                let res_list = n.results.iter().map(|v| format!("%{:?}", v)).collect::<Vec<_>>().join(", ");
-                let ty = n.ty.as_ref().map(|t| format!("{:?}", t)).unwrap_or_else(|| "_".into());
+                let res_list = n
+                    .results
+                    .iter()
+                    .map(|v| format!("%{:?}", v))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let ty =
+                    n.ty.as_ref()
+                        .map(|t| format!("{:?}", t))
+                        .unwrap_or_else(|| "_".into());
                 writeln!(f, "  {} = {:?} :: {}", res_list, n.kind, ty)?;
             }
         }
@@ -1152,7 +1469,7 @@ impl<'m> Builder<'m> {
     pub fn make_closure(&mut self, callee: FuncId, env: ValueId) -> ValueId {
         let (_nid, res) = self.push_node(
             Inst::MakeClosure { callee, env },
-            Some(Type::Closure(None)),   // <-- fix
+            Some(Type::Closure(None)), // <-- fix
             1,
             false,
         );
@@ -1160,7 +1477,11 @@ impl<'m> Builder<'m> {
     }
     pub fn call_closure(&mut self, fun: ValueId, args: Vec<ValueId>) -> ValueId {
         let (_nid, res) = self.push_node(
-            Inst::CallClosure { conv: CallConv::Fast, fun, args },
+            Inst::CallClosure {
+                conv: CallConv::Fast,
+                fun,
+                args,
+            },
             Some(Type::Int32),
             1,
             true,
@@ -1170,14 +1491,14 @@ impl<'m> Builder<'m> {
 }
 
 impl<'m> Builder<'m> {
-        /// Read from an ESM live binding cell. `ty` is optional; leave `None` and let the
+    /// Read from an ESM live binding cell. `ty` is optional; leave `None` and let the
     /// type engine infer/attach after linking if no static info is available.
     pub fn load_binding(&mut self, binding: BindingId, ty: Option<Type>) -> ValueId {
         let (_nid, res) = self.push_node(
             Inst::LoadBinding { binding },
-            ty,        // often None; can be Some if the resolver knows it
+            ty, // often None; can be Some if the resolver knows it
             1,
-            true,      // may throw TDZ → needs effect
+            true, // may throw TDZ → needs effect
         );
         res[0]
     }
@@ -1188,7 +1509,7 @@ impl<'m> Builder<'m> {
             Inst::StoreBinding { binding, val },
             Some(Type::Top), // no value result
             0,
-            true,            // it mutates shared binding state
+            true, // it mutates shared binding state
         );
     }
 
@@ -1199,7 +1520,7 @@ impl<'m> Builder<'m> {
             Inst::MakeNamespace { exports },
             Some(Type::AnyRef), // could be a dedicated ModuleNamespace type later
             1,
-            true,               // allocates
+            true, // allocates
         );
         res[0]
     }
@@ -1210,7 +1531,7 @@ impl<'m> Builder<'m> {
             Inst::ImportDynamic { spec },
             Some(Type::AnyRef), // Promise<any>; use a dedicated Promise<T> type later if desired
             1,
-            true,               // calls into loader/runtime
+            true, // calls into loader/runtime
         );
         res[0]
     }
@@ -1228,12 +1549,18 @@ impl<'m> Builder<'m> {
         res[0]
     }
     pub fn array_unshift(&mut self, arr: ValueId, val: ValueId) -> ValueId {
-        let (_nid, res) = self.push_node(Inst::ArrayUnshift { arr, val }, Some(Type::Int32), 1, true);
+        let (_nid, res) =
+            self.push_node(Inst::ArrayUnshift { arr, val }, Some(Type::Int32), 1, true);
         res[0]
     }
 
     pub fn array_map(&mut self, func: FuncId, arr: ValueId) -> ValueId {
-        let (_nid, res) = self.push_node(Inst::ArrayMap { func, arr }, Some(Type::Array(Box::new(None))), 1, true);
+        let (_nid, res) = self.push_node(
+            Inst::ArrayMap { func, arr },
+            Some(Type::Array(Box::new(None))),
+            1,
+            true,
+        );
         res[0]
     }
     pub fn array_for_each(&mut self, func: FuncId, arr: ValueId) {
@@ -1244,11 +1571,21 @@ impl<'m> Builder<'m> {
         res[0]
     }
     pub fn array_find_index(&mut self, func: FuncId, arr: ValueId) -> ValueId {
-        let (_nid, res) = self.push_node(Inst::ArrayFindIndex { func, arr }, Some(Type::Int32), 1, true);
+        let (_nid, res) = self.push_node(
+            Inst::ArrayFindIndex { func, arr },
+            Some(Type::Int32),
+            1,
+            true,
+        );
         res[0]
     }
     pub fn array_filter(&mut self, func: FuncId, arr: ValueId) -> ValueId {
-        let (_nid, res) = self.push_node(Inst::ArrayFilter { func, arr }, Some(Type::Array(Box::new(None))), 1, true);
+        let (_nid, res) = self.push_node(
+            Inst::ArrayFilter { func, arr },
+            Some(Type::Array(Box::new(None))),
+            1,
+            true,
+        );
         res[0]
     }
     pub fn array_reduce(&mut self, func: FuncId, init: ValueId, arr: ValueId) -> ValueId {

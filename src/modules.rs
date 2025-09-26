@@ -6,15 +6,15 @@ use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use bumpalo::Bump;
 use hybrid_rc::Arc;
 use may::coroutine;
+use std::num::NonZeroUsize;
+use std::thread;
 use std::{
     cell::RefCell,
     path::{Path, PathBuf},
 };
-use std::thread;
-use std::num::NonZeroUsize;
 
 use crate::front::{ModuleAST, Parser, Program};
-use crate::lowerer::{Lowerer, LinkInfo};
+use crate::lowerer::{LinkInfo, Lowerer};
 use crate::opt::optimization::optimization_passes;
 use crate::wir::IdRemap;
 
@@ -131,14 +131,14 @@ impl ProgramBuilder {
 
             // Merge global pools/metadata here; at least bump counters
             // so future fresh_*() keep monotonicity:
-            dst.next_shape    = dst.next_shape.max(src.next_shape);
-            dst.next_field    = dst.next_field.max(src.next_field);
+            dst.next_shape = dst.next_shape.max(src.next_shape);
+            dst.next_field = dst.next_field.max(src.next_field);
             dst.next_envshape = dst.next_envshape.max(src.next_envshape);
-            dst.next_site     = dst.next_site.max(src.next_site);
-            dst.next_deopt    = dst.next_deopt.max(src.next_deopt);
-            dst.next_class    = dst.next_class.max(src.next_class);
-            dst.next_binding  = dst.next_binding.max(src.next_binding);
-            dst.next_func     = dst.next_func.max(src.next_func);
+            dst.next_site = dst.next_site.max(src.next_site);
+            dst.next_deopt = dst.next_deopt.max(src.next_deopt);
+            dst.next_class = dst.next_class.max(src.next_class);
+            dst.next_binding = dst.next_binding.max(src.next_binding);
+            dst.next_func = dst.next_func.max(src.next_func);
 
             // Move functions verbatim, preserving Function.id
             for f in src.funcs.drain(..) {
@@ -153,8 +153,8 @@ impl ProgramBuilder {
     /// Resolves the entry to an absolute path, parses it, drains the queue of modules
     /// discovered through `import`, and binds named imports to exporters.
     pub fn build_from_entry(&mut self, entry: &str) -> Result<crate::wir::Module, String> {
-        let abs = std::fs::canonicalize(entry)
-            .map_err(|e| format!("canonicalize({entry}): {e}"))?;
+        let abs =
+            std::fs::canonicalize(entry).map_err(|e| format!("canonicalize({entry}): {e}"))?;
         let abs = Arc::new(abs);
 
         self.enqueue_if_new(abs.clone());
@@ -189,7 +189,9 @@ impl ProgramBuilder {
         &self,
     ) -> Result<HashMap<Arc<PathBuf>, crate::wir::Module>, String> {
         use may::coroutine::Builder as CoBuilder;
-        let num_cpus: usize = thread::available_parallelism().unwrap_or(NonZeroUsize::new(1).unwrap()).get();
+        let num_cpus: usize = thread::available_parallelism()
+            .unwrap_or(NonZeroUsize::new(1).unwrap())
+            .get();
         may::config().set_workers(num_cpus).set_worker_pin(true);
         may::config().set_stack_size(WORKER_STACK_BYTES);
 
@@ -219,11 +221,10 @@ impl ProgramBuilder {
             // Build LinkInfo **from AST boxes** (imports resolved + own exports)
             let links = {
                 let mut links = LinkInfo::default();
-                let mbox = self
-                    .ctx
-                    .registry
-                    .get(&path)
-                    .ok_or_else(|| format!("lower(parallel): missing ModuleAST for {:?}", path))?;
+                let mbox =
+                    self.ctx.registry.get(&path).ok_or_else(|| {
+                        format!("lower(parallel): missing ModuleAST for {:?}", path)
+                    })?;
                 let m: &ModuleAST<'static> = &**mbox;
 
                 // imports: local name -> provider BindingId
@@ -248,9 +249,8 @@ impl ProgramBuilder {
         for (i, job) in jobs.into_iter().enumerate() {
             let name = format!("lower#{}", i);
             let h = unsafe {
-                CoBuilder::new()
-                    .name(name)
-                    .spawn(move || -> Result<(Arc<PathBuf>, crate::wir::Module), String> {
+                CoBuilder::new().name(name).spawn(
+                    move || -> Result<(Arc<PathBuf>, crate::wir::Module), String> {
                         // Lower into a fresh module
                         let mut m = crate::wir::Module::new();
 
@@ -264,8 +264,10 @@ impl ProgramBuilder {
                         optimize.optimize_module(&mut m);
 
                         Ok((job.path, m))
-                    })
-            }.map_err(|e| format!("may spawn failed: {e}"))?;
+                    },
+                )
+            }
+            .map_err(|e| format!("may spawn failed: {e}"))?;
             handles.push(h);
         }
 
@@ -273,7 +275,9 @@ impl ProgramBuilder {
         let mut out: HashMap<Arc<PathBuf>, crate::wir::Module> = HashMap::default();
         let mut coroutine_counter = 1;
         for h in handles {
-            let (p, m) = h.join().map_err(|e| format!("fiber join failed: {}", coroutine_counter))??;
+            let (p, m) = h
+                .join()
+                .map_err(|e| format!("fiber join failed: {}", coroutine_counter))??;
             out.insert(p, m);
             coroutine_counter += 1;
         }
@@ -296,7 +300,10 @@ impl ProgramBuilder {
             let tgt = &**tgt_box;
             for (_k, req) in &tgt.imports {
                 let src = req.from_path.clone();
-                outgoing.entry(src.clone()).or_default().push(tgt_path.clone());
+                outgoing
+                    .entry(src.clone())
+                    .or_default()
+                    .push(tgt_path.clone());
                 *incoming.entry(tgt_path.clone()).or_insert(0) += 1;
                 // aseguros de tener src en incoming
                 incoming.entry(src).or_insert(0);
@@ -339,7 +346,7 @@ impl ProgramBuilder {
 
     pub fn build_bundle(&mut self, entry: &str) -> Result<BuiltBundle, String> {
         // 1) parser + bind imports
-        self.build_from_entry(entry)?;        // ya parsea cola y hace `bind_imports()`
+        self.build_from_entry(entry)?; // ya parsea cola y hace `bind_imports()`
 
         // 2) lowering and optimization (parallel)
         let shards = self.lower_all_modules_parallel_sharded()?;
@@ -399,8 +406,11 @@ impl ProgramBuilder {
 
         // Insert the Box into the registry and take a temporary raw pointer
         let ast_ptr: *mut ModuleAST<'_> = {
-            let entry: &mut Box<ModuleAST<'static>> =
-                self.ctx.registry.entry(abs.clone()).or_insert(ast_box_static);
+            let entry: &mut Box<ModuleAST<'static>> = self
+                .ctx
+                .registry
+                .entry(abs.clone())
+                .or_insert(ast_box_static);
             &mut **entry as *mut ModuleAST<'static> as *mut ModuleAST<'_>
         };
 
@@ -414,9 +424,9 @@ impl ProgramBuilder {
                 abs.clone(), // referrer
             );
 
-            let prog = p.program().map_err(|e| {
-                format!("Parse error in {:?}: {} at {:?}", abs, e.msg, e.span)
-            })?;
+            let prog = p
+                .program()
+                .map_err(|e| format!("Parse error in {:?}: {} at {:?}", abs, e.msg, e.span))?;
 
             // Debug while `p` (and its borrows) are still in-scope
             #[cfg(debug_assertions)]
@@ -486,21 +496,19 @@ impl ProgramBuilder {
         for (tgt_path, from_path, names) in jobs {
             for name in names {
                 let binding_opt = {
-                    let src_box = self
-                        .ctx
-                        .registry
-                        .get(&from_path)
-                        .ok_or_else(|| format!("bind: source module not found: {:?}", from_path))?;
+                    let src_box =
+                        self.ctx.registry.get(&from_path).ok_or_else(|| {
+                            format!("bind: source module not found: {:?}", from_path)
+                        })?;
                     let src = &**src_box;
                     src.exports.get(name).map(|ei| ei.binding)
                 };
 
                 if let Some(binding) = binding_opt {
-                    let tgt_box_mut = self
-                        .ctx
-                        .registry
-                        .get_mut(&tgt_path)
-                        .ok_or_else(|| format!("bind: target module not found: {:?}", tgt_path))?;
+                    let tgt_box_mut =
+                        self.ctx.registry.get_mut(&tgt_path).ok_or_else(|| {
+                            format!("bind: target module not found: {:?}", tgt_path)
+                        })?;
                     let tgt: &mut ModuleAST<'static> = &mut **tgt_box_mut;
                     if let Some(req_mut) = tgt.imports.get_mut(&from_path) {
                         req_mut.resolved.push((name, binding));
@@ -530,18 +538,21 @@ pub fn build_whole_program_from_entry(entry: &str) -> Result<crate::wir::Module,
 pub fn build_simple_program_from_entry(entry: &str) -> Result<crate::wir::Module, String> {
     let abs = std::fs::canonicalize(entry).map_err(|e| format!("canonicalize({entry}): {e}"))?;
 
-    let src = std::fs::read_to_string(&abs).map_err(|e| format!("read_to_string({}): {e}", entry))?;
+    let src =
+        std::fs::read_to_string(&abs).map_err(|e| format!("read_to_string({}): {e}", entry))?;
 
     let mut parser: Parser = Parser::new(&src);
 
-    let prog = parser.program().map_err(|e| {
-        format!("Parse error in {:?}: {} at {:?}", abs, e.msg, e.span)
-    })?;
+    let prog = parser
+        .program()
+        .map_err(|e| format!("Parse error in {:?}: {} at {:?}", abs, e.msg, e.span))?;
 
     let mut m = crate::wir::Module::new();
 
     let mut lowerer = Lowerer::new(&mut m);
-    lowerer.lower_program(&prog).map_err(|e| format!("lower error in {:?}: {:?}", &abs, e))?;
+    lowerer
+        .lower_program(&prog)
+        .map_err(|e| format!("lower error in {:?}: {:?}", &abs, e))?;
 
     let optimize = optimization_passes();
     optimize.optimize_module(&mut m);

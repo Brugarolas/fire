@@ -2,21 +2,21 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
-use logos::Logos;
-use std::{collections::BTreeSet, ops::Deref};
-use ahash::{AHashSet as HashSet, AHashMap as HashMap};
-use std::collections::hash_map::Entry;
-use smallbox::SmallBox;
-use std::{path::PathBuf};
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use ariadne::{Color, FileCache, FnCache, Label, Report, ReportKind, Source};
 use hybrid_rc::Arc;
-use ariadne::{Report, ReportKind, Label, Color, Source, FileCache, FnCache};
+use logos::Logos;
+use smallbox::SmallBox;
+use std::collections::hash_map::Entry;
+use std::path::PathBuf;
+use std::{collections::BTreeSet, ops::Deref};
 
 // Bring in the WIR types from your other file/module.
+use crate::modules::{FSLoader, ModuleId, ModuleLoader, ModulesCTX, ProgramBuilder};
 use crate::wir::{
-    Builder, Constant, FieldId, FuncId, Inst, IntBinOp, Module, Type, ValueId,
-    MethodInfo, AccessorInfo, BindingId, next_id,
+    AccessorInfo, BindingId, Builder, Constant, FieldId, FuncId, Inst, IntBinOp, MethodInfo,
+    Module, Type, ValueId, next_id,
 };
-use crate::modules::{ModuleId, ModulesCTX, ProgramBuilder, FSLoader, ModuleLoader};
 
 /// -------------------------
 /// LEXER (Logos)
@@ -33,51 +33,88 @@ pub enum Tok {
     _BlockComment,
 
     // Keywords
-    #[token("fn")] Fn,
-    #[token("function")] Function,
-    #[token("var")] Var,
-    #[token("let")] Let,
-    #[token("const")] Const,
-    #[token("if")] If,
-    #[token("unless")] Unless,
-    #[token("else")] Else,
-    #[token("while")] While,
-    #[token("for")] For,
-    #[token("return")] Return,
-    #[token("true")] True,
-    #[token("false")] False,
-    #[token("null")] Null,
-    #[token("in")] In,
-    #[token("delete")] Delete,
+    #[token("fn")]
+    Fn,
+    #[token("function")]
+    Function,
+    #[token("var")]
+    Var,
+    #[token("let")]
+    Let,
+    #[token("const")]
+    Const,
+    #[token("if")]
+    If,
+    #[token("unless")]
+    Unless,
+    #[token("else")]
+    Else,
+    #[token("while")]
+    While,
+    #[token("for")]
+    For,
+    #[token("return")]
+    Return,
+    #[token("true")]
+    True,
+    #[token("false")]
+    False,
+    #[token("null")]
+    Null,
+    #[token("in")]
+    In,
+    #[token("delete")]
+    Delete,
 
     // Class support
-    #[token("class")] Class,
-    #[token("extends")] Extends,
-    #[token("static")] Static,
-    #[token("constructor")] Constructor,
-    #[token("destructor")] Destructor,
-    #[token("get")] Get,
-    #[token("set")] Set,
-    #[token("new")] New,
-    #[token("this")] This,
-    #[token("super")] Super,
+    #[token("class")]
+    Class,
+    #[token("extends")]
+    Extends,
+    #[token("static")]
+    Static,
+    #[token("constructor")]
+    Constructor,
+    #[token("destructor")]
+    Destructor,
+    #[token("get")]
+    Get,
+    #[token("set")]
+    Set,
+    #[token("new")]
+    New,
+    #[token("this")]
+    This,
+    #[token("super")]
+    Super,
 
     // Async/await & defer/errdefer
-    #[token("async")] Async,
-    #[token("await")] Await,
-    #[token("defer")] Defer,
-    #[token("errdefer")] ErrDefer,
+    #[token("async")]
+    Async,
+    #[token("await")]
+    Await,
+    #[token("defer")]
+    Defer,
+    #[token("errdefer")]
+    ErrDefer,
 
     // Import/export
-    #[token("import")] Import,
-    #[token("export")] Export,
-    #[token("from")] From,
-    #[token("as")] As,
+    #[token("import")]
+    Import,
+    #[token("export")]
+    Export,
+    #[token("from")]
+    From,
+    #[token("as")]
+    As,
 
     // Simple builtins
-    #[token("Array")] ListBuiltin,
-    #[token("Promise")] PromiseBuiltin,
-    #[token("Deferred")] DeferredBuiltin,
+    #[token("Array")]
+    ListBuiltin,
+    #[token("Promise")]
+    PromiseBuiltin,
+    #[token("Deferred")]
+    DeferredBuiltin,
 
     // Identifiers & literals
     #[regex(r"[A-Za-z_][A-Za-z0-9_]*", |lex| lex.slice().to_string())]
@@ -90,37 +127,68 @@ pub enum Tok {
     Str(String),
 
     // Operators / punctuation
-    #[token("==")] EqEq,
-    #[token("!=")] BangEq,
-    #[token("<=")] LtEq,
-    #[token(">=")] GtEq,
-    #[token("&&")] AndAnd,
-    #[token("||")] OrOr,
-    #[token("+=")] PlusEq,
-    #[token("-=")] MinusEq,
-    #[token("*=")] StarEq,
-    #[token("/=")] SlashEq,
-    #[token("%=")] PercentEq,
-    #[token("|")] Pipe,
-    #[token("=")] Eq,
-    #[token("<")] Lt,
-    #[token(">")] Gt,
-    #[token("+")] Plus,
-    #[token("-")] Minus,
-    #[token("*")] Star,
-    #[token("/")] Slash,
-    #[token("%")] Percent,
-    #[token("!")] Bang,
-    #[token(".")] Dot,
-    #[token(",")] Comma,
-    #[token(";")] Semi,
-    #[token("(")] LParen,
-    #[token(")")] RParen,
-    #[token("{")] LBrace,
-    #[token("}")] RBrace,
-    #[token("[")] LBracket,
-    #[token("]")] RBracket,
-    #[token(":")] Colon,
+    #[token("==")]
+    EqEq,
+    #[token("!=")]
+    BangEq,
+    #[token("<=")]
+    LtEq,
+    #[token(">=")]
+    GtEq,
+    #[token("&&")]
+    AndAnd,
+    #[token("||")]
+    OrOr,
+    #[token("+=")]
+    PlusEq,
+    #[token("-=")]
+    MinusEq,
+    #[token("*=")]
+    StarEq,
+    #[token("/=")]
+    SlashEq,
+    #[token("%=")]
+    PercentEq,
+    #[token("|")]
+    Pipe,
+    #[token("=")]
+    Eq,
+    #[token("<")]
+    Lt,
+    #[token(">")]
+    Gt,
+    #[token("+")]
+    Plus,
+    #[token("-")]
+    Minus,
+    #[token("*")]
+    Star,
+    #[token("/")]
+    Slash,
+    #[token("%")]
+    Percent,
+    #[token("!")]
+    Bang,
+    #[token(".")]
+    Dot,
+    #[token(",")]
+    Comma,
+    #[token(";")]
+    Semi,
+    #[token("(")]
+    LParen,
+    #[token(")")]
+    RParen,
+    #[token("{")]
+    LBrace,
+    #[token("}")]
+    RBrace,
+    #[token("[")]
+    LBracket,
+    #[token("]")]
+    RBracket,
+    #[token(":")]
+    Colon,
 }
 
 fn unescape_string(raw: &str) -> String {
@@ -156,10 +224,10 @@ fn unescape_string(raw: &str) -> String {
 #[derive(Debug, Clone)]
 pub struct Program {
     pub functions: Vec<FuncDecl>,
-    pub classes:   Vec<ClassDecl>,
-    pub imports:   Vec<ImportDecl>,
-    pub exports:   Vec<ExportDecl>,
-    pub modules:   Vec<ModuleAST<'static>>,
+    pub classes: Vec<ClassDecl>,
+    pub imports: Vec<ImportDecl>,
+    pub exports: Vec<ExportDecl>,
+    pub modules: Vec<ModuleAST<'static>>,
 }
 
 #[derive(Debug, Clone)]
@@ -180,13 +248,13 @@ pub struct ExportItem<'a> {
 pub struct ImportRequest<'a> {
     pub from_path: Arc<PathBuf>,
     pub names: Vec<&'a str>,
-    pub resolved: Vec<( &'a str, BindingId )>,
+    pub resolved: Vec<(&'a str, BindingId)>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ClassDecl {
     pub name: String,
-    pub base: Option<String>,        // name after `extends`
+    pub base: Option<String>, // name after `extends`
     pub members: Vec<ClassMember>,
 }
 
@@ -196,17 +264,17 @@ pub enum ClassMember {
     Stored {
         is_static: bool,
         name: String,
-        type_ann: Option<String>,    // parsed after ':', kept as raw for now
-        init: Option<Expr>,          // optional initializer
+        type_ann: Option<String>, // parsed after ':', kept as raw for now
+        init: Option<Expr>,       // optional initializer
     },
 
     // `var name { get(){...} set(x){...} }` (either/both accessors; instance or static)
     Accessor {
         is_static: bool,
         name: String,
-        getter: Option<Block>,       // body of `get()`
+        getter: Option<Block>, // body of `get()`
         setter_param: Option<String>,
-        setter_body: Option<Block>,  // body of `set(param)`
+        setter_body: Option<Block>, // body of `set(param)`
     },
 
     // `fn name(params) { ... }`     (instance)   or  `static fn name(...) { ... }`
@@ -222,7 +290,7 @@ pub enum ClassMember {
     Constructor {
         params: Vec<String>,
         body: Block,
-        is_async: bool,              // allow `async constructor` now or later
+        is_async: bool, // allow `async constructor` now or later
     },
 
     // `destructor() { ... }`
@@ -247,10 +315,25 @@ pub struct Block {
 
 #[derive(Debug, Clone)]
 pub enum Stmt {
-    Var { name: String, init: Option<Expr> },
-    If { cond: Expr, then_b: Block, else_b: Option<Block> },
-    While { cond: Expr, body: Block },
-    For { init: Option<SmallBox<Stmt, u8>>, cond: Option<Expr>, step: Option<Expr>, body: Block },
+    Var {
+        name: String,
+        init: Option<Expr>,
+    },
+    If {
+        cond: Expr,
+        then_b: Block,
+        else_b: Option<Block>,
+    },
+    While {
+        cond: Expr,
+        body: Block,
+    },
+    For {
+        init: Option<SmallBox<Stmt, u8>>,
+        cond: Option<Expr>,
+        step: Option<Expr>,
+        body: Block,
+    },
     Return(Option<Expr>),
     Expr(Expr),
     Listen(ListenDecl),
@@ -258,8 +341,8 @@ pub enum Stmt {
 
 #[derive(Debug, Clone)]
 pub enum PropKey {
-    Ident(String),  // identifier property name (interned later)
-    Str(String),    // string-literal property name
+    Ident(String), // identifier property name (interned later)
+    Str(String),   // string-literal property name
 }
 
 #[derive(Debug, Clone)]
@@ -272,30 +355,70 @@ pub enum Expr {
     Ident(String),
 
     Assign(SmallBox<LValue, u8>, SmallBox<Expr, u8>),
-    Binary { op: BinOp, a: SmallBox<Expr, u8>, b: SmallBox<Expr, u8> },
-    Unary { op: UnOp, e: SmallBox<Expr, u8> },
-    Call { callee: SmallBox<Expr, u8>, args: Vec<Expr> },
+    Binary {
+        op: BinOp,
+        a: SmallBox<Expr, u8>,
+        b: SmallBox<Expr, u8>,
+    },
+    Unary {
+        op: UnOp,
+        e: SmallBox<Expr, u8>,
+    },
+    Call {
+        callee: SmallBox<Expr, u8>,
+        args: Vec<Expr>,
+    },
 
-    GetProp { recv: SmallBox<Expr, u8>, name: String },
-    Index { recv: SmallBox<Expr, u8>, index: SmallBox<Expr, u8> },
+    GetProp {
+        recv: SmallBox<Expr, u8>,
+        name: String,
+    },
+    Index {
+        recv: SmallBox<Expr, u8>,
+        index: SmallBox<Expr, u8>,
+    },
     Group(SmallBox<Expr, u8>),
-    FnLit { params: Vec<String>, body: Block },
-    FnRef { name: String },
+    FnLit {
+        params: Vec<String>,
+        body: Block,
+    },
+    FnRef {
+        name: String,
+    },
     ArrayLit(Vec<Expr>),
 
-    This,                                   // `this`
-    SuperProp(String),                      // `super.m`
-    SuperCall(Vec<Expr>),                   // `super(args...)` (only valid in derived ctor)
-    New { class: String, args: Vec<Expr> }, // `new ClassName(args...)`
+    This,                 // `this`
+    SuperProp(String),    // `super.m`
+    SuperCall(Vec<Expr>), // `super(args...)` (only valid in derived ctor)
+    New {
+        class: String,
+        args: Vec<Expr>,
+    }, // `new ClassName(args...)`
 
-    ObjLit(Vec<(PropKey, Expr)>),                                                    // { a: 1, "b": 2, c: x+y }
-    GetPropObj { obj: SmallBox<Expr, u8>, key: PropKey },                            // obj.x   or   obj["x"]
-    SetPropObj { obj: SmallBox<Expr, u8>, key: PropKey, value: SmallBox<Expr, u8> }, // obj.x = value   or   obj["x"] = value
-    In { key: SmallBox<Expr, u8>, obj: SmallBox<Expr, u8> },                         // "<key>" in obj
-    DeleteProp { obj: SmallBox<Expr, u8>, key: PropKey },                            // delete obj.x / delete obj["x"]
-    DeleteIndex { obj: SmallBox<Expr, u8>, index: SmallBox<Expr, u8> },              // delete obj[expr]
+    ObjLit(Vec<(PropKey, Expr)>), // { a: 1, "b": 2, c: x+y }
+    GetPropObj {
+        obj: SmallBox<Expr, u8>,
+        key: PropKey,
+    }, // obj.x   or   obj["x"]
+    SetPropObj {
+        obj: SmallBox<Expr, u8>,
+        key: PropKey,
+        value: SmallBox<Expr, u8>,
+    }, // obj.x = value   or   obj["x"] = value
+    In {
+        key: SmallBox<Expr, u8>,
+        obj: SmallBox<Expr, u8>,
+    }, // "<key>" in obj
+    DeleteProp {
+        obj: SmallBox<Expr, u8>,
+        key: PropKey,
+    }, // delete obj.x / delete obj["x"]
+    DeleteIndex {
+        obj: SmallBox<Expr, u8>,
+        index: SmallBox<Expr, u8>,
+    }, // delete obj[expr]
 
-    Await(SmallBox<Expr, u8>) // await <expression>
+    Await(SmallBox<Expr, u8>), // await <expression>
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,14 +450,26 @@ pub enum LValue {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
-    Add, Sub, Mul, Div, Rem,
-    Eq, Ne, Lt, Le, Gt, Ge,
-    And, Or,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    And,
+    Or,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnOp {
-    Neg, Pos, Not,
+    Neg,
+    Pos,
+    Not,
 }
 
 #[derive(Debug, Clone)]
@@ -349,20 +484,27 @@ pub enum ImportItem {
 
 #[derive(Debug, Clone)]
 pub struct ImportDecl {
-    pub specifier: String,          // "./math", "../lib/util", etc.
-    pub items: Vec<ImportItem>,     // vacío => import "path"; (solo efectos)
+    pub specifier: String,      // "./math", "../lib/util", etc.
+    pub items: Vec<ImportItem>, // vacío => import "path"; (solo efectos)
 }
 
 #[derive(Debug, Clone)]
 pub enum ExportDecl {
     // export { a, b as c };
-    Named { items: Vec<(String, Option<String>)> },
+    Named {
+        items: Vec<(String, Option<String>)>,
+    },
 
     // export { a, b as c } from "path";
-    From  { specifier: String, items: Vec<(String, Option<String>)> },
+    From {
+        specifier: String,
+        items: Vec<(String, Option<String>)>,
+    },
 
     // export * from "path";
-    AllFrom { specifier: String },
+    AllFrom {
+        specifier: String,
+    },
 
     // export var/let / fn / class (referencia al símbolo local exportado)
     Var(String),
@@ -378,9 +520,9 @@ pub struct ListenDecl {
 
 #[derive(Debug, Clone)]
 pub struct RouteDecl {
-    pub method: String,  // e.g. "GET"
-    pub pattern: Expr,   // we store it as an Expr (usually ArrayLit of strings)
-    pub handler: Expr,   // a FnLit / hoisted FnRef
+    pub method: String, // e.g. "GET"
+    pub pattern: Expr,  // we store it as an Expr (usually ArrayLit of strings)
+    pub handler: Expr,  // a FnLit / hoisted FnRef
 }
 
 /// -------------------------
@@ -446,9 +588,7 @@ pub struct Parser<'src> {
 }
 
 impl<'src> Parser<'src> {
-    pub fn new(
-        src: &'src str,
-    ) -> Self {
+    pub fn new(src: &'src str) -> Self {
         let mut lex = Tok::lexer(src);
         let mut toks = Vec::new();
         let mut lexer_errors = Vec::new();
@@ -467,7 +607,16 @@ impl<'src> Parser<'src> {
             }
         }
 
-        Self { toks, i: 0, _src: src, lexer_errors, module_ptr: None, ctx: None, resolver: None, referrer: None }
+        Self {
+            toks,
+            i: 0,
+            _src: src,
+            lexer_errors,
+            module_ptr: None,
+            ctx: None,
+            resolver: None,
+            referrer: None,
+        }
     }
 
     pub fn with_module<'a>(
@@ -605,24 +754,32 @@ impl<'src> Parser<'src> {
             return Err(self.lexer_errors[0].clone());
         }
 
-        let mut functions  = Vec::new();
-        let mut classes   = Vec::new();
+        let mut functions = Vec::new();
+        let mut classes = Vec::new();
         let mut toplevel_stmts: Vec<Stmt> = Vec::new();
 
         let mut imports = Vec::new();
         let mut exports = Vec::new();
 
         while !self.is_eof() {
-            if self.matches(&Tok::Semi) { continue; }
+            if self.matches(&Tok::Semi) {
+                continue;
+            }
 
             if self.check(&Tok::Import) {
                 imports.push(self.parse_import_decl()?);
             } else if self.check(&Tok::Export) {
                 self.next()?; // consume 'export'
-                self.parse_export_decl(&mut functions, &mut classes, &mut toplevel_stmts, &mut exports)?;
+                self.parse_export_decl(
+                    &mut functions,
+                    &mut classes,
+                    &mut toplevel_stmts,
+                    &mut exports,
+                )?;
             } else if self.check(&Tok::Class) {
                 classes.push(self.class_decl()?);
-            } else if self.check(&Tok::Fn) || self.check(&Tok::Function) || self.check(&Tok::Async) {
+            } else if self.check(&Tok::Fn) || self.check(&Tok::Function) || self.check(&Tok::Async)
+            {
                 let is_async = if self.matches(&Tok::Async) {
                     self.expect(Tok::Fn, "expected 'fn'/'function' after 'async'")?;
                     true
@@ -642,7 +799,9 @@ impl<'src> Parser<'src> {
                 fid: FuncId(next_id()),
                 name: "__toplevel__".to_string(),
                 params: Vec::new(),
-                body: Block { stmts: toplevel_stmts },
+                body: Block {
+                    stmts: toplevel_stmts,
+                },
                 is_async: true, // Allows top-level async
             });
         }
@@ -652,7 +811,8 @@ impl<'src> Parser<'src> {
             // 1) Lo que el parser recogió por sintaxis (Program)
             eprintln!(
                 "[parser:end] prog.syntactic imports={}, exports={}",
-                imports.len(), exports.len()
+                imports.len(),
+                exports.len()
             );
 
             // 2) Si tenemos ModuleAST real, dump de la cajita del módulo
@@ -661,7 +821,9 @@ impl<'src> Parser<'src> {
                     let m = &*m_ptr;
                     eprintln!(
                         "  [module-box] path={:?} imports={} exports={}",
-                        m.path, m.imports.len(), m.exports.len()
+                        m.path,
+                        m.imports.len(),
+                        m.exports.len()
                     );
                     if m.imports.is_empty() {
                         eprintln!("    [imports] (none)");
@@ -675,7 +837,10 @@ impl<'src> Parser<'src> {
                             };
                             eprintln!(
                                 "      - key={:?}\n        from_path={:?}\n        names=[{}]\n        resolved_items={}",
-                                key_path, req.from_path, names, req.resolved.len()
+                                key_path,
+                                req.from_path,
+                                names,
+                                req.resolved.len()
                             );
                         }
                     }
@@ -697,7 +862,13 @@ impl<'src> Parser<'src> {
             }
         }
 
-        Ok(Program { functions, classes, imports, exports, modules: Vec::new() })
+        Ok(Program {
+            functions,
+            classes,
+            imports,
+            exports,
+            modules: Vec::new(),
+        })
     }
 
     fn record_export(&mut self, name: &str) {
@@ -720,16 +891,26 @@ impl<'src> Parser<'src> {
                 let binding = bind_opt.unwrap_or_else(|| BindingId(next_id()));
                 m.exports.insert(
                     name_intern,
-                    ExportItem { name: name_intern, binding },
+                    ExportItem {
+                        name: name_intern,
+                        binding,
+                    },
                 );
             }
         }
     }
 
-    fn record_import_and_enqueue(&mut self, spec: &str, item_names_local: &[String]) -> Result<(), ParseError> {
-        if let (Some(m_ptr), Some(ctx_ptr), Some(res_ptr), Some(referrer)) =
-            (self.module_ptr, self.ctx, self.resolver, self.referrer.clone())
-        {
+    fn record_import_and_enqueue(
+        &mut self,
+        spec: &str,
+        item_names_local: &[String],
+    ) -> Result<(), ParseError> {
+        if let (Some(m_ptr), Some(ctx_ptr), Some(res_ptr), Some(referrer)) = (
+            self.module_ptr,
+            self.ctx,
+            self.resolver,
+            self.referrer.clone(),
+        ) {
             // Resolver a ruta absoluta con el loader de FS
             let loader = FSLoader;
             let abs = loader
@@ -741,7 +922,8 @@ impl<'src> Parser<'src> {
                 let m: &mut ModuleAST<'static> = &mut *m_ptr;
 
                 // Internar cada nombre en la arena y construir ImportRequest
-                let mut names_bumped: Vec<&'static str> = Vec::with_capacity(item_names_local.len());
+                let mut names_bumped: Vec<&'static str> =
+                    Vec::with_capacity(item_names_local.len());
                 for n in item_names_local {
                     let s = ctx.arena.alloc_str(n);
                     names_bumped.push(std::mem::transmute::<&str, &'static str>(s));
@@ -768,24 +950,33 @@ impl<'src> Parser<'src> {
         let t = self.next()?;
         let name = match t.tok {
             Tok::Ident(s) => s,
-            ref tok => return Err(ParseError {
-                msg: format!("expected class name (identifier), found {:?}", tok),
-                span: t.span,
-            }),
+            ref tok => {
+                return Err(ParseError {
+                    msg: format!("expected class name (identifier), found {:?}", tok),
+                    span: t.span,
+                });
+            }
         };
 
         let base = if self.matches(&Tok::Extends) {
             let t = self.next()?;
             match t.tok {
                 Tok::Ident(s) => Some(s),
-                ref tok => return Err(ParseError {
-                    msg: format!("expected base class name after 'extends', found {:?}", tok),
-                    span: t.span,
-                }),
+                ref tok => {
+                    return Err(ParseError {
+                        msg: format!("expected base class name after 'extends', found {:?}", tok),
+                        span: t.span,
+                    });
+                }
             }
-        } else { None };
+        } else {
+            None
+        };
 
-        self.expect(Tok::LBrace, "expected opening brace after class declaration")?;
+        self.expect(
+            Tok::LBrace,
+            "expected opening brace after class declaration",
+        )?;
 
         let mut members = Vec::new();
         loop {
@@ -799,7 +990,11 @@ impl<'src> Parser<'src> {
             members.push(self.class_member()?);
         }
 
-        Ok(ClassDecl { name, base, members })
+        Ok(ClassDecl {
+            name,
+            base,
+            members,
+        })
     }
 
     fn class_member(&mut self) -> PResult<ClassMember> {
@@ -812,8 +1007,12 @@ impl<'src> Parser<'src> {
         // constructor
         if self.matches(&Tok::Constructor) {
             let params = self.parse_fn_param_names()?;
-            let body   = self.block()?;
-            return Ok(ClassMember::Constructor { params, body, is_async });
+            let body = self.block()?;
+            return Ok(ClassMember::Constructor {
+                params,
+                body,
+                is_async,
+            });
         }
 
         // destructor
@@ -833,16 +1032,22 @@ impl<'src> Parser<'src> {
             let t = self.next()?;
             let name = match t.tok {
                 Tok::Ident(s) => s,
-                ref tok => return Err(ParseError {
-                    msg: format!("expected field name after 'var', found {:?}", tok),
-                    span: t.span,
-                }),
+                ref tok => {
+                    return Err(ParseError {
+                        msg: format!("expected field name after 'var', found {:?}", tok),
+                        span: t.span,
+                    });
+                }
             };
 
             // ignore optional type annotation for now
             let _ = self.maybe_skip_type_annot()?;
 
-            let init = if self.matches(&Tok::Eq) { Some(self.expr()?) } else { None };
+            let init = if self.matches(&Tok::Eq) {
+                Some(self.expr()?)
+            } else {
+                None
+            };
             self.expect(Tok::Semi, "expected ';' after field declaration")?;
             return Ok(ClassMember::Stored {
                 is_static,
@@ -860,10 +1065,12 @@ impl<'src> Parser<'src> {
             let t = self.next()?;
             let name = match t.tok {
                 Tok::Ident(s) => s,
-                ref tok => return Err(ParseError {
-                    msg: format!("expected property name after 'get', found {:?}", tok),
-                    span: t.span,
-                }),
+                ref tok => {
+                    return Err(ParseError {
+                        msg: format!("expected property name after 'get', found {:?}", tok),
+                        span: t.span,
+                    });
+                }
             };
             self.expect(Tok::LParen, "expected '(' after getter name")?;
             self.expect(Tok::RParen, "expected ')' after getter params")?;
@@ -883,19 +1090,23 @@ impl<'src> Parser<'src> {
             let t = self.next()?;
             let name = match t.tok {
                 Tok::Ident(s) => s,
-                ref tok => return Err(ParseError {
-                    msg: format!("expected property name after 'set', found {:?}", tok),
-                    span: t.span,
-                }),
+                ref tok => {
+                    return Err(ParseError {
+                        msg: format!("expected property name after 'set', found {:?}", tok),
+                        span: t.span,
+                    });
+                }
             };
             self.expect(Tok::LParen, "expected '(' after setter name")?;
             let t = self.next()?;
             let param = match t.tok {
                 Tok::Ident(s) => s,
-                ref tok => return Err(ParseError {
-                    msg: format!("expected setter parameter name, found {:?}", tok),
-                    span: t.span,
-                }),
+                ref tok => {
+                    return Err(ParseError {
+                        msg: format!("expected setter parameter name, found {:?}", tok),
+                        span: t.span,
+                    });
+                }
             };
             self.expect(Tok::RParen, "expected ')' after setter parameter")?;
             let body = self.block()?;
@@ -917,17 +1128,25 @@ impl<'src> Parser<'src> {
         let t = self.next()?;
         let name = match t.tok {
             Tok::Ident(s) => s,
-            ref tok => return Err(ParseError {
-                msg: format!("expected method name (identifier), found {:?}", tok),
-                span: t.span,
-            }),
+            ref tok => {
+                return Err(ParseError {
+                    msg: format!("expected method name (identifier), found {:?}", tok),
+                    span: t.span,
+                });
+            }
         };
 
         self.expect(Tok::LParen, "expected '(' after method name")?;
         let params = self.parse_param_list()?;
         let body = self.block()?;
 
-        Ok(ClassMember::Method { is_static, name, params, body, is_async })
+        Ok(ClassMember::Method {
+            is_static,
+            name,
+            params,
+            body,
+            is_async,
+        })
     }
 
     fn maybe_skip_type_annot(&mut self) -> PResult<()> {
@@ -963,19 +1182,33 @@ impl<'src> Parser<'src> {
         self.expect(Tok::Import, "expected 'import' keyword")?;
 
         // 1) import "path";
-        if matches!(self.peek(), Some(SpannedTok { tok: Tok::Str(_), .. })) {
+        if matches!(
+            self.peek(),
+            Some(SpannedTok {
+                tok: Tok::Str(_),
+                ..
+            })
+        ) {
             let t = self.next()?;
             let spec = match t.tok {
                 Tok::Str(s) => s,
-                ref tok => return Err(ParseError {
-                    msg: format!("expected string literal for import specifier, found {:?}", tok),
-                    span: t.span,
-                }),
+                ref tok => {
+                    return Err(ParseError {
+                        msg: format!(
+                            "expected string literal for import specifier, found {:?}",
+                            tok
+                        ),
+                        span: t.span,
+                    });
+                }
             };
             self.expect(Tok::Semi, "expected ';' after import specifier")?;
             // side-effect import: sin items → no hay nombres, pero igualmente encolamos
             self.record_import_and_enqueue(&spec, &[])?;
-            return Ok(ImportDecl { specifier: spec, items: vec![] });
+            return Ok(ImportDecl {
+                specifier: spec,
+                items: vec![],
+            });
         }
 
         // 2) import * as ns from "path";
@@ -984,26 +1217,33 @@ impl<'src> Parser<'src> {
             let t = self.next()?;
             let alias = match t.tok {
                 Tok::Ident(s) => s,
-                ref tok => return Err(ParseError {
-                    msg: format!("expected identifier after 'as', found {:?}", tok),
-                    span: t.span,
-                }),
+                ref tok => {
+                    return Err(ParseError {
+                        msg: format!("expected identifier after 'as', found {:?}", tok),
+                        span: t.span,
+                    });
+                }
             };
             self.expect(Tok::From, "expected 'from'")?;
             let t = self.next()?;
             let spec = match t.tok {
                 Tok::Str(s) => s,
-                ref tok => return Err(ParseError {
-                    msg: format!("expected string literal after 'from', found {:?}", tok),
-                    span: t.span,
-                }),
+                ref tok => {
+                    return Err(ParseError {
+                        msg: format!("expected string literal after 'from', found {:?}", tok),
+                        span: t.span,
+                    });
+                }
             };
             self.expect(Tok::Semi, "expected ';' after import")?;
 
             // nombres locales = [alias]
             self.record_import_and_enqueue(&spec, &[alias.clone()])?;
 
-            return Ok(ImportDecl { specifier: spec, items: vec![ImportItem::Namespace { alias }] });
+            return Ok(ImportDecl {
+                specifier: spec,
+                items: vec![ImportItem::Namespace { alias }],
+            });
         }
 
         // 3) import { a, b as c } from "path";
@@ -1021,19 +1261,29 @@ impl<'src> Parser<'src> {
             let t = self.next()?;
             let name = match t.tok {
                 Tok::Ident(s) => s,
-                ref tok => return Err(ParseError {
-                    msg: format!("expected imported name (identifier), found {:?}", tok),
-                    span: t.span,
-                }),
+                ref tok => {
+                    return Err(ParseError {
+                        msg: format!("expected imported name (identifier), found {:?}", tok),
+                        span: t.span,
+                    });
+                }
             };
             let alias = if self.matches(&Tok::As) {
                 let t = self.next()?;
                 match t.tok {
-                    Tok::Ident(s) => { locals.push(s.clone()); Some(s) }
-                    ref tok => return Err(ParseError {
-                        msg: format!("expected alias name (identifier) after 'as', found {:?}", tok),
-                        span: t.span,
-                    }),
+                    Tok::Ident(s) => {
+                        locals.push(s.clone());
+                        Some(s)
+                    }
+                    ref tok => {
+                        return Err(ParseError {
+                            msg: format!(
+                                "expected alias name (identifier) after 'as', found {:?}",
+                                tok
+                            ),
+                            span: t.span,
+                        });
+                    }
                 }
             } else {
                 locals.push(name.clone());
@@ -1050,25 +1300,30 @@ impl<'src> Parser<'src> {
         let t = self.next()?;
         let spec = match t.tok {
             Tok::Str(s) => s,
-            ref tok => return Err(ParseError {
-                msg: format!("expected string literal after 'from', found {:?}", tok),
-                span: t.span,
-            }),
+            ref tok => {
+                return Err(ParseError {
+                    msg: format!("expected string literal after 'from', found {:?}", tok),
+                    span: t.span,
+                });
+            }
         };
         self.expect(Tok::Semi, "expected ';' after import")?;
 
         // Registrar en cajita + encolarlo para parseo posterior
         self.record_import_and_enqueue(&spec, &locals)?;
 
-        Ok(ImportDecl { specifier: spec, items })
+        Ok(ImportDecl {
+            specifier: spec,
+            items,
+        })
     }
 
     fn parse_export_decl(
         &mut self,
         functions: &mut Vec<FuncDecl>,
-        classes:   &mut Vec<ClassDecl>,
-        toplevel:  &mut Vec<Stmt>,
-        exports:   &mut Vec<ExportDecl>,
+        classes: &mut Vec<ClassDecl>,
+        toplevel: &mut Vec<Stmt>,
+        exports: &mut Vec<ExportDecl>,
     ) -> PResult<()> {
         // export fn / export async fn
         if self.check(&Tok::Async) || self.check(&Tok::Fn) {
@@ -1116,14 +1371,26 @@ impl<'src> Parser<'src> {
             let t = self.next()?;
             let name = match t.tok {
                 Tok::Ident(s) => s,
-                ref tok => return Err(ParseError {
-                    msg: format!("expected identifier after 'export var/let/const', found {:?}", tok),
-                    span: t.span,
-                }),
+                ref tok => {
+                    return Err(ParseError {
+                        msg: format!(
+                            "expected identifier after 'export var/let/const', found {:?}",
+                            tok
+                        ),
+                        span: t.span,
+                    });
+                }
             };
-            let init = if self.matches(&Tok::Eq) { Some(self.expr()?) } else { None };
+            let init = if self.matches(&Tok::Eq) {
+                Some(self.expr()?)
+            } else {
+                None
+            };
             self.expect(Tok::Semi, "expected ';' after export var/let/const")?;
-            toplevel.push(Stmt::Var { name: name.clone(), init });
+            toplevel.push(Stmt::Var {
+                name: name.clone(),
+                init,
+            });
             self.record_export(&name);
             exports.push(ExportDecl::Var(name));
             return Ok(());
@@ -1135,10 +1402,12 @@ impl<'src> Parser<'src> {
             let t = self.next()?;
             let spec = match t.tok {
                 Tok::Str(s) => s,
-                ref tok => return Err(ParseError {
-                    msg: format!("expected string literal after 'from', found {:?}", tok),
-                    span: t.span,
-                }),
+                ref tok => {
+                    return Err(ParseError {
+                        msg: format!("expected string literal after 'from', found {:?}", tok),
+                        span: t.span,
+                    });
+                }
             };
             self.expect(Tok::Semi, "expected ';' after export")?;
             exports.push(ExportDecl::AllFrom { specifier: spec });
@@ -1159,21 +1428,30 @@ impl<'src> Parser<'src> {
                 let t = self.next()?;
                 let name = match t.tok {
                     Tok::Ident(s) => s,
-                    ref tok => return Err(ParseError {
-                        msg: format!("expected exported name (identifier), found {:?}", tok),
-                        span: t.span,
-                    }),
+                    ref tok => {
+                        return Err(ParseError {
+                            msg: format!("expected exported name (identifier), found {:?}", tok),
+                            span: t.span,
+                        });
+                    }
                 };
                 let alias = if self.matches(&Tok::As) {
                     let t = self.next()?;
                     match t.tok {
                         Tok::Ident(s) => Some(s),
-                        ref tok => return Err(ParseError {
-                            msg: format!("expected alias name (identifier) after 'as', found {:?}", tok),
-                            span: t.span,
-                        }),
+                        ref tok => {
+                            return Err(ParseError {
+                                msg: format!(
+                                    "expected alias name (identifier) after 'as', found {:?}",
+                                    tok
+                                ),
+                                span: t.span,
+                            });
+                        }
                     }
-                } else { None };
+                } else {
+                    None
+                };
                 items.push((name, alias));
                 // TODO Record export with the alias
                 if self.check(&Tok::RBrace) {
@@ -1186,16 +1464,21 @@ impl<'src> Parser<'src> {
                 let t = self.next()?;
                 let spec = match t.tok {
                     Tok::Str(s) => s,
-                    ref tok => return Err(ParseError {
-                        msg: format!("expected string literal after 'from', found {:?}", tok),
-                        span: t.span,
-                    }),
+                    ref tok => {
+                        return Err(ParseError {
+                            msg: format!("expected string literal after 'from', found {:?}", tok),
+                            span: t.span,
+                        });
+                    }
                 };
                 self.expect(Tok::Semi, "expected ';' after export")?;
                 for (exp_name, _) in &items {
                     self.record_export(exp_name);
                 }
-                exports.push(ExportDecl::From { specifier: spec, items });
+                exports.push(ExportDecl::From {
+                    specifier: spec,
+                    items,
+                });
             } else {
                 self.expect(Tok::Semi, "expected ';' after export list")?;
                 for (exp_name, _) in &items {
@@ -1218,10 +1501,12 @@ impl<'src> Parser<'src> {
         let t = self.next()?;
         let name = match t.tok {
             Tok::Ident(s) => s,
-            ref tok => return Err(ParseError {
-                msg: format!("expected method name, found {:?}", tok),
-                span: t.span,
-            }),
+            ref tok => {
+                return Err(ParseError {
+                    msg: format!("expected method name, found {:?}", tok),
+                    span: t.span,
+                });
+            }
         };
         self.expect(Tok::LParen, "expected '(' after method name")?;
         let params = self.parse_param_list()?;
@@ -1233,10 +1518,12 @@ impl<'src> Parser<'src> {
         let t = self.next()?;
         let name = match t.tok {
             Tok::Ident(s) => s,
-            ref tok => return Err(ParseError {
-                msg: format!("expected function name (identifier), found {:?}", tok),
-                span: t.span,
-            }),
+            ref tok => {
+                return Err(ParseError {
+                    msg: format!("expected function name (identifier), found {:?}", tok),
+                    span: t.span,
+                });
+            }
         };
         self.expect(Tok::LParen, "expected '(' after function name")?;
         let mut params = Vec::new();
@@ -1251,10 +1538,12 @@ impl<'src> Parser<'src> {
             let t = self.next()?;
             let ident = match t.tok {
                 Tok::Ident(s) => s,
-                ref tok => return Err(ParseError {
-                    msg: format!("expected parameter name (identifier), found {:?}", tok),
-                    span: t.span,
-                }),
+                ref tok => {
+                    return Err(ParseError {
+                        msg: format!("expected parameter name (identifier), found {:?}", tok),
+                        span: t.span,
+                    });
+                }
             };
             params.push(ident);
             if self.check(&Tok::RParen) {
@@ -1264,7 +1553,13 @@ impl<'src> Parser<'src> {
             self.expect(Tok::Comma, "expected ',' between parameters")?;
         }
         let body = self.block()?;
-        Ok(FuncDecl { fid: FuncId(next_id()), name, params, body, is_async })
+        Ok(FuncDecl {
+            fid: FuncId(next_id()),
+            name,
+            params,
+            body,
+            is_async,
+        })
     }
 
     fn block(&mut self) -> PResult<Block> {
@@ -1276,7 +1571,9 @@ impl<'src> Parser<'src> {
                 break;
             }
             if self.is_eof() {
-                return Err(self.err_here("unexpected end of file; expected closing brace for block"));
+                return Err(
+                    self.err_here("unexpected end of file; expected closing brace for block")
+                );
             }
             stmts.push(self.stmt()?);
         }
@@ -1296,10 +1593,12 @@ impl<'src> Parser<'src> {
             let t = self.next()?;
             let name = match t.tok {
                 Tok::Ident(s) => s,
-                ref tok => return Err(ParseError {
-                    msg: format!("expected parameter name (identifier), found {:?}", tok),
-                    span: t.span,
-                }),
+                ref tok => {
+                    return Err(ParseError {
+                        msg: format!("expected parameter name (identifier), found {:?}", tok),
+                        span: t.span,
+                    });
+                }
             };
             params.push(name);
             if self.check(&Tok::RParen) {
@@ -1326,12 +1625,21 @@ impl<'src> Parser<'src> {
             let t = self.next()?;
             let name = match t.tok {
                 Tok::Ident(s) => s,
-                ref tok => return Err(ParseError {
-                    msg: format!("expected identifier after 'var'/'let'/'const', found {:?}", tok),
-                    span: t.span,
-                }),
+                ref tok => {
+                    return Err(ParseError {
+                        msg: format!(
+                            "expected identifier after 'var'/'let'/'const', found {:?}",
+                            tok
+                        ),
+                        span: t.span,
+                    });
+                }
             };
-            let init = if self.matches(&Tok::Eq) { Some(self.expr()?) } else { None };
+            let init = if self.matches(&Tok::Eq) {
+                Some(self.expr()?)
+            } else {
+                None
+            };
             self.expect(Tok::Semi, "expected ';' after variable declaration")?;
             Ok(Stmt::Var { name, init })
         } else if self.matches(&Tok::If) {
@@ -1344,13 +1652,25 @@ impl<'src> Parser<'src> {
             let else_b = if self.matches(&Tok::Else) {
                 if self.matches(&Tok::If) || self.matches(&Tok::Unless) {
                     // Was it "else unless"?
-                    let negated = if self.toks.get(self.i.saturating_sub(1)).map(|tt| tt.tok == Tok::Unless).unwrap_or(false) { true } else { false };
+                    let negated = if self
+                        .toks
+                        .get(self.i.saturating_sub(1))
+                        .map(|tt| tt.tok == Tok::Unless)
+                        .unwrap_or(false)
+                    {
+                        true
+                    } else {
+                        false
+                    };
 
                     self.expect(Tok::LParen, "expected '(' after 'else if'/'else unless'")?;
                     let mut cond2 = self.expr()?;
                     self.expect(Tok::RParen, "expected ')' after condition")?;
                     if negated {
-                        cond2 = Expr::Unary { op: UnOp::Not, e: SmallBox::new(cond2) };
+                        cond2 = Expr::Unary {
+                            op: UnOp::Not,
+                            e: SmallBox::new(cond2),
+                        };
                     }
                     let then2 = self.block()?;
 
@@ -1363,7 +1683,11 @@ impl<'src> Parser<'src> {
 
                     // Desugar into: else { if (cond2) then2 else tail_else }
                     Some(Block {
-                        stmts: vec![Stmt::If { cond: cond2, then_b: then2, else_b: tail_else }]
+                        stmts: vec![Stmt::If {
+                            cond: cond2,
+                            then_b: then2,
+                            else_b: tail_else,
+                        }],
                     })
                 } else {
                     // Plain "else { … }"
@@ -1373,25 +1697,38 @@ impl<'src> Parser<'src> {
                 None
             };
 
-            Ok(Stmt::If { cond, then_b, else_b })
+            Ok(Stmt::If {
+                cond,
+                then_b,
+                else_b,
+            })
         } else if self.matches(&Tok::Unless) {
             // unless (cond) { then } [ else { ... } | else if (...) { ... } | else unless (...) { ... } ]
             self.expect(Tok::LParen, "expected '(' after 'unless'")?;
             let cond0 = self.expr()?;
             self.expect(Tok::RParen, "expected ')' after 'unless' condition")?;
-            let cond = Expr::Unary { op: UnOp::Not, e: SmallBox::new(cond0) };
+            let cond = Expr::Unary {
+                op: UnOp::Not,
+                e: SmallBox::new(cond0),
+            };
             let then_b = self.block()?;
 
             // else { … } | else if (…) { … } | else unless (…) { … }
             let else_b = if self.matches(&Tok::Else) {
                 // “else if …” or “else unless …”
                 if self.matches(&Tok::If) || self.matches(&Tok::Unless) {
-                    let was_unless = matches!(self.toks.get(self.i.saturating_sub(1)).map(|tt| &tt.tok), Some(Tok::Unless));
+                    let was_unless = matches!(
+                        self.toks.get(self.i.saturating_sub(1)).map(|tt| &tt.tok),
+                        Some(Tok::Unless)
+                    );
                     self.expect(Tok::LParen, "expected '(' after 'else if'/'else unless'")?;
                     let mut cond2 = self.expr()?;
                     self.expect(Tok::RParen, "expected ')' after condition")?;
                     if was_unless {
-                        cond2 = Expr::Unary { op: UnOp::Not, e: SmallBox::new(cond2) };
+                        cond2 = Expr::Unary {
+                            op: UnOp::Not,
+                            e: SmallBox::new(cond2),
+                        };
                     }
                     let then2 = self.block()?;
 
@@ -1404,7 +1741,11 @@ impl<'src> Parser<'src> {
 
                     // Desugar into: else { if (cond2) then2 else tail_else }
                     Some(Block {
-                        stmts: vec![Stmt::If { cond: cond2, then_b: then2, else_b: tail_else }],
+                        stmts: vec![Stmt::If {
+                            cond: cond2,
+                            then_b: then2,
+                            else_b: tail_else,
+                        }],
                     })
                 } else {
                     // Plain "else { … }"
@@ -1414,7 +1755,11 @@ impl<'src> Parser<'src> {
                 None
             };
 
-            Ok(Stmt::If { cond, then_b, else_b })
+            Ok(Stmt::If {
+                cond,
+                then_b,
+                else_b,
+            })
         } else if self.matches(&Tok::While) {
             self.expect(Tok::LParen, "expected '(' after 'while'")?;
             let cond = self.expr()?;
@@ -1429,12 +1774,21 @@ impl<'src> Parser<'src> {
                 let t = self.next()?;
                 let name = match t.tok {
                     Tok::Ident(s) => s,
-                    ref tok => return Err(ParseError {
-                        msg: format!("expected identifier after 'var' in for init, found {:?}", tok),
-                        span: t.span,
-                    }),
+                    ref tok => {
+                        return Err(ParseError {
+                            msg: format!(
+                                "expected identifier after 'var' in for init, found {:?}",
+                                tok
+                            ),
+                            span: t.span,
+                        });
+                    }
                 };
-                let init_e = if self.matches(&Tok::Eq) { Some(self.expr()?) } else { None };
+                let init_e = if self.matches(&Tok::Eq) {
+                    Some(self.expr()?)
+                } else {
+                    None
+                };
                 self.expect(Tok::Semi, "expected ';' after for init")?;
                 Some(SmallBox::new(Stmt::Var { name, init: init_e }))
             } else {
@@ -1457,7 +1811,12 @@ impl<'src> Parser<'src> {
                 Some(e)
             };
             let body = self.block()?;
-            Ok(Stmt::For { init, cond, step, body })
+            Ok(Stmt::For {
+                init,
+                cond,
+                step,
+                body,
+            })
         } else if self.matches(&Tok::Return) {
             if self.matches(&Tok::Semi) {
                 Ok(Stmt::Return(None))
@@ -1474,11 +1833,11 @@ impl<'src> Parser<'src> {
     }
 
     // Pratt parser for expressions
-    pub fn expr(&mut self) -> PResult<Expr> { 
+    pub fn expr(&mut self) -> PResult<Expr> {
         if self.is_eof() {
             return Err(self.err_here("expected expression"));
         }
-        self.parse_assign() 
+        self.parse_assign()
     }
 
     fn parse_assign(&mut self) -> PResult<Expr> {
@@ -1486,15 +1845,25 @@ impl<'src> Parser<'src> {
 
         // Which assignment operator (if any) did we see?
         // Try the multi-char ones first.
-        let op = if self.matches(&Tok::PlusEq)    { Some(("PlusEq",  BinOp::Add)) }
-            else if self.matches(&Tok::MinusEq)       { Some(("MinusEq", BinOp::Sub)) }
-            else if self.matches(&Tok::StarEq)        { Some(("StarEq",  BinOp::Mul)) }
-            else if self.matches(&Tok::SlashEq)       { Some(("SlashEq", BinOp::Div)) }
-            else if self.matches(&Tok::PercentEq)     { Some(("PercentEq", BinOp::Rem)) }
-            else if self.matches(&Tok::Eq)            { Some(("Eq",      // plain '='
-                                                        // dummy op, won't be used
-                                                        BinOp::Add)) }
-            else { None };
+        let op = if self.matches(&Tok::PlusEq) {
+            Some(("PlusEq", BinOp::Add))
+        } else if self.matches(&Tok::MinusEq) {
+            Some(("MinusEq", BinOp::Sub))
+        } else if self.matches(&Tok::StarEq) {
+            Some(("StarEq", BinOp::Mul))
+        } else if self.matches(&Tok::SlashEq) {
+            Some(("SlashEq", BinOp::Div))
+        } else if self.matches(&Tok::PercentEq) {
+            Some(("PercentEq", BinOp::Rem))
+        } else if self.matches(&Tok::Eq) {
+            Some((
+                "Eq", // plain '='
+                // dummy op, won't be used
+                BinOp::Add,
+            ))
+        } else {
+            None
+        };
 
         if let Some((kind, bop)) = op {
             // Turn `left` into an LValue
@@ -1536,7 +1905,11 @@ impl<'src> Parser<'src> {
         let mut e = self.parse_and()?;
         while self.matches(&Tok::OrOr) {
             let rhs = self.parse_and()?;
-            e = Expr::Binary { op: BinOp::Or, a: SmallBox::new(e), b: SmallBox::new(rhs) };
+            e = Expr::Binary {
+                op: BinOp::Or,
+                a: SmallBox::new(e),
+                b: SmallBox::new(rhs),
+            };
         }
         Ok(e)
     }
@@ -1544,7 +1917,11 @@ impl<'src> Parser<'src> {
         let mut e = self.parse_eq()?;
         while self.matches(&Tok::AndAnd) {
             let rhs = self.parse_eq()?;
-            e = Expr::Binary { op: BinOp::And, a: SmallBox::new(e), b: SmallBox::new(rhs) };
+            e = Expr::Binary {
+                op: BinOp::And,
+                a: SmallBox::new(e),
+                b: SmallBox::new(rhs),
+            };
         }
         Ok(e)
     }
@@ -1553,11 +1930,21 @@ impl<'src> Parser<'src> {
         loop {
             if self.matches(&Tok::EqEq) {
                 let rhs = self.parse_cmp()?;
-                e = Expr::Binary { op: BinOp::Eq, a: SmallBox::new(e), b: SmallBox::new(rhs) };
+                e = Expr::Binary {
+                    op: BinOp::Eq,
+                    a: SmallBox::new(e),
+                    b: SmallBox::new(rhs),
+                };
             } else if self.matches(&Tok::BangEq) {
                 let rhs = self.parse_cmp()?;
-                e = Expr::Binary { op: BinOp::Ne, a: SmallBox::new(e), b: SmallBox::new(rhs) };
-            } else { break; }
+                e = Expr::Binary {
+                    op: BinOp::Ne,
+                    a: SmallBox::new(e),
+                    b: SmallBox::new(rhs),
+                };
+            } else {
+                break;
+            }
         }
         Ok(e)
     }
@@ -1566,20 +1953,39 @@ impl<'src> Parser<'src> {
         loop {
             if self.matches(&Tok::Lt) {
                 let rhs = self.parse_term()?;
-                e = Expr::Binary { op: BinOp::Lt, a: SmallBox::new(e), b: SmallBox::new(rhs) };
+                e = Expr::Binary {
+                    op: BinOp::Lt,
+                    a: SmallBox::new(e),
+                    b: SmallBox::new(rhs),
+                };
             } else if self.matches(&Tok::LtEq) {
                 let rhs = self.parse_term()?;
-                e = Expr::Binary { op: BinOp::Le, a: SmallBox::new(e), b: SmallBox::new(rhs) };
+                e = Expr::Binary {
+                    op: BinOp::Le,
+                    a: SmallBox::new(e),
+                    b: SmallBox::new(rhs),
+                };
             } else if self.matches(&Tok::Gt) {
                 let rhs = self.parse_term()?;
-                e = Expr::Binary { op: BinOp::Gt, a: SmallBox::new(e), b: SmallBox::new(rhs) };
+                e = Expr::Binary {
+                    op: BinOp::Gt,
+                    a: SmallBox::new(e),
+                    b: SmallBox::new(rhs),
+                };
             } else if self.matches(&Tok::GtEq) {
                 let rhs = self.parse_term()?;
-                e = Expr::Binary { op: BinOp::Ge, a: SmallBox::new(e), b: SmallBox::new(rhs) };
+                e = Expr::Binary {
+                    op: BinOp::Ge,
+                    a: SmallBox::new(e),
+                    b: SmallBox::new(rhs),
+                };
             } else if self.matches(&Tok::In) {
                 let rhs = self.parse_term()?;
                 // left "in" right → Expr::In { key: left, obj: right }
-                e = Expr::In { key: SmallBox::new(e), obj: SmallBox::new(rhs) };
+                e = Expr::In {
+                    key: SmallBox::new(e),
+                    obj: SmallBox::new(rhs),
+                };
             } else {
                 break;
             }
@@ -1591,11 +1997,21 @@ impl<'src> Parser<'src> {
         loop {
             if self.matches(&Tok::Plus) {
                 let rhs = self.parse_factor()?;
-                e = Expr::Binary { op: BinOp::Add, a: SmallBox::new(e), b: SmallBox::new(rhs) };
+                e = Expr::Binary {
+                    op: BinOp::Add,
+                    a: SmallBox::new(e),
+                    b: SmallBox::new(rhs),
+                };
             } else if self.matches(&Tok::Minus) {
                 let rhs = self.parse_factor()?;
-                e = Expr::Binary { op: BinOp::Sub, a: SmallBox::new(e), b: SmallBox::new(rhs) };
-            } else { break; }
+                e = Expr::Binary {
+                    op: BinOp::Sub,
+                    a: SmallBox::new(e),
+                    b: SmallBox::new(rhs),
+                };
+            } else {
+                break;
+            }
         }
         Ok(e)
     }
@@ -1604,14 +2020,28 @@ impl<'src> Parser<'src> {
         loop {
             if self.matches(&Tok::Star) {
                 let rhs = self.parse_unary()?;
-                e = Expr::Binary { op: BinOp::Mul, a: SmallBox::new(e), b: SmallBox::new(rhs) };
+                e = Expr::Binary {
+                    op: BinOp::Mul,
+                    a: SmallBox::new(e),
+                    b: SmallBox::new(rhs),
+                };
             } else if self.matches(&Tok::Slash) {
                 let rhs = self.parse_unary()?;
-                e = Expr::Binary { op: BinOp::Div, a: SmallBox::new(e), b: SmallBox::new(rhs) };
+                e = Expr::Binary {
+                    op: BinOp::Div,
+                    a: SmallBox::new(e),
+                    b: SmallBox::new(rhs),
+                };
             } else if self.matches(&Tok::Percent) {
                 let rhs = self.parse_unary()?;
-                e = Expr::Binary { op: BinOp::Rem, a: SmallBox::new(e), b: SmallBox::new(rhs) };
-            } else { break; }
+                e = Expr::Binary {
+                    op: BinOp::Rem,
+                    a: SmallBox::new(e),
+                    b: SmallBox::new(rhs),
+                };
+            } else {
+                break;
+            }
         }
         Ok(e)
     }
@@ -1620,15 +2050,25 @@ impl<'src> Parser<'src> {
             // await <unary>
             let e = self.parse_unary()?;
             return Ok(Expr::Await(SmallBox::new(e)));
-        } if self.matches(&Tok::Bang) {
+        }
+        if self.matches(&Tok::Bang) {
             let e = self.parse_unary()?;
-            Ok(Expr::Unary { op: UnOp::Not, e: SmallBox::new(e) })
+            Ok(Expr::Unary {
+                op: UnOp::Not,
+                e: SmallBox::new(e),
+            })
         } else if self.matches(&Tok::Minus) {
             let e = self.parse_unary()?;
-            Ok(Expr::Unary { op: UnOp::Neg, e: SmallBox::new(e) })
+            Ok(Expr::Unary {
+                op: UnOp::Neg,
+                e: SmallBox::new(e),
+            })
         } else if self.matches(&Tok::Plus) {
             let e = self.parse_unary()?;
-            Ok(Expr::Unary { op: UnOp::Pos, e: SmallBox::new(e) })
+            Ok(Expr::Unary {
+                op: UnOp::Pos,
+                e: SmallBox::new(e),
+            })
         } else {
             self.parse_call()
         }
@@ -1653,34 +2093,45 @@ impl<'src> Parser<'src> {
                     }
                     self.expect(Tok::Comma, "expected ',' in argument list")?;
                 }
-                e = Expr::Call { callee: SmallBox::new(e), args };
+                e = Expr::Call {
+                    callee: SmallBox::new(e),
+                    args,
+                };
             } else if self.matches(&Tok::Dot) {
                 let t = self.next()?;
                 let name = match t.tok {
                     Tok::Ident(s) => s,
-                    ref tok => return Err(ParseError {
-                        msg: format!("expected identifier after '.', found {:?}", tok),
-                        span: t.span,
-                    }),
+                    ref tok => {
+                        return Err(ParseError {
+                            msg: format!("expected identifier after '.', found {:?}", tok),
+                            span: t.span,
+                        });
+                    }
                 };
-                e = Expr::GetProp { recv: SmallBox::new(e), name };
+                e = Expr::GetProp {
+                    recv: SmallBox::new(e),
+                    name,
+                };
             } else if self.matches(&Tok::LBracket) {
                 let idx = self.expr()?;
                 self.expect(Tok::RBracket, "expected ']' after index")?;
-                e = Expr::Index { recv: SmallBox::new(e), index: SmallBox::new(idx) };
+                e = Expr::Index {
+                    recv: SmallBox::new(e),
+                    index: SmallBox::new(idx),
+                };
             } else {
                 break;
             }
         }
         Ok(e)
     }
-    fn parse_primary(&mut self) -> PResult<Expr> { 
+    fn parse_primary(&mut self) -> PResult<Expr> {
         if self.is_eof() {
             return Err(self.err_here("expected primary expression"));
         }
         let t = self.next()?;
         match t.tok {
-            Tok::This  => Ok(Expr::This),
+            Tok::This => Ok(Expr::This),
 
             Tok::Super => {
                 if self.check(&Tok::LParen) {
@@ -1708,14 +2159,18 @@ impl<'src> Parser<'src> {
                     let t = self.next()?;
                     let name = match t.tok {
                         Tok::Ident(s) => s,
-                        ref tok => return Err(ParseError {
-                            msg: format!("expected identifier after 'super.', found {:?}", tok),
-                            span: t.span,
-                        }),
+                        ref tok => {
+                            return Err(ParseError {
+                                msg: format!("expected identifier after 'super.', found {:?}", tok),
+                                span: t.span,
+                            });
+                        }
                     };
                     Ok(Expr::SuperProp(name))
                 } else {
-                    Err(self.err_here("expected '(' for super call or '.' for super property after 'super'"))
+                    Err(self.err_here(
+                        "expected '(' for super call or '.' for super property after 'super'",
+                    ))
                 }
             }
 
@@ -1724,12 +2179,20 @@ impl<'src> Parser<'src> {
                 let t = self.next()?;
                 let class = match t.tok {
                     Tok::Ident(s) => s,
-                    ref tok => return Err(ParseError {
-                        msg: format!("expected class name (identifier) after 'new', found {:?}", tok),
-                        span: t.span,
-                    }),
+                    ref tok => {
+                        return Err(ParseError {
+                            msg: format!(
+                                "expected class name (identifier) after 'new', found {:?}",
+                                tok
+                            ),
+                            span: t.span,
+                        });
+                    }
                 };
-                self.expect(Tok::LParen, "expected '(' after class name in new expression")?;
+                self.expect(
+                    Tok::LParen,
+                    "expected '(' after class name in new expression",
+                )?;
                 let mut args = Vec::new();
                 loop {
                     if self.check(&Tok::RParen) {
@@ -1792,7 +2255,10 @@ impl<'src> Parser<'src> {
             Tok::Fn | Tok::Function => {
                 // Stage #1: only the anonymous form inside expressions.
                 // Expect '(' immediately (no name allowed here).
-                self.expect(Tok::LParen, "expected '(' after 'fn'/'function' in function literal")?;
+                self.expect(
+                    Tok::LParen,
+                    "expected '(' after 'fn'/'function' in function literal",
+                )?;
                 let params = self.parse_param_list()?;
                 let body = self.block()?;
                 Ok(Expr::FnLit { params, body })
@@ -1811,10 +2277,15 @@ impl<'src> Parser<'src> {
                     let t = self.next()?;
                     let name = match t.tok {
                         Tok::Ident(s) => s,
-                        ref tok => return Err(ParseError {
-                            msg: format!("expected parameter name (identifier) in lambda, found {:?}", tok),
-                            span: t.span,
-                        }),
+                        ref tok => {
+                            return Err(ParseError {
+                                msg: format!(
+                                    "expected parameter name (identifier) in lambda, found {:?}",
+                                    tok
+                                ),
+                                span: t.span,
+                            });
+                        }
                     };
                     params.push(name);
                     if self.check(&Tok::Pipe) {
@@ -1830,14 +2301,19 @@ impl<'src> Parser<'src> {
                 } else {
                     // expression-body -> synthesize a block with an implicit return
                     let expr = self.expr()?;
-                    let body = Block { stmts: vec![Stmt::Return(Some(expr))] };
+                    let body = Block {
+                        stmts: vec![Stmt::Return(Some(expr))],
+                    };
                     Ok(Expr::FnLit { params, body })
                 }
             }
             Tok::LBrace => self.parse_object_literal(),
             Tok::Delete => self.parse_delete(),
             ref tok => Err(ParseError {
-                msg: format!("unexpected token {:?}, expected literal, identifier, 'this', 'super', 'new', '(', '[', '{{', 'fn', 'function', '|', or 'delete'", tok),
+                msg: format!(
+                    "unexpected token {:?}, expected literal, identifier, 'this', 'super', 'new', '(', '[', '{{', 'fn', 'function', '|', or 'delete'",
+                    tok
+                ),
                 span: t.span,
             }),
         }
@@ -1850,10 +2326,15 @@ impl<'src> Parser<'src> {
         let t = self.next()?;
         let addr = match t.tok {
             Tok::Str(s) => s,
-            ref tok => return Err(ParseError {
-                msg: format!("expected string literal for address after 'listen', found {:?}", tok),
-                span: t.span,
-            }),
+            ref tok => {
+                return Err(ParseError {
+                    msg: format!(
+                        "expected string literal for address after 'listen', found {:?}",
+                        tok
+                    ),
+                    span: t.span,
+                });
+            }
         };
         // body
         self.expect(Tok::LBrace, "expected '{' after listen address")?;
@@ -1882,10 +2363,15 @@ impl<'src> Parser<'src> {
         let method = match t.tok {
             Tok::Str(s) => s,
             Tok::Ident(s) => s, // allow: route GET [...]
-            ref tok => return Err(ParseError {
-                msg: format!("expected HTTP method (string literal or identifier), found {:?}", tok),
-                span: t.span,
-            }),
+            ref tok => {
+                return Err(ParseError {
+                    msg: format!(
+                        "expected HTTP method (string literal or identifier), found {:?}",
+                        tok
+                    ),
+                    span: t.span,
+                });
+            }
         };
 
         // [ pattern parts ]  -- we parse a general array expression to keep it flexible
@@ -1923,14 +2409,23 @@ impl<'src> Parser<'src> {
         } else {
             // expression-body → implicit return
             let e = self.expr()?;
-            Block { stmts: vec![Stmt::Return(Some(e))] }
+            Block {
+                stmts: vec![Stmt::Return(Some(e))],
+            }
         };
 
         // optional ';' after a block is allowed by your grammar, require it for consistency
         self.expect(Tok::Semi, "expected ';' after route declaration")?;
 
-        let handler = Expr::FnLit { params, body: handler_body };
-        Ok(RouteDecl { method, pattern: pattern_expr, handler })
+        let handler = Expr::FnLit {
+            params,
+            body: handler_body,
+        };
+        Ok(RouteDecl {
+            method,
+            pattern: pattern_expr,
+            handler,
+        })
     }
 
     // Parse an object literal: { a: 1, "b": 2, c: x+y }
@@ -1971,7 +2466,9 @@ impl<'src> Parser<'src> {
                         _ => return Err(self.err_here("expected property name (identifier or string literal) in object literal")),
                     }
                 } else {
-                    return Err(self.err_here("unexpected end of file; expected property name in object literal"));
+                    return Err(self.err_here(
+                        "unexpected end of file; expected property name in object literal",
+                    ));
                 }
             };
 
@@ -1999,12 +2496,17 @@ impl<'src> Parser<'src> {
             let t = self.next()?;
             let name = match t.tok {
                 Tok::Ident(s) => s,
-                ref tok => return Err(ParseError {
-                    msg: format!("expected identifier after '.' in delete, found {:?}", tok),
-                    span: t.span,
-                }),
+                ref tok => {
+                    return Err(ParseError {
+                        msg: format!("expected identifier after '.' in delete, found {:?}", tok),
+                        span: t.span,
+                    });
+                }
             };
-            return Ok(Expr::DeleteProp { obj: SmallBox::new(recv), key: PropKey::Ident(name) });
+            return Ok(Expr::DeleteProp {
+                obj: SmallBox::new(recv),
+                key: PropKey::Ident(name),
+            });
         }
 
         if self.matches(&Tok::LBracket) {
@@ -2017,12 +2519,18 @@ impl<'src> Parser<'src> {
             if let Some(key) = key_opt {
                 self.next()?; // consume key
                 self.expect(Tok::RBracket, "expected ']' after key in delete")?;
-                return Ok(Expr::DeleteProp { obj: SmallBox::new(recv), key });
+                return Ok(Expr::DeleteProp {
+                    obj: SmallBox::new(recv),
+                    key,
+                });
             } else {
                 // general: delete obj[expr]
                 let index = self.expr()?;
                 self.expect(Tok::RBracket, "expected ']' after index in delete")?;
-                return Ok(Expr::DeleteIndex { obj: SmallBox::new(recv), index: SmallBox::new(index) });
+                return Ok(Expr::DeleteIndex {
+                    obj: SmallBox::new(recv),
+                    index: SmallBox::new(index),
+                });
             }
         }
 
@@ -2033,9 +2541,13 @@ impl<'src> Parser<'src> {
 fn lvalue_to_expr(lv: &LValue) -> Expr {
     match lv {
         LValue::Ident(s) => Expr::Ident(s.clone()),
-        LValue::GetProp { recv, name } =>
-            Expr::GetProp { recv: SmallBox::new(recv.clone()), name: name.clone() },
-        LValue::Index { recv, index } =>
-            Expr::Index { recv: SmallBox::new(recv.clone()), index: SmallBox::new(index.clone()) },
+        LValue::GetProp { recv, name } => Expr::GetProp {
+            recv: SmallBox::new(recv.clone()),
+            name: name.clone(),
+        },
+        LValue::Index { recv, index } => Expr::Index {
+            recv: SmallBox::new(recv.clone()),
+            index: SmallBox::new(index.clone()),
+        },
     }
 }

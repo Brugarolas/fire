@@ -43,8 +43,8 @@ pub fn hash_aarch64_fast(input: &[u8]) -> u64 {
     unsafe {
         // Define your initial key as a [u8; 16] array
         let initial_key: [u8; 16] = [
-            0xA1, 0x12, 0x02, 0xC9, 0xB4, 0x68, 0xBE, 0xA1,
-            0xD7, 0x51, 0x57, 0xA0, 0x14, 0x52, 0x49, 0x5B,
+            0xA1, 0x12, 0x02, 0xC9, 0xB4, 0x68, 0xBE, 0xA1, 0xD7, 0x51, 0x57, 0xA0, 0x14, 0x52,
+            0x49, 0x5B,
         ];
 
         // Load the initial key into a SIMD vector using vld1q_u8
@@ -68,8 +68,8 @@ pub fn hash_aarch64_fast(input: &[u8]) -> u64 {
 
         // "Finalization" round
         let finalization_key: [u8; 16] = [
-            0x8E, 0x51, 0xEF, 0x21, 0xFA, 0xBB, 0x45, 0x22,
-            0xE4, 0x3D, 0x7A, 0x06, 0x56, 0x95, 0x4B, 0x6C,
+            0x8E, 0x51, 0xEF, 0x21, 0xFA, 0xBB, 0x45, 0x22, 0xE4, 0x3D, 0x7A, 0x06, 0x56, 0x95,
+            0x4B, 0x6C,
         ];
         let finalization_key_vec = vld1q_u8(finalization_key.as_ptr());
         hash = vaeseq_u8(hash, finalization_key_vec);
@@ -125,9 +125,7 @@ pub struct CopyHashMap<K: Copy + Eq + Hash, V: Copy, const N: usize> {
 impl<K: Copy + Eq + Hash, V: Copy, const N: usize> CopyHashMap<K, V, N> {
     /// Creates a new empty HashMap with fixed capacity N.
     pub fn new() -> Self {
-        Self {
-            buckets: [None; N],
-        }
+        Self { buckets: [None; N] }
     }
 
     /// Computes the hash index for the given key using custom AES hasher.
@@ -211,9 +209,7 @@ pub struct CopyHashSet<K: Copy + Eq + Hash, const N: usize> {
 impl<K: Copy + Eq + Hash, const N: usize> CopyHashSet<K, N> {
     /// Creates a new empty HashSet with fixed capacity N.
     pub fn new() -> Self {
-        Self {
-            buckets: [None; N],
-        }
+        Self { buckets: [None; N] }
     }
 
     /// Computes the hash index for the given key using custom AES hasher.

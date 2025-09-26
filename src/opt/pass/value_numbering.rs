@@ -4,12 +4,11 @@
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use smallvec::SmallVec;
-use std::mem::{discriminant, Discriminant};
+use std::mem::{Discriminant, discriminant};
 
 use crate::opt::{InstCursor, OptimizationWIR, WirEditQueue};
 use crate::wir::{
-    BlockId, Constant, Function, Inst, InstId, ValueDef, ValueId,
-    IntBinOp, F64BinOp, CmpKind,
+    BlockId, CmpKind, Constant, F64BinOp, Function, Inst, InstId, IntBinOp, ValueDef, ValueId,
 };
 
 /// GVN runs lazily once per Function (per pass round).
@@ -19,7 +18,11 @@ pub struct GlobalValueNumbering {
 }
 
 impl Default for GlobalValueNumbering {
-    fn default() -> Self { Self { last_func_ptr: None } }
+    fn default() -> Self {
+        Self {
+            last_func_ptr: None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -31,13 +34,20 @@ struct VnCtx {
 
 impl VnCtx {
     fn new(func: &Function) -> Self {
-        Self { val2vn: vec![0; func.values.len()], next_vn: 1, const2vn: HashMap::new() }
+        Self {
+            val2vn: vec![0; func.values.len()],
+            next_vn: 1,
+            const2vn: HashMap::new(),
+        }
     }
 
     #[inline]
     fn get_vn_of_const(&mut self, ck: ConstKey) -> u32 {
-        if let Some(&vn) = self.const2vn.get(&ck) { return vn; }
-        let vn = self.next_vn; self.next_vn += 1;
+        if let Some(&vn) = self.const2vn.get(&ck) {
+            return vn;
+        }
+        let vn = self.next_vn;
+        self.next_vn += 1;
         self.const2vn.insert(ck, vn);
         vn
     }
@@ -48,7 +58,9 @@ impl VnCtx {
             self.val2vn.resize(f.values.len(), 0);
         }
         let cached = self.val2vn[idx];
-        if cached != 0 { return cached; }
+        if cached != 0 {
+            return cached;
+        }
 
         if let Some(ck) = constant_of_value(f, v) {
             let vn = self.get_vn_of_const(ck);
@@ -56,7 +68,8 @@ impl VnCtx {
             return vn;
         }
 
-        let vn = self.next_vn; self.next_vn += 1;
+        let vn = self.next_vn;
+        self.next_vn += 1;
         self.val2vn[idx] = vn;
         vn
     }
@@ -64,13 +77,17 @@ impl VnCtx {
     #[inline]
     fn set_vn(&mut self, v: ValueId, vn: u32) {
         let idx = v.0 as usize;
-        if idx >= self.val2vn.len() { self.val2vn.resize(idx + 1, 0); }
+        if idx >= self.val2vn.len() {
+            self.val2vn.resize(idx + 1, 0);
+        }
         self.val2vn[idx] = vn;
     }
 }
 
 impl GlobalValueNumbering {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Run once over the whole function, emitting ReplaceKind edits into `q`.
     fn run_on_function(&mut self, func: &Function, q: &mut WirEditQueue) {
@@ -81,7 +98,9 @@ impl GlobalValueNumbering {
 
         // BlockId -> index (O(1) lookups; avoid linear scans).
         let mut ix_of: HashMap<BlockId, usize> = HashMap::with_capacity(func.blocks.len());
-        for (i, b) in func.blocks.iter().enumerate() { ix_of.insert(b.id, i); }
+        for (i, b) in func.blocks.iter().enumerate() {
+            ix_of.insert(b.id, i);
+        }
 
         let mut expr2leader: HashMap<ExprKey, ValueId> = HashMap::new();
         let mut expr_stack: SmallVec<[ExprKey; 32]> = SmallVec::new(); // per-scope keys
@@ -108,15 +127,31 @@ impl OptimizationWIR for GlobalValueNumbering {
         let v0 = ValueId(0);
         let tags = [
             discriminant(&Const(Constant::Null)),
-            discriminant(&IntBin { op: IntBinOp::Add, a: v0, b: v0 }),
-            discriminant(&F64Bin { op: F64BinOp::Add, a: v0, b: v0 }),
+            discriminant(&IntBin {
+                op: IntBinOp::Add,
+                a: v0,
+                b: v0,
+            }),
+            discriminant(&F64Bin {
+                op: F64BinOp::Add,
+                a: v0,
+                b: v0,
+            }),
             discriminant(&NumAdd(v0, v0)),
             discriminant(&NumSub(v0, v0)),
             discriminant(&NumMul(v0, v0)),
             discriminant(&NumDiv(v0, v0)),
             discriminant(&NumRem(v0, v0)),
-            discriminant(&CmpInt { kind: CmpKind::Eq, a: v0, b: v0 }),
-            discriminant(&CmpF64 { kind: CmpKind::Eq, a: v0, b: v0 }),
+            discriminant(&CmpInt {
+                kind: CmpKind::Eq,
+                a: v0,
+                b: v0,
+            }),
+            discriminant(&CmpF64 {
+                kind: CmpKind::Eq,
+                a: v0,
+                b: v0,
+            }),
             discriminant(&CmpRefEq { a: v0, b: v0 }),
             discriminant(&ArrayLen(v0)),
             discriminant(&StrLen(v0)),
@@ -148,7 +183,7 @@ impl OptimizationWIR for GlobalValueNumbering {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum ConstKey {
     I32(i32),
-    F64(u64),       // bit-exact (handles -0.0, NaNs)
+    F64(u64), // bit-exact (handles -0.0, NaNs)
     Bool(bool),
     Null,
     Str(String),
@@ -158,10 +193,10 @@ impl ConstKey {
     fn from_const(c: &Constant) -> Self {
         match c {
             Constant::Int32(x) => ConstKey::I32(*x),
-            Constant::F64(x)   => ConstKey::F64(x.to_bits()),
-            Constant::Bool(b)  => ConstKey::Bool(*b),
-            Constant::Null     => ConstKey::Null,
-            Constant::Str(s)   => ConstKey::Str(s.clone()),
+            Constant::F64(x) => ConstKey::F64(x.to_bits()),
+            Constant::Bool(b) => ConstKey::Bool(*b),
+            Constant::Null => ConstKey::Null,
+            Constant::Str(s) => ConstKey::Str(s.clone()),
             Constant::Undefined => ConstKey::Null, // Treat undefined as null for GVN purposes
         }
     }
@@ -173,23 +208,31 @@ fn constant_of_value(func: &Function, v: ValueId) -> Option<ConstKey> {
         ValueDef::InstResult(iid, _) => {
             if let Inst::Const(ref c) = func.nodes[iid.0 as usize].kind {
                 Some(ConstKey::from_const(c))
-            } else { None }
+            } else {
+                None
+            }
         }
         _ => None,
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum NumOp { Add, Sub, Mul, Div, Rem }
+enum NumOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+}
 
 fn num_op_of(k: &Inst) -> Option<NumOp> {
     use NumOp::*;
     match k {
-        Inst::NumAdd(_,_) => Some(Add),
-        Inst::NumSub(_,_) => Some(Sub),
-        Inst::NumMul(_,_) => Some(Mul),
-        Inst::NumDiv(_,_) => Some(Div),
-        Inst::NumRem(_,_) => Some(Rem),
+        Inst::NumAdd(_, _) => Some(Add),
+        Inst::NumSub(_, _) => Some(Sub),
+        Inst::NumMul(_, _) => Some(Mul),
+        Inst::NumDiv(_, _) => Some(Div),
+        Inst::NumRem(_, _) => Some(Rem),
         _ => None,
     }
 }
@@ -202,16 +245,16 @@ enum ExprKey {
     // Pure numeric ops
     IntBin { op: IntBinOp, a: u32, b: u32 },
     F64Bin { op: F64BinOp, a: u32, b: u32 },
-    NumOp  { kind: NumOp,   a: u32, b: u32 },
+    NumOp { kind: NumOp, a: u32, b: u32 },
 
     // Comparisons
-    CmpInt   { kind: CmpKind, a: u32, b: u32 },
-    CmpF64   { kind: CmpKind, a: u32, b: u32 },
-    CmpRefEq {               a: u32, b: u32 },
+    CmpInt { kind: CmpKind, a: u32, b: u32 },
+    CmpF64 { kind: CmpKind, a: u32, b: u32 },
+    CmpRefEq { a: u32, b: u32 },
 
     // Simple queries
-    ArrayLen   { a: u32 },
-    StrLen     { a: u32 },
+    ArrayLen { a: u32 },
+    StrLen { a: u32 },
     StrCompare { a: u32, b: u32 },
 }
 
@@ -220,23 +263,34 @@ impl ExprKey {
         use CmpKind::*;
         match &mut self {
             ExprKey::IntBin { op, a, b } => {
-                if matches!(op, IntBinOp::Add | IntBinOp::Mul | IntBinOp::And | IntBinOp::Or | IntBinOp::Xor) {
-                    if *a > *b { std::mem::swap(a, b); }
+                if matches!(
+                    op,
+                    IntBinOp::Add | IntBinOp::Mul | IntBinOp::And | IntBinOp::Or | IntBinOp::Xor
+                ) {
+                    if *a > *b {
+                        std::mem::swap(a, b);
+                    }
                 }
             }
             ExprKey::F64Bin { op, a, b } => {
                 if matches!(op, F64BinOp::Add | F64BinOp::Mul) {
-                    if *a > *b { std::mem::swap(a, b); }
+                    if *a > *b {
+                        std::mem::swap(a, b);
+                    }
                 }
             }
             ExprKey::NumOp { kind, a, b } => {
                 if matches!(kind, NumOp::Add | NumOp::Mul) {
-                    if *a > *b { std::mem::swap(a, b); }
+                    if *a > *b {
+                        std::mem::swap(a, b);
+                    }
                 }
             }
             ExprKey::CmpInt { kind, a, b } => {
                 if matches!(kind, Eq | Ne) {
-                    if *a > *b { std::mem::swap(a, b); }
+                    if *a > *b {
+                        std::mem::swap(a, b);
+                    }
                 } else if *a > *b {
                     *kind = flip_cmp(*kind);
                     std::mem::swap(a, b);
@@ -244,17 +298,23 @@ impl ExprKey {
             }
             ExprKey::CmpF64 { kind, a, b } => {
                 if matches!(kind, Eq | Ne) {
-                    if *a > *b { std::mem::swap(a, b); }
+                    if *a > *b {
+                        std::mem::swap(a, b);
+                    }
                 } else if *a > *b {
                     *kind = flip_cmp(*kind);
                     std::mem::swap(a, b);
                 }
             }
             ExprKey::CmpRefEq { a, b } => {
-                if *a > *b { std::mem::swap(a, b); }
+                if *a > *b {
+                    std::mem::swap(a, b);
+                }
             }
             ExprKey::StrCompare { a, b } => {
-                if *a > *b { std::mem::swap(a, b); }
+                if *a > *b {
+                    std::mem::swap(a, b);
+                }
             }
             _ => {}
         }
@@ -265,7 +325,14 @@ impl ExprKey {
 #[inline]
 fn flip_cmp(k: CmpKind) -> CmpKind {
     use CmpKind::*;
-    match k { Lt => Gt, Le => Ge, Gt => Lt, Ge => Le, Eq => Eq, Ne => Ne }
+    match k {
+        Lt => Gt,
+        Le => Ge,
+        Gt => Lt,
+        Ge => Le,
+        Eq => Eq,
+        Ne => Ne,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -340,7 +407,12 @@ fn visit_block_ix(
                 if let Some(dst) = node.results.get(0).copied() {
                     let va = ctx.get_vn(func, *a);
                     let vb = ctx.get_vn(func, *b);
-                    let key = ExprKey::IntBin { op: *op, a: va, b: vb }.canonicalized();
+                    let key = ExprKey::IntBin {
+                        op: *op,
+                        a: va,
+                        b: vb,
+                    }
+                    .canonicalized();
                     gvn_lookup_or_insert(key, dst, expr2leader, expr_stack, q, nid, func, ctx);
                 }
             }
@@ -349,16 +421,30 @@ fn visit_block_ix(
                 if let Some(dst) = node.results.get(0).copied() {
                     let va = ctx.get_vn(func, *a);
                     let vb = ctx.get_vn(func, *b);
-                    let key = ExprKey::F64Bin { op: *op, a: va, b: vb }.canonicalized();
+                    let key = ExprKey::F64Bin {
+                        op: *op,
+                        a: va,
+                        b: vb,
+                    }
+                    .canonicalized();
                     gvn_lookup_or_insert(key, dst, expr2leader, expr_stack, q, nid, func, ctx);
                 }
             }
 
-            Inst::NumAdd(a,b) | Inst::NumSub(a,b) | Inst::NumMul(a,b) | Inst::NumDiv(a,b) | Inst::NumRem(a,b) => {
+            Inst::NumAdd(a, b)
+            | Inst::NumSub(a, b)
+            | Inst::NumMul(a, b)
+            | Inst::NumDiv(a, b)
+            | Inst::NumRem(a, b) => {
                 if let Some(dst) = node.results.get(0).copied() {
                     let va = ctx.get_vn(func, *a);
                     let vb = ctx.get_vn(func, *b);
-                    let key = ExprKey::NumOp { kind: num_op_of(&node.kind).unwrap(), a: va, b: vb }.canonicalized();
+                    let key = ExprKey::NumOp {
+                        kind: num_op_of(&node.kind).unwrap(),
+                        a: va,
+                        b: vb,
+                    }
+                    .canonicalized();
                     gvn_lookup_or_insert(key, dst, expr2leader, expr_stack, q, nid, func, ctx);
                 }
             }
@@ -367,7 +453,12 @@ fn visit_block_ix(
                 if let Some(dst) = node.results.get(0).copied() {
                     let va = ctx.get_vn(func, *a);
                     let vb = ctx.get_vn(func, *b);
-                    let key = ExprKey::CmpInt { kind: *kind, a: va, b: vb }.canonicalized();
+                    let key = ExprKey::CmpInt {
+                        kind: *kind,
+                        a: va,
+                        b: vb,
+                    }
+                    .canonicalized();
                     gvn_lookup_or_insert(key, dst, expr2leader, expr_stack, q, nid, func, ctx);
                 }
             }
@@ -375,7 +466,12 @@ fn visit_block_ix(
                 if let Some(dst) = node.results.get(0).copied() {
                     let va = ctx.get_vn(func, *a);
                     let vb = ctx.get_vn(func, *b);
-                    let key = ExprKey::CmpF64 { kind: *kind, a: va, b: vb }.canonicalized();
+                    let key = ExprKey::CmpF64 {
+                        kind: *kind,
+                        a: va,
+                        b: vb,
+                    }
+                    .canonicalized();
                     gvn_lookup_or_insert(key, dst, expr2leader, expr_stack, q, nid, func, ctx);
                 }
             }
@@ -415,7 +511,8 @@ fn visit_block_ix(
                 // Assign fresh VNs to any results we haven't seen.
                 for &dst in &node.results {
                     if ctx.get_vn(func, dst) == 0 {
-                        let vn = ctx.next_vn; ctx.next_vn += 1;
+                        let vn = ctx.next_vn;
+                        ctx.next_vn += 1;
                         ctx.set_vn(dst, vn);
                     }
                 }
@@ -427,7 +524,16 @@ fn visit_block_ix(
     if let Some(children) = dom_children.get(&block.id) {
         for &c in children {
             if let Some(&cbix) = ix_of.get(&c) {
-                visit_block_ix(func, cbix, dom_children, ix_of, expr2leader, expr_stack, ctx, q);
+                visit_block_ix(
+                    func,
+                    cbix,
+                    dom_children,
+                    ix_of,
+                    expr2leader,
+                    expr_stack,
+                    ctx,
+                    q,
+                );
             }
         }
     }
@@ -442,7 +548,12 @@ fn visit_block_ix(
 
 // -------------------- CFG & Dom utils --------------------
 
-fn build_cfg(func: &Function) -> (HashMap<BlockId, Vec<BlockId>>, HashMap<BlockId, Vec<BlockId>>) {
+fn build_cfg(
+    func: &Function,
+) -> (
+    HashMap<BlockId, Vec<BlockId>>,
+    HashMap<BlockId, Vec<BlockId>>,
+) {
     let mut succs: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
     let mut preds: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
 
@@ -451,17 +562,26 @@ fn build_cfg(func: &Function) -> (HashMap<BlockId, Vec<BlockId>>, HashMap<BlockI
         if let Some(&last) = b.insts.last() {
             match &func.nodes[last.0 as usize].kind {
                 Inst::Jump(tgt, _) => list.push(*tgt),
-                Inst::Branch { then_b, else_b, .. } => { list.push(*then_b); list.push(*else_b); }
-                Inst::Switch { default_b, table, .. } => {
+                Inst::Branch { then_b, else_b, .. } => {
+                    list.push(*then_b);
+                    list.push(*else_b);
+                }
+                Inst::Switch {
+                    default_b, table, ..
+                } => {
                     list.push(*default_b);
-                    for &(_, blk) in table { list.push(blk); }
+                    for &(_, blk) in table {
+                        list.push(blk);
+                    }
                 }
                 Inst::Return(_) | Inst::Throw(_) => {}
                 _ => {}
             }
         }
         succs.insert(b.id, list.clone());
-        for s in list { preds.entry(s).or_default().push(b.id); }
+        for s in list {
+            preds.entry(s).or_default().push(b.id);
+        }
         // Ensure entry for isolated nodes
         preds.entry(b.id).or_default();
     }
@@ -472,10 +592,19 @@ fn rpo_order(entry: BlockId, succs: &HashMap<BlockId, Vec<BlockId>>) -> Vec<Bloc
     let mut seen: HashSet<BlockId> = HashSet::new();
     let mut out: Vec<BlockId> = Vec::new();
 
-    fn dfs(u: BlockId, succs: &HashMap<BlockId, Vec<BlockId>>, seen: &mut HashSet<BlockId>, out: &mut Vec<BlockId>) {
-        if !seen.insert(u) { return; }
+    fn dfs(
+        u: BlockId,
+        succs: &HashMap<BlockId, Vec<BlockId>>,
+        seen: &mut HashSet<BlockId>,
+        out: &mut Vec<BlockId>,
+    ) {
+        if !seen.insert(u) {
+            return;
+        }
         if let Some(vs) = succs.get(&u) {
-            for &v in vs { dfs(v, succs, seen, out); }
+            for &v in vs {
+                dfs(v, succs, seen, out);
+            }
         }
         out.push(u);
     }
@@ -485,10 +614,16 @@ fn rpo_order(entry: BlockId, succs: &HashMap<BlockId, Vec<BlockId>>) -> Vec<Bloc
     out
 }
 
-fn compute_idom(entry: BlockId, preds: &HashMap<BlockId, Vec<BlockId>>, rpo: &Vec<BlockId>) -> HashMap<BlockId, BlockId> {
+fn compute_idom(
+    entry: BlockId,
+    preds: &HashMap<BlockId, Vec<BlockId>>,
+    rpo: &Vec<BlockId>,
+) -> HashMap<BlockId, BlockId> {
     // Map block -> rpo index
     let mut index: HashMap<BlockId, usize> = HashMap::new();
-    for (i, &b) in rpo.iter().enumerate() { index.insert(b, i); }
+    for (i, &b) in rpo.iter().enumerate() {
+        index.insert(b, i);
+    }
 
     let mut idom: HashMap<BlockId, BlockId> = HashMap::new();
     idom.insert(entry, entry);
@@ -497,7 +632,9 @@ fn compute_idom(entry: BlockId, preds: &HashMap<BlockId, Vec<BlockId>>, rpo: &Ve
     while changed {
         changed = false;
         for &b in rpo {
-            if b == entry { continue; }
+            if b == entry {
+                continue;
+            }
             // Pick one processed predecessor as seed
             let mut new_idom: Option<BlockId> = None;
             if let Some(ps) = preds.get(&b) {
@@ -522,10 +659,19 @@ fn compute_idom(entry: BlockId, preds: &HashMap<BlockId, Vec<BlockId>>, rpo: &Ve
     idom
 }
 
-fn intersect(mut a: BlockId, mut b: BlockId, idom: &HashMap<BlockId, BlockId>, index: &HashMap<BlockId, usize>) -> BlockId {
+fn intersect(
+    mut a: BlockId,
+    mut b: BlockId,
+    idom: &HashMap<BlockId, BlockId>,
+    index: &HashMap<BlockId, usize>,
+) -> BlockId {
     while a != b {
-        while index[&a] > index[&b] { a = idom[&a]; }
-        while index[&b] > index[&a] { b = idom[&b]; }
+        while index[&a] > index[&b] {
+            a = idom[&a];
+        }
+        while index[&b] > index[&a] {
+            b = idom[&b];
+        }
     }
     a
 }
@@ -533,7 +679,9 @@ fn intersect(mut a: BlockId, mut b: BlockId, idom: &HashMap<BlockId, BlockId>, i
 fn build_dom_tree(idom: &HashMap<BlockId, BlockId>) -> HashMap<BlockId, Vec<BlockId>> {
     let mut tree: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
     for (b, &id) in idom {
-        if *b == id { continue; } // entry
+        if *b == id {
+            continue;
+        } // entry
         tree.entry(id).or_default().push(*b);
         tree.entry(*b).or_default(); // ensure key present
     }

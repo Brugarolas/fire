@@ -2,29 +2,30 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
+mod event_loop;
+mod front;
+mod gc;
+mod helpers;
+mod hoister;
+mod http;
+mod jit;
+mod lowerer;
+mod modules;
+mod native_promises;
+mod native_timers;
+mod opt;
+mod runtime;
 mod value;
 mod wir;
-mod front;
-mod lowerer;
-mod hoister;
-mod opt;
-mod gc;
-mod runtime;
-mod jit;
-mod event_loop;
-mod native_timers;
-mod native_promises;
-mod http;
-mod modules;
-mod helpers;
 
+use crate::native_timers::invoke_and_pump;
 use crate::opt::Optimize;
 use crate::opt::optimization::optimization_passes;
-use mimalloc::MiMalloc;
 use ahash::AHashMap as HashMap;
-use std::time::Instant;
+use front::Parser;
+use mimalloc::MiMalloc;
 use std::path::Path;
-use crate::native_timers::invoke_and_pump;
+use std::time::Instant;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -39,41 +40,82 @@ fn default_script() -> &'static str {
     "#
 }
 
+fn build_module_from_source(name: &str, src: &str) -> Result<wir::Module, String> {
+    let mut parser = Parser::new(src);
+    let prog = parser
+        .program()
+        .map_err(|e| format!("Parse error in {name}: {} at {:?}", e.msg, e.span))?;
+
+    let mut module = wir::Module::new();
+    let mut lowerer = lowerer::Lowerer::new(&mut module);
+    lowerer
+        .lower_program(&prog)
+        .map_err(|e| format!("Lower error in {name}: {:?}", e))?;
+
+    let optimize = optimization_passes();
+    optimize.optimize_module(&mut module);
+    Ok(module)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    // ¿Tenemos una ruta de entrada real? ⇒ modo multi-módulo
-    let try_multi = args.len() > 1 && Path::new(&args[1]).exists();
-
     // 4.1) Init GC y bind
-    #[cfg(feature = "gc")] {
+    #[cfg(feature = "gc")]
+    {
         let _gc = gc::NapalmGc::new();
         _gc.bind_current_thread();
     }
 
-    #[cfg(debug_assertions)]
-    eprintln!("(Debug build) Building whole-program (modules graph) from {} ...", &args[1]);
-    let b0 = Instant::now();
-
-    let m = modules::build_simple_program_from_entry(&args[1]);
-    let module = match m {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("Error building whole program: {}", e);
-            return;
+    let build_start = Instant::now();
+    let (module, build_label) = if args.len() > 1 {
+        let input_path = &args[1];
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "(Debug build) Building whole-program (modules graph) from {} ...",
+            input_path
+        );
+        match modules::build_simple_program_from_entry(input_path) {
+            Ok(m) => (m, input_path.clone()),
+            Err(e) => {
+                eprintln!("Error building whole program: {}", e);
+                return;
+            }
+        }
+    } else {
+        #[cfg(debug_assertions)]
+        eprintln!("(Debug build) Building embedded default script ...");
+        match build_module_from_source("<default>", default_script()) {
+            Ok(m) => (m, "<default>".to_string()),
+            Err(e) => {
+                eprintln!("Error building default script: {}", e);
+                return;
+            }
         }
     };
 
-    let b1 = Instant::now();
+    let build_elapsed = build_start.elapsed();
     #[cfg(debug_assertions)]
-    eprintln!("(Debug build) Whole-program build took {:.6} seconds", (b1 - b0).as_secs_f64());
+    eprintln!(
+        "(Debug build) Build for {} took {:.6} seconds",
+        build_label,
+        build_elapsed.as_secs_f64()
+    );
 
     // 4.2) JIT compile ALL functions
     let mut jit = jit::JIT::default();
     let mut fptrs = HashMap::new();
+
+    if let Err(e) = jit.predeclare(&module.funcs) {
+        eprintln!("JIT predeclare error: {}", e);
+        return;
+    }
+
     for f in &module.funcs {
         match jit.compile(f) {
-            Ok(fp) => { fptrs.insert(f.sig.name.clone(), fp); }
+            Ok(fp) => {
+                fptrs.insert(f.sig.name.clone(), fp);
+            }
             Err(e) => {
                 eprintln!("JIT compile error in {}: {}", f.sig.name, e);
                 return;
@@ -87,11 +129,17 @@ fn main() {
         std::process::exit(1);
     });
 
-    let entry_fun = module.funcs.iter().find(|f| f.sig.name == entry_name).unwrap();
+    let entry_fun = module
+        .funcs
+        .iter()
+        .find(|f| f.sig.name == entry_name)
+        .unwrap();
     #[cfg(debug_assertions)]
     eprintln!(
         "(Debug build) Selected function: {} (id={:?}) with {} params",
-        entry_fun.sig.name, entry_fun.id, entry_fun.sig.params.len()
+        entry_fun.sig.name,
+        entry_fun.id,
+        entry_fun.sig.params.len()
     );
 
     // 6) Build argv and run (ABI: (argv_ptr, argc) -> i64)
@@ -105,7 +153,9 @@ fn main() {
 
     eprintln!(
         "(Debug build) Program returned: {} (0x{:x}) and took {:.6} seconds",
-        ret, ret as u64, (t1 - t0).as_secs_f64()
+        ret,
+        ret as u64,
+        (t1 - t0).as_secs_f64()
     );
 }
 

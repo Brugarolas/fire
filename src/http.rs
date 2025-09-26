@@ -2,35 +2,38 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 #![allow(unused_unsafe)]
-
 #![allow(unsafe_op_in_unsafe_fn)]
+use ahash::AHashMap as HashMap;
 use axum::{
-    body::{Bytes, Body},
+    Router,
+    body::{Body, Bytes},
     http::{HeaderMap, Method, StatusCode},
     response::IntoResponse,
     routing::any,
-    Router,
 };
-use once_cell::sync::Lazy;
-use futures_util::stream::StreamExt;
-use tokio_stream::wrappers::ReceiverStream;
-use tokio::net::TcpListener;
-use serde_json;
-use reqwest;
 use core::ptr::read_unaligned;
-use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::{runtime::Runtime, sync::{oneshot, mpsc}};
-use ahash::AHashMap as HashMap;
+use futures_util::stream::StreamExt;
+use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use rclite::Arc;
+use reqwest;
+use serde_json;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::net::TcpListener;
+use tokio::{
+    runtime::Runtime,
+    sync::{mpsc, oneshot},
+};
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::event_loop::EVENT_LOOP;
 use crate::gc::NAPALM_GC;
+use crate::native_promises::{wir_deferred_new, wir_deferred_reject, wir_deferred_resolve};
+use crate::runtime::{wir_is_str, wir_obj_get_str, wir_obj_new, wir_obj_set_str};
 use crate::value::{
-    ObjHeader, TAG_STRING, TAG_OBJECT, BoxedStr, make_smi, is_imm, smi_to_i64, fmt_value, dbg_addr, dbg_classify,
+    BoxedStr, ObjHeader, TAG_OBJECT, TAG_STRING, dbg_addr, dbg_classify, fmt_value, is_imm,
+    make_smi, smi_to_i64,
 };
-use crate::runtime::{wir_obj_get_str, wir_obj_set_str, wir_obj_new, wir_is_str};
-use crate::native_promises::{wir_deferred_new, wir_deferred_resolve, wir_deferred_reject};
 
 /// -------- Tokio runtime on a dedicated thread (net/io) --------
 #[cfg(feature = "gc")]
@@ -38,7 +41,9 @@ static TOKIO_RT: Lazy<Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("napalm-net")
-        .on_thread_start(|| unsafe { NAPALM_GC.bind_current_thread(); })
+        .on_thread_start(|| unsafe {
+            NAPALM_GC.bind_current_thread();
+        })
         .build()
         .expect("tokio runtime")
 });
@@ -54,24 +59,31 @@ static TOKIO_RT: Lazy<Runtime> = Lazy::new(|| {
 
 /// -------- simple ID counters --------
 static NEXT_SERVER_ID: AtomicU64 = AtomicU64::new(1);
-static NEXT_REQ_ID:    AtomicU64 = AtomicU64::new(1);
-fn rand_id() -> u64 { NEXT_SERVER_ID.fetch_add(1, Ordering::Relaxed) }
-fn next_req_id() -> u64 { NEXT_REQ_ID.fetch_add(1, Ordering::Relaxed) }
+static NEXT_REQ_ID: AtomicU64 = AtomicU64::new(1);
+fn rand_id() -> u64 {
+    NEXT_SERVER_ID.fetch_add(1, Ordering::Relaxed)
+}
+fn next_req_id() -> u64 {
+    NEXT_REQ_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 /// -------- route registry (kept as GC roots; see http_with_root_slots()) --------
 #[derive(Clone)]
 struct Route {
     method: String,
     tokens: Vec<Token>,
-    handler_closure: i64,    // VM closure value
+    handler_closure: i64, // VM closure value
 }
 
 #[derive(Clone)]
-enum Token { Lit(String), Param(String) }
+enum Token {
+    Lit(String),
+    Param(String),
+}
 
 struct ServerEntry {
     addr: String,
-    dispatch_closure: i64,   // VM closure used by net thread to enqueue microtasks
+    dispatch_closure: i64, // VM closure used by net thread to enqueue microtasks
     routes: Vec<Route>,
 }
 
@@ -79,33 +91,32 @@ static SERVERS: Lazy<Mutex<HashMap<u64, Arc<ServerEntry>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Map (server_id, req_id) -> response sender (no VM values inside)
-static RESP_SENDERS: Lazy<Mutex<HashMap<(u64,u64), oneshot::Sender<ResponseMsg>>>> =
+static RESP_SENDERS: Lazy<Mutex<HashMap<(u64, u64), oneshot::Sender<ResponseMsg>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Streaming data channels: VM writes -> net thread streams
-static STREAM_RX: Lazy<Mutex<HashMap<(u64,u64), mpsc::Receiver<Vec<u8>>>>> =
+static STREAM_RX: Lazy<Mutex<HashMap<(u64, u64), mpsc::Receiver<Vec<u8>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
-static STREAM_TX: Lazy<Mutex<HashMap<(u64,u64), mpsc::Sender<Vec<u8>>>>> =
+static STREAM_TX: Lazy<Mutex<HashMap<(u64, u64), mpsc::Sender<Vec<u8>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Keep owned byte buffers alive for strings we create on the VM side.
-static HTTP_BYTES_KEEPALIVE: Lazy<Mutex<Vec<Box<[u8]>>>> =
-    Lazy::new(|| Mutex::new(Vec::new()));
+static HTTP_BYTES_KEEPALIVE: Lazy<Mutex<Vec<Box<[u8]>>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 /// ---------- Messages crossing threads (pure Rust data) ----------
 pub struct ReqMsg {
     pub server_id: u64,
-    pub req_id:    u64,
-    pub method:    String,
-    pub path:      String,
-    pub body:      Vec<u8>,
-    pub headers:   Vec<(String,String)>,
+    pub req_id: u64,
+    pub method: String,
+    pub path: String,
+    pub body: Vec<u8>,
+    pub headers: Vec<(String, String)>,
 }
 
 pub struct ResponseMsg {
-    pub status:  u16,
-    pub body:    Vec<u8>,
-    pub headers: Vec<(String,String)>,
+    pub status: u16,
+    pub body: Vec<u8>,
+    pub headers: Vec<(String, String)>,
 }
 
 // --- GC roots for in-flight HTTP deferreds (store as usize to be Send/Sync) ---
@@ -115,11 +126,11 @@ type RootSlot = i64; // holds a Box<i64> pointer
 #[repr(C)]
 struct HttpResult {
     deferred: RootSlot,
-    status:   i64,    // SMI
-    body:     Vec<u8>,
-    headers:  Vec<(String,String)>,
-    is_err:   bool,
-    as_json:  bool,
+    status: i64, // SMI
+    body: Vec<u8>,
+    headers: Vec<(String, String)>,
+    is_err: bool,
+    as_json: bool,
 }
 
 static DEFERRED_ROOTS: Lazy<Mutex<Vec<RootSlot>>> = Lazy::new(|| Mutex::new(Vec::new()));
@@ -139,7 +150,9 @@ fn unroot_deferred(slot: RootSlot) {
     }
     drop(v);
     // free the slot
-    unsafe { drop(Box::from_raw(slot as *mut i64)); }
+    unsafe {
+        drop(Box::from_raw(slot as *mut i64));
+    }
 }
 
 /// ---- tiny utils ----
@@ -178,9 +191,13 @@ fn box_str_keepalive(bytes: Vec<u8>) -> i64 {
 ///  - string → 200 + utf8 bytes
 ///  - object {status?, body?, headers?} where:
 ///      status = SMI, body = string; headers = array of [key, value] pairs (strings)
-fn value_to_response(v: i64) -> (u16, Vec<u8>, Vec<(String,String)>) {
+fn value_to_response(v: i64) -> (u16, Vec<u8>, Vec<(String, String)>) {
     #[cfg(debug_assertions)]
-    eprintln!("[http] value_to_response: v={} ({})", dbg_addr(v), dbg_classify(v));
+    eprintln!(
+        "[http] value_to_response: v={} ({})",
+        dbg_addr(v),
+        dbg_classify(v)
+    );
 
     // string?
     unsafe {
@@ -200,20 +217,22 @@ fn value_to_response(v: i64) -> (u16, Vec<u8>, Vec<(String,String)>) {
         }
     }
 
-    let status_key  = static_str_value("status");
-    let body_key    = static_str_value("body");
+    let status_key = static_str_value("status");
+    let body_key = static_str_value("body");
     let headers_key = static_str_value("headers");
 
     let mut status_u16: u16 = 200;
     let mut body_out: Vec<u8> = Vec::new();
-    let mut headers_out: Vec<(String,String)> = Vec::new();
+    let mut headers_out: Vec<(String, String)> = Vec::new();
 
     unsafe {
         // status
         let s = wir_obj_get_str(v, status_key);
         if s != 0 && is_imm(s) {
             let st = smi_to_i64(s);
-            if (100..=599).contains(&st) { status_u16 = st as u16; }
+            if (100..=599).contains(&st) {
+                status_u16 = st as u16;
+            }
         }
 
         // body
@@ -259,13 +278,23 @@ fn value_to_response(v: i64) -> (u16, Vec<u8>, Vec<(String,String)>) {
 }
 
 /// Send a response back to net thread for (server_id, req_id)
-fn send_response(server_id: u64, req_id: u64, status: u16, body: Vec<u8>, headers: Vec<(String,String)>) {
+fn send_response(
+    server_id: u64,
+    req_id: u64,
+    status: u16,
+    body: Vec<u8>,
+    headers: Vec<(String, String)>,
+) {
     let tx = {
         let mut g = RESP_SENDERS.lock();
         g.remove(&(server_id, req_id))
     };
     if let Some(tx) = tx {
-        let _ = tx.send(ResponseMsg { status, body, headers });
+        let _ = tx.send(ResponseMsg {
+            status,
+            body,
+            headers,
+        });
     } else {
         eprintln!("[http] missing response sender for ({server_id},{req_id})");
     }
@@ -280,10 +309,16 @@ fn send_immediate_response(server_id: u64, req_id: u64, v: i64) {
 /// Promise-like detection: check obj["then"] first; else treat as private promise pointer.
 fn is_promise_like(v: i64) -> bool {
     #[cfg(debug_assertions)]
-    eprintln!("[http] is_promise_like? v={} ({})", dbg_addr(v), dbg_classify(v));
+    eprintln!(
+        "[http] is_promise_like? v={} ({})",
+        dbg_addr(v),
+        dbg_classify(v)
+    );
 
     // null or immediate → not a promise
-    if v == 0 || (v & 1) == 1 { return false; }
+    if v == 0 || (v & 1) == 1 {
+        return false;
+    }
 
     unsafe {
         let hdr = &*(v as *const ObjHeader);
@@ -292,9 +327,13 @@ fn is_promise_like(v: i64) -> bool {
         eprintln!("[http]   tag={}", hdr.tag);
 
         // strings are not promises
-        if hdr.tag == TAG_STRING { return false; }
+        if hdr.tag == TAG_STRING {
+            return false;
+        }
         // your native/private Promise uses tag 0
-        if hdr.tag == 0 { return true; }
+        if hdr.tag == 0 {
+            return true;
+        }
         // Only objects may be "thenables"
         if hdr.tag == TAG_OBJECT {
             let then = wir_obj_get_str(v, static_str_value("then"));
@@ -310,7 +349,9 @@ fn is_promise_like(v: i64) -> bool {
 
 /// Attach then/catch that send (sid,rid) when fulfilled/rejected.
 fn attach_then_catch(promise: i64, sid: u64, rid: u64) {
-    unsafe extern "C" { fn wir_call_closure(clo: i64, argv: *const i64, argc: i64) -> i64; }
+    unsafe extern "C" {
+        fn wir_call_closure(clo: i64, argv: *const i64, argc: i64) -> i64;
+    }
     extern "C" fn on_f(argv: *const i64, argc: usize) -> i64 {
         unsafe {
             let sid = argv_read(argv, 0) as u64;
@@ -364,7 +405,11 @@ pub extern "C" fn wir_server_create(addr_ptr: i64) -> i64 {
     let server_id = rand_id();
 
     let dispatch_closure = crate::value::closure_new(dispatch_tramp as usize, 0);
-    let entry = Arc::new(ServerEntry { addr, dispatch_closure, routes: Vec::new() });
+    let entry = Arc::new(ServerEntry {
+        addr,
+        dispatch_closure,
+        routes: Vec::new(),
+    });
     SERVERS.lock().insert(server_id, entry);
     server_id as i64
 }
@@ -375,7 +420,10 @@ pub extern "C" fn wir_server_create(addr_ptr: i64) -> i64 {
 ///   - parameters must start with ':' (e.g. ":id")
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_server_add_route(
-    server_id: i64, method_ptr: i64, pattern_arr: i64, handler: i64
+    server_id: i64,
+    method_ptr: i64,
+    pattern_arr: i64,
+    handler: i64,
 ) -> i64 {
     let method = unsafe { boxedstr_to_string(method_ptr) };
 
@@ -388,7 +436,9 @@ pub extern "C" fn wir_server_add_route(
         let n = smi_to_i64(wir_array_len(pattern_arr)).max(0) as usize;
         for i in 0..n {
             let v = wir_array_get(pattern_arr, make_smi(i as i64));
-            if wir_is_str(v) == 0 { continue; }
+            if wir_is_str(v) == 0 {
+                continue;
+            }
             let s = boxedstr_to_string(v);
             for seg in s.split('/').filter(|x| !x.is_empty()) {
                 if let Some(name) = seg.strip_prefix(':') {
@@ -402,7 +452,14 @@ pub extern "C" fn wir_server_add_route(
 
     let mut g = SERVERS.lock();
     let entry = g.get_mut(&(server_id as u64)).expect("server");
-    Arc::get_mut(entry).expect("no other refs").routes.push(Route { method, tokens, handler_closure: handler });
+    Arc::get_mut(entry)
+        .expect("no other refs")
+        .routes
+        .push(Route {
+            method,
+            tokens,
+            handler_closure: handler,
+        });
     0
 }
 
@@ -416,55 +473,69 @@ pub extern "C" fn wir_server_listen(server_id: i64) -> i64 {
     TOKIO_RT.spawn(async move {
         let app = Router::new().route(
             "/{*path}",
-            any(move |method: Method, uri: axum::http::Uri, headers: HeaderMap, body: Bytes| {
-                let entry = entry.clone();
-                async move {
-                    let req_id = next_req_id();
-                    let path = uri.path().to_string();
+            any(
+                move |method: Method, uri: axum::http::Uri, headers: HeaderMap, body: Bytes| {
+                    let entry = entry.clone();
+                    async move {
+                        let req_id = next_req_id();
+                        let path = uri.path().to_string();
 
-                    let (tx, rx) = oneshot::channel::<ResponseMsg>();
-                    RESP_SENDERS.lock().insert((server_id, req_id), tx);
+                        let (tx, rx) = oneshot::channel::<ResponseMsg>();
+                        RESP_SENDERS.lock().insert((server_id, req_id), tx);
 
-                    let mut hdrs_vec = Vec::with_capacity(headers.len());
-                    for (k, v) in headers.iter() {
-                        let key = k.as_str().to_string();
-                        let val = v.to_str().unwrap_or_default().to_string();
-                        hdrs_vec.push((key, val));
-                    }
-
-                    let msg = Box::new(ReqMsg {
-                        server_id, req_id,
-                        method: method.as_str().to_string(),
-                        path,
-                        body: body.to_vec(),
-                        headers: hdrs_vec,
-                    });
-                    let arg = (&*msg as *const ReqMsg as usize) as i64;
-                    std::mem::forget(msg);
-
-                    EVENT_LOOP.enqueue_microtask(entry.dispatch_closure, arg);
-
-                    match rx.await {
-                        Ok(r) => {
-                            if let Some(rx_stream) = STREAM_RX.lock().remove(&(server_id, req_id)) {
-                                use futures_util::stream::StreamExt;
-                                let stream = tokio_stream::wrappers::ReceiverStream::new(rx_stream)
-                                    .map(|chunk| Ok::<Bytes, std::io::Error>(Bytes::from(chunk)));
-                                let mut resp = axum::response::Response::builder()
-                                    .status(StatusCode::from_u16(r.status).unwrap_or(StatusCode::OK));
-                                for (k, v) in r.headers { resp = resp.header(k, v); }
-                                resp.body(Body::from_stream(stream)).unwrap()
-                            } else {
-                                let mut res = axum::response::Response::builder()
-                                    .status(StatusCode::from_u16(r.status).unwrap_or(StatusCode::OK));
-                                for (k, v) in r.headers { res = res.header(k, v); }
-                                res.body(Body::from(r.body)).unwrap()
-                            }
+                        let mut hdrs_vec = Vec::with_capacity(headers.len());
+                        for (k, v) in headers.iter() {
+                            let key = k.as_str().to_string();
+                            let val = v.to_str().unwrap_or_default().to_string();
+                            hdrs_vec.push((key, val));
                         }
-                        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "VM dropped response").into_response(),
+
+                        let msg = Box::new(ReqMsg {
+                            server_id,
+                            req_id,
+                            method: method.as_str().to_string(),
+                            path,
+                            body: body.to_vec(),
+                            headers: hdrs_vec,
+                        });
+                        let arg = (&*msg as *const ReqMsg as usize) as i64;
+                        std::mem::forget(msg);
+
+                        EVENT_LOOP.enqueue_microtask(entry.dispatch_closure, arg);
+
+                        match rx.await {
+                            Ok(r) => {
+                                if let Some(rx_stream) =
+                                    STREAM_RX.lock().remove(&(server_id, req_id))
+                                {
+                                    use futures_util::stream::StreamExt;
+                                    let stream = tokio_stream::wrappers::ReceiverStream::new(
+                                        rx_stream,
+                                    )
+                                    .map(|chunk| Ok::<Bytes, std::io::Error>(Bytes::from(chunk)));
+                                    let mut resp = axum::response::Response::builder().status(
+                                        StatusCode::from_u16(r.status).unwrap_or(StatusCode::OK),
+                                    );
+                                    for (k, v) in r.headers {
+                                        resp = resp.header(k, v);
+                                    }
+                                    resp.body(Body::from_stream(stream)).unwrap()
+                                } else {
+                                    let mut res = axum::response::Response::builder().status(
+                                        StatusCode::from_u16(r.status).unwrap_or(StatusCode::OK),
+                                    );
+                                    for (k, v) in r.headers {
+                                        res = res.header(k, v);
+                                    }
+                                    res.body(Body::from(r.body)).unwrap()
+                                }
+                            }
+                            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "VM dropped response")
+                                .into_response(),
+                        }
                     }
-                }
-            }),
+                },
+            ),
         );
 
         // NEW: Axum 0.7 serve
@@ -478,19 +549,31 @@ pub extern "C" fn wir_server_listen(server_id: i64) -> i64 {
 }
 /// ---------- Route matching & VM dispatch (runs on VM thread) ----------
 
-fn match_route<'a>(routes: &'a [Route], method: &str, path: &str) -> Option<(&'a Route, HashMap<String,String>)> {
+fn match_route<'a>(
+    routes: &'a [Route],
+    method: &str,
+    path: &str,
+) -> Option<(&'a Route, HashMap<String, String>)> {
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     for r in routes {
-        if !r.method.eq_ignore_ascii_case(method) { continue; }
+        if !r.method.eq_ignore_ascii_case(method) {
+            continue;
+        }
         let mut params = HashMap::new();
         let mut i = 0usize;
         let mut ok = true;
 
         for t in &r.tokens {
-            if i >= segs.len() { ok = false; break; }
+            if i >= segs.len() {
+                ok = false;
+                break;
+            }
             match t {
                 Token::Lit(s) => {
-                    if segs[i] != s { ok = false; break; }
+                    if segs[i] != s {
+                        ok = false;
+                        break;
+                    }
                 }
                 Token::Param(name) => {
                     params.insert(name.clone(), segs[i].to_string());
@@ -517,11 +600,11 @@ pub extern "C" fn vm_dispatch(argv: *const i64, _argc: usize) -> i64 {
         let req_obj = wir_obj_new();
         // method/path/body
         let method_v = box_str_keepalive(std::mem::take(&mut req.method).into_bytes());
-        let path_v   = box_str_keepalive(std::mem::take(&mut req.path).into_bytes());
-        let body_v   = box_str_keepalive(std::mem::take(&mut req.body));
+        let path_v = box_str_keepalive(std::mem::take(&mut req.path).into_bytes());
+        let body_v = box_str_keepalive(std::mem::take(&mut req.body));
         wir_obj_set_str(req_obj, static_str_value("method"), method_v);
-        wir_obj_set_str(req_obj, static_str_value("path"),   path_v);
-        wir_obj_set_str(req_obj, static_str_value("body"),   body_v);
+        wir_obj_set_str(req_obj, static_str_value("path"), path_v);
+        wir_obj_set_str(req_obj, static_str_value("body"), body_v);
 
         // headers object
         let hdrs_obj = wir_obj_new();
@@ -537,26 +620,54 @@ pub extern "C" fn vm_dispatch(argv: *const i64, _argc: usize) -> i64 {
 
         // 2) Route match
         let entry = SERVERS.lock().get(&req.server_id).cloned().expect("server");
-        let Some((route, filled_params)) = match_route(&entry.routes, &method_to_str(method_v), &value_to_str(path_v)) else {
-            send_response(req.server_id, req.req_id, 404, b"Not Found".to_vec(), vec![]);
+        let Some((route, filled_params)) = match_route(
+            &entry.routes,
+            &method_to_str(method_v),
+            &value_to_str(path_v),
+        ) else {
+            send_response(
+                req.server_id,
+                req.req_id,
+                404,
+                b"Not Found".to_vec(),
+                vec![],
+            );
             return 0;
         };
-        for (k,v) in filled_params {
-            wir_obj_set_str(params, box_str_keepalive(k.into_bytes()), box_str_keepalive(v.into_bytes()));
+        for (k, v) in filled_params {
+            wir_obj_set_str(
+                params,
+                box_str_keepalive(k.into_bytes()),
+                box_str_keepalive(v.into_bytes()),
+            );
         }
         wir_obj_set_str(req_obj, static_str_value("params"), params);
 
         // expose ids for streaming helpers
-        wir_obj_set_str(req_obj, static_str_value("serverId"), make_smi(req.server_id as i64));
-        wir_obj_set_str(req_obj, static_str_value("reqId"),    make_smi(req.req_id as i64));
+        wir_obj_set_str(
+            req_obj,
+            static_str_value("serverId"),
+            make_smi(req.server_id as i64),
+        );
+        wir_obj_set_str(
+            req_obj,
+            static_str_value("reqId"),
+            make_smi(req.req_id as i64),
+        );
 
         // 3) Call handler(req)
-        unsafe extern "C" { fn wir_call_closure(clo: i64, argv: *const i64, argc: i64) -> i64; }
+        unsafe extern "C" {
+            fn wir_call_closure(clo: i64, argv: *const i64, argc: i64) -> i64;
+        }
         let argv = [req_obj];
         let ret = wir_call_closure(route.handler_closure, argv.as_ptr(), 1);
 
         #[cfg(debug_assertions)]
-        eprintln!("[http] route returned v={} ({})", dbg_addr(ret), dbg_classify(ret));
+        eprintln!(
+            "[http] route returned v={} ({})",
+            dbg_addr(ret),
+            dbg_classify(ret)
+        );
 
         // 4) Return mapping
         if is_promise_like(ret) {
@@ -577,7 +688,9 @@ fn method_to_str(v: i64) -> String {
     }
 }
 #[inline]
-fn value_to_str(v: i64) -> String { method_to_str(v) }
+fn value_to_str(v: i64) -> String {
+    method_to_str(v)
+}
 
 /// ---------- HTTP client: request/get/post (+ JSON) ----------
 
@@ -603,7 +716,7 @@ static HTTP_RESOLVE_CLO: Lazy<i64> = Lazy::new(|| {
 
             if hr.is_err {
                 let _ = wir_deferred_reject(deferred, 0);
-                unroot_deferred(hr.deferred);   // free the slot now that we're done
+                unroot_deferred(hr.deferred); // free the slot now that we're done
                 return 0;
             }
 
@@ -645,16 +758,20 @@ static HTTP_RESOLVE_CLO: Lazy<i64> = Lazy::new(|| {
 });
 
 #[inline(always)]
-fn http_resolve_closure() -> i64 { *HTTP_RESOLVE_CLO }
+fn http_resolve_closure() -> i64 {
+    *HTTP_RESOLVE_CLO
+}
 
-fn collect_headers_from_arr(arr: i64) -> Vec<(String,String)> {
+fn collect_headers_from_arr(arr: i64) -> Vec<(String, String)> {
     let mut out = Vec::new();
     unsafe {
         unsafe extern "C" {
             fn wir_array_len(arr: i64) -> i64;
             fn wir_array_get(arr: i64, idx: i64) -> i64;
         }
-        if arr == 0 { return out; }
+        if arr == 0 {
+            return out;
+        }
         let n = smi_to_i64(wir_array_len(arr)).max(0) as usize;
         for i in 0..n {
             let pair = wir_array_get(arr, make_smi(i as i64));
@@ -675,15 +792,25 @@ fn collect_headers_from_arr(arr: i64) -> Vec<(String,String)> {
     out
 }
 
-fn spawn_request(method: String, url: String, body: Option<Vec<u8>>, headers: Vec<(String,String)>, as_json: bool) -> i64 {
+fn spawn_request(
+    method: String,
+    url: String,
+    body: Option<Vec<u8>>,
+    headers: Vec<(String, String)>,
+    as_json: bool,
+) -> i64 {
     let d = wir_deferred_new();
-    let dslot = root_deferred(d);               // <-- KEEP A ROOT SLOT
+    let dslot = root_deferred(d); // <-- KEEP A ROOT SLOT
 
     TOKIO_RT.spawn(async move {
         let client = reqwest::Client::new();
         let mut req = client.request(method.parse().unwrap_or(reqwest::Method::GET), &url);
-        if let Some(b) = body.clone() { req = req.body(b); }
-        for (k, v) in &headers { req = req.header(k, v); }
+        if let Some(b) = body.clone() {
+            req = req.body(b);
+        }
+        for (k, v) in &headers {
+            req = req.header(k, v);
+        }
 
         let res = req.send().await;
         match res {
@@ -691,13 +818,19 @@ fn spawn_request(method: String, url: String, body: Option<Vec<u8>>, headers: Ve
                 let status = r.status().as_u16() as i64;
                 let mut hdrs = Vec::with_capacity(r.headers().len());
                 for (k, v) in r.headers().iter() {
-                    hdrs.push((k.as_str().to_string(), v.to_str().unwrap_or_default().to_string()));
+                    hdrs.push((
+                        k.as_str().to_string(),
+                        v.to_str().unwrap_or_default().to_string(),
+                    ));
                 }
                 let body = r.bytes().await.unwrap_or_default().to_vec();
                 let msg = Box::new(HttpResult {
                     deferred: dslot,
-                    status, body, headers: hdrs,
-                    is_err: false, as_json
+                    status,
+                    body,
+                    headers: hdrs,
+                    is_err: false,
+                    as_json,
                 });
                 let arg = Box::into_raw(msg) as i64;
                 EVENT_LOOP.enqueue_microtask(http_resolve_closure(), arg);
@@ -705,8 +838,11 @@ fn spawn_request(method: String, url: String, body: Option<Vec<u8>>, headers: Ve
             Err(_) => {
                 let msg = Box::new(HttpResult {
                     deferred: dslot,
-                    status: 0, body: Vec::new(), headers: vec![],
-                    is_err: true, as_json
+                    status: 0,
+                    body: Vec::new(),
+                    headers: vec![],
+                    is_err: true,
+                    as_json,
                 });
                 let arg = Box::into_raw(msg) as i64;
                 EVENT_LOOP.enqueue_microtask(http_resolve_closure(), arg);
@@ -726,7 +862,13 @@ pub extern "C" fn wir_http_get(url_ptr: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_http_get_json(url_ptr: i64) -> i64 {
     let url = unsafe { boxedstr_to_string(url_ptr) };
-    spawn_request("GET".to_string(), url, None, vec![("accept".into(), "application/json".into())], true)
+    spawn_request(
+        "GET".to_string(),
+        url,
+        None,
+        vec![("accept".into(), "application/json".into())],
+        true,
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -737,21 +879,31 @@ pub extern "C" fn wir_http_post(url_ptr: i64, body_ptr: i64, headers_arr: i64) -
             let s = &*(body_ptr as *const BoxedStr);
             std::slice::from_raw_parts(s.data, s.len).to_vec()
         })
-    } else { None };
+    } else {
+        None
+    };
     let headers = collect_headers_from_arr(headers_arr);
     spawn_request("POST".into(), url, body, headers, false)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn wir_http_request(method_ptr: i64, url_ptr: i64, body_ptr: i64, headers_arr: i64, as_json: i64) -> i64 {
+pub extern "C" fn wir_http_request(
+    method_ptr: i64,
+    url_ptr: i64,
+    body_ptr: i64,
+    headers_arr: i64,
+    as_json: i64,
+) -> i64 {
     let method = unsafe { boxedstr_to_string(method_ptr) };
-    let url    = unsafe { boxedstr_to_string(url_ptr) };
+    let url = unsafe { boxedstr_to_string(url_ptr) };
     let body = if body_ptr != 0 {
         Some(unsafe {
             let s = &*(body_ptr as *const BoxedStr);
             std::slice::from_raw_parts(s.data, s.len).to_vec()
         })
-    } else { None };
+    } else {
+        None
+    };
     let headers = collect_headers_from_arr(headers_arr);
     spawn_request(method, url, body, headers, as_json != 0)
 }
@@ -761,7 +913,10 @@ pub extern "C" fn wir_http_post_json(url_ptr: i64, json_str_ptr: i64, headers_ar
     let url = unsafe { boxedstr_to_string(url_ptr) };
     let mut headers = collect_headers_from_arr(headers_arr);
     // ensure content-type if not set
-    if !headers.iter().any(|(k,_)| k.eq_ignore_ascii_case("content-type")) {
+    if !headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+    {
         headers.push(("content-type".into(), "application/json".into()));
     }
     let body = if json_str_ptr != 0 {
@@ -769,14 +924,21 @@ pub extern "C" fn wir_http_post_json(url_ptr: i64, json_str_ptr: i64, headers_ar
             let s = &*(json_str_ptr as *const BoxedStr);
             std::slice::from_raw_parts(s.data, s.len).to_vec()
         })
-    } else { Some(b"null".to_vec()) };
+    } else {
+        Some(b"null".to_vec())
+    };
     spawn_request("POST".into(), url, body, headers, true)
 }
 
 /// ---------- Server-side streaming: start/write/end ----------
 
 #[unsafe(no_mangle)]
-pub extern "C" fn wir_http_start_stream(server_id_smi: i64, req_id_smi: i64, status_smi: i64, headers_arr: i64) -> i64 {
+pub extern "C" fn wir_http_start_stream(
+    server_id_smi: i64,
+    req_id_smi: i64,
+    status_smi: i64,
+    headers_arr: i64,
+) -> i64 {
     let sid = smi_to_i64(server_id_smi) as u64;
     let rid = smi_to_i64(req_id_smi) as u64;
     let status = smi_to_i64(status_smi) as u16;
@@ -792,10 +954,16 @@ pub extern "C" fn wir_http_start_stream(server_id_smi: i64, req_id_smi: i64, sta
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn wir_http_stream_write(server_id_smi: i64, req_id_smi: i64, chunk_ptr: i64) -> i64 {
+pub extern "C" fn wir_http_stream_write(
+    server_id_smi: i64,
+    req_id_smi: i64,
+    chunk_ptr: i64,
+) -> i64 {
     let sid = smi_to_i64(server_id_smi) as u64;
     let rid = smi_to_i64(req_id_smi) as u64;
-    let Some(tx) = STREAM_TX.lock().get(&(sid, rid)).cloned() else { return 0; };
+    let Some(tx) = STREAM_TX.lock().get(&(sid, rid)).cloned() else {
+        return 0;
+    };
     let bytes = unsafe {
         let s = &*(chunk_ptr as *const BoxedStr);
         std::slice::from_raw_parts(s.data, s.len).to_vec()
@@ -814,7 +982,11 @@ pub extern "C" fn wir_http_stream_end(server_id_smi: i64, req_id_smi: i64) -> i6
 
 /// Convenience: start stream using fields on `req` (serverId/reqId)
 #[unsafe(no_mangle)]
-pub extern "C" fn wir_http_start_stream_from_req(req_obj: i64, status_smi: i64, headers_arr: i64) -> i64 {
+pub extern "C" fn wir_http_start_stream_from_req(
+    req_obj: i64,
+    status_smi: i64,
+    headers_arr: i64,
+) -> i64 {
     unsafe {
         let sid = wir_obj_get_str(req_obj, static_str_value("serverId"));
         let rid = wir_obj_get_str(req_obj, static_str_value("reqId"));
@@ -832,18 +1004,23 @@ fn json_to_vm(v: &serde_json::Value) -> i64 {
         }
         match v {
             serde_json::Value::Null => 0,
-            serde_json::Value::Bool(b) => if *b { 1 } else { 0 },
+            serde_json::Value::Bool(b) => {
+                if *b {
+                    1
+                } else {
+                    0
+                }
+            }
             serde_json::Value::Number(n) => {
                 // prefer SMI when exact i64; else boxed f64
-                if let Some(i) = n.as_i64() { make_smi(i) }
-                else {
+                if let Some(i) = n.as_i64() {
+                    make_smi(i)
+                } else {
                     let f = n.as_f64().unwrap_or(0.0);
                     crate::jit::wir_box_f64_runtime(f.to_bits())
                 }
             }
-            serde_json::Value::String(s) => {
-                box_str_keepalive(s.clone().into_bytes())
-            }
+            serde_json::Value::String(s) => box_str_keepalive(s.clone().into_bytes()),
             serde_json::Value::Array(a) => {
                 let arr = wir_array_new(make_smi(0));
                 for x in a {
@@ -856,7 +1033,7 @@ fn json_to_vm(v: &serde_json::Value) -> i64 {
                 let o = wir_obj_new();
                 for (k, x) in m.iter() {
                     let key = box_str_keepalive(k.clone().into_bytes());
-                    let vx  = json_to_vm(x);
+                    let vx = json_to_vm(x);
                     wir_obj_set_str(o, key, vx);
                 }
                 o
@@ -875,7 +1052,9 @@ fn json_bytes_to_vm(bytes: &[u8]) -> Option<i64> {
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_json_parse(str_ptr: i64) -> i64 {
     unsafe {
-        if str_ptr == 0 || wir_is_str(str_ptr) == 0 { return 0; }
+        if str_ptr == 0 || wir_is_str(str_ptr) == 0 {
+            return 0;
+        }
         let s = &*(str_ptr as *const BoxedStr);
         let bytes = std::slice::from_raw_parts(s.data, s.len);
         match serde_json::from_slice::<serde_json::Value>(bytes) {
@@ -887,7 +1066,7 @@ pub extern "C" fn wir_json_parse(str_ptr: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_http_send_json(status_smi: i64, body_val: i64, headers_arr: i64) -> i64 {
-    use crate::value::{make_smi};
+    use crate::value::make_smi;
 
     // 1) Normalize status
     let mut status = smi_to_i64(status_smi);
@@ -897,7 +1076,10 @@ pub extern "C" fn wir_http_send_json(status_smi: i64, body_val: i64, headers_arr
 
     // 2) Collect headers (array of [k, v]) and ensure content-type
     let mut headers = collect_headers_from_arr(headers_arr);
-    if !headers.iter().any(|(k,_)| k.eq_ignore_ascii_case("content-type")) {
+    if !headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+    {
         headers.push(("content-type".into(), "application/json".into()));
     }
 
@@ -953,7 +1135,11 @@ pub fn http_with_root_slots<F: FnMut(*mut i64)>(mut f: F) {
     #[cfg(debug_assertions)]
     {
         let cur = unsafe { *p };
-        eprintln!("[http] root deferred slot {:?} -> {}", p, crate::value::dbg_addr(cur));
+        eprintln!(
+            "[http] root deferred slot {:?} -> {}",
+            p,
+            crate::value::dbg_addr(cur)
+        );
     }
 
     f(p);

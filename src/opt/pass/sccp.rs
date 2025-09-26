@@ -1,20 +1,23 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
-use std::collections::VecDeque;
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use smallvec::SmallVec;
-use std::mem::{discriminant, Discriminant};
+use std::collections::VecDeque;
+use std::mem::{Discriminant, discriminant};
 
 use crate::opt::{InstCursor, OptimizationWIR, WirEditQueue};
 use crate::wir::{
-    BlockId, Function, Inst, InstId, ValueDef, ValueId, Constant, Type,
-    IntBinOp, F64BinOp, CmpKind,
+    BlockId, CmpKind, Constant, F64BinOp, Function, Inst, InstId, IntBinOp, Type, ValueDef, ValueId,
 };
 
 /// SCCP lattice (3-point): Undef < Const(c) < Overdef
 #[derive(Clone, Debug)]
-enum Lat { Undef, Const(Constant), Overdef }
+enum Lat {
+    Undef,
+    Const(Constant),
+    Overdef,
+}
 
 // Manual PartialEq so we don't require Constant: PartialEq
 impl PartialEq for Lat {
@@ -32,8 +35,18 @@ impl PartialEq for Lat {
 pub struct Sccp {
     last_func_ptr: Option<usize>,
 }
-impl Default for Sccp { fn default() -> Self { Self { last_func_ptr: None } } }
-impl Sccp { pub fn new() -> Self { Self::default() } }
+impl Default for Sccp {
+    fn default() -> Self {
+        Self {
+            last_func_ptr: None,
+        }
+    }
+}
+impl Sccp {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 impl OptimizationWIR for Sccp {
     /// Wake up on control-flow (so we discover CFG) and on common foldable ops.
@@ -42,22 +55,42 @@ impl OptimizationWIR for Sccp {
         let v0 = ValueId(0);
         let tags = [
             // Control
-            discriminant(&Branch { cond: v0, then_b: BlockId(0), else_b: BlockId(0) }),
+            discriminant(&Branch {
+                cond: v0,
+                then_b: BlockId(0),
+                else_b: BlockId(0),
+            }),
             discriminant(&Jump(BlockId(0), Vec::<ValueId>::new())),
             // (Skip Switch discriminant construction to avoid field-shape coupling)
 
             // Things we often fold/propagate
             discriminant(&Const(Constant::Null)),
             discriminant(&Mov(v0)),
-            discriminant(&IntBin { op: IntBinOp::Add, a: v0, b: v0 }),
-            discriminant(&F64Bin { op: F64BinOp::Add, a: v0, b: v0 }),
+            discriminant(&IntBin {
+                op: IntBinOp::Add,
+                a: v0,
+                b: v0,
+            }),
+            discriminant(&F64Bin {
+                op: F64BinOp::Add,
+                a: v0,
+                b: v0,
+            }),
             discriminant(&NumAdd(v0, v0)),
             discriminant(&NumSub(v0, v0)),
             discriminant(&NumMul(v0, v0)),
             discriminant(&NumDiv(v0, v0)),
             discriminant(&NumRem(v0, v0)),
-            discriminant(&CmpInt { kind: CmpKind::Eq, a: v0, b: v0 }),
-            discriminant(&CmpF64 { kind: CmpKind::Eq, a: v0, b: v0 }),
+            discriminant(&CmpInt {
+                kind: CmpKind::Eq,
+                a: v0,
+                b: v0,
+            }),
+            discriminant(&CmpF64 {
+                kind: CmpKind::Eq,
+                a: v0,
+                b: v0,
+            }),
             discriminant(&StrLen(v0)),
             discriminant(&StrCompare { a: v0, b: v0 }),
         ];
@@ -81,8 +114,12 @@ pub fn run_on_function(func: &Function, q: &mut WirEditQueue) -> bool {
     let n_values = func.values.len();
 
     // --------- Fast indices and CFG ---------
-    let bid_to_idx: HashMap<BlockId, usize> = func.blocks.iter()
-        .enumerate().map(|(i,b)| (b.id, i)).collect();
+    let bid_to_idx: HashMap<BlockId, usize> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.id, i))
+        .collect();
     let idx_to_bid: Vec<BlockId> = func.blocks.iter().map(|b| b.id).collect();
 
     let (_succs, preds) = build_cfg(func, &bid_to_idx);
@@ -99,7 +136,9 @@ pub fn run_on_function(func: &Function, q: &mut WirEditQueue) -> bool {
     }
     let entry_idx = bid_to_idx[&func.entry];
     let block_of_inst = |iid: InstId| -> usize {
-        pos_of_inst[iid.0 as usize].map(|(bi, _)| bi).unwrap_or(entry_idx)
+        pos_of_inst[iid.0 as usize]
+            .map(|(bi, _)| bi)
+            .unwrap_or(entry_idx)
     };
 
     // --------- Lattice & dataflow state ---------
@@ -108,7 +147,13 @@ pub fn run_on_function(func: &Function, q: &mut WirEditQueue) -> bool {
         match (a, b) {
             (Undef, x) => x.clone(),
             (x, Undef) => x.clone(),
-            (Const(c1), Const(c2)) => if const_eq(c1, c2) { Const(c1.clone()) } else { Overdef },
+            (Const(c1), Const(c2)) => {
+                if const_eq(c1, c2) {
+                    Const(c1.clone())
+                } else {
+                    Overdef
+                }
+            }
             _ => Overdef,
         }
     }
@@ -136,7 +181,13 @@ pub fn run_on_function(func: &Function, q: &mut WirEditQueue) -> bool {
 
     // --------- Initialization ---------
     if let Some(&entry_idx) = bid_to_idx.get(&func.entry) {
-        mark_block_executable(entry_idx, func, &mut exec_block, &mut block_wl, &mut inst_wl);
+        mark_block_executable(
+            entry_idx,
+            func,
+            &mut exec_block,
+            &mut block_wl,
+            &mut inst_wl,
+        );
     }
 
     // --------- Main sparse propagation loop ---------
@@ -144,12 +195,22 @@ pub fn run_on_function(func: &Function, q: &mut WirEditQueue) -> bool {
         // Process new executable blocks
         while let Some(bi) = block_wl.pop_front() {
             // Drive control decisions by visiting the terminator
-            if let Some(tid) = terms[bi] { inst_wl.push_back(tid); }
+            if let Some(tid) = terms[bi] {
+                inst_wl.push_back(tid);
+            }
 
             // If term is an unconditional Jump, mark edge & propagate params immediately
-            if let Some(TerminatorInfo::Jump { to_idx, args, .. }) = terms_info(func, bi, &bid_to_idx) {
+            if let Some(TerminatorInfo::Jump { to_idx, args, .. }) =
+                terms_info(func, bi, &bid_to_idx)
+            {
                 if exec_edge.insert((bi, to_idx)) {
-                    mark_block_executable(to_idx, func, &mut exec_block, &mut block_wl, &mut inst_wl);
+                    mark_block_executable(
+                        to_idx,
+                        func,
+                        &mut exec_block,
+                        &mut block_wl,
+                        &mut inst_wl,
+                    );
                     propagate_jump_params(func, to_idx, &args, &mut val_lat, &mut value_wl);
                 }
             }
@@ -158,60 +219,115 @@ pub fn run_on_function(func: &Function, q: &mut WirEditQueue) -> bool {
         // Process pending insts
         while let Some(nid) = inst_wl.pop_front() {
             let bidx = block_of_inst(nid);
-            if !exec_block[bidx] { continue; }
+            if !exec_block[bidx] {
+                continue;
+            }
             let node = &func.nodes[nid.0 as usize];
 
             match &node.kind {
                 // ---- Control flow ----
-                Inst::Branch { cond, then_b, else_b } => {
+                Inst::Branch {
+                    cond,
+                    then_b,
+                    else_b,
+                } => {
                     let cl = val_lat[cond.0 as usize].clone();
                     match cl {
                         Lat::Const(Constant::Bool(true)) => {
                             let t = bid_to_idx[then_b];
                             if exec_edge.insert((bidx, t)) {
-                                mark_block_executable(t, func, &mut exec_block, &mut block_wl, &mut inst_wl);
+                                mark_block_executable(
+                                    t,
+                                    func,
+                                    &mut exec_block,
+                                    &mut block_wl,
+                                    &mut inst_wl,
+                                );
                             }
                         }
                         Lat::Const(Constant::Bool(false)) => {
                             let e = bid_to_idx[else_b];
                             if exec_edge.insert((bidx, e)) {
-                                mark_block_executable(e, func, &mut exec_block, &mut block_wl, &mut inst_wl);
+                                mark_block_executable(
+                                    e,
+                                    func,
+                                    &mut exec_block,
+                                    &mut block_wl,
+                                    &mut inst_wl,
+                                );
                             }
                         }
                         _ => {
                             let t = bid_to_idx[then_b];
                             let e = bid_to_idx[else_b];
                             if exec_edge.insert((bidx, t)) {
-                                mark_block_executable(t, func, &mut exec_block, &mut block_wl, &mut inst_wl);
+                                mark_block_executable(
+                                    t,
+                                    func,
+                                    &mut exec_block,
+                                    &mut block_wl,
+                                    &mut inst_wl,
+                                );
                             }
                             if exec_edge.insert((bidx, e)) {
-                                mark_block_executable(e, func, &mut exec_block, &mut block_wl, &mut inst_wl);
+                                mark_block_executable(
+                                    e,
+                                    func,
+                                    &mut exec_block,
+                                    &mut block_wl,
+                                    &mut inst_wl,
+                                );
                             }
                         }
                     }
                 }
-                Inst::Switch { tag, default_b, table } => {
+                Inst::Switch {
+                    tag,
+                    default_b,
+                    table,
+                } => {
                     let tl = val_lat[tag.0 as usize].clone();
                     match tl {
                         Lat::Const(Constant::Int32(tval)) => {
                             let mut target = *default_b;
                             for &(key, bb) in table {
-                                if key as i32 == tval { target = bb; break; }
+                                if key as i32 == tval {
+                                    target = bb;
+                                    break;
+                                }
                             }
                             let s = bid_to_idx[&target];
                             if exec_edge.insert((bidx, s)) {
-                                mark_block_executable(s, func, &mut exec_block, &mut block_wl, &mut inst_wl);
+                                mark_block_executable(
+                                    s,
+                                    func,
+                                    &mut exec_block,
+                                    &mut block_wl,
+                                    &mut inst_wl,
+                                );
                             }
                         }
                         _ => {
                             let d = bid_to_idx[default_b];
                             if exec_edge.insert((bidx, d)) {
-                                mark_block_executable(d, func, &mut exec_block, &mut block_wl, &mut inst_wl);
+                                mark_block_executable(
+                                    d,
+                                    func,
+                                    &mut exec_block,
+                                    &mut block_wl,
+                                    &mut inst_wl,
+                                );
                             }
                             for &(_, bb) in table {
                                 let s = bid_to_idx[&bb];
                                 if exec_edge.insert((bidx, s)) {
-                                    mark_block_executable(s, func, &mut exec_block, &mut block_wl, &mut inst_wl);
+                                    mark_block_executable(
+                                        s,
+                                        func,
+                                        &mut exec_block,
+                                        &mut block_wl,
+                                        &mut inst_wl,
+                                    );
                                 }
                             }
                         }
@@ -268,22 +384,35 @@ pub fn run_on_function(func: &Function, q: &mut WirEditQueue) -> bool {
 
     // 1) Branch/Switch -> Jump
     for (bi, b) in func.blocks.iter().enumerate() {
-        if !exec_block[bi] { continue; }
+        if !exec_block[bi] {
+            continue;
+        }
         if let Some(&last) = b.insts.last() {
             let node = &func.nodes[last.0 as usize];
             match &node.kind {
-                Inst::Branch { cond, then_b, else_b } => {
+                Inst::Branch {
+                    cond,
+                    then_b,
+                    else_b,
+                } => {
                     if let Lat::Const(Constant::Bool(c)) = &val_lat[cond.0 as usize] {
                         let to = if *c { *then_b } else { *else_b };
                         q.replace_kind(last, Inst::Jump(to, Vec::new()));
                         changed = true;
                     }
                 }
-                Inst::Switch { tag, default_b, table } => {
+                Inst::Switch {
+                    tag,
+                    default_b,
+                    table,
+                } => {
                     if let Lat::Const(Constant::Int32(tval)) = &val_lat[tag.0 as usize] {
                         let mut target = *default_b;
                         for &(key, bb) in table {
-                            if key as i32 == *tval { target = bb; break; }
+                            if key as i32 == *tval {
+                                target = bb;
+                                break;
+                            }
                         }
                         q.replace_kind(last, Inst::Jump(target, Vec::new()));
                         changed = true;
@@ -311,14 +440,18 @@ pub fn run_on_function(func: &Function, q: &mut WirEditQueue) -> bool {
 /* ---------------- helper functions ---------------- */
 
 #[derive(Copy, Clone)]
-enum Terminator { Jump, Branch, Switch }
+enum Terminator {
+    Jump,
+    Branch,
+    Switch,
+}
 
 fn collect_terminators(func: &Function) -> Vec<Option<InstId>> {
     let mut out = vec![None; func.blocks.len()];
     for (i, b) in func.blocks.iter().enumerate() {
         if let Some(&nid) = b.insts.last() {
             match func.nodes[nid.0 as usize].kind {
-                Inst::Jump(_,_) | Inst::Branch { .. } | Inst::Switch { .. } => out[i] = Some(nid),
+                Inst::Jump(_, _) | Inst::Branch { .. } | Inst::Switch { .. } => out[i] = Some(nid),
                 _ => {}
             }
         }
@@ -327,7 +460,11 @@ fn collect_terminators(func: &Function) -> Vec<Option<InstId>> {
 }
 
 enum TerminatorInfo {
-    Jump { pred_idx: usize, to_idx: usize, args: Vec<ValueId> },
+    Jump {
+        pred_idx: usize,
+        to_idx: usize,
+        args: Vec<ValueId>,
+    },
     Branch,
     Switch,
 }
@@ -340,7 +477,11 @@ fn terms_info(
     let b = &func.blocks[bidx];
     let &nid = b.insts.last()?;
     match &func.nodes[nid.0 as usize].kind {
-        Inst::Jump(to, args) => Some(TerminatorInfo::Jump { pred_idx: bidx, to_idx: bid_to_idx[to], args: args.clone() }),
+        Inst::Jump(to, args) => Some(TerminatorInfo::Jump {
+            pred_idx: bidx,
+            to_idx: bid_to_idx[to],
+            args: args.clone(),
+        }),
         Inst::Branch { .. } => Some(TerminatorInfo::Branch),
         Inst::Switch { .. } => Some(TerminatorInfo::Switch),
         _ => None,
@@ -359,17 +500,28 @@ fn build_cfg(
         if let Some(&last) = b.insts.last() {
             match &func.nodes[last.0 as usize].kind {
                 Inst::Jump(tgt, _) => {
-                    let j = bid_to_idx[tgt]; succs[i].push(j); preds[j].push(i);
+                    let j = bid_to_idx[tgt];
+                    succs[i].push(j);
+                    preds[j].push(i);
                 }
                 Inst::Branch { then_b, else_b, .. } => {
-                    let j1 = bid_to_idx[then_b]; let j2 = bid_to_idx[else_b];
-                    succs[i].push(j1); preds[j1].push(i);
-                    succs[i].push(j2); preds[j2].push(i);
+                    let j1 = bid_to_idx[then_b];
+                    let j2 = bid_to_idx[else_b];
+                    succs[i].push(j1);
+                    preds[j1].push(i);
+                    succs[i].push(j2);
+                    preds[j2].push(i);
                 }
-                Inst::Switch { default_b, table, .. } => {
-                    let jd = bid_to_idx[default_b]; succs[i].push(jd); preds[jd].push(i);
+                Inst::Switch {
+                    default_b, table, ..
+                } => {
+                    let jd = bid_to_idx[default_b];
+                    succs[i].push(jd);
+                    preds[jd].push(i);
                     for &(_, bid) in table {
-                        let j = bid_to_idx[&bid]; succs[i].push(j); preds[j].push(i);
+                        let j = bid_to_idx[&bid];
+                        succs[i].push(j);
+                        preds[j].push(i);
                     }
                 }
                 _ => {}
@@ -387,7 +539,9 @@ fn mark_block_executable(
     block_wl: &mut VecDeque<usize>,
     inst_wl: &mut VecDeque<InstId>,
 ) {
-    if exec_block[bi] { return; }
+    if exec_block[bi] {
+        return;
+    }
     exec_block[bi] = true;
     // Enqueue whole block (so we can visit terminator immediately)
     block_wl.push_back(bi);
@@ -415,7 +569,13 @@ fn propagate_jump_params(
             match (a, b) {
                 (Lat::Undef, x) => x.clone(),
                 (x, Lat::Undef) => x.clone(),
-                (Lat::Const(c1), Lat::Const(c2)) => if const_eq(c1, c2) { Lat::Const(c1.clone()) } else { Lat::Overdef },
+                (Lat::Const(c1), Lat::Const(c2)) => {
+                    if const_eq(c1, c2) {
+                        Lat::Const(c1.clone())
+                    } else {
+                        Lat::Overdef
+                    }
+                }
                 _ => Lat::Overdef,
             }
         };
@@ -430,7 +590,14 @@ fn on_value_change(
     vid: ValueId,
     func: &Function,
     uses: &HashMap<ValueId, Vec<InstId>>,
-    jump_arg_uses: &HashMap<ValueId, Vec<(usize /*pred_idx*/, usize /*succ_idx*/, usize /*param_i*/)>>,
+    jump_arg_uses: &HashMap<
+        ValueId,
+        Vec<(
+            usize, /*pred_idx*/
+            usize, /*succ_idx*/
+            usize, /*param_i*/
+        )>,
+    >,
 
     exec_block: &[bool],
     exec_edge: &HashSet<(usize, usize)>,
@@ -442,7 +609,9 @@ fn on_value_change(
     bid_to_idx: &HashMap<BlockId, usize>,
 ) {
     if let Some(us) = uses.get(&vid) {
-        for &nid in us { inst_wl.push_back(nid); }
+        for &nid in us {
+            inst_wl.push_back(nid);
+        }
     }
     if let Some(edges) = jump_arg_uses.get(&vid) {
         for &(pred_i, succ_i, param_i) in edges {
@@ -455,7 +624,13 @@ fn on_value_change(
                     match (a, b) {
                         (Lat::Undef, x) => x.clone(),
                         (x, Lat::Undef) => x.clone(),
-                        (Lat::Const(c1), Lat::Const(c2)) => if const_eq(c1, c2) { Lat::Const(c1.clone()) } else { Lat::Overdef },
+                        (Lat::Const(c1), Lat::Const(c2)) => {
+                            if const_eq(c1, c2) {
+                                Lat::Const(c1.clone())
+                            } else {
+                                Lat::Overdef
+                            }
+                        }
                         _ => Lat::Overdef,
                     }
                 };
@@ -475,7 +650,7 @@ fn inst_operands(k: &Inst) -> Vec<ValueId> {
         Phi(vs) => vs.clone(),
         IntBin { a, b, .. } => vec![*a, *b],
         F64Bin { a, b, .. } => vec![*a, *b],
-        NumAdd(a,b) | NumSub(a,b) | NumMul(a,b) | NumDiv(a,b) | NumRem(a,b) => vec![*a, *b],
+        NumAdd(a, b) | NumSub(a, b) | NumMul(a, b) | NumDiv(a, b) | NumRem(a, b) => vec![*a, *b],
         CmpInt { a, b, .. } => vec![*a, *b],
         CmpF64 { a, b, .. } => vec![*a, *b],
         StrLen(v) => vec![*v],
@@ -493,22 +668,38 @@ fn build_use_lists(
     func: &Function,
 ) -> (
     HashMap<ValueId, Vec<InstId>>,
-    HashMap<ValueId, Vec<(usize /*pred_idx*/, usize /*succ_idx*/, usize /*param_i*/)>>
+    HashMap<
+        ValueId,
+        Vec<(
+            usize, /*pred_idx*/
+            usize, /*succ_idx*/
+            usize, /*param_i*/
+        )>,
+    >,
 ) {
     let mut uses: HashMap<ValueId, Vec<InstId>> = HashMap::new();
     let mut jump_arg_uses: HashMap<ValueId, Vec<(usize, usize, usize)>> = HashMap::new();
 
-    let bid_to_idx: HashMap<BlockId, usize> = func.blocks.iter()
-        .enumerate().map(|(i,b)| (b.id, i)).collect();
+    let bid_to_idx: HashMap<BlockId, usize> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.id, i))
+        .collect();
 
     for (bi, b) in func.blocks.iter().enumerate() {
         for &nid in &b.insts {
             let k = &func.nodes[nid.0 as usize].kind;
-            for op in inst_operands(k) { uses.entry(op).or_default().push(nid); }
+            for op in inst_operands(k) {
+                uses.entry(op).or_default().push(nid);
+            }
             if let Inst::Jump(to, args) = k {
                 let succ_idx = bid_to_idx[to];
                 for (i, &arg) in args.iter().enumerate() {
-                    jump_arg_uses.entry(arg).or_default().push((bi, succ_idx, i));
+                    jump_arg_uses
+                        .entry(arg)
+                        .or_default()
+                        .push((bi, succ_idx, i));
                 }
             }
         }
@@ -521,10 +712,19 @@ fn is_pure_non_effectful(k: &Inst) -> bool {
     use Inst::*;
     match k {
         Const(_) | Mov(_) => true,
-        IntBin { .. } | F64Bin { .. } |
-        NumAdd(_,_) | NumSub(_,_) | NumMul(_,_) | NumDiv(_,_) | NumRem(_,_) |
-        CmpInt { .. } | CmpF64 { .. } |
-        StrLen(_) | StrConcat { .. } | StrCompare { .. } | StrContains { .. } => true,
+        IntBin { .. }
+        | F64Bin { .. }
+        | NumAdd(_, _)
+        | NumSub(_, _)
+        | NumMul(_, _)
+        | NumDiv(_, _)
+        | NumRem(_, _)
+        | CmpInt { .. }
+        | CmpF64 { .. }
+        | StrLen(_)
+        | StrConcat { .. }
+        | StrCompare { .. }
+        | StrContains { .. } => true,
         _ => false,
     }
 }
@@ -533,10 +733,10 @@ fn is_pure_non_effectful(k: &Inst) -> bool {
 fn const_type_hint(kind: &Inst) -> Type {
     match kind {
         Inst::Const(Constant::Int32(_)) => Type::Int32,
-        Inst::Const(Constant::F64(_))   => Type::F64,
-        Inst::Const(Constant::Bool(_))  => Type::Bool,
-        Inst::Const(Constant::Null)     => Type::Null,
-        Inst::Const(Constant::Str(_))   => Type::Str,
+        Inst::Const(Constant::F64(_)) => Type::F64,
+        Inst::Const(Constant::Bool(_)) => Type::Bool,
+        Inst::Const(Constant::Null) => Type::Null,
+        Inst::Const(Constant::Str(_)) => Type::Str,
         _ => Type::Top,
     }
 }
@@ -545,10 +745,10 @@ fn const_eq(a: &Constant, b: &Constant) -> bool {
     use Constant::*;
     match (a, b) {
         (Int32(x), Int32(y)) => x == y,
-        (F64(x), F64(y))     => x.to_bits() == y.to_bits(), // preserve -0.0 / NaN bits
-        (Bool(x), Bool(y))   => x == y,
-        (Null, Null)         => true,
-        (Str(sa), Str(sb))   => sa == sb,
+        (F64(x), F64(y)) => x.to_bits() == y.to_bits(), // preserve -0.0 / NaN bits
+        (Bool(x), Bool(y)) => x == y,
+        (Null, Null) => true,
+        (Str(sa), Str(sb)) => sa == sb,
         _ => false,
     }
 }
@@ -559,17 +759,17 @@ fn transfer_inst(k: &Inst, lat: &Vec<Lat>) -> Lat {
 
     match k {
         Const(c) => Lat::Const(c.clone()),
-        Mov(v)   => get(*v),
+        Mov(v) => get(*v),
 
         IntBin { op, a, b } => fold_int_bin(*op, get(*a), get(*b)),
         F64Bin { op, a, b } => fold_f64_bin(*op, get(*a), get(*b)),
 
         // Num* : if both ints -> int path; else if any f64 -> f64 path
-        NumAdd(a,b) => fold_num_bin(IntBinOp::Add, get(*a), get(*b)),
-        NumSub(a,b) => fold_num_bin(IntBinOp::Sub, get(*a), get(*b)),
-        NumMul(a,b) => fold_num_bin(IntBinOp::Mul, get(*a), get(*b)),
-        NumDiv(a,b) => fold_num_bin(IntBinOp::DivS, get(*a), get(*b)),
-        NumRem(a,b) => fold_num_bin(IntBinOp::RemS, get(*a), get(*b)),
+        NumAdd(a, b) => fold_num_bin(IntBinOp::Add, get(*a), get(*b)),
+        NumSub(a, b) => fold_num_bin(IntBinOp::Sub, get(*a), get(*b)),
+        NumMul(a, b) => fold_num_bin(IntBinOp::Mul, get(*a), get(*b)),
+        NumDiv(a, b) => fold_num_bin(IntBinOp::DivS, get(*a), get(*b)),
+        NumRem(a, b) => fold_num_bin(IntBinOp::RemS, get(*a), get(*b)),
 
         CmpInt { kind, a, b } => fold_cmp_int(*kind, get(*a), get(*b)),
         CmpF64 { kind, a, b } => fold_cmp_f64(*kind, get(*a), get(*b)),
@@ -582,20 +782,23 @@ fn transfer_inst(k: &Inst, lat: &Vec<Lat>) -> Lat {
         },
         StrConcat { a, b } => match (get(*a), get(*b)) {
             (Lat::Const(Constant::Str(mut sa)), Lat::Const(Constant::Str(sb))) => {
-                sa.push_str(&sb); Lat::Const(Constant::Str(sa))
+                sa.push_str(&sb);
+                Lat::Const(Constant::Str(sa))
             }
             (Lat::Overdef, _) | (_, Lat::Overdef) => Lat::Overdef,
             _ => Lat::Undef,
         },
         StrCompare { a, b } => match (get(*a), get(*b)) {
-            (Lat::Const(Constant::Str(sa)), Lat::Const(Constant::Str(sb))) =>
-                Lat::Const(Constant::Bool(sa == sb)),
+            (Lat::Const(Constant::Str(sa)), Lat::Const(Constant::Str(sb))) => {
+                Lat::Const(Constant::Bool(sa == sb))
+            }
             (Lat::Overdef, _) | (_, Lat::Overdef) => Lat::Overdef,
             _ => Lat::Undef,
         },
         StrContains { s, sub } => match (get(*s), get(*sub)) {
-            (Lat::Const(Constant::Str(h)), Lat::Const(Constant::Str(n))) =>
-                Lat::Const(Constant::Bool(h.contains(&n))),
+            (Lat::Const(Constant::Str(h)), Lat::Const(Constant::Str(n))) => {
+                Lat::Const(Constant::Bool(h.contains(&n)))
+            }
             (Lat::Overdef, _) | (_, Lat::Overdef) => Lat::Overdef,
             _ => Lat::Undef,
         },
@@ -614,13 +817,21 @@ fn fold_int_bin(op: IntBinOp, la: Lat, lb: Lat) -> Lat {
                 IntBinOp::Sub => Some(x.wrapping_sub(y)),
                 IntBinOp::Mul => Some(x.wrapping_mul(y)),
                 IntBinOp::DivS => {
-                    if y == 0 || (x == i32::MIN && y == -1) { None } else { Some(x.wrapping_div(y)) }
+                    if y == 0 || (x == i32::MIN && y == -1) {
+                        None
+                    } else {
+                        Some(x.wrapping_div(y))
+                    }
                 }
                 IntBinOp::RemS => {
-                    if y == 0 { None } else { Some(x.wrapping_rem(y)) }
+                    if y == 0 {
+                        None
+                    } else {
+                        Some(x.wrapping_rem(y))
+                    }
                 }
                 IntBinOp::And => Some(x & y),
-                IntBinOp::Or  => Some(x | y),
+                IntBinOp::Or => Some(x | y),
                 IntBinOp::Xor => Some(x ^ y),
                 IntBinOp::Shl => Some(x.wrapping_shl((y as u32) & 31)),
                 IntBinOp::ShrU => Some(((x as u32) >> ((y as u32) & 31)) as i32),
@@ -664,7 +875,11 @@ fn fold_num_bin(iop: IntBinOp, la: Lat, lb: Lat) -> Lat {
                 IntBinOp::RemS => F64BinOp::Rem,
                 _ => return Overdef,
             };
-            fold_f64_bin(fop, Lat::Const(Constant::F64(*x)), Lat::Const(Constant::F64(*y)))
+            fold_f64_bin(
+                fop,
+                Lat::Const(Constant::F64(*x)),
+                Lat::Const(Constant::F64(*y)),
+            )
         }
         (Const(Constant::Int32(x)), Const(Constant::F64(y))) => {
             let fop = match iop {
@@ -675,7 +890,11 @@ fn fold_num_bin(iop: IntBinOp, la: Lat, lb: Lat) -> Lat {
                 IntBinOp::RemS => F64BinOp::Rem,
                 _ => return Overdef,
             };
-            fold_f64_bin(fop, Lat::Const(Constant::F64(*x as f64)), Lat::Const(Constant::F64(*y)))
+            fold_f64_bin(
+                fop,
+                Lat::Const(Constant::F64(*x as f64)),
+                Lat::Const(Constant::F64(*y)),
+            )
         }
         (Const(Constant::F64(x)), Const(Constant::Int32(y))) => {
             let fop = match iop {
@@ -686,7 +905,11 @@ fn fold_num_bin(iop: IntBinOp, la: Lat, lb: Lat) -> Lat {
                 IntBinOp::RemS => F64BinOp::Rem,
                 _ => return Overdef,
             };
-            fold_f64_bin(fop, Lat::Const(Constant::F64(*x)), Lat::Const(Constant::F64(*y as f64)))
+            fold_f64_bin(
+                fop,
+                Lat::Const(Constant::F64(*x)),
+                Lat::Const(Constant::F64(*y as f64)),
+            )
         }
         (Overdef, _) | (_, Overdef) => Overdef,
         _ => Undef,

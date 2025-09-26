@@ -1,2 +1,2 @@
-mod hash;
 mod copy;
+mod hash;
