@@ -1,5 +1,4 @@
 // src/lowerer.rs
-#![allow(unused_imports)]
 #![allow(unused_variables)]
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
@@ -62,9 +61,11 @@ pub struct LinkInfo {
     /// nombres locales que corresponden a `export class` del proveedor (para saber que son clase)
     pub imported_class_bindings: HashSet<BindingId>,
     /// Imports that the linker resolved to FuncId: local name → provider's FuncId.
-    /// In __modinit__ they are materialized as closures (trampolines) with env = null.
+    /// In __modinit__ they are materialized as closures (trampolines) with env = 0.
     pub import_funcids: HashMap<String, FuncId>,
     pub import_classes: HashMap<String, (Option<FuncId>, Vec<(String, FuncId)>)>,
+    pub class_bindings: HashMap<String, BindingId>,
+    pub proto_bindings: HashMap<String, BindingId>,
 }
 
 pub struct Lowerer<'m> {
@@ -74,6 +75,8 @@ pub struct Lowerer<'m> {
     classes: HashMap<String, ClassInfo>,
     links: LinkInfo,
     pending_export_names: Vec<String>,
+    pending_local_class_names: Vec<String>,
+    pending_proto_names: Vec<String>,
 }
 
 impl<'m> Lowerer<'m> {
@@ -85,6 +88,8 @@ impl<'m> Lowerer<'m> {
             classes: Default::default(),
             links: Default::default(),
             pending_export_names: Vec::new(),
+            pending_local_class_names: Vec::new(),
+            pending_proto_names: Vec::new(),
         }
     }
 
@@ -123,6 +128,10 @@ impl<'m> Lowerer<'m> {
         }
         self.ensure_namespace_cells_prealloc();
 
+        // Prealloc class and proto cells
+        self.ensure_local_class_cells_prealloc();
+        self.ensure_proto_cells_prealloc();
+
         #[cfg(debug_assertions)]
         {
             eprintln!(
@@ -133,10 +142,7 @@ impl<'m> Lowerer<'m> {
                 "[lower_program] links.namespaces= {:?}",
                 self.links.namespace_imports.keys().collect::<Vec<_>>()
             );
-            eprintln!(
-                "[lower_program] links.ns_cells  = {:?}",
-                self.links.namespace_cells
-            );
+            eprintln!("[links] namespace_cells: {:?}", self.links.namespace_cells);
         }
 
         for c in &prog.classes {
@@ -257,41 +263,41 @@ impl<'m> Lowerer<'m> {
         // 3.2 Reserve for class-generated functions in the SAME order lower_one_class emits them
         let mut extra_names: Vec<String> = Vec::new();
         for c in &prog.classes {
-            let cname = &c.name;
-            let ci = self.classes.get(cname).expect("class collected");
+            let fid_raw = c.name.clone();
+            let ci = self.classes.get(&fid_raw).expect("class collected");
 
             // Accessors
             for (pname, get, set) in &ci.props {
                 if get.is_some() {
-                    extra_names.push(format!("__get_{}_{}", cname, pname));
+                    extra_names.push(format!("__get_{}_{}", fid_raw, pname));
                 }
                 if set.is_some() {
-                    extra_names.push(format!("__set_{}_{}", cname, pname));
+                    extra_names.push(format!("__set_{}_{}", fid_raw, pname));
                 }
             }
 
             // Instance methods (skip ctor/dtor)
             for (mname, _, _, _) in &ci.methods {
-                if mname != "constructor" && mname != "destructor" {
-                    extra_names.push(format!("__method_{}_{}", cname, mname));
+                if *mname != "constructor" && *mname != "destructor" {
+                    extra_names.push(format!("__method_{}_{}", fid_raw, mname));
                 }
             }
 
             // Statics
             for (mname, _, _, _) in &ci.static_methods {
-                extra_names.push(format!("__static_{}_{}", cname, mname));
+                extra_names.push(format!("__static_{}_{}", fid_raw, mname));
             }
 
             // Ctor / Dtor
             if ci.has_ctor {
-                extra_names.push(format!("__ctor_{}", cname));
+                extra_names.push(format!("__ctor_{}", fid_raw));
             }
             if ci.has_dtor {
-                extra_names.push(format!("__dtor_{}", cname));
+                extra_names.push(format!("__dtor_{}", fid_raw));
             }
 
             // Allocator
-            extra_names.push(format!("__class_new_{}", cname));
+            extra_names.push(format!("__class_new_{}", fid_raw));
         }
 
         for nm in extra_names {
@@ -469,7 +475,7 @@ fn lower_block_free<'m>(
     links: &LinkInfo,
 ) -> LResult<()> {
     for s in &blk.stmts {
-        lower_stmt_free(b, locals, fields, next_field, s, funcs, lam_caps, links)?; // <-- pass through
+        lower_stmt_free(b, locals, fields, next_field, s, funcs, lam_caps, links)?; // <-- pass
     }
     Ok(())
 }
@@ -719,7 +725,16 @@ fn lower_stmt_free<'m>(
             b.branch(c, body_b, exit);
 
             b.position_at(body_b);
-            lower_block_free(b, locals, fields, next_field, body, funcs, lam_caps, links)?; // <-- pass
+            lower_block_free(
+                b,
+                locals,
+                fields,
+                next_field,
+                body,
+                funcs,
+                lam_caps,
+                links,
+            )?; // <-- pass
             let back_args: Vec<ValueId> =
                 mut_names.iter().map(|n| *locals.get(n).unwrap()).collect();
             b.jump(head, &back_args);
@@ -735,7 +750,7 @@ fn lower_stmt_free<'m>(
             step,
             body,
         } => {
-            if let Some(i) = init {
+            if let Some(i) = init.as_deref() {
                 lower_stmt_free(b, locals, fields, next_field, i, funcs, lam_caps, links)?;
             } // <-- pass
 
@@ -782,7 +797,16 @@ fn lower_stmt_free<'m>(
             b.branch(c, body_b, exit);
 
             b.position_at(body_b);
-            lower_block_free(b, locals, fields, next_field, body, funcs, lam_caps, links)?; // <-- pass
+            lower_block_free(
+                b,
+                locals,
+                fields,
+                next_field,
+                body,
+                funcs,
+                lam_caps,
+                links,
+            )?; // <-- pass
             if let Some(se) = step {
                 let _ = lower_expr_free(b, locals, fields, next_field, se, funcs, lam_caps, links)?;
             } // <-- pass
@@ -921,6 +945,7 @@ fn lower_general_getprop<'m>(
     let str_hit = b.block();
     let try_fast = b.block();
     let cont = b.block();
+    let out_ptr = cont;
     let out_val = b.add_block_param(cont, Type::Int32);
 
     b.branch(has_str[0], str_hit, try_fast);
@@ -1152,7 +1177,7 @@ fn lower_block_free_async<'m>(
 }
 
 fn lower_stmt_free_async<'m>(
-    b: &mut Builder<'m>,
+    mut b: &mut Builder<'m>,
     locals: &mut HashMap<String, ValueId>,
     fields: &mut HashMap<String, FieldId>,
     next_field: &mut u32,
@@ -1210,25 +1235,11 @@ fn lower_stmt_free_async<'m>(
 
             // add routes
             for rt in &ld.routes {
-                let pat_v = lower_expr_free(
-                    b,
-                    locals,
-                    fields,
-                    next_field,
-                    &rt.pattern,
-                    funcs,
-                    lam_caps,
-                    links,
+                let pat_v = lower_expr_free_async(
+                    b, locals, fields, next_field, &rt.pattern, funcs, lam_caps, in_async, links,
                 )?;
-                let hnd_v = lower_expr_free(
-                    b,
-                    locals,
-                    fields,
-                    next_field,
-                    &rt.handler,
-                    funcs,
-                    lam_caps,
-                    links,
+                let hnd_v = lower_expr_free_async(
+                    b, locals, fields, next_field, &rt.handler, funcs, lam_caps, in_async, links,
                 )?;
                 let (_mid, mr) = b.push_node(
                     Inst::Const(Constant::Str(rt.method.clone())),
@@ -1293,8 +1304,7 @@ fn lower_stmt_free_async<'m>(
                             PropKey::Ident(name) => name.as_str(),
                             PropKey::Str(name) => name.as_str(),
                         };
-                        let value =
-                            lower_general_getprop(b, obj_val, prop_name, fields, next_field);
+                        let value = lower_general_getprop(b, obj_val, prop_name, fields, next_field);
                         locals.insert(field.binding.clone(), value);
                         if let Some(&bid) = links.export_bindings.get(&field.binding) {
                             b.store_binding(bid, value);
@@ -1403,7 +1413,7 @@ fn lower_stmt_free_async<'m>(
                     b.position_at(then_id);
                     let mut locals_then = incoming.clone();
                     lower_block_free_async(
-                        b,
+                        &mut b,
                         &mut locals_then,
                         fields,
                         next_field,
@@ -1422,7 +1432,7 @@ fn lower_stmt_free_async<'m>(
                     let mut locals_else = incoming.clone();
                     if let Some(eb) = else_b {
                         lower_block_free_async(
-                            b,
+                            &mut b,
                             &mut locals_else,
                             fields,
                             next_field,
@@ -1864,7 +1874,7 @@ fn lower_array_method_call<'m>(
                 true,
             );
 
-            let next = b.int_bin(crate::wir::IntBinOp::Add, i_phi, one);
+            let next = b.int_bin(IntBinOp::Add, i_phi, one);
             b.jump(head, &[next]);
 
             b.position_at(exit);
@@ -1980,7 +1990,7 @@ fn lower_array_method_call<'m>(
             b.jump(cont_b, &[]);
 
             b.position_at(cont_b);
-            let next = b.int_bin(crate::wir::IntBinOp::Add, i_phi, one);
+            let next = b.int_bin(IntBinOp::Add, i_phi, one);
             b.jump(head, &[next]);
 
             b.position_at(exit);
@@ -2063,7 +2073,7 @@ fn lower_array_method_call<'m>(
                 true,
             );
 
-            let next = b.int_bin(crate::wir::IntBinOp::Add, i_phi, one);
+            let next = b.int_bin(IntBinOp::Add, i_phi, one);
             b.jump(head, &[next]);
 
             b.position_at(exit);
@@ -2092,7 +2102,6 @@ fn lower_array_method_call<'m>(
                 links,
             )?;
 
-            // len(arr)
             let (_nid, len_res) = b.push_node(
                 Inst::CallNative {
                     name: "wir_array_len".into(),
@@ -2309,7 +2318,7 @@ fn lower_array_method_call<'m>(
             b.jump(cont, &[el]);
 
             b.position_at(cont_b);
-            let next = b.int_bin(crate::wir::IntBinOp::Add, i_phi, one);
+            let next = b.int_bin(IntBinOp::Add, i_phi, one);
             b.jump(head, &[next]);
 
             b.position_at(exit);
@@ -2407,7 +2416,7 @@ fn lower_array_method_call<'m>(
             b.jump(cont, &[i_phi]);
 
             b.position_at(cont_b);
-            let next = b.int_bin(crate::wir::IntBinOp::Add, i_phi, one);
+            let next = b.int_bin(IntBinOp::Add, i_phi, one);
             b.jump(head, &[next]);
 
             b.position_at(exit);
@@ -2417,10 +2426,8 @@ fn lower_array_method_call<'m>(
             return Ok(Some(resp));
         }
 
-        _ => {}
+        _ => Ok(None),
     }
-
-    Ok(None)
 }
 
 fn lower_expr_free<'m>(
@@ -2797,7 +2804,6 @@ fn lower_expr_free<'m>(
 
                     b.branch(is_str[0], str_b, arr_b);
 
-                    // object["key"] = rv  (also mirror into fast field if you want symmetry)
                     b.position_at(str_b);
                     let (_nid_set_s, _r_s) = b.push_node(
                         Inst::CallNative {
@@ -2812,7 +2818,6 @@ fn lower_expr_free<'m>(
                     );
                     b.jump(cont, &[]);
 
-                    // array[index] = rv
                     b.position_at(arr_b);
                     let (_nid_set_a, _r_a) = b.push_node(
                         Inst::CallNative {
@@ -4722,7 +4727,7 @@ impl<'m> Lowerer<'m> {
 
         // 2) Instance methods (skip ctor/dtor pseudo entries)
         for (mname, params, body, is_async) in &ci.methods {
-            if mname == "constructor" || mname == "destructor" {
+            if *mname == "constructor" || *mname == "destructor" {
                 continue;
             }
             let fname = format!("__method_{}_{}", cname, mname);
@@ -4745,7 +4750,7 @@ impl<'m> Lowerer<'m> {
 
         // 4) Ctor (optional) — must share the same field-id map
         if let Some((_, ctor_params, ctor_body, _)) =
-            ci.methods.iter().find(|(n, _, _, _)| n == "constructor")
+            ci.methods.iter().find(|(n, _, _, _)| *n == "constructor")
         {
             let fname = format!("__ctor_{}", cname);
             self.lower_instance_fun(
@@ -4762,7 +4767,7 @@ impl<'m> Lowerer<'m> {
         // 5) Dtor (optional)
         if ci.has_dtor {
             if let Some((_, _, dtor_body, _)) =
-                ci.methods.iter().find(|(n, _, _, _)| n == "destructor")
+                ci.methods.iter().find(|(n, _, _, _) | *n == "destructor")
             {
                 let fname = format!("__dtor_{}", cname);
                 self.lower_instance_fun(
@@ -4782,41 +4787,34 @@ impl<'m> Lowerer<'m> {
         Ok(())
     }
 
-    fn lower_instance_fun(
+    fn lower_free_like_fun(
         &mut self,
-        class_name: &str,
         fname: &str,
         params: &[String],
         body: &Block,
         is_async: bool,
-        // class-shared field-id table (important!)
-        fields: &mut HashMap<String, FieldId>,
-        next_field: &mut u32,
     ) -> LResult<()> {
         use crate::wir::{Inst, Type};
 
-        // Keep your private/super rewriter
-        let body_rw = self.rewrite_privates_in_block(class_name, body);
-
-        // Build function: hidden `this` + user params
         let mut f = {
-            let argc = params.len() + 1;
             let mut b = Builder::new(
                 self.module,
                 fname,
-                vec![Type::Int32; argc],
+                vec![Type::Int32; params.len()],
                 vec![Type::Int32],
             );
 
-            // Bind locals
+            // Bind params
             let mut locals: HashMap<String, ValueId> = Default::default();
-            locals.insert("this".to_string(), b.param(0));
-            for (i, name) in params.iter().enumerate() {
-                locals.insert(name.clone(), b.param(i + 1));
+            for (i, p) in params.iter().enumerate() {
+                locals.insert(p.clone(), b.param(i));
             }
 
+            let mut fields: HashMap<String, FieldId> = Default::default();
+            let mut next_field: u32 = 0;
+
             if is_async {
-                // --- Async prologue: d = Deferred()
+                // Deferred prologue
                 let (_nid, d_res) = b.push_node(
                     Inst::CallNative {
                         name: "wir_deferred_new".into(),
@@ -4831,20 +4829,18 @@ impl<'m> Lowerer<'m> {
                 let d = d_res[0];
                 locals.insert("__deferred".to_string(), d);
 
-                // Lower body with async-aware lowering.
                 lower_block_free_async(
                     &mut b,
                     &mut locals,
-                    fields,
-                    next_field,
-                    &body_rw,
+                    &mut fields,
+                    &mut next_field,
+                    body,
                     &self.funcs,
                     &self.lam_captures,
-                    true, // in_async
+                    true,
                     &self.links,
                 )?;
 
-                // Fallthrough: if the body didn’t explicitly return, resolve with 0 and return d.
                 if !b.current_block_terminated() {
                     let zero = b.const_i32(0);
                     let (_nid, _) = b.push_node(
@@ -4861,13 +4857,12 @@ impl<'m> Lowerer<'m> {
                     b.ret(&[d]);
                 }
             } else {
-                // --- Sync path (what you already had), but sharing the CLASS field-id map
                 lower_block_free(
                     &mut b,
                     &mut locals,
-                    fields,
-                    next_field,
-                    &body_rw,
+                    &mut fields,
+                    &mut next_field,
+                    body,
                     &self.funcs,
                     &self.lam_captures,
                     &self.links,
@@ -5040,7 +5035,10 @@ impl<'m> Lowerer<'m> {
                         new_args.push(Expr::This);
                         new_args.extend(args.iter().cloned());
                         Expr::Call {
-                            callee: SmallBox::new(Expr::Ident(format!("__ctor_{}", base))),
+                            callee: SmallBox::new(Expr::Ident(format!(
+                                "__ctor_{}",
+                                base
+                            ))),
                             args: new_args,
                         }
                     } else {
@@ -5080,6 +5078,115 @@ impl<'m> Lowerer<'m> {
         rw_block(body, f)
     }
 
+    fn lower_instance_fun(
+        &mut self,
+        class_name: &str,
+        fname: &str,
+        params: &[String],
+        body: &Block,
+        is_async: bool,
+        // class-shared field-id table (important!)
+        fields: &mut HashMap<String, FieldId>,
+        next_field: &mut u32,
+    ) -> LResult<()> {
+        use crate::wir::{Inst, Type};
+
+        // Keep your private/super rewriter
+        let body_rw = self.rewrite_privates_in_block(class_name, body);
+
+        // Build function: hidden `this` + user params
+        let mut f = {
+            let argc = params.len() + 1;
+            let mut b = Builder::new(
+                self.module,
+                fname,
+                vec![Type::Int32; argc],
+                vec![Type::Int32],
+            );
+
+            // Bind locals
+            let mut locals: HashMap<String, ValueId> = Default::default();
+            locals.insert("this".to_string(), b.param(0));
+            for (i, name) in params.iter().enumerate() {
+                locals.insert(name.clone(), b.param(i + 1));
+            }
+
+            if is_async {
+                // --- Async prologue: d = Deferred()
+                let (_nid, d_res) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_deferred_new".into(),
+                        args: vec![],
+                        pure: false,
+                        can_throw: false,
+                    },
+                    None,
+                    1,
+                    true,
+                );
+                let d = d_res[0];
+                locals.insert("__deferred".to_string(), d);
+
+                // Lower body with async-aware lowering.
+                lower_block_free_async(
+                    &mut b,
+                    &mut locals,
+                    fields,
+                    next_field,
+                    &body_rw,
+                    &self.funcs,
+                    &self.lam_captures,
+                    true,
+                    &self.links,
+                )?;
+
+                // Fallthrough: if the body didn’t explicitly return, resolve with 0 and return d.
+                if !b.current_block_terminated() {
+                    let zero = b.const_i32(0);
+                    let (_nid, _) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_deferred_resolve".into(),
+                            args: vec![d, zero],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        None,
+                        1,
+                        true,
+                    );
+                    b.ret(&[d]);
+                }
+            } else {
+                // --- Sync path (what you already had), but sharing the CLASS field-id map
+                lower_block_free(
+                    &mut b,
+                    &mut locals,
+                    fields,
+                    next_field,
+                    &body_rw,
+                    &self.funcs,
+                    &self.lam_captures,
+                    &self.links,
+                )?;
+                if !b.current_block_terminated() {
+                    let zero = b.const_i32(0);
+                    b.ret(&[zero]);
+                }
+            }
+
+            b.finish()
+        };
+
+        // Set the reserved ID before pushing
+        let reserved_fid = *self.funcs.get(fname).expect("reserved");
+        f.id = reserved_fid;
+
+        // Publish into the module preserving the reserved ID
+        let fid = self.module.push_function_preserve_id(f);
+        assert_eq!(fid, reserved_fid, "push preserved ID");
+        Ok(())
+    }
+
     fn lower_allocator(
         &mut self,
         ci: &ClassInfo,
@@ -5104,7 +5211,7 @@ impl<'m> Lowerer<'m> {
             let ctor_params: Vec<String> = ci
                 .methods
                 .iter()
-                .find(|(n, _, _, _)| n == "constructor")
+                .find(|(n, _, _, _)| *n == "constructor")
                 .map(|(_, ps, _, _)| ps.clone())
                 .unwrap_or_default();
 
@@ -5130,7 +5237,7 @@ impl<'m> Lowerer<'m> {
             let obj = obj_r[0];
 
             // null for closures
-            let (_nid_null, nul) =
+            let (_nid, nul) =
                 b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
 
             // ---- Install inherited methods/accessors (root base first) ----
@@ -5138,7 +5245,7 @@ impl<'m> Lowerer<'m> {
                 if let Some(bci) = self.classes.get(bn) {
                     // methods (skip ctor/dtor)
                     for (mname, _ps, _body, _ia) in &bci.methods {
-                        if mname == "constructor" || mname == "destructor" {
+                        if *mname == "constructor" || *mname == "destructor" {
                             continue;
                         }
                         if let Some(&mfid) = self.funcs.get(&format!("__method_{}_{}", bn, mname)) {
@@ -5240,7 +5347,7 @@ impl<'m> Lowerer<'m> {
 
             // ---- Install own methods/accessors (override base if name matches) ----
             for (mname, _ps, _body, _ia) in &ci.methods {
-                if mname == "constructor" || mname == "destructor" {
+                if *mname == "constructor" || *mname == "destructor" {
                     continue;
                 }
                 if let Some(&mfid) = self.funcs.get(&format!("__method_{}_{}", ci.name, mname)) {
@@ -5413,105 +5520,6 @@ impl<'m> Lowerer<'m> {
         Ok(())
     }
 
-    fn lower_free_like_fun(
-        &mut self,
-        fname: &str,
-        params: &[String],
-        body: &Block,
-        is_async: bool,
-    ) -> LResult<()> {
-        use crate::wir::{Inst, Type};
-
-        let mut f = {
-            let mut b = Builder::new(
-                self.module,
-                fname,
-                vec![Type::Int32; params.len()],
-                vec![Type::Int32],
-            );
-
-            // Bind params
-            let mut locals: HashMap<String, ValueId> = Default::default();
-            for (i, p) in params.iter().enumerate() {
-                locals.insert(p.clone(), b.param(i));
-            }
-
-            let mut fields: HashMap<String, FieldId> = Default::default();
-            let mut next_field: u32 = 0;
-
-            if is_async {
-                // Deferred prologue
-                let (_nid, d_res) = b.push_node(
-                    Inst::CallNative {
-                        name: "wir_deferred_new".into(),
-                        args: vec![],
-                        pure: false,
-                        can_throw: false,
-                    },
-                    None,
-                    1,
-                    true,
-                );
-                let d = d_res[0];
-                locals.insert("__deferred".to_string(), d);
-
-                lower_block_free_async(
-                    &mut b,
-                    &mut locals,
-                    &mut fields,
-                    &mut next_field,
-                    body,
-                    &self.funcs,
-                    &self.lam_captures,
-                    true,
-                    &self.links,
-                )?;
-
-                if !b.current_block_terminated() {
-                    let zero = b.const_i32(0);
-                    let (_nid, _) = b.push_node(
-                        Inst::CallNative {
-                            name: "wir_deferred_resolve".into(),
-                            args: vec![d, zero],
-                            pure: false,
-                            can_throw: false,
-                        },
-                        None,
-                        1,
-                        true,
-                    );
-                    b.ret(&[d]);
-                }
-            } else {
-                lower_block_free(
-                    &mut b,
-                    &mut locals,
-                    &mut fields,
-                    &mut next_field,
-                    body,
-                    &self.funcs,
-                    &self.lam_captures,
-                    &self.links,
-                )?;
-                if !b.current_block_terminated() {
-                    let zero = b.const_i32(0);
-                    b.ret(&[zero]);
-                }
-            }
-
-            b.finish()
-        };
-
-        // Set the reserved ID before pushing
-        let reserved_fid = *self.funcs.get(fname).expect("reserved");
-        f.id = reserved_fid;
-
-        // Publish into the module preserving the reserved ID
-        let fid = self.module.push_function_preserve_id(f);
-        assert_eq!(fid, reserved_fid, "push preserved ID");
-        Ok(())
-    }
-
     /// Ensure a BindingId exists for every imported namespace (ns in `import * as ns from ...`).
     /// This must run before lowering any function body so identifiers like `ns` never hit UnknownVar.
     fn ensure_namespace_cells_prealloc(&mut self) {
@@ -5530,8 +5538,26 @@ impl<'m> Lowerer<'m> {
         }
     }
 
+    fn ensure_local_class_cells_prealloc(&mut self) {
+        for name in &self.pending_local_class_names {
+            self.links
+                .class_bindings
+                .entry(name.clone())
+                .or_insert_with(|| self.module.fresh_binding());
+        }
+    }
+
+    fn ensure_proto_cells_prealloc(&mut self) {
+        for name in &self.pending_proto_names {
+            self.links
+                .proto_bindings
+                .entry(name.clone())
+                .or_insert_with(|| self.module.fresh_binding());
+        }
+    }
+
     fn ensure_export_cells_prealloc(&mut self) {
-        for name in std::mem::take(&mut self.pending_export_names) {
+        for name in &self.pending_export_names {
             self.links
                 .export_bindings
                 .entry(name.clone())
@@ -5597,6 +5623,19 @@ impl<'m> Lowerer<'m> {
                 }
             }
             // Nota: import "m"; (sólo efectos) → items vacío → no hace falta predeclarar nada
+        }
+
+        // --- CLASSES: local class names and proto for all classes ---
+        self.pending_local_class_names.clear();
+        self.pending_proto_names.clear();
+
+        for c in &prog.classes {
+            let name = c.name.clone();
+            self.pending_proto_names.push(name.clone());
+
+            if !self.links.export_bindings.contains_key(&name) {
+                self.pending_local_class_names.push(name);
+            }
         }
 
         #[cfg(debug_assertions)]

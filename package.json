@@ -8,7 +8,7 @@
         "cargo::run": "RUSTFLAGS=\" -Awarnings\" cargo run -- scripts/index.napalm",
         "cargo::run::file": "RUSTFLAGS=\" -Awarnings\" cargo run > log.txt 2>&1 -- scripts/index.napalm",
         "cargo::run::no_debug": "RUSTFLAGS=\"-C debug-assertions=no -Awarnings\" cargo run -- scripts/index.napalm",
-        "cargo::run::classes": "RUSTFLAGS=\"-Awarnings\" cargo run -- scripts/classes.napalm",
+        "cargo::run::classes": "RUSTFLAGS=\"-Awarnings\" cargo run > log.txt 2>&1 -- scripts/classes.napalm",
         "cargo::run::imports": "RUSTFLAGS=\"-Awarnings\" cargo run > log.txt 2>&1 -- scripts/import.napalm",
         "cargo::build": "RUSTFLAGS=\"-Awarnings\" cargo build --release"
     },
