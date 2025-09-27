@@ -158,6 +158,57 @@ print(c.find(|x| (x % 2) == 0 && x >= 4));   // expect 4
 var find_index = 4;
 print(c.findIndex(|x| x == 4));              // expect 4
 
+print("===== Classes =====");
+// --- Base class: ctor, instance methods, static, getter ---
+class Base {
+  constructor(a) { this.a = a; }
+
+  fn m(k) { return this.a + k; }
+
+  // mutate via instance method (used to confirm 'this' works)
+  fn inc(n) { this.a = this.a + n; return this.a; }
+
+  static fn S(v) { return v + 100; }
+
+  get double() { return this.a + this.a; }
+}
+
+// --- Derived: single inheritance + super(...) + super.m(...) override ---
+class Derived extends Base {
+  constructor(a) {
+    super(a + 1);           // exercise super(...) rewrite
+  }
+  fn m(k) {
+    return super.m(k + 1) + 1;  // exercise super.m(...) rewrite
+  }
+}
+
+// --- Class with literal field initializer (pure) ---
+class InitOnly {
+  var z = 7;                 // tested during allocation
+  async fn getZ() { return await this.z; }
+}
+
+var b = new Base(10);
+print(b.m(5));          // expect 15
+
+// If your tiny patch added bracket-call 'this' injection, this should also be 15:
+print(b);       // expect 10 (or skip if not yet supported)
+
+print(Base.S(1));       // expect 101
+
+var d = new Derived(10);             // Base.a receives 11
+print(d.m(5));          // super.m(6)=17; +1 => 18
+print(d);       // expect 18 (same caveat as T2)
+
+print(b.double);        // getter → 20
+
+var i = new InitOnly();
+print(await i.getZ());        // expect 7
+
+b.a = b.a + 5;                         // a: 10 -> 15
+print(b.a);             // expect 15
+
 print("===== Closures =====");
 fn make_adder(x) {
     return |y| x + y;
@@ -195,10 +246,10 @@ setTimeout(| | { e.reject(1); }, 0);
 
 print("===== Timers =====");
 print("(async)");
-setTimeout(fn () { print("Timer"); }, 50);
+setTimeout(fn () { print("Timer"); }, 10);
 
 // Timer (2)
-setTimeout(fn () { print("Timer (2)"); }, 100);
+setTimeout(fn () { print("Timer (2)"); }, 20);
 
 print("===== Async/Await =====");
 print("(async)");

@@ -241,6 +241,7 @@ fn compute_reachable_vec(func: &Function, bix_of: &HashMap<BlockId, usize>) -> V
 
 /// Enumerate operands and bump `uses[v]` for each occurrence.
 /// Keep in sync with the IR; conservative overcounting is safe for DCE.
+/// Enumerate operands and bump `uses[v]` for each occurrence.
 fn bump_uses_for_inst(uses: &mut [usize], k: &Inst) {
     #[inline]
     fn bump(uses: &mut [usize], v: ValueId) {
@@ -250,29 +251,25 @@ fn bump_uses_for_inst(uses: &mut [usize], k: &Inst) {
         }
     }
 
+    // A helper for instructions with a common `(receiver, [args...])` pattern
+    fn bump_recv_args(uses: &mut [usize], recv: ValueId, args: &[ValueId]) {
+        bump(uses, recv);
+        for &arg in args {
+            bump(uses, arg);
+        }
+    }
+
     match k {
         // ---- Control ----
-        Inst::Phi(vals) => {
-            for &v in vals {
-                bump(uses, v);
-            }
-        }
-        Inst::Jump(_b, args) => {
-            for &v in args {
-                bump(uses, v);
-            }
-        }
+        Inst::Phi(vals) => vals.iter().for_each(|&v| bump(uses, v)),
+        Inst::Jump(_b, args) => args.iter().for_each(|&v| bump(uses, v)),
         Inst::Branch { cond, .. } => bump(uses, *cond),
         Inst::Switch { tag, .. } => bump(uses, *tag),
-        Inst::Return(vals) => {
-            for &v in vals {
-                bump(uses, v);
-            }
-        }
+        Inst::Return(vals) => vals.iter().for_each(|&v| bump(uses, v)),
         Inst::Throw(v) => bump(uses, *v),
 
         // ---- Effect / bookkeeping ----
-        Inst::EffectEntry | Inst::Safepoint => {}
+        Inst::EffectEntry | Inst::Safepoint | Inst::OSRPoint => {}
 
         // ---- Constants / moves ----
         Inst::Const(_) => {}
@@ -290,15 +287,18 @@ fn bump_uses_for_inst(uses: &mut [usize], k: &Inst) {
         Inst::GuardIsF64 { val, .. } => bump(uses, *val),
         Inst::Bailout { .. } => {}
 
-        // ---- Objects ----
-        Inst::AllocObj { .. } => {}
+        // ---- Objects & Classes ----
+        Inst::AllocObj { .. } | Inst::AllocInstance { .. } => {}
         Inst::LoadField { obj, .. } => bump(uses, *obj),
         Inst::StoreField { obj, val, .. } => {
             bump(uses, *obj);
             bump(uses, *val);
         }
         Inst::TransitionShape { obj, .. } => bump(uses, *obj),
-
+        Inst::LoadMethod { obj, .. } => bump(uses, *obj),
+        Inst::LoadSuperMethod { recv, .. } => bump(uses, *recv),
+        Inst::InstanceOf { obj, .. } => bump(uses, *obj),
+        
         // ---- Arrays ----
         Inst::AllocArray { len, .. } => bump(uses, *len),
         Inst::ArrayLen(v) => bump(uses, *v),
@@ -320,19 +320,15 @@ fn bump_uses_for_inst(uses: &mut [usize], k: &Inst) {
             bump(uses, *start);
             bump(uses, *end);
         }
-
-        // Array methods / higher-level ops
         Inst::ArrayPush { arr, val } => {
             bump(uses, *arr);
             bump(uses, *val);
         }
-        Inst::ArrayPop(arr) => bump(uses, *arr),
-        Inst::ArrayShift(arr) => bump(uses, *arr),
+        Inst::ArrayPop(arr) | Inst::ArrayShift(arr) => bump(uses, *arr),
         Inst::ArrayUnshift { arr, val } => {
             bump(uses, *arr);
             bump(uses, *val);
         }
-
         Inst::ArrayMap { arr, .. } => bump(uses, *arr),
         Inst::ArrayReduce { init, arr, .. } => {
             bump(uses, *init);
@@ -347,15 +343,14 @@ fn bump_uses_for_inst(uses: &mut [usize], k: &Inst) {
             bump(uses, *src);
             bump(uses, *len);
         }
-
-        Inst::ArrayForEach { arr, .. } => bump(uses, *arr),
-        Inst::ArrayFind { arr, .. } => bump(uses, *arr),
-        Inst::ArrayFindIndex { arr, .. } => bump(uses, *arr),
-        Inst::ArrayFilter { arr, .. } => bump(uses, *arr),
+        Inst::ArrayForEach { arr, .. }
+        | Inst::ArrayFind { arr, .. }
+        | Inst::ArrayFindIndex { arr, .. }
+        | Inst::ArrayFilter { arr, .. } => bump(uses, *arr),
 
         // ---- Strings ----
         Inst::StrLen(s) => bump(uses, *s),
-        Inst::StrConcat { a, b } => {
+        Inst::StrConcat { a, b } | Inst::StrCompare { a, b } => {
             bump(uses, *a);
             bump(uses, *b);
         }
@@ -364,10 +359,6 @@ fn bump_uses_for_inst(uses: &mut [usize], k: &Inst) {
             bump(uses, *start);
             bump(uses, *end);
         }
-        Inst::StrCompare { a, b } => {
-            bump(uses, *a);
-            bump(uses, *b);
-        }
         Inst::StrContains { s, sub } => {
             bump(uses, *s);
             bump(uses, *sub);
@@ -375,31 +366,16 @@ fn bump_uses_for_inst(uses: &mut [usize], k: &Inst) {
         Inst::StrToNumber(s) => bump(uses, *s),
 
         // ---- Numerics ----
-        Inst::IntBin { a, b, .. } => {
-            bump(uses, *a);
-            bump(uses, *b);
-        }
-        Inst::F64Bin { a, b, .. } => {
-            bump(uses, *a);
-            bump(uses, *b);
-        }
-        Inst::NumAdd(a, b)
+        Inst::IntBin { a, b, .. }
+        | Inst::F64Bin { a, b, .. }
+        | Inst::NumAdd(a, b)
         | Inst::NumSub(a, b)
         | Inst::NumMul(a, b)
         | Inst::NumDiv(a, b)
-        | Inst::NumRem(a, b) => {
-            bump(uses, *a);
-            bump(uses, *b);
-        }
-        Inst::CmpInt { a, b, .. } => {
-            bump(uses, *a);
-            bump(uses, *b);
-        }
-        Inst::CmpF64 { a, b, .. } => {
-            bump(uses, *a);
-            bump(uses, *b);
-        }
-        Inst::CmpRefEq { a, b } => {
+        | Inst::NumRem(a, b)
+        | Inst::CmpInt { a, b, .. }
+        | Inst::CmpF64 { a, b, .. }
+        | Inst::CmpRefEq { a, b } => {
             bump(uses, *a);
             bump(uses, *b);
         }
@@ -412,24 +388,13 @@ fn bump_uses_for_inst(uses: &mut [usize], k: &Inst) {
         | Inst::UnboxToF64(v) => bump(uses, *v),
 
         // ---- Calls / closures ----
-        Inst::CallDirect { args, .. } => {
-            for &v in args {
-                bump(uses, v);
-            }
-        }
-        Inst::CallDirectMemoized { args, .. } => {
-            for &v in args {
-                bump(uses, v);
-            }
-        }
-        Inst::CallIC { recv, args, .. } => {
-            bump(uses, *recv);
-            for &v in args {
-                bump(uses, v);
-            }
-        }
+        Inst::CallDirect { args, .. } 
+        | Inst::CallDirectMemoized { args, .. } => args.iter().for_each(|&v| bump(uses, v)),
+        Inst::CallIC { recv, args, .. } => bump_recv_args(uses, *recv, args),
+        Inst::CallMethodIC { recv, args, .. } => bump_recv_args(uses, *recv, args),
+        Inst::CallSuper { recv, args, .. } => bump_recv_args(uses, *recv, args),
         Inst::MethodLookup { obj, .. } => bump(uses, *obj),
-        Inst::AllocClosure { .. } => {}
+        Inst::AllocClosure { .. } => {} // Produces a value, has no ValueId operands
         Inst::LoadEnv { clos, .. } => bump(uses, *clos),
         Inst::StoreEnv { clos, val, .. } => {
             bump(uses, *clos);
@@ -438,28 +403,39 @@ fn bump_uses_for_inst(uses: &mut [usize], k: &Inst) {
         Inst::MakeClosure { env, .. } => bump(uses, *env),
         Inst::CallClosure { fun, args, .. } => {
             bump(uses, *fun);
-            for &v in args {
-                bump(uses, v);
-            }
+            args.iter().for_each(|&v| bump(uses, v));
         }
 
-        // ---- Native / intrinsics ----
-        Inst::CallNative { args, .. } => {
-            for &v in args {
-                bump(uses, v);
-            }
+        // ---- Natives / Timers / GC ----
+        Inst::CallNative { args, .. } => args.iter().for_each(|&v| bump(uses, v)),
+        Inst::SetTimeout { fun, delay_ms } => {
+            bump(uses, *fun);
+            bump(uses, *delay_ms);
         }
-
-        // ---- GC barriers ----
+        Inst::SetInterval { fun, period_ms } => {
+            bump(uses, *fun);
+            bump(uses, *period_ms);
+        }
+        Inst::ClearTimeout { id } | Inst::ClearInterval { id } => bump(uses, *id),
         Inst::PostWriteBarrier { obj, val } => {
             bump(uses, *obj);
             bump(uses, *val);
         }
         Inst::ReadBarrier { obj } => bump(uses, *obj),
 
-        // ---- OSR ----
-        Inst::OSRPoint => {}
+        // ---- Modules / ESM ----
+        // This was the critical missing case!
+        Inst::StoreBinding { val, .. } => bump(uses, *val),
+        // These produce values but have no ValueId operands
+        Inst::LoadBinding { .. } | Inst::MakeNamespace { .. } => {}
+        // This one was also missing
+        Inst::ImportDynamic { spec } => bump(uses, *spec),
 
-        _ => { /* other instructions: ignore or add as needed */ }
+        // ---- Classes (that were not covered yet) ----
+        // These instructions use IDs, not ValueIds, so they don't need bumping
+        Inst::RegisterClass { .. } => {}
+
+        // ---- Other ----
+        _ => {}
     }
 }

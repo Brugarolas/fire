@@ -16,7 +16,7 @@ use std::{
 use crate::front::{ExportDecl, ImportItem, ModuleAST, Parser, Program};
 use crate::lowerer::{LinkInfo, Lowerer};
 use crate::opt::optimization::optimization_passes;
-use crate::wir::{Builder as WirBuilder, CallConv, FuncId, IdRemap, Inst, Type};
+use crate::wir::{Builder as WirBuilder, CallConv, FuncId, IdRemap, Inst, Type, BindingId};
 
 /// -----------------------------------------
 /// Minimal infra
@@ -242,45 +242,52 @@ impl ProgramBuilder {
         &self,
         path: &Arc<PathBuf>,
         prog: &Program,
+        // This cache is important to avoid re-analyzing the AST of modules that are imported multiple times.
         export_kind_cache: &mut HashMap<Arc<PathBuf>, HashMap<String, ExportSymbolKind>>,
     ) -> Result<LinkInfo, String> {
-        let mbox = self
+        // 1. Start with a fresh LinkInfo for the current module.
+        let mut links = LinkInfo::default();
+
+        // 2. Get the ModuleAST for the current module, which contains the results of the parse-time binding.
+        let module_ast = self
             .ctx
             .registry
             .get(path)
-            .ok_or_else(|| format!("link: missing ModuleAST for {:?}", path))?;
-        let module_ast: &ModuleAST<'static> = &**mbox;
+            .ok_or_else(|| format!("[Linker] FATAL: Missing ModuleAST for own module {:?}", path))?;
 
-        let mut links = LinkInfo::default();
-
-        // Exports owned by this module.
+        // 3. Populate this module's OWN exports. The BindingIds were already created correctly by the parser
+        //    and stored in this module's ModuleAST. We just copy them over.
         for (name, item) in &module_ast.exports {
             links
                 .export_bindings
                 .insert((*name).to_string(), item.binding);
         }
 
+        // 4. Iterate through all `import` statements in this module to resolve them.
         for imp in &prog.imports {
-            // Resolve specifier just like the parser did so we can locate the provider module.
-            let resolved = self
+            // Resolve the "./math" style specifier to a full, canonical path.
+            let resolved_provider_path = self
                 .loader
                 .resolve(path.as_ref(), &imp.specifier)
-                .map_err(|e| format!("resolve({:?}, {}): {e}", path, imp.specifier))?;
-            let resolved_arc = Arc::new(resolved);
+                .map_err(|e| format!("Linker cannot resolve '{}' from {:?}: {}", imp.specifier, path, e))?;
+            let resolved_provider_arc = Arc::new(resolved_provider_path);
 
-            let provider_ast_box = self
+            // Get the ModuleAST of the module we are importing FROM.
+            let provider_ast = self
                 .ctx
                 .registry
-                .get(&resolved_arc)
-                .ok_or_else(|| format!("link: source module not found: {:?}", resolved_arc))?;
-            let provider_ast: &ModuleAST<'static> = &**provider_ast_box;
+                .get(&resolved_provider_arc)
+                .ok_or_else(|| format!("[Linker] FATAL: Missing provider ModuleAST for {:?}", resolved_provider_arc))?;
 
-            if !export_kind_cache.contains_key(&resolved_arc) {
+            // 5. To know if an import is a class, we need to inspect the provider's full AST.
+            //    We do this once per provider and cache the results.
+            if !export_kind_cache.contains_key(&resolved_provider_arc) {
                 let provider_prog = self
                     .programs
-                    .get(&resolved_arc)
-                    .ok_or_else(|| format!("link: missing Program for {:?}", resolved_arc))?;
-                let mut kind_map: HashMap<String, ExportSymbolKind> = HashMap::default();
+                    .get(&resolved_provider_arc)
+                    .ok_or_else(|| format!("[Linker] FATAL: Missing provider Program AST for {:?}", resolved_provider_arc))?;
+
+                let mut kind_map = HashMap::default();
                 for ed in &provider_prog.exports {
                     match ed {
                         ExportDecl::Func(name) => {
@@ -294,59 +301,65 @@ impl ProgramBuilder {
                         }
                         ExportDecl::Named { items } | ExportDecl::From { items, .. } => {
                             for (local, alias) in items {
-                                let public = alias.clone().unwrap_or_else(|| local.clone());
-                                kind_map.entry(public).or_insert(ExportSymbolKind::Other);
+                                let public_name = alias.clone().unwrap_or_else(|| local.clone());
+                                // We can't know the original type of a re-export without deep analysis,
+                                // so we conservatively mark it as 'Other'.
+                                kind_map.entry(public_name).or_insert(ExportSymbolKind::Other);
                             }
                         }
                         ExportDecl::AllFrom { .. } => {
-                            // Without resolving the re-export chain we can't classify; leave empty.
+                            // Re-exporting all is too complex to analyze here, skip for now.
                         }
                     }
                 }
-                export_kind_cache.insert(resolved_arc.clone(), kind_map);
+                export_kind_cache.insert(resolved_provider_arc.clone(), kind_map);
             }
+            let export_kinds = export_kind_cache.get(&resolved_provider_arc).unwrap();
 
-            let export_kinds = export_kind_cache
-                .get(&resolved_arc)
-                .expect("export kind cache entry");
-
-            let mut provider_exports: Vec<(String, crate::wir::BindingId)> = provider_ast
-                .exports
-                .iter()
-                .map(|(name, item)| ((*name).to_string(), item.binding))
-                .collect();
-            provider_exports.sort_by(|a, b| a.0.cmp(&b.0));
-
+            // 6. Now, process each item in the `import` statement (`{a, b}`, `* as ns`).
             for item in &imp.items {
                 match item {
+                    // Case: `import { name as alias } from ...`
                     ImportItem::Named { name, alias } => {
-                        let local = alias.as_ref().unwrap_or(name).clone();
-                        if let Some(export_item) = provider_ast.exports.get(name.as_str()) {
-                            links.import_bindings.insert(local, export_item.binding);
+                        let local_name = alias.as_ref().unwrap_or(name);
 
-                            if matches!(export_kinds.get(name), Some(ExportSymbolKind::Class)) {
-                                links.imported_class_bindings.insert(export_item.binding);
+                        // Find the export in the provider module to get the globally unique BindingId.
+                        if let Some(provider_export_item) = provider_ast.exports.get(name.as_str()) {
+                            let global_binding_id = provider_export_item.binding;
+
+                            // Map our local name to that global ID.
+                            links.import_bindings.insert(local_name.clone(), global_binding_id);
+
+                            // Check if this binding is for a class and record it.
+                            if matches!(export_kinds.get(name), Some(&ExportSymbolKind::Class)) {
+                                links.imported_class_bindings.insert(global_binding_id);
                             }
                         } else {
+                            // This would be a linker error in a real compiler.
                             #[cfg(debug_assertions)]
-                            {
-                                eprintln!(
-                                    "[bind] WARNING: {:?} imports '{}' from {:?}, but it's not exported there.",
-                                    path, name, resolved_arc
-                                );
-                            }
+                            eprintln!(
+                                "[Linker] WARNING: Module {:?} imports '{}' from {:?}, but it is not exported.",
+                                path, name, resolved_provider_arc
+                            );
                         }
                     }
+                    // Case: `import * as ns from ...`
                     ImportItem::Namespace { alias } => {
-                        links
-                            .namespace_imports
-                            .entry(alias.clone())
-                            .or_insert_with(|| provider_exports.clone());
+                        // Collect ALL exports from the provider module.
+                        let all_provider_exports: Vec<(String, BindingId)> = provider_ast
+                            .exports
+                            .iter()
+                            .map(|(name, item)| ((*name).to_string(), item.binding))
+                            .collect();
+
+                        // Map our local namespace alias to this full list.
+                        links.namespace_imports.insert(alias.clone(), all_provider_exports);
                     }
                 }
             }
         }
 
+        // 7. Return the fully populated LinkInfo for this module.
         Ok(links)
     }
 

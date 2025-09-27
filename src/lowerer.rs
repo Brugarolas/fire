@@ -107,9 +107,6 @@ pub struct Lowerer<'m> {
     lam_captures: HashMap<String, Vec<String>>,
     classes: HashMap<String, ClassInfo>,
     links: LinkInfo,
-    pending_export_names: Vec<String>,
-    pending_local_class_names: Vec<String>,
-    pending_proto_names: Vec<String>,
 }
 
 impl<'m> Lowerer<'m> {
@@ -120,9 +117,6 @@ impl<'m> Lowerer<'m> {
             lam_captures: Default::default(),
             classes: Default::default(),
             links: Default::default(),
-            pending_export_names: Vec::new(),
-            pending_local_class_names: Vec::new(),
-            pending_proto_names: Vec::new(),
         }
     }
 
@@ -145,38 +139,6 @@ impl<'m> Lowerer<'m> {
     pub fn lower_program(&mut self, prog: &Program) -> LResult<Vec<FuncId>> {
         // -------- Stage 1: collect classes & their metadata --------
         self.classes.clear();
-
-        // Build LinkInfo from AST once
-        self.seed_links_from_ast(prog);
-
-        self.ensure_export_cells_prealloc();
-
-        // Make sure namespace cells exist so `Ident(ns)` resolves as a binding load.
-        #[cfg(debug_assertions)]
-        {
-            eprintln!(
-                "[lower_program] prealloc ns cells — imports: {:?}",
-                self.links.namespace_imports.keys().collect::<Vec<_>>()
-            );
-        }
-        self.ensure_namespace_cells_prealloc();
-
-        // Prealloc class and proto cells
-        self.ensure_local_class_cells_prealloc();
-        self.ensure_proto_cells_prealloc();
-
-        #[cfg(debug_assertions)]
-        {
-            eprintln!(
-                "[lower_program] links.imports   = {:?}",
-                self.links.import_bindings.keys().collect::<Vec<_>>()
-            );
-            eprintln!(
-                "[lower_program] links.namespaces= {:?}",
-                self.links.namespace_imports.keys().collect::<Vec<_>>()
-            );
-            eprintln!("[links] namespace_cells: {:?}", self.links.namespace_cells);
-        }
 
         for c in &prog.classes {
             // gather accessors by name so we can form (getter,setter)
@@ -2625,8 +2587,6 @@ fn lower_expr_free<'m>(
             }
 
             // 6) Namespace import cached in `__modinit__` (fast path).
-            //    If `seed_links_from_ast` detected a namespace alias and `__modinit__`
-            //    cached it into a local binding, we can read it directly.
             if let Some(&cell) = links.namespace_cells.get(name) {
                 let ns_obj = b.load_binding(cell, None);
                 return Ok(ns_obj);
@@ -5788,135 +5748,6 @@ impl<'m> Lowerer<'m> {
         let fid = self.module.push_function_preserve_id(f);
         assert_eq!(fid, reserved_fid, "push preserved ID");
         Ok(())
-    }
-
-    /// Ensure a BindingId exists for every imported namespace (ns in `import * as ns from ...`).
-    /// This must run before lowering any function body so identifiers like `ns` never hit UnknownVar.
-    fn ensure_namespace_cells_prealloc(&mut self) {
-        // Collect keys first to avoid borrow conflicts
-        let keys: Vec<String> = self.links.namespace_imports.keys().cloned().collect();
-        for ns in keys {
-            self.links
-                .namespace_cells
-                .entry(ns.clone())
-                .or_insert_with(|| {
-                    #[cfg(debug_assertions)]
-                    eprintln!("[links] prealloc namespace cell for {:?}", ns);
-
-                    self.module.fresh_binding()
-                });
-        }
-    }
-
-    fn ensure_local_class_cells_prealloc(&mut self) {
-        for name in &self.pending_local_class_names {
-            self.links
-                .class_bindings
-                .entry(name.clone())
-                .or_insert_with(|| self.module.fresh_binding());
-        }
-    }
-
-    fn ensure_proto_cells_prealloc(&mut self) {
-        for name in &self.pending_proto_names {
-            self.links
-                .proto_bindings
-                .entry(name.clone())
-                .or_insert_with(|| self.module.fresh_binding());
-        }
-    }
-
-    fn ensure_export_cells_prealloc(&mut self) {
-        for name in &self.pending_export_names {
-            self.links
-                .export_bindings
-                .entry(name.clone())
-                .or_insert_with(|| self.module.fresh_binding());
-        }
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[prealloc exports] export cells = {:?}",
-            self.links.export_bindings.keys().collect::<Vec<_>>()
-        );
-    }
-
-    pub fn seed_links_from_ast(&mut self, prog: &Program) {
-        // --- EXPORTS: sólo registramos los nombres que queremos prealocar luego ---
-        self.pending_export_names.clear();
-
-        for e in &prog.exports {
-            match e {
-                ExportDecl::Var(name) | ExportDecl::Func(name) | ExportDecl::Class(name) => {
-                    self.pending_export_names.push(name.clone());
-                }
-
-                // export { local as alias }
-                ExportDecl::Named { items } => {
-                    for (local, alias) in items {
-                        let public = alias.clone().unwrap_or_else(|| local.clone());
-                        self.pending_export_names.push(public);
-                    }
-                }
-
-                // Re-exports: no crean símbolo local
-                ExportDecl::From { .. } | ExportDecl::AllFrom { .. } => {}
-            }
-        }
-
-        // --- IMPORTS: usa ImportDecl { specifier, items: Vec<ImportItem> } ---
-        for imp in &prog.imports {
-            for item in &imp.items {
-                match item {
-                    // import { name } from "m"
-                    // import { name as alias } from "m"
-                    ImportItem::Named { name, alias } => {
-                        let local = alias.as_ref().unwrap_or(name).clone();
-                        self.links
-                            .import_bindings
-                            .entry(local)
-                            .or_insert_with(|| self.module.fresh_binding());
-                    }
-
-                    // import * as ns from "m"
-                    ImportItem::Namespace { alias } => {
-                        self.links
-                            .namespace_cells
-                            .entry(alias.clone())
-                            .or_insert_with(|| self.module.fresh_binding());
-
-                        // Mantén también un registro para que __modinit__ pueda materializar el objeto namespace si toca
-                        self.links
-                            .namespace_imports
-                            .entry(alias.clone())
-                            .or_insert_with(Vec::new);
-                    }
-                }
-            }
-            // Nota: import "m"; (sólo efectos) → items vacío → no hace falta predeclarar nada
-        }
-
-        // --- CLASSES: local class names and proto for all classes ---
-        self.pending_local_class_names.clear();
-        self.pending_proto_names.clear();
-
-        for c in &prog.classes {
-            let name = c.name.clone();
-            self.pending_proto_names.push(name.clone());
-
-            if !self.links.export_bindings.contains_key(&name) {
-                self.pending_local_class_names.push(name);
-            }
-        }
-
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[seed_links_from_ast] will alloc export cells for {:?}",
-            self.pending_export_names
-        );
-    }
-
-    pub fn links_snapshot(&self) -> LinkInfo {
-        self.links.clone()
     }
 }
 
