@@ -4,6 +4,7 @@
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use logos::Logos;
 use smallbox::SmallBox;
+use std::cell::Cell;
 use std::collections::hash_map::Entry;
 use std::{collections::BTreeSet, ops::Deref};
 
@@ -45,6 +46,37 @@ pub enum LowerError {
 }
 
 type LResult<T> = Result<T, LowerError>;
+
+thread_local! {
+    static AWAIT_SCOPE_DEPTH: Cell<u32> = Cell::new(0);
+}
+
+struct AwaitScopeGuard;
+
+impl AwaitScopeGuard {
+    fn enter() -> Self {
+        AWAIT_SCOPE_DEPTH.with(|depth| {
+            let cur = depth.get();
+            depth.set(cur.saturating_add(1));
+        });
+        AwaitScopeGuard
+    }
+}
+
+impl Drop for AwaitScopeGuard {
+    fn drop(&mut self) {
+        AWAIT_SCOPE_DEPTH.with(|depth| {
+            let cur = depth.get();
+            if cur > 0 {
+                depth.set(cur - 1);
+            }
+        });
+    }
+}
+
+fn await_allowed() -> bool {
+    AWAIT_SCOPE_DEPTH.with(|depth| depth.get() > 0)
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct LinkInfo {
@@ -725,16 +757,7 @@ fn lower_stmt_free<'m>(
             b.branch(c, body_b, exit);
 
             b.position_at(body_b);
-            lower_block_free(
-                b,
-                locals,
-                fields,
-                next_field,
-                body,
-                funcs,
-                lam_caps,
-                links,
-            )?; // <-- pass
+            lower_block_free(b, locals, fields, next_field, body, funcs, lam_caps, links)?; // <-- pass
             let back_args: Vec<ValueId> =
                 mut_names.iter().map(|n| *locals.get(n).unwrap()).collect();
             b.jump(head, &back_args);
@@ -797,16 +820,7 @@ fn lower_stmt_free<'m>(
             b.branch(c, body_b, exit);
 
             b.position_at(body_b);
-            lower_block_free(
-                b,
-                locals,
-                fields,
-                next_field,
-                body,
-                funcs,
-                lam_caps,
-                links,
-            )?; // <-- pass
+            lower_block_free(b, locals, fields, next_field, body, funcs, lam_caps, links)?; // <-- pass
             if let Some(se) = step {
                 let _ = lower_expr_free(b, locals, fields, next_field, se, funcs, lam_caps, links)?;
             } // <-- pass
@@ -1236,10 +1250,26 @@ fn lower_stmt_free_async<'m>(
             // add routes
             for rt in &ld.routes {
                 let pat_v = lower_expr_free_async(
-                    b, locals, fields, next_field, &rt.pattern, funcs, lam_caps, in_async, links,
+                    b,
+                    locals,
+                    fields,
+                    next_field,
+                    &rt.pattern,
+                    funcs,
+                    lam_caps,
+                    in_async,
+                    links,
                 )?;
                 let hnd_v = lower_expr_free_async(
-                    b, locals, fields, next_field, &rt.handler, funcs, lam_caps, in_async, links,
+                    b,
+                    locals,
+                    fields,
+                    next_field,
+                    &rt.handler,
+                    funcs,
+                    lam_caps,
+                    in_async,
+                    links,
                 )?;
                 let (_mid, mr) = b.push_node(
                     Inst::Const(Constant::Str(rt.method.clone())),
@@ -1304,7 +1334,8 @@ fn lower_stmt_free_async<'m>(
                             PropKey::Ident(name) => name.as_str(),
                             PropKey::Str(name) => name.as_str(),
                         };
-                        let value = lower_general_getprop(b, obj_val, prop_name, fields, next_field);
+                        let value =
+                            lower_general_getprop(b, obj_val, prop_name, fields, next_field);
                         locals.insert(field.binding.clone(), value);
                         if let Some(&bid) = links.export_bindings.get(&field.binding) {
                             b.store_binding(bid, value);
@@ -1627,31 +1658,11 @@ fn lower_expr_free_async<'m>(
     in_async: bool,
     links: &LinkInfo,
 ) -> LResult<ValueId> {
-    match e {
-        Expr::Await(inner) => {
-            if !in_async {
-                return Err(LowerError::NotLowerable("await outside async function"));
-            }
-            let pv = lower_expr_free_async(
-                b, locals, fields, next_field, inner, funcs, lam_caps, in_async, links,
-            )?;
-            let (_nid, res) = b.push_node(
-                Inst::CallNative {
-                    name: "wir_await".into(),
-                    args: vec![pv],
-                    pure: false,
-                    can_throw: false,
-                },
-                None,
-                1,
-                true,
-            );
-            Ok(res[0])
-        }
-        _ => {
-            // fall back to your original lowerer
-            lower_expr_free(b, locals, fields, next_field, e, funcs, lam_caps, links)
-        }
+    if in_async {
+        let _guard = AwaitScopeGuard::enter();
+        lower_expr_free(b, locals, fields, next_field, e, funcs, lam_caps, links)
+    } else {
+        lower_expr_free(b, locals, fields, next_field, e, funcs, lam_caps, links)
     }
 }
 
@@ -2464,9 +2475,24 @@ fn lower_expr_free<'m>(
             Ok(res[0])
         }
 
-        // If 'await' ever reaches the sync lowerer, give a precise error.
-        Expr::Await(_) => {
-            return Err(LowerError::NotLowerable("await outside async function"));
+        // Allow await when inside an async lowering scope.
+        Expr::Await(inner) => {
+            if !await_allowed() {
+                return Err(LowerError::NotLowerable("await outside async function"));
+            }
+            let pv = lower_expr_free(b, locals, fields, next_field, inner, funcs, lam_caps, links)?;
+            let (_nid, res) = b.push_node(
+                Inst::CallNative {
+                    name: "wir_await".into(),
+                    args: vec![pv],
+                    pure: false,
+                    can_throw: false,
+                },
+                None,
+                1,
+                true,
+            );
+            return Ok(res[0]);
         }
         // Unhoisted function literal shouldn't reach the lowerer
         Expr::FnLit { .. } => {
@@ -4535,7 +4561,10 @@ impl<'m> Lowerer<'m> {
         for (name, &bid) in &links.export_bindings {
             if let Some(&fid) = self.funcs.get(name) {
                 #[cfg(debug_assertions)]
-                eprintln!("[modinit] export function {} -> fid {:?} binding {:?}", name, fid, bid);
+                eprintln!(
+                    "[modinit] export function {} -> fid {:?} binding {:?}",
+                    name, fid, bid
+                );
                 // export function <name>
                 fn_exports.push((bid, fid));
                 continue;
@@ -4767,7 +4796,7 @@ impl<'m> Lowerer<'m> {
         // 5) Dtor (optional)
         if ci.has_dtor {
             if let Some((_, _, dtor_body, _)) =
-                ci.methods.iter().find(|(n, _, _, _) | *n == "destructor")
+                ci.methods.iter().find(|(n, _, _, _)| *n == "destructor")
             {
                 let fname = format!("__dtor_{}", cname);
                 self.lower_instance_fun(
@@ -5035,10 +5064,7 @@ impl<'m> Lowerer<'m> {
                         new_args.push(Expr::This);
                         new_args.extend(args.iter().cloned());
                         Expr::Call {
-                            callee: SmallBox::new(Expr::Ident(format!(
-                                "__ctor_{}",
-                                base
-                            ))),
+                            callee: SmallBox::new(Expr::Ident(format!("__ctor_{}", base))),
                             args: new_args,
                         }
                     } else {
@@ -5237,8 +5263,7 @@ impl<'m> Lowerer<'m> {
             let obj = obj_r[0];
 
             // null for closures
-            let (_nid, nul) =
-                b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
+            let (_nid, nul) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
 
             // ---- Install inherited methods/accessors (root base first) ----
             for bn in &base_chain {

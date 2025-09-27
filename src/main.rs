@@ -124,7 +124,10 @@ fn main() {
         return;
     }
 
-    for f in &module.funcs {
+    let mut compile_order: Vec<&wir::Function> = module.funcs.iter().collect();
+    compile_order.sort_by_key(|f| compile_priority(&f.sig.name));
+
+    for f in compile_order {
         match jit.compile(f) {
             Ok(fp) => {
                 fptrs.insert(f.sig.name.clone(), fp);
@@ -183,4 +186,19 @@ fn pick_entrypoint(module: &wir::Module) -> Option<String> {
         return Some("main".to_string());
     }
     module.funcs.get(0).map(|f| f.sig.name.clone())
+}
+
+fn compile_priority(name: &str) -> u8 {
+    if name.starts_with("__get_")
+        || name.starts_with("__set_")
+        || name.starts_with("__method_")
+        || name.starts_with("__static_")
+        || name.starts_with("__ctor_")
+        || name.starts_with("__dtor_")
+        || name.starts_with("__class_new_")
+    {
+        0
+    } else {
+        1
+    }
 }

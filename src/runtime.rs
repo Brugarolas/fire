@@ -35,6 +35,25 @@ fn decode_field_smi(v: i64) -> u32 {
 }
 
 #[inline(always)]
+fn is_heap_ptr(v: i64) -> bool {
+    v != 0 && (v & 1) == 0
+}
+
+#[inline(always)]
+fn heap_tag(v: i64) -> Option<u32> {
+    if is_heap_ptr(v) {
+        unsafe { (v as *const ObjHeader).as_ref().map(|h| h.tag) }
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
+fn is_closure_value(v: i64) -> bool {
+    matches!(heap_tag(v), Some(TAG_CLOSURE))
+}
+
+#[inline(always)]
 unsafe fn boxedstr_to_string(p: i64) -> Option<String> {
     if p == 0 {
         return None;
@@ -490,16 +509,26 @@ fn pp(v: i64, depth: usize, max_depth: usize, max_elems: usize, seen: &mut HashS
                         // Print string-keyed props first (sorted for stability)
                         let mut skeys: Vec<&String> = o.by_str.keys().collect();
                         skeys.sort_unstable();
+                        let is_class_instance = skeys
+                            .iter()
+                            .any(|k| k.starts_with("__get__") || k.starts_with("__set__"));
                         for k in skeys {
                             if wrote >= max_elems {
                                 break;
+                            }
+                            let key_str = k.as_str();
+                            if key_str.starts_with("__get__") || key_str.starts_with("__set__") {
+                                continue;
+                            }
+                            let val = o.by_str.get(k).copied().unwrap_or(NULL);
+                            if is_class_instance && is_closure_value(val) {
+                                continue;
                             }
                             if !first {
                                 s.push_str(", ");
                             } else {
                                 first = false;
                             }
-                            let val = o.by_str.get(k).copied().unwrap_or(NULL);
                             s.push_str(&format!(
                                 "{:?}: {}",
                                 k,
@@ -509,7 +538,7 @@ fn pp(v: i64, depth: usize, max_depth: usize, max_elems: usize, seen: &mut HashS
                         }
 
                         // Then FieldId (u32) props (also sorted)
-                        if wrote < max_elems {
+                        if wrote < max_elems && !is_class_instance {
                             let mut fids: Vec<u32> = o.by_id.keys().copied().collect();
                             fids.sort_unstable();
                             for id in fids {
