@@ -218,6 +218,34 @@ var bb = await Promise(|resolve, reject| {
 });
 print(bb);                     // expect 7
 
+print("===== Conditional / Nullish =====");
+print((1 < 2) ? 10 : 20);              // expect 10
+print((1 > 2) ? 10 : 20);              // expect 20
+print(null ?? 99);                     // expect 99
+print(0 ?? 123);                       // expect 0 (0 is not nullish)
+
+print("===== Optional chaining =====");
+var maybe = null;
+print(maybe?.missing);                 // expect null
+var chain = { inner: { value: 7 } };
+print(chain?.inner?.value);            // expect 7
+class MulBox {
+  constructor(k) { this.k = k; }
+  fn mul(x) { return this.k * x; }
+}
+var optObj = new MulBox(3);
+print(optObj?.mul(4));                 // expect 12
+var none = null;
+print(none?.mul(4));                   // expect null
+var maybeFn = null;
+print(maybeFn?.(5));                   // expect null
+
+print("===== Pipeline operator =====");
+fn inc1(v) { return v + 1; }
+fn double(v) { return v * 2; }
+print(3 |> inc1);                      // expect 4
+print(3 |> inc1 |> double);           // expect 8
+
 // multiple awaits in sequence
 var a1 = await delay(0, 10);
 var a2 = await delay(0, 32);

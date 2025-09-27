@@ -16,7 +16,8 @@ use crate::wir::{
 
 use crate::front::{
     BinOp, Block, ClassDecl, ClassMember, ExportDecl, Expr, FuncDecl, ImportDecl, ImportItem,
-    LValue, ListenDecl, ObjItem, ObjPattern, Program, PropKey, RouteDecl, Stmt, UnOp,
+    LValue, ListenDecl, ObjItem, ObjPattern, OptionalAccess, Program, PropKey, RouteDecl, Stmt,
+    UnOp,
 };
 
 use crate::hoister::hoist_fn_lits_program;
@@ -1074,6 +1075,15 @@ fn collect_mut_locals_in_expr(e: &Expr, out: &mut BTreeSet<String>) {
             }
             collect_mut_locals_in_expr(rhs, out);
         }
+        Expr::Conditional {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            collect_mut_locals_in_expr(cond, out);
+            collect_mut_locals_in_expr(then_branch, out);
+            collect_mut_locals_in_expr(else_branch, out);
+        }
         Expr::Binary { a, b, .. } => {
             collect_mut_locals_in_expr(a, out);
             collect_mut_locals_in_expr(b, out);
@@ -1096,6 +1106,18 @@ fn collect_mut_locals_in_expr(e: &Expr, out: &mut BTreeSet<String>) {
                 match item {
                     ObjItem::Prop(_, value) => collect_mut_locals_in_expr(value, out),
                     ObjItem::Spread(expr) => collect_mut_locals_in_expr(expr, out),
+                }
+            }
+        }
+        Expr::OptionalChain { base, access } => {
+            collect_mut_locals_in_expr(base, out);
+            match access {
+                OptionalAccess::Prop(_) => {}
+                OptionalAccess::Index(expr) => collect_mut_locals_in_expr(expr, out),
+                OptionalAccess::Call(args) => {
+                    for a in args {
+                        collect_mut_locals_in_expr(a, out);
+                    }
                 }
             }
         }
@@ -2475,6 +2497,49 @@ fn lower_expr_free<'m>(
             Ok(res[0])
         }
 
+        Expr::Conditional {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            let cond_v =
+                lower_expr_free(b, locals, fields, next_field, cond, funcs, lam_caps, links)?;
+            let then_b = b.block();
+            let else_b = b.block();
+            let cont = b.block();
+            let res_param = b.add_block_param(cont, Type::Int32);
+            b.branch(cond_v, then_b, else_b);
+
+            b.position_at(then_b);
+            let tval = lower_expr_free(
+                b,
+                locals,
+                fields,
+                next_field,
+                then_branch,
+                funcs,
+                lam_caps,
+                links,
+            )?;
+            b.jump(cont, &[tval]);
+
+            b.position_at(else_b);
+            let fval = lower_expr_free(
+                b,
+                locals,
+                fields,
+                next_field,
+                else_branch,
+                funcs,
+                lam_caps,
+                links,
+            )?;
+            b.jump(cont, &[fval]);
+
+            b.position_at(cont);
+            Ok(res_param)
+        }
+
         // Allow await when inside an async lowering scope.
         Expr::Await(inner) => {
             if !await_allowed() {
@@ -2588,6 +2653,136 @@ fn lower_expr_free<'m>(
             Err(LowerError::UnknownVar(name.clone()))
         }
 
+        Expr::OptionalChain { base, access } => {
+            let base_v =
+                lower_expr_free(b, locals, fields, next_field, base, funcs, lam_caps, links)?;
+            let cont = b.block();
+            let res_param = b.add_block_param(cont, Type::Top);
+            let null_v = b.const_null();
+            let null_block = b.block();
+            let value_block = b.block();
+            let (_nid, is_null) = b.push_node(
+                Inst::CallNative {
+                    name: "wir_is_nullish".into(),
+                    args: vec![base_v],
+                    pure: false,
+                    can_throw: false,
+                },
+                Some(Type::Bool),
+                1,
+                true,
+            );
+            b.branch(is_null[0], null_block, value_block);
+
+            b.position_at(null_block);
+            b.jump(cont, &[null_v]);
+
+            b.position_at(value_block);
+            let value = match access {
+                OptionalAccess::Prop(name) => {
+                    lower_general_getprop(b, base_v, name, fields, next_field)
+                }
+                OptionalAccess::Index(idx_expr) => {
+                    let idx_val = lower_expr_free(
+                        b, locals, fields, next_field, idx_expr, funcs, lam_caps, links,
+                    )?;
+                    let (_nid_is, is_str) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_is_str".into(),
+                            args: vec![idx_val],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::Bool),
+                        1,
+                        true,
+                    );
+
+                    let str_b = b.block();
+                    let arr_b = b.block();
+                    let idx_cont = b.block();
+                    let idx_res = b.add_block_param(idx_cont, Type::Top);
+                    b.branch(is_str[0], str_b, arr_b);
+
+                    b.position_at(str_b);
+                    let (_nid_get, sv) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_obj_get_str".into(),
+                            args: vec![base_v, idx_val],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        None,
+                        1,
+                        true,
+                    );
+                    b.jump(idx_cont, &[sv[0]]);
+
+                    b.position_at(arr_b);
+                    let (_nid_arr, av) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_array_get".into(),
+                            args: vec![base_v, idx_val],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        None,
+                        1,
+                        true,
+                    );
+                    b.jump(idx_cont, &[av[0]]);
+
+                    b.position_at(idx_cont);
+                    idx_res
+                }
+                OptionalAccess::Call(args) => {
+                    let mut argv = Vec::with_capacity(args.len() + 1);
+                    let mut this_source: Option<Expr> = None;
+                    match &**base {
+                        Expr::GetProp { recv, .. } => {
+                            this_source = Some((**recv).clone());
+                        }
+                        Expr::Index { recv, index } if matches!(&**index, Expr::Str(_)) => {
+                            this_source = Some((**recv).clone());
+                        }
+                        Expr::OptionalChain {
+                            base: inner,
+                            access: OptionalAccess::Prop(_),
+                        } => {
+                            this_source = Some((**inner).clone());
+                        }
+                        _ => {}
+                    }
+                    if let Some(expr) = this_source {
+                        let this_v = lower_expr_free(
+                            b, locals, fields, next_field, &expr, funcs, lam_caps, links,
+                        )?;
+                        argv.push(this_v);
+                    }
+                    for arg in args {
+                        argv.push(lower_expr_free(
+                            b, locals, fields, next_field, arg, funcs, lam_caps, links,
+                        )?);
+                    }
+                    let (_nid, res) = b.push_node(
+                        Inst::CallClosure {
+                            conv: crate::wir::CallConv::Fast,
+                            fun: base_v,
+                            args: argv,
+                        },
+                        Some(Type::Int32),
+                        1,
+                        true,
+                    );
+                    res[0]
+                }
+            };
+            b.jump(cont, &[value]);
+
+            b.position_at(cont);
+            Ok(res_param)
+        }
+
         Expr::Group(inner) => {
             lower_expr_free(b, locals, fields, next_field, inner, funcs, lam_caps, links)
         }
@@ -2624,14 +2819,35 @@ fn lower_expr_free<'m>(
 
         Expr::Binary { op, a, b: bb } => {
             let va = lower_expr_free(b, locals, fields, next_field, a, funcs, lam_caps, links)?;
-            let vb = lower_expr_free(b, locals, fields, next_field, bb, funcs, lam_caps, links)?;
             match op {
-                Add => Ok(b.int_bin(IntBinOp::Add, va, vb)),
-                Sub => Ok(b.int_bin(IntBinOp::Sub, va, vb)),
-                Mul => Ok(b.int_bin(IntBinOp::Mul, va, vb)),
-                Div => Ok(b.int_bin(IntBinOp::DivS, va, vb)),
-                Rem => Ok(b.int_bin(IntBinOp::RemS, va, vb)),
+                Add => {
+                    let vb =
+                        lower_expr_free(b, locals, fields, next_field, bb, funcs, lam_caps, links)?;
+                    Ok(b.int_bin(IntBinOp::Add, va, vb))
+                }
+                Sub => {
+                    let vb =
+                        lower_expr_free(b, locals, fields, next_field, bb, funcs, lam_caps, links)?;
+                    Ok(b.int_bin(IntBinOp::Sub, va, vb))
+                }
+                Mul => {
+                    let vb =
+                        lower_expr_free(b, locals, fields, next_field, bb, funcs, lam_caps, links)?;
+                    Ok(b.int_bin(IntBinOp::Mul, va, vb))
+                }
+                Div => {
+                    let vb =
+                        lower_expr_free(b, locals, fields, next_field, bb, funcs, lam_caps, links)?;
+                    Ok(b.int_bin(IntBinOp::DivS, va, vb))
+                }
+                Rem => {
+                    let vb =
+                        lower_expr_free(b, locals, fields, next_field, bb, funcs, lam_caps, links)?;
+                    Ok(b.int_bin(IntBinOp::RemS, va, vb))
+                }
                 Eq | Ne | Lt | Le | Gt | Ge => {
+                    let vb =
+                        lower_expr_free(b, locals, fields, next_field, bb, funcs, lam_caps, links)?;
                     let kind = match *op {
                         BinOp::Eq => crate::wir::CmpKind::Eq,
                         BinOp::Ne => crate::wir::CmpKind::Ne,
@@ -2688,6 +2904,35 @@ fn lower_expr_free<'m>(
                         lower_expr_free(b, locals, fields, next_field, bb, funcs, lam_caps, links)?
                     };
                     b.jump(cont, &[fval]);
+
+                    b.position_at(cont);
+                    Ok(res_param)
+                }
+                Nullish => {
+                    let cont = b.block();
+                    let res_param = b.add_block_param(cont, Type::Top);
+                    let null_block = b.block();
+                    let value_block = b.block();
+                    let (_nid, is_nullish) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_is_nullish".into(),
+                            args: vec![va],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::Bool),
+                        1,
+                        true,
+                    );
+                    b.branch(is_nullish[0], null_block, value_block);
+
+                    b.position_at(null_block);
+                    let vb =
+                        lower_expr_free(b, locals, fields, next_field, bb, funcs, lam_caps, links)?;
+                    b.jump(cont, &[vb]);
+
+                    b.position_at(value_block);
+                    b.jump(cont, &[va]);
 
                     b.position_at(cont);
                     Ok(res_param)

@@ -135,6 +135,10 @@ pub enum Tok {
     LtEq,
     #[token(">=")]
     GtEq,
+    #[token("??")]
+    QuestionQuestion,
+    #[token("?.")]
+    QuestionDot,
     #[token("&&")]
     AndAnd,
     #[token("||")]
@@ -149,8 +153,12 @@ pub enum Tok {
     SlashEq,
     #[token("%=")]
     PercentEq,
+    #[token("|>")]
+    PipeForward,
     #[token("|")]
     Pipe,
+    #[token("?")]
+    Question,
     #[token("=")]
     Eq,
     #[token("<")]
@@ -379,6 +387,11 @@ pub enum Expr {
     Ident(String),
 
     Assign(SmallBox<LValue, u8>, SmallBox<Expr, u8>),
+    Conditional {
+        cond: SmallBox<Expr, u8>,
+        then_branch: SmallBox<Expr, u8>,
+        else_branch: SmallBox<Expr, u8>,
+    },
     Binary {
         op: BinOp,
         a: SmallBox<Expr, u8>,
@@ -443,6 +456,10 @@ pub enum Expr {
     }, // delete obj[expr]
 
     Await(SmallBox<Expr, u8>), // await <expression>
+    OptionalChain {
+        base: SmallBox<Expr, u8>,
+        access: OptionalAccess,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -487,6 +504,7 @@ pub enum BinOp {
     Ge,
     And,
     Or,
+    Nullish,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -494,6 +512,13 @@ pub enum UnOp {
     Neg,
     Pos,
     Not,
+}
+
+#[derive(Debug, Clone)]
+pub enum OptionalAccess {
+    Prop(String),
+    Index(SmallBox<Expr, u8>),
+    Call(Vec<Expr>),
 }
 
 #[derive(Debug, Clone)]
@@ -1900,7 +1925,7 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_assign(&mut self) -> PResult<Expr> {
-        let mut left = self.parse_or()?;
+        let left = self.parse_conditional()?;
 
         // Which assignment operator (if any) did we see?
         // Try the multi-char ones first.
@@ -1958,6 +1983,47 @@ impl<'src> Parser<'src> {
         } else {
             Ok(left)
         }
+    }
+
+    fn parse_conditional(&mut self) -> PResult<Expr> {
+        let cond = self.parse_pipeline()?;
+        if self.matches(&Tok::Question) {
+            let then_branch = self.parse_assign()?;
+            self.expect(Tok::Colon, "expected ':' in conditional expression")?;
+            let else_branch = self.parse_assign()?;
+            Ok(Expr::Conditional {
+                cond: SmallBox::new(cond),
+                then_branch: SmallBox::new(then_branch),
+                else_branch: SmallBox::new(else_branch),
+            })
+        } else {
+            Ok(cond)
+        }
+    }
+
+    fn parse_pipeline(&mut self) -> PResult<Expr> {
+        let mut e = self.parse_nullish()?;
+        while self.matches(&Tok::PipeForward) {
+            let rhs = self.parse_nullish()?;
+            e = Expr::Call {
+                callee: SmallBox::new(rhs),
+                args: vec![e],
+            };
+        }
+        Ok(e)
+    }
+
+    fn parse_nullish(&mut self) -> PResult<Expr> {
+        let mut e = self.parse_or()?;
+        while self.matches(&Tok::QuestionQuestion) {
+            let rhs = self.parse_or()?;
+            e = Expr::Binary {
+                op: BinOp::Nullish,
+                a: SmallBox::new(e),
+                b: SmallBox::new(rhs),
+            };
+        }
+        Ok(e)
     }
 
     fn parse_or(&mut self) -> PResult<Expr> {
@@ -2152,10 +2218,65 @@ impl<'src> Parser<'src> {
                     }
                     self.expect(Tok::Comma, "expected ',' in argument list")?;
                 }
-                e = Expr::Call {
-                    callee: SmallBox::new(e),
-                    args,
-                };
+                let prev = e;
+                if let Expr::OptionalChain { .. } = prev {
+                    e = Expr::OptionalChain {
+                        base: SmallBox::new(prev),
+                        access: OptionalAccess::Call(args),
+                    };
+                } else {
+                    e = Expr::Call {
+                        callee: SmallBox::new(prev),
+                        args,
+                    };
+                }
+            } else if self.matches(&Tok::QuestionDot) {
+                if self.matches(&Tok::LParen) {
+                    let mut args = Vec::new();
+                    loop {
+                        if self.check(&Tok::RParen) {
+                            let _ = self.next()?;
+                            break;
+                        }
+                        if self.is_eof() {
+                            return Err(self.err_here(
+                                "unexpected end of file in optional call argument list",
+                            ));
+                        }
+                        args.push(self.expr()?);
+                        if self.check(&Tok::RParen) {
+                            let _ = self.next()?;
+                            break;
+                        }
+                        self.expect(Tok::Comma, "expected ',' in optional call arguments")?;
+                    }
+                    e = Expr::OptionalChain {
+                        base: SmallBox::new(e),
+                        access: OptionalAccess::Call(args),
+                    };
+                } else if self.matches(&Tok::LBracket) {
+                    let idx = self.expr()?;
+                    self.expect(Tok::RBracket, "expected ']' after optional index")?;
+                    e = Expr::OptionalChain {
+                        base: SmallBox::new(e),
+                        access: OptionalAccess::Index(SmallBox::new(idx)),
+                    };
+                } else {
+                    let t = self.next()?;
+                    let name = match t.tok {
+                        Tok::Ident(s) => s,
+                        ref tok => {
+                            return Err(ParseError {
+                                msg: format!("expected identifier after '?.', found {:?}", tok),
+                                span: t.span,
+                            });
+                        }
+                    };
+                    e = Expr::OptionalChain {
+                        base: SmallBox::new(e),
+                        access: OptionalAccess::Prop(name),
+                    };
+                }
             } else if self.matches(&Tok::Dot) {
                 let t = self.next()?;
                 let name = match t.tok {

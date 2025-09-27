@@ -16,7 +16,8 @@ use crate::wir::{
 
 use crate::front::{
     BinOp, Block, ClassDecl, ClassMember, ExportDecl, Expr, FuncDecl, ImportDecl, ImportItem,
-    LValue, ListenDecl, ObjItem, ObjPattern, Program, PropKey, RouteDecl, Stmt, UnOp,
+    LValue, ListenDecl, ObjItem, ObjPattern, OptionalAccess, Program, PropKey, RouteDecl, Stmt,
+    UnOp,
 };
 
 /// Hoist all function literals to top-level functions, replacing them with
@@ -515,6 +516,36 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                     lam_caps_out,
                 )),
             ),
+            Expr::Conditional {
+                cond,
+                then_branch,
+                else_branch,
+            } => Expr::Conditional {
+                cond: SmallBox::new(rw_expr(
+                    cond,
+                    used,
+                    counter,
+                    enclosing_locals,
+                    out_funcs,
+                    lam_caps_out,
+                )),
+                then_branch: SmallBox::new(rw_expr(
+                    then_branch,
+                    used,
+                    counter,
+                    enclosing_locals,
+                    out_funcs,
+                    lam_caps_out,
+                )),
+                else_branch: SmallBox::new(rw_expr(
+                    else_branch,
+                    used,
+                    counter,
+                    enclosing_locals,
+                    out_funcs,
+                    lam_caps_out,
+                )),
+            },
             Expr::Binary { op, a, b } => Expr::Binary {
                 op: *op,
                 a: SmallBox::new(rw_expr(
@@ -790,6 +821,34 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                 out_funcs,
                 lam_caps_out,
             ))),
+            Expr::OptionalChain { base, access } => Expr::OptionalChain {
+                base: SmallBox::new(rw_expr(
+                    base,
+                    used,
+                    counter,
+                    enclosing_locals,
+                    out_funcs,
+                    lam_caps_out,
+                )),
+                access: match access {
+                    OptionalAccess::Prop(name) => OptionalAccess::Prop(name.clone()),
+                    OptionalAccess::Index(expr) => OptionalAccess::Index(SmallBox::new(rw_expr(
+                        expr,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    ))),
+                    OptionalAccess::Call(args) => OptionalAccess::Call(
+                        args.iter()
+                            .map(|a| {
+                                rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out)
+                            })
+                            .collect(),
+                    ),
+                },
+            },
         }
     }
 

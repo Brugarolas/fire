@@ -252,6 +252,15 @@ pub extern "C" fn wir_obj_assign(dst: i64, src: i64) -> i64 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn wir_is_nullish(v: i64) -> i64 {
+    if v == NULL {
+        1
+    } else {
+        0
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn wir_obj_clone(obj: i64) -> i64 {
     unsafe { obj_clone_shallow(obj) }
 }
