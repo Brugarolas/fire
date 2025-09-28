@@ -41,7 +41,7 @@ use crate::runtime::{
     wir_obj_clone, wir_obj_del_field, wir_obj_del_str, wir_obj_get_field, wir_obj_get_field_deep,
     wir_obj_get_method, wir_obj_get_proto, wir_obj_get_str, wir_obj_get_str_deep,
     wir_obj_has_field, wir_obj_has_str, wir_obj_new, wir_obj_set_field, wir_obj_set_proto,
-    wir_obj_set_str, wir_super_get_method,
+    wir_obj_set_str, wir_super_get_method, wir_string_equals,
 };
 #[allow(unused_imports)]
 use crate::value::{
@@ -49,7 +49,7 @@ use crate::value::{
     wir_array_copy, wir_array_fill, wir_array_filter, wir_array_find, wir_array_find_index,
     wir_array_for_each, wir_array_get, wir_array_len, wir_array_map, wir_array_new, wir_array_pop,
     wir_array_push, wir_array_reduce, wir_array_set, wir_array_set_len, wir_array_shift,
-    wir_array_slice, wir_array_unshift,
+    wir_array_slice, wir_array_unshift, wir_string_get_char, wir_string_len
 };
 
 impl JIT {
@@ -228,8 +228,7 @@ pub struct JIT {
 
 impl Default for JIT {
     fn default() -> Self {
-        let mut jb = cranelift_jit::JITBuilder::new(cranelift_module::default_libcall_names())
-            .expect("JITBuilder::new");
+        let mut jb = cranelift_jit::JITBuilder::new(cranelift_module::default_libcall_names()).expect("JITBuilder::new");
 
         unsafe extern "C" {
             fn wir_resolve_funptr(fid: i64) -> *const u8;
@@ -322,8 +321,11 @@ impl Default for JIT {
             fn wir_obj_set_str(obj: i64, key: i64, val: i64) -> i64;
             fn wir_obj_has_str(obj: i64, key: i64) -> i64;
             fn wir_obj_del_str(obj: i64, key: i64) -> i64;
+            fn wir_string_equals(s1_val: i64, s2_val: i64) -> i64;
             fn wir_obj_assign(dst: i64, src: i64) -> i64;
             fn wir_obj_clone(obj: i64) -> i64;
+            fn wir_string_get_char(s_val: i64, index_smi: i64) -> i64;
+            fn wir_string_len(s_val: i64) -> i64;
         }
 
         unsafe extern "C" {
@@ -563,6 +565,10 @@ impl Default for JIT {
                 "wir_is_nullish",
                 wir_is_nullish as *const extern "C" fn(i64) -> i64 as *const u8,
             );
+            jb.symbol(
+                "wir_string_equals",
+                wir_string_equals as *const extern "C" fn(i64, i64) -> i64 as *const u8,
+            );
 
             jb.symbol(
                 "wir_obj_get_field",
@@ -604,6 +610,14 @@ impl Default for JIT {
             jb.symbol(
                 "wir_obj_clone",
                 wir_obj_clone as *const extern "C" fn(i64) -> i64 as *const u8,
+            );
+            jb.symbol(
+                "wir_string_get_char",
+                wir_string_get_char as *const extern "C" fn(i64, i64) -> i64 as *const u8,
+            );
+            jb.symbol(
+                "wir_string_len",
+                wir_string_len as *const extern "C" fn(i64) -> i64 as *const u8,
             );
 
             jb.symbol(

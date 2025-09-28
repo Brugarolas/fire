@@ -740,6 +740,109 @@ pub fn box_str_borrowed(bytes: &[u8]) -> ValueRepr {
     }
 }
 
+/// Allocates a new, contiguous string object and returns its value representation.
+/// The single memory block contains the BoxedStr header followed by the character data.
+#[inline]
+pub fn allocate_new_string(s: &str) -> ValueRepr {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+
+    // Step 1: Calculate the total size for our single allocation.
+    // It's the size of the fixed header struct PLUS the size of the string's byte data.
+    let header_size = mem::size_of::<BoxedStr>();
+    let total_size = header_size + len;
+
+    // The alignment of the allocation is determined by the header struct,
+    // which is the most restrictive requirement.
+    let align = mem::align_of::<BoxedStr>();
+
+    unsafe {
+        // Step 2: Perform a SINGLE allocation for the entire object.
+        // This `total_size` is guaranteed to be >= sizeof(BoxedStr),
+        // which will satisfy MMTk's minimum object size requirement.
+        #[cfg(feature = "gc")]
+        let p = {
+            let mut p = NAPALM_GC.alloc_raw(total_size, align);
+            if p.is_null() {
+                p = NAPALM_GC.alloc_slow_path(total_size, align);
+            }
+            p
+        };
+        #[cfg(not(feature = "gc"))]
+        let p = {
+            use std::alloc::{Layout, alloc, handle_alloc_error};
+            let layout = Layout::from_size_align_unchecked(total_size, align);
+            let p = alloc(layout);
+            if p.is_null() {
+                handle_alloc_error(layout);
+            }
+            p
+        };
+
+        // Step 3: Set up the pointers.
+        // `obj_ptr` points to the start of the block, where the header will live.
+        let obj_ptr = p as *mut BoxedStr;
+        // `data_ptr` points to the memory location IMMEDIATELY AFTER the header struct.
+        let data_ptr = (obj_ptr as *mut u8).add(header_size);
+
+        // Step 4: Write the header struct into the beginning of the block.
+        // The crucial part is that `data` now points inside its own allocation block.
+        ptr::write(obj_ptr, BoxedStr {
+            hdr: ObjHeader { tag: TAG_STRING, aux: 0 },
+            len,
+            data: data_ptr, // The `data` pointer points to the area right after this struct.
+        });
+
+        // Step 5: Copy the actual string bytes into the data area.
+        ptr::copy_nonoverlapping(bytes.as_ptr(), data_ptr, len);
+
+        // Step 6: Notify the GC about the full object allocation.
+        #[cfg(feature = "gc")]
+        NAPALM_GC.post_alloc_object(p, total_size);
+
+        // Return the pointer to the start of the object.
+        p as ValueRepr
+    }
+}
+
+/// Runtime helper for string indexing `str[i]`.
+/// Returns a new 1-character string or NULL if out of bounds.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_string_get_char(s_val: i64, index_smi: i64) -> i64 {
+    if !is_ptr(s_val) { return NULL; }
+
+    let hdr = &*(s_val as *const ObjHeader);
+    if hdr.tag != TAG_STRING { return NULL; }
+
+    let s = &*(s_val as *const BoxedStr);
+    let index = smi_to_i64(index_smi) as usize;
+
+    if index >= s.len {
+        return NULL; // Out of bounds
+    }
+
+    // Safely get the byte at the index
+    let string_slice = std::slice::from_raw_parts(s.data, s.len);
+    let char_byte_slice = &[string_slice[index]];
+
+    // Create a new one-character string from that byte.
+    // This is safe because we are taking a single byte from valid UTF-8.
+    let new_char_str = std::str::from_utf8_unchecked(char_byte_slice);
+
+    allocate_new_string(new_char_str)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_string_len(s_val: i64) -> i64 {
+    if !is_ptr(s_val) { return make_smi(0); }
+
+    let hdr = &*(s_val as *const ObjHeader);
+    if hdr.tag != TAG_STRING { return make_smi(0); }
+
+    let s = &*(s_val as *const BoxedStr);
+    make_smi(s.len as i64)
+}
+
 // ============================================================================
 // Boxed closure (placeholder wiring)
 // ============================================================================

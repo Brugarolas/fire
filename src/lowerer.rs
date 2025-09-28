@@ -2756,24 +2756,78 @@ fn lower_expr_free<'m>(
                     Ok(b.int_bin(IntBinOp::RemS, va, vb))
                 }
                 Eq | Ne | Lt | Le | Gt | Ge => {
-                    let vb =
-                        lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
-                    let kind = match *op {
-                        BinOp::Eq => crate::wir::CmpKind::Eq,
-                        BinOp::Ne => crate::wir::CmpKind::Ne,
-                        BinOp::Lt => crate::wir::CmpKind::Lt,
-                        BinOp::Le => crate::wir::CmpKind::Le,
-                        BinOp::Gt => crate::wir::CmpKind::Gt,
-                        BinOp::Ge => crate::wir::CmpKind::Ge,
-                        _ => unreachable!(),
-                    };
-                    let (_nid, res) = b.push_node(
-                        Inst::CmpInt { kind, a: va, b: vb },
-                        Some(Type::Bool),
-                        1,
-                        false,
-                    );
-                    Ok(res[0])
+                    let va = lower_expr_free(b, locals, fields, next_field, a, lowering_ctx)?;
+                    let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
+
+                    // Handle equality operators (==, !=) with a special path for strings.
+                    if *op == BinOp::Eq || *op == BinOp::Ne {
+                        // At runtime, check if either operand is a string.
+                        let (_nid1, is_a_str) = b.push_node(
+                            Inst::CallNative { name: "wir_is_str".into(), args: vec![va], pure: false, can_throw: false },
+                            Some(Type::Bool), 1, true,
+                        );
+                        let (_nid2, is_b_str) = b.push_node(
+                            Inst::CallNative { name: "wir_is_str".into(), args: vec![vb], pure: false, can_throw: false },
+                            Some(Type::Bool), 1, true,
+                        );
+                        let is_either_str = build_bool_or(b, is_a_str[0], is_b_str[0]);
+
+                        let string_path = b.block();
+                        let int_path = b.block();
+                        let cont = b.block();
+                        let result_phi = b.add_block_param(cont, Type::Bool);
+
+                        b.branch(is_either_str, string_path, int_path);
+
+                        // PATH 1: At least one operand is a string. Use content comparison.
+                        b.position_at(string_path);
+                        let (_nid_streq, str_eq_res) = b.push_node(
+                            Inst::CallNative { name: "wir_string_equals".into(), args: vec![va, vb], pure: false, can_throw: false },
+                            Some(Type::Bool), 1, true,
+                        );
+                        let str_res = if *op == BinOp::Ne {
+                            let one = b.const_i32(1); // Your bools are 0/1
+                            b.int_bin(IntBinOp::Xor, str_eq_res[0], one) // a != b is !(a == b)
+                        } else {
+                            str_eq_res[0]
+                        };
+                        b.jump(cont, &[str_res]);
+
+                        // PATH 2: Neither operand is a string. Use the fast integer/SMI comparison.
+                        b.position_at(int_path);
+                        let kind = if *op == BinOp::Eq {
+                            crate::wir::CmpKind::Eq // This is the correct WIR enum
+                        } else {
+                            crate::wir::CmpKind::Ne // This is the correct WIR enum
+                        };
+                        let (_nid_int, int_res) = b.push_node(
+                            Inst::CmpInt { kind, a: va, b: vb }, // Generate the correct WIR instruction
+                            Some(Type::Bool), 1, false,
+                        );
+                        b.jump(cont, &[int_res[0]]);
+
+                        // Join the paths and return the result.
+                        b.position_at(cont);
+                        return Ok(result_phi);
+
+                    } else {
+                        // For Lt, Gt, etc., we keep the original, simple integer comparison logic for now.
+                        // This preserves the existing functionality.
+                        let kind = match *op {
+                            BinOp::Lt => crate::wir::CmpKind::Lt,
+                            BinOp::Le => crate::wir::CmpKind::Le,
+                            BinOp::Gt => crate::wir::CmpKind::Gt,
+                            BinOp::Ge => crate::wir::CmpKind::Ge,
+                            _ => unreachable!(),
+                        };
+                        let (_nid, res) = b.push_node(
+                            Inst::CmpInt { kind, a: va, b: vb },
+                            Some(Type::Bool),
+                            1,
+                            false,
+                        );
+                        Ok(res[0])
+                    }
                 }
                 And | Or => {
                     let then_b = b.block();
@@ -3126,24 +3180,67 @@ fn lower_expr_free<'m>(
                 }
             }
 
-            // Special-case: arr.length
             if name == "length" {
-                let arr =
-                    lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
-                let (_nid, res) = b.push_node(
+                let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
+
+                // At runtime, check if the receiver `recv_v` is a string.
+                let (_nid_is_s, is_string_res) = b.push_node(
                     Inst::CallNative {
-                        name: "wir_array_len".into(),
-                        args: vec![arr],
+                        name: "wir_is_str".into(),
+                        args: vec![recv_v],
                         pure: false,
                         can_throw: false,
                     },
-                    Some(Type::Int32),
+                    Some(Type::Bool),
                     1,
                     true,
                 );
-                return Ok(res[0]);
+                let is_string = is_string_res[0];
+
+                // Create blocks for the two paths and a join block.
+                let string_path = b.block();
+                let array_path = b.block();
+                let cont = b.block();
+                let result_phi = b.add_block_param(cont, Type::Int32);
+
+                b.branch(is_string, string_path, array_path);
+
+                // Path 1: It's a string. Call our new `wir_string_len` helper.
+                b.position_at(string_path);
+                let (_nid_len, len_res) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_string_len".into(),
+                        args: vec![recv_v],
+                        pure: false,
+                        can_throw: false,
+                    },
+                    None, // Returns a SMI (i64)
+                    1,
+                    true,
+                );
+                b.jump(cont, &[len_res[0]]);
+
+                // Path 2: Not a string. Assume it's an array and use the original `wir_array_len`.
+                b.position_at(array_path);
+                let (_nid_a, arr_res) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_array_len".into(),
+                        args: vec![recv_v],
+                        pure: false,
+                        can_throw: false,
+                    },
+                    None, // Returns a SMI (i64)
+                    1,
+                    true,
+                );
+                b.jump(cont, &[arr_res[0]]);
+
+                // Join and return the result from the appropriate path.
+                b.position_at(cont);
+                return Ok(result_phi);
             }
 
+            // Fallback to the generic property getter for all other property names.
             let obj = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
             let value = lower_general_getprop(b, obj, name, fields, next_field);
             Ok(value)
@@ -4185,148 +4282,101 @@ fn lower_expr_free<'m>(
         }
 
         Expr::Index { recv, index } => {
-            // If index is a string literal, prefer string-table FIRST, then fast-field as a fallback.
+            // Path A: The index is a compile-time string literal, e.g., obj["key"].
+            // This is the most common case for object property access and can be optimized.
             if let Expr::Str(s) = &**index {
-                let obj =
-                    lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
-
-                // string path first
-                let (_nid_sc, ks) = b.push_node(
-                    Inst::Const(Constant::Str(s.clone())),
-                    Some(Type::Str),
-                    1,
-                    false,
-                );
-                let (_nid_hs, has_str) = b.push_node(
-                    Inst::CallNative {
-                        name: "wir_obj_has_str".into(),
-                        args: vec![obj, ks[0]],
-                        pure: false,
-                        can_throw: false,
-                    },
-                    Some(Type::Bool),
-                    1,
-                    true,
-                );
-
-                let str_hit = b.block();
-                let try_fast = b.block();
-                let cont = b.block();
-                let out = b.add_block_param(cont, Type::Int32);
-
-                b.branch(has_str[0], str_hit, try_fast);
-
-                b.position_at(str_hit);
-                let (_nid_s, sv) = b.push_node(
-                    Inst::CallNative {
-                        name: "wir_obj_get_str".into(),
-                        args: vec![obj, ks[0]],
-                        pure: false,
-                        can_throw: false,
-                    },
-                    None,
-                    1,
-                    true,
-                );
-                b.jump(cont, &[sv[0]]);
-
-                // fallback: fast field (works when literal and same lowering context)
-                b.position_at(try_fast);
-                let field = intern_field_local(fields, next_field, s);
-                let fid_smi = b.const_i32(field.0 as i32);
-                let (_nid_hf, hasf) = b.push_node(
-                    Inst::CallNative {
-                        name: "wir_obj_has_field".into(),
-                        args: vec![obj, fid_smi],
-                        pure: false,
-                        can_throw: false,
-                    },
-                    Some(Type::Bool),
-                    1,
-                    true,
-                );
-
-                let fast_b = b.block();
-                let miss = b.block();
-                b.branch(hasf[0], fast_b, miss);
-
-                b.position_at(fast_b);
-                let (_nid_f, fv) = b.push_node(
-                    Inst::LoadField {
-                        obj,
-                        field,
-                        expected: None,
-                    },
-                    None,
-                    1,
-                    false,
-                );
-                b.jump(cont, &[fv[0]]);
-
-                b.position_at(miss);
-                let z = b.const_i32(0);
-                b.jump(cont, &[z]);
-
-                b.position_at(cont);
-                return Ok(out);
+                // Your existing, correct logic for this case is perfect.
+                let obj = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
+                let value = lower_general_getprop(b, obj, s, fields, next_field);
+                return Ok(value);
             }
 
-            // Generic path: decide at runtime. If index is a string → object["key"]; else → array[index].
-            let obj = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
-            let idxv =
-                lower_expr_free(b, locals, fields, next_field, index, lowering_ctx)?;
+            // Path B: The index is a dynamic expression, e.g., obj[i] or obj[key_b].
+            // We need to generate code that handles all possibilities at runtime.
+            let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
+            let idx_v = lower_expr_free(b, locals, fields, next_field, index, lowering_ctx)?;
 
-            let (_nid_is, is_str) = b.push_node(
+            // Runtime Decision Point 1: Is the INDEX a string?
+            let (_nid_is_idx_str, is_idx_string_res) = b.push_node(
                 Inst::CallNative {
                     name: "wir_is_str".into(),
-                    args: vec![idxv],
-                    pure: false,
-                    can_throw: false,
+                    args: vec![idx_v],
+                    pure: false, can_throw: false,
                 },
-                Some(Type::Bool),
-                1,
-                true,
+                Some(Type::Bool), 1, true,
             );
+            let is_idx_string = is_idx_string_res[0];
 
-            let str_b = b.block();
-            let arr_b = b.block();
+            let obj_key_path = b.block();      // Path for obj[string_key]
+            let numeric_key_path = b.block();  // Path for string[i] or array[i]
             let cont = b.block();
-            let out = b.add_block_param(cont, Type::Int32);
+            let result_phi = b.add_block_param(cont, Type::Int32);
 
-            b.branch(is_str[0], str_b, arr_b);
+            b.branch(is_idx_string, obj_key_path, numeric_key_path);
 
-            // object["key"]  — dynamic string path (no fast-field here; we can't safely pick a FieldId)
-            b.position_at(str_b);
-            let (_nid_hs, sv) = b.push_node(
+            // --- Logic for when the index is a string ---
+            b.position_at(obj_key_path);
+            // This is a dynamic property access on an object.
+            let (_nid_get, obj_res) = b.push_node(
                 Inst::CallNative {
                     name: "wir_obj_get_str".into(),
-                    args: vec![obj, idxv],
-                    pure: false,
-                    can_throw: false,
+                    args: vec![recv_v, idx_v],
+                    pure: false, can_throw: false,
                 },
-                None,
-                1,
-                true,
+                None, 1, true,
             );
-            b.jump(cont, &[sv[0]]);
+            b.jump(cont, &[obj_res[0]]);
 
-            // array[index]
-            b.position_at(arr_b);
-            let (_nid_a, av) = b.push_node(
+            // --- Logic for when the index is NOT a string (i.e., numeric) ---
+            b.position_at(numeric_key_path);
+            // Runtime Decision Point 2: Is the RECEIVER a string?
+            let (_nid_is_recv_str, is_recv_string_res) = b.push_node(
+                Inst::CallNative {
+                    name: "wir_is_str".into(),
+                    args: vec![recv_v],
+                    pure: false, can_throw: false,
+                },
+                Some(Type::Bool), 1, true,
+            );
+            let is_recv_string = is_recv_string_res[0];
+
+            let string_recv_path = b.block(); // Path for "string"[i]
+            let array_recv_path = b.block();  // Path for array[i]
+
+            // We need a nested join block here.
+            let numeric_cont = b.block();
+            let numeric_phi = b.add_block_param(numeric_cont, Type::Int32);
+
+            b.branch(is_recv_string, string_recv_path, array_recv_path);
+
+            b.position_at(string_recv_path);
+            let (_nid_char, char_res) = b.push_node(
+                Inst::CallNative {
+                    name: "wir_string_get_char".into(),
+                    args: vec![recv_v, idx_v],
+                    pure: false, can_throw: false,
+                },
+                None, 1, true,
+            );
+            b.jump(numeric_cont, &[char_res[0]]);
+
+            b.position_at(array_recv_path);
+            let (_nid_arr, arr_res) = b.push_node(
                 Inst::CallNative {
                     name: "wir_array_get".into(),
-                    args: vec![obj, idxv],
-                    pure: false,
-                    can_throw: false,
+                    args: vec![recv_v, idx_v],
+                    pure: false, can_throw: false,
                 },
-                None,
-                1,
-                true,
+                None, 1, true,
             );
-            b.jump(cont, &[av[0]]);
+            b.jump(numeric_cont, &[arr_res[0]]);
 
+            b.position_at(numeric_cont);
+            b.jump(cont, &[numeric_phi]); // Forward the result to the final join block.
+
+            // Final join block for all paths.
             b.position_at(cont);
-            Ok(out)
+            Ok(result_phi)
         }
 
         Expr::ArrayLit(elems) => {

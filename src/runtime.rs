@@ -247,6 +247,41 @@ pub extern "C" fn wir_obj_del_str(obj: i64, key_ptr: i64) -> i64 {
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_string_equals(s1_val: i64, s2_val: i64) -> i64 {
+    // Fast path: if the values are identical (e.g., two SMIs, two pointers to the
+    // same object, or both null), they are equal.
+    if s1_val == s2_val { return 1; }
+
+    // Check if both values are valid, non-null pointers to string objects.
+    // If one isn't a string, they can't be equal (since the pointer equality check failed).
+    if wir_is_str(s1_val) == 0 || wir_is_str(s2_val) == 0 {
+        return 0;
+    }
+
+    // At this point, we know both are valid pointers to BoxedStr headers.
+    let s1 = &*(s1_val as *const BoxedStr);
+    let s2 = &*(s2_val as *const BoxedStr);
+
+    // Fast path 2: If the byte lengths are different, they cannot be equal.
+    if s1.len != s2.len {
+        return 0;
+    }
+
+    // If both strings are empty, they are equal.
+    if s1.len == 0 {
+        return 1;
+    }
+
+    // This is the correct way to compare the content using your struct definition.
+    // We create temporary slices from the raw `data` pointer and `len` field.
+    let slice1 = std::slice::from_raw_parts(s1.data, s1.len);
+    let slice2 = std::slice::from_raw_parts(s2.data, s2.len);
+
+    // Let Rust perform a fast, bytewise comparison on the slices.
+    if slice1 == slice2 { 1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn wir_obj_assign(dst: i64, src: i64) -> i64 {
     unsafe { obj_assign(dst, src) }
 }

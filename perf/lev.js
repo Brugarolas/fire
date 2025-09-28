@@ -48,8 +48,8 @@ const EXPECTED = 3;
 const ITERS = Number(process.argv[2] ?? process.env.ITERS ?? 1_000_000);
 
 // Warm up JIT
-let tmp = 0;
-for (let i = 0; i < 10_000; ++i) tmp ^= levenshtein(A, B);
+//let tmp = 0;
+//for (let i = 0; i < 10_000; ++i) tmp ^= levenshtein(A, B);
 
 // Sanity check
 const d = levenshtein(A, B);
