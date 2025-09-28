@@ -3531,24 +3531,41 @@ fn lower_expr_free<'m>(
 
                 // 0d) Array instance methods (map/filter/etc.) — AFTER static check (this lowers `recv`)
                 if let Some(v) = lower_array_method_call(
-                    b, locals, fields, next_field, recv, name, args, lowering_ctx 
+                    b, locals, fields, next_field, recv, name, args, lowering_ctx
                 )? {
                     return Ok(v);
                 }
 
-                // 0e) Generic property call: inject receiver as implicit first arg ("this")
-                let this_v =
-                    lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
+                // 0e) Generic property call: Distinguish between static and instance calls.
+                let is_static_call = if let Expr::Ident(id_name) = &**recv {
+                    // This is now valid! We use the passed-in context.
+                    lowering_ctx.is_class_ident(id_name)
+                } else {
+                    false
+                };
+
+                // The function to be called is the result of the property lookup.
                 let fun_v = lower_expr_free(
-                    b, locals, fields, next_field, callee, lowering_ctx 
+                    b, locals, fields, next_field, callee, lowering_ctx
                 )?;
-                let mut argv = Vec::with_capacity(args.len() + 1);
-                argv.push(this_v);
-                for a in args {
-                    argv.push(lower_expr_free(
-                        b, locals, fields, next_field, a, lowering_ctx 
-                    )?);
+
+                let mut argv = Vec::new();
+
+                if is_static_call {
+                    // Static call: `Counter.times3(7)` -> args are just `[7]`
+                    argv.reserve(args.len());
+                } else {
+                    // Instance call: `c.inc()` -> args are `[c]`
+                    argv.reserve(args.len() + 1);
+                    let this_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
+                    argv.push(this_v);
                 }
+
+                // Append the explicit arguments.
+                for a in args {
+                    argv.push(lower_expr_free(b, locals, fields, next_field, a, lowering_ctx)?);
+                }
+
                 let (_nid, res) = b.push_node(
                     Inst::CallClosure {
                         conv: crate::wir::CallConv::Fast,
