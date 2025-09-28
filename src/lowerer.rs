@@ -93,35 +93,24 @@ pub struct LinkInfo {
     pub namespace_cells: HashMap<String, BindingId>,
     /// nombres locales que corresponden a `export class` del proveedor (para saber que son clase)
     pub imported_class_bindings: HashSet<BindingId>,
-    /// Imports that the linker resolved to FuncId: local name → provider's FuncId.
-    /// In __modinit__ they are materialized as closures (trampolines) with env = 0.
-    pub import_funcids: HashMap<String, FuncId>,
-    pub import_classes: HashMap<String, (Option<FuncId>, Vec<(String, FuncId)>)>,
-    pub class_bindings: HashMap<String, BindingId>,
-    pub proto_bindings: HashMap<String, BindingId>,
 }
 
-pub struct Lowerer<'m> {
-    module: &'m mut Module,
-    funcs: HashMap<String, FuncId>,
-    lam_captures: HashMap<String, Vec<String>>,
-    classes: HashMap<String, ClassInfo>,
-    links: LinkInfo,
+#[derive(Debug, Clone)]
+pub struct LoweringContext {
+    pub funcs: HashMap<String, FuncId>,
+    pub lam_captures: HashMap<String, Vec<String>>,
+    pub classes: HashMap<String, ClassInfo>,
+    pub links: LinkInfo,
 }
 
-impl<'m> Lowerer<'m> {
-    pub fn new(module: &'m mut Module) -> Self {
+impl LoweringContext {
+    pub fn new() -> Self {
         Self {
-            module,
             funcs: Default::default(),
             lam_captures: Default::default(),
             classes: Default::default(),
             links: Default::default(),
         }
-    }
-
-    pub fn set_links(&mut self, links: LinkInfo) {
-        self.links = links;
     }
 
     fn is_class_ident(&self, name: &str) -> bool {
@@ -135,10 +124,30 @@ impl<'m> Lowerer<'m> {
         }
         false // fall back to generic value lowering
     }
+}
+
+#[derive(Debug)]
+pub struct Lowerer<'m> {
+    module: &'m mut Module,
+    lowering_ctx: LoweringContext,
+}
+
+impl<'m> Lowerer<'m> {
+    pub fn new(module: &'m mut Module) -> Self {
+        Self {
+            module,
+            lowering_ctx: LoweringContext::new(),
+        }
+    }
+
+    pub fn set_links(&mut self, links: LinkInfo) -> &mut Self {
+        self.lowering_ctx.links = links;
+        self
+    }
 
     pub fn lower_program(&mut self, prog: &Program) -> LResult<Vec<FuncId>> {
         // -------- Stage 1: collect classes & their metadata --------
-        self.classes.clear();
+        self.lowering_ctx.classes.clear();
 
         for c in &prog.classes {
             // gather accessors by name so we can form (getter,setter)
@@ -237,29 +246,29 @@ impl<'m> Lowerer<'m> {
             }
 
             ci.props = prop_map.into_iter().map(|(n, (g, s))| (n, g, s)).collect();
-            self.classes.insert(c.name.clone(), ci);
+            self.lowering_ctx.classes.insert(c.name.clone(), ci);
         }
 
         // -------- Stage 2: hoist lambdas (produces __lam_* functions) --------
         let (prog, lam_caps) = hoist_fn_lits_program(prog);
-        self.lam_captures = lam_caps;
+        self.lowering_ctx.lam_captures = lam_caps;
 
         // -------- Stage 3: RESERVE FuncId for ALL functions post-hoist --------
-        self.funcs.clear();
+        self.lowering_ctx.funcs.clear();
 
         // 3.1 Reserve for free/hoisted functions first (includes __lam_* and __toplevel__)
         for f in &prog.functions {
             let fid = self.module.reserve_func_id();
             #[cfg(debug_assertions)]
             eprintln!("[reserve func] {} -> {:?}", f.name, fid);
-            self.funcs.insert(f.name.clone(), fid);
+            self.lowering_ctx.funcs.insert(f.name.clone(), fid);
         }
 
         // 3.2 Reserve for class-generated functions in the SAME order lower_one_class emits them
         let mut extra_names: Vec<String> = Vec::new();
         for c in &prog.classes {
             let fid_raw = c.name.clone();
-            let ci = self.classes.get(&fid_raw).expect("class collected");
+            let ci = self.lowering_ctx.classes.get(&fid_raw).expect("class collected");
 
             // Accessors
             for (pname, get, set) in &ci.props {
@@ -297,7 +306,7 @@ impl<'m> Lowerer<'m> {
 
         for nm in extra_names {
             let fid = self.module.reserve_func_id();
-            self.funcs.insert(nm, fid);
+            self.lowering_ctx.funcs.insert(nm, fid);
         }
 
         // -------- Stage 4: lower free/hoisted functions --------
@@ -311,7 +320,7 @@ impl<'m> Lowerer<'m> {
         self.lower_all_classes(&prog)?;
 
         // -------- Stage 6: ahora SÍ, __modinit__ AL FINAL --------
-        let modinit = self.lower_modinit(&prog, &self.links.clone())?;
+        let modinit = self.lower_modinit(&prog, &self.lowering_ctx.links.clone())?;
         out.push(modinit);
 
         Ok(out)
@@ -322,6 +331,7 @@ impl<'m> Lowerer<'m> {
 
         // Capture list for this (hoisted) function, if any.
         let lam_caps_for_this = self
+            .lowering_ctx
             .lam_captures
             .get(&fdecl.name)
             .cloned()
@@ -337,7 +347,7 @@ impl<'m> Lowerer<'m> {
         let ret_tys = vec![Type::Int32];
 
         // Snapshot the function table so we can resolve direct calls without borrowing &mut self.
-        let funcs_snapshot = self.funcs.clone();
+        let funcs_snapshot = self.lowering_ctx.funcs.clone();
         let func_name = fdecl.name.clone();
         let is_async = fdecl.is_async;
 
@@ -402,10 +412,8 @@ impl<'m> Lowerer<'m> {
                     &mut fields,
                     &mut next_field,
                     &fdecl.body,
-                    &funcs_snapshot,
-                    &self.lam_captures,
+                    &self.lowering_ctx,
                     true, // in_async
-                    &self.links,
                 )?;
 
                 // Fallthrough: if the body didn’t explicitly return, resolve with 0 and return d.
@@ -433,9 +441,7 @@ impl<'m> Lowerer<'m> {
                     &mut fields,
                     &mut next_field,
                     &fdecl.body,
-                    &funcs_snapshot,
-                    &self.lam_captures,
-                    &self.links,
+                    &self.lowering_ctx,
                 )?;
 
                 // Fallthrough return 0 (matches previous convention).
@@ -449,7 +455,7 @@ impl<'m> Lowerer<'m> {
         };
 
         // Set the reserved ID before pushing
-        let reserved_fid = *self.funcs.get(&fdecl.name).expect("reserved");
+        let reserved_fid = *self.lowering_ctx.funcs.get(&fdecl.name).expect("reserved");
         func.id = reserved_fid;
 
         // Publish into the module preserving the reserved ID
@@ -465,12 +471,10 @@ fn lower_block_free<'m>(
     fields: &mut HashMap<String, FieldId>,
     next_field: &mut u32,
     blk: &Block,
-    funcs: &HashMap<String, FuncId>,
-    lam_caps: &HashMap<String, Vec<String>>,
-    links: &LinkInfo,
+    lowering_ctx: &LoweringContext,
 ) -> LResult<()> {
     for s in &blk.stmts {
-        lower_stmt_free(b, locals, fields, next_field, s, funcs, lam_caps, links)?; // <-- pass
+        lower_stmt_free(b, locals, fields, next_field, s, lowering_ctx)?; // <-- pass
     }
     Ok(())
 }
@@ -481,14 +485,12 @@ fn lower_stmt_free<'m>(
     fields: &mut HashMap<String, FieldId>,
     next_field: &mut u32,
     s: &Stmt,
-    funcs: &HashMap<String, FuncId>,
-    lam_caps: &HashMap<String, Vec<String>>,
-    links: &LinkInfo,
+    lowering_ctx: &LoweringContext,
 ) -> LResult<()> {
     match s {
         Stmt::Var { name, init } => {
             let val = if let Some(e) = init {
-                lower_expr_free(b, locals, fields, next_field, e, funcs, lam_caps, links)? // <-- pass
+                lower_expr_free(b, locals, fields, next_field, e, lowering_ctx)? // <-- pass
             } else {
                 b.const_i32(0)
             };
@@ -499,25 +501,25 @@ fn lower_stmt_free<'m>(
                 eprintln!("lower_stmt_free() Stmt::Var {{ {} }}", name);
                 eprintln!(
                     "[links] exports        : {:?}",
-                    links.export_bindings.keys().collect::<Vec<_>>()
+                    lowering_ctx.links.export_bindings.keys().collect::<Vec<_>>()
                 );
                 eprintln!(
                     "[links] imports        : {:?}",
-                    links.import_bindings.keys().collect::<Vec<_>>()
+                    lowering_ctx.links.import_bindings.keys().collect::<Vec<_>>()
                 );
                 eprintln!(
                     "[links] namespace_imps : {:?}",
-                    links.namespace_imports.keys().collect::<Vec<_>>()
+                    lowering_ctx.links.namespace_imports.keys().collect::<Vec<_>>()
                 );
-                eprintln!("[links] namespace_cells: {:?}", links.namespace_cells);
+                eprintln!("[links] namespace_cells: {:?}", lowering_ctx.links.namespace_cells);
             }
-            if let Some(&bid) = links.export_bindings.get(name) {
+            if let Some(&bid) = lowering_ctx.links.export_bindings.get(name) {
                 b.store_binding(bid, val);
             }
         }
         Stmt::VarDestruct { pattern, init } => {
             let obj_val =
-                lower_expr_free(b, locals, fields, next_field, init, funcs, lam_caps, links)?;
+                lower_expr_free(b, locals, fields, next_field, init, lowering_ctx)?;
 
             for field in &pattern.fields {
                 let prop_name = match &field.key {
@@ -526,7 +528,7 @@ fn lower_stmt_free<'m>(
                 };
                 let value = lower_general_getprop(b, obj_val, prop_name, fields, next_field);
                 locals.insert(field.binding.clone(), value);
-                if let Some(&bid) = links.export_bindings.get(&field.binding) {
+                if let Some(&bid) = lowering_ctx.links.export_bindings.get(&field.binding) {
                     b.store_binding(bid, value);
                 }
             }
@@ -603,7 +605,7 @@ fn lower_stmt_free<'m>(
                 }
 
                 locals.insert(rest_name.clone(), rest_obj);
-                if let Some(&bid) = links.export_bindings.get(rest_name) {
+                if let Some(&bid) = lowering_ctx.links.export_bindings.get(rest_name) {
                     b.store_binding(bid, rest_obj);
                 }
             }
@@ -613,7 +615,7 @@ fn lower_stmt_free<'m>(
             then_b,
             else_b,
         } => {
-            let c = lower_expr_free(b, locals, fields, next_field, cond, funcs, lam_caps, links)?; // <-- pass
+            let c = lower_expr_free(b, locals, fields, next_field, cond, lowering_ctx)?; // <-- pass
             let then_id = b.block();
             let else_id = b.block();
             let then_end = b.block();
@@ -632,9 +634,7 @@ fn lower_stmt_free<'m>(
                 fields,
                 next_field,
                 then_b,
-                funcs,
-                lam_caps,
-                links,
+                lowering_ctx
             )?; // <-- pass
             if !b.current_block_terminated() {
                 b.jump(then_end, &[]);
@@ -650,9 +650,7 @@ fn lower_stmt_free<'m>(
                     fields,
                     next_field,
                     eb,
-                    funcs,
-                    lam_caps,
-                    links,
+                    lowering_ctx
                 )?; // <-- pass
             }
             if !b.current_block_terminated() {
@@ -716,11 +714,11 @@ fn lower_stmt_free<'m>(
             for (nm, p) in mut_names.iter().zip(phi_vals.iter()) {
                 locals.insert(nm.clone(), *p);
             }
-            let c = lower_expr_free(b, locals, fields, next_field, cond, funcs, lam_caps, links)?; // <-- pass
+            let c = lower_expr_free(b, locals, fields, next_field, cond, lowering_ctx)?; // <-- pass
             b.branch(c, body_b, exit);
 
             b.position_at(body_b);
-            lower_block_free(b, locals, fields, next_field, body, funcs, lam_caps, links)?; // <-- pass
+            lower_block_free(b, locals, fields, next_field, body, lowering_ctx)?; // <-- pass
             let back_args: Vec<ValueId> =
                 mut_names.iter().map(|n| *locals.get(n).unwrap()).collect();
             b.jump(head, &back_args);
@@ -737,7 +735,7 @@ fn lower_stmt_free<'m>(
             body,
         } => {
             if let Some(i) = init.as_deref() {
-                lower_stmt_free(b, locals, fields, next_field, i, funcs, lam_caps, links)?;
+                lower_stmt_free(b, locals, fields, next_field, i, lowering_ctx)?;
             } // <-- pass
 
             let head = b.block();
@@ -770,7 +768,7 @@ fn lower_stmt_free<'m>(
                 locals.insert(nm.clone(), *p);
             }
             let c = if let Some(e) = cond {
-                lower_expr_free(b, locals, fields, next_field, e, funcs, lam_caps, links)? // <-- pass
+                lower_expr_free(b, locals, fields, next_field, e, lowering_ctx)? // <-- pass
             } else {
                 let (_nid, res) = b.push_node(
                     Inst::Const(Constant::Bool(true)),
@@ -783,9 +781,9 @@ fn lower_stmt_free<'m>(
             b.branch(c, body_b, exit);
 
             b.position_at(body_b);
-            lower_block_free(b, locals, fields, next_field, body, funcs, lam_caps, links)?; // <-- pass
+            lower_block_free(b, locals, fields, next_field, body, lowering_ctx)?; // <-- pass
             if let Some(se) = step {
-                let _ = lower_expr_free(b, locals, fields, next_field, se, funcs, lam_caps, links)?;
+                let _ = lower_expr_free(b, locals, fields, next_field, se, lowering_ctx)?;
             } // <-- pass
             let back_args: Vec<ValueId> =
                 mut_names.iter().map(|n| *locals.get(n).unwrap()).collect();
@@ -798,7 +796,7 @@ fn lower_stmt_free<'m>(
         }
         Stmt::Return(e) => {
             if let Some(e) = e {
-                let v = lower_expr_free(b, locals, fields, next_field, e, funcs, lam_caps, links)?; // <-- pass
+                let v = lower_expr_free(b, locals, fields, next_field, e, lowering_ctx)?;
                 b.ret(&[v]);
             } else {
                 let z = b.const_i32(0);
@@ -835,9 +833,7 @@ fn lower_stmt_free<'m>(
                     fields,
                     next_field,
                     &rt.pattern,
-                    funcs,
-                    lam_caps,
-                    links,
+                    lowering_ctx
                 )?;
                 let hnd_v = lower_expr_free(
                     b,
@@ -845,9 +841,7 @@ fn lower_stmt_free<'m>(
                     fields,
                     next_field,
                     &rt.handler,
-                    funcs,
-                    lam_caps,
-                    links,
+                    lowering_ctx
                 )?;
                 let (_mid, mr) = b.push_node(
                     Inst::Const(Constant::Str(rt.method.clone())),
@@ -885,7 +879,7 @@ fn lower_stmt_free<'m>(
         }
 
         Stmt::Expr(e) => {
-            let _ = lower_expr_free(b, locals, fields, next_field, e, funcs, lam_caps, links)?;
+            let _ = lower_expr_free(b, locals, fields, next_field, e, lowering_ctx)?;
         } // <-- pass
     }
 
@@ -1161,14 +1155,12 @@ fn lower_block_free_async<'m>(
     fields: &mut HashMap<String, FieldId>,
     next_field: &mut u32,
     blk: &Block,
-    funcs: &HashMap<String, FuncId>,
-    lam_caps: &HashMap<String, Vec<String>>,
+    lowering_ctx: &LoweringContext,
     in_async: bool,
-    links: &LinkInfo,
 ) -> LResult<()> {
     for s in &blk.stmts {
         lower_stmt_free_async(
-            b, locals, fields, next_field, s, funcs, lam_caps, in_async, links,
+            b, locals, fields, next_field, s, lowering_ctx, in_async,
         )?;
     }
     Ok(())
@@ -1180,17 +1172,15 @@ fn lower_stmt_free_async<'m>(
     fields: &mut HashMap<String, FieldId>,
     next_field: &mut u32,
     s: &Stmt,
-    funcs: &HashMap<String, FuncId>,
-    lam_caps: &HashMap<String, Vec<String>>,
+    lowering_ctx: &LoweringContext,
     in_async: bool,
-    links: &LinkInfo,
 ) -> LResult<()> {
     match s {
         Stmt::Return(eopt) if in_async => {
             let d = *locals.get("__deferred").expect("__deferred present");
             let v = if let Some(e) = eopt {
                 lower_expr_free_async(
-                    b, locals, fields, next_field, e, funcs, lam_caps, in_async, links,
+                    b, locals, fields, next_field, e, lowering_ctx, in_async,
                 )?
             } else {
                 b.const_i32(0)
@@ -1239,10 +1229,8 @@ fn lower_stmt_free_async<'m>(
                     fields,
                     next_field,
                     &rt.pattern,
-                    funcs,
-                    lam_caps,
+                    lowering_ctx,
                     in_async,
-                    links,
                 )?;
                 let hnd_v = lower_expr_free_async(
                     b,
@@ -1250,10 +1238,8 @@ fn lower_stmt_free_async<'m>(
                     fields,
                     next_field,
                     &rt.handler,
-                    funcs,
-                    lam_caps,
+                    lowering_ctx,
                     in_async,
-                    links,
                 )?;
                 let (_mid, mr) = b.push_node(
                     Inst::Const(Constant::Str(rt.method.clone())),
@@ -1297,20 +1283,20 @@ fn lower_stmt_free_async<'m>(
                 Stmt::Var { name, init } => {
                     let val = if let Some(e) = init {
                         lower_expr_free_async(
-                            b, locals, fields, next_field, e, funcs, lam_caps, in_async, links,
+                            b, locals, fields, next_field, e, lowering_ctx, in_async,
                         )?
                     } else {
                         b.const_i32(0)
                     };
                     locals.insert(name.clone(), val);
-                    if let Some(&bid) = links.export_bindings.get(name) {
+                    if let Some(&bid) = lowering_ctx.links.export_bindings.get(name) {
                         b.store_binding(bid, val);
                     }
                     Ok(())
                 }
                 Stmt::VarDestruct { pattern, init } => {
                     let obj_val = lower_expr_free_async(
-                        b, locals, fields, next_field, init, funcs, lam_caps, in_async, links,
+                        b, locals, fields, next_field, init, lowering_ctx, in_async,
                     )?;
 
                     for field in &pattern.fields {
@@ -1321,7 +1307,7 @@ fn lower_stmt_free_async<'m>(
                         let value =
                             lower_general_getprop(b, obj_val, prop_name, fields, next_field);
                         locals.insert(field.binding.clone(), value);
-                        if let Some(&bid) = links.export_bindings.get(&field.binding) {
+                        if let Some(&bid) = lowering_ctx.links.export_bindings.get(&field.binding) {
                             b.store_binding(bid, value);
                         }
                     }
@@ -1398,7 +1384,7 @@ fn lower_stmt_free_async<'m>(
                         }
 
                         locals.insert(rest_name.clone(), rest_obj);
-                        if let Some(&bid) = links.export_bindings.get(rest_name) {
+                        if let Some(&bid) = lowering_ctx.links.export_bindings.get(rest_name) {
                             b.store_binding(bid, rest_obj);
                         }
                     }
@@ -1410,7 +1396,7 @@ fn lower_stmt_free_async<'m>(
                     else_b,
                 } => {
                     let c = lower_expr_free_async(
-                        b, locals, fields, next_field, cond, funcs, lam_caps, in_async, links,
+                        b, locals, fields, next_field, cond, lowering_ctx, in_async,
                     )?;
                     // (rest identical to your If lowering, but using lower_block_free_async)
                     // ...
@@ -1433,10 +1419,8 @@ fn lower_stmt_free_async<'m>(
                         fields,
                         next_field,
                         then_b,
-                        funcs,
-                        lam_caps,
+                        lowering_ctx,
                         in_async,
-                        links,
                     )?;
                     if !b.current_block_terminated() {
                         b.jump(then_end, &[]);
@@ -1452,10 +1436,8 @@ fn lower_stmt_free_async<'m>(
                             fields,
                             next_field,
                             eb,
-                            funcs,
-                            lam_caps,
+                            lowering_ctx,
                             in_async,
-                            links,
                         )?;
                     }
                     if !b.current_block_terminated() {
@@ -1524,13 +1506,13 @@ fn lower_stmt_free_async<'m>(
                         locals.insert(nm.clone(), *p);
                     }
                     let c = lower_expr_free_async(
-                        b, locals, fields, next_field, cond, funcs, lam_caps, in_async, links,
+                        b, locals, fields, next_field, cond, lowering_ctx, in_async,
                     )?;
                     b.branch(c, body_b, exit);
 
                     b.position_at(body_b);
                     lower_block_free_async(
-                        b, locals, fields, next_field, body, funcs, lam_caps, in_async, links,
+                        b, locals, fields, next_field, body, lowering_ctx, in_async,
                     )?;
                     let back_args: Vec<ValueId> =
                         mut_names.iter().map(|n| *locals.get(n).unwrap()).collect();
@@ -1550,7 +1532,7 @@ fn lower_stmt_free_async<'m>(
                 } => {
                     if let Some(i) = init {
                         lower_stmt_free_async(
-                            b, locals, fields, next_field, i, funcs, lam_caps, in_async, links,
+                            b, locals, fields, next_field, i, lowering_ctx, in_async,
                         )?;
                     }
 
@@ -1585,7 +1567,7 @@ fn lower_stmt_free_async<'m>(
                     }
                     let c = if let Some(e) = cond {
                         lower_expr_free_async(
-                            b, locals, fields, next_field, e, funcs, lam_caps, in_async, links,
+                            b, locals, fields, next_field, e, lowering_ctx, in_async,
                         )?
                     } else {
                         let (_nid, res) = b.push_node(
@@ -1600,11 +1582,11 @@ fn lower_stmt_free_async<'m>(
 
                     b.position_at(body_b);
                     lower_block_free_async(
-                        b, locals, fields, next_field, body, funcs, lam_caps, in_async, links,
+                        b, locals, fields, next_field, body, lowering_ctx, in_async,
                     )?;
                     if let Some(se) = step {
                         let _ = lower_expr_free_async(
-                            b, locals, fields, next_field, se, funcs, lam_caps, in_async, links,
+                            b, locals, fields, next_field, se, lowering_ctx, in_async,
                         )?;
                     }
                     let back_args: Vec<ValueId> =
@@ -1619,7 +1601,7 @@ fn lower_stmt_free_async<'m>(
                 }
                 Stmt::Expr(e) => {
                     let _ = lower_expr_free_async(
-                        b, locals, fields, next_field, e, funcs, lam_caps, in_async, links,
+                        b, locals, fields, next_field, e, lowering_ctx, in_async,
                     )?;
                     Ok(())
                 }
@@ -1637,16 +1619,14 @@ fn lower_expr_free_async<'m>(
     fields: &mut HashMap<String, FieldId>,
     next_field: &mut u32,
     e: &Expr,
-    funcs: &HashMap<String, FuncId>,
-    lam_caps: &HashMap<String, Vec<String>>,
+    lowering_ctx: &LoweringContext,
     in_async: bool,
-    links: &LinkInfo,
 ) -> LResult<ValueId> {
     if in_async {
         let _guard = AwaitScopeGuard::enter();
-        lower_expr_free(b, locals, fields, next_field, e, funcs, lam_caps, links)
+        lower_expr_free(b, locals, fields, next_field, e, lowering_ctx)
     } else {
-        lower_expr_free(b, locals, fields, next_field, e, funcs, lam_caps, links)
+        lower_expr_free(b, locals, fields, next_field, e, lowering_ctx)
     }
 }
 
@@ -1658,9 +1638,7 @@ fn lower_array_method_call<'m>(
     recv: &Expr,
     name: &str,
     args: &[Expr],
-    funcs: &HashMap<String, FuncId>,
-    lam_caps: &HashMap<String, Vec<String>>,
-    links: &LinkInfo,
+    lowering_ctx: &LoweringContext,
 ) -> LResult<Option<ValueId>> {
     use crate::wir::{Inst, Type};
 
@@ -1670,9 +1648,7 @@ fn lower_array_method_call<'m>(
         _fields,
         _next_field,
         recv,
-        funcs,
-        lam_caps,
-        links,
+        lowering_ctx,
     )?;
 
     // Small helper to call a simple native
@@ -1713,9 +1689,7 @@ fn lower_array_method_call<'m>(
                 _fields,
                 _next_field,
                 &args[0],
-                funcs,
-                lam_caps,
-                links,
+                lowering_ctx
             )?;
             return cn!("wir_array_set_len", [arr, n], Some(Type::Int32));
         }
@@ -1729,9 +1703,7 @@ fn lower_array_method_call<'m>(
                 _fields,
                 _next_field,
                 &args[0],
-                funcs,
-                lam_caps,
-                links,
+                lowering_ctx
             )?;
             return cn!("wir_array_push", [arr, v], Some(Type::Int32));
         }
@@ -1757,9 +1729,7 @@ fn lower_array_method_call<'m>(
                 _fields,
                 _next_field,
                 &args[0],
-                funcs,
-                lam_caps,
-                links,
+                lowering_ctx
             )?;
             return cn!("wir_array_unshift", [arr, v], Some(Type::Int32));
         }
@@ -1775,9 +1745,7 @@ fn lower_array_method_call<'m>(
                 _fields,
                 _next_field,
                 &args[0],
-                funcs,
-                lam_caps,
-                links,
+                lowering_ctx
             )?;
 
             // len
@@ -1887,9 +1855,7 @@ fn lower_array_method_call<'m>(
                 _fields,
                 _next_field,
                 &args[0],
-                funcs,
-                lam_caps,
-                links,
+                lowering_ctx
             )?;
 
             let (_nid, len_res) = b.push_node(
@@ -2003,9 +1969,7 @@ fn lower_array_method_call<'m>(
                 _fields,
                 _next_field,
                 &args[0],
-                funcs,
-                lam_caps,
-                links,
+                lowering_ctx
             )?;
 
             let (_nid, len_res) = b.push_node(
@@ -2092,9 +2056,7 @@ fn lower_array_method_call<'m>(
                 _fields,
                 _next_field,
                 &args[0],
-                funcs,
-                lam_caps,
-                links,
+                lowering_ctx
             )?;
 
             let (_nid, len_res) = b.push_node(
@@ -2126,9 +2088,7 @@ fn lower_array_method_call<'m>(
                     _fields,
                     _next_field,
                     &args[1],
-                    funcs,
-                    lam_caps,
-                    links,
+                    lowering_ctx
                 )?;
                 b.jump(seed_join, &[zero, init]);
             } else {
@@ -2237,9 +2197,7 @@ fn lower_array_method_call<'m>(
                 _fields,
                 _next_field,
                 &args[0],
-                funcs,
-                lam_caps,
-                links,
+                lowering_ctx
             )?;
 
             let (_nid, len_res) = b.push_node(
@@ -2334,9 +2292,7 @@ fn lower_array_method_call<'m>(
                 _fields,
                 _next_field,
                 &args[0],
-                funcs,
-                lam_caps,
-                links,
+                lowering_ctx
             )?;
 
             let (_nid, len_res) = b.push_node(
@@ -2431,9 +2387,7 @@ fn lower_expr_free<'m>(
     fields: &mut HashMap<String, FieldId>,
     next_field: &mut u32,
     e: &Expr,
-    funcs: &HashMap<String, FuncId>,
-    lam_caps: &HashMap<String, Vec<String>>,
-    links: &LinkInfo,
+    lowering_ctx: &LoweringContext,
 ) -> LResult<ValueId> {
     use BinOp::*;
 
@@ -2465,7 +2419,7 @@ fn lower_expr_free<'m>(
             else_branch,
         } => {
             let cond_v =
-                lower_expr_free(b, locals, fields, next_field, cond, funcs, lam_caps, links)?;
+                lower_expr_free(b, locals, fields, next_field, cond, lowering_ctx)?;
             let then_b = b.block();
             let else_b = b.block();
             let cont = b.block();
@@ -2479,9 +2433,7 @@ fn lower_expr_free<'m>(
                 fields,
                 next_field,
                 then_branch,
-                funcs,
-                lam_caps,
-                links,
+                lowering_ctx
             )?;
             b.jump(cont, &[tval]);
 
@@ -2492,9 +2444,7 @@ fn lower_expr_free<'m>(
                 fields,
                 next_field,
                 else_branch,
-                funcs,
-                lam_caps,
-                links,
+                lowering_ctx
             )?;
             b.jump(cont, &[fval]);
 
@@ -2507,7 +2457,7 @@ fn lower_expr_free<'m>(
             if !await_allowed() {
                 return Err(LowerError::NotLowerable("await outside async function"));
             }
-            let pv = lower_expr_free(b, locals, fields, next_field, inner, funcs, lam_caps, links)?;
+            let pv = lower_expr_free(b, locals, fields, next_field, inner, lowering_ctx)?;
             let (_nid, res) = b.push_node(
                 Inst::CallNative {
                     name: "wir_await".into(),
@@ -2557,7 +2507,7 @@ fn lower_expr_free<'m>(
             }
 
             // 3) Known global function name → make a closure with null env
-            if let Some(&fid) = funcs.get(name) {
+            if let Some(&fid) = lowering_ctx.funcs.get(name) {
                 let (_nid, env_null) =
                     b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
                 let (_nid, clos) = b.push_node(
@@ -2574,20 +2524,20 @@ fn lower_expr_free<'m>(
 
             // 4) Named import: read provider's live binding (must be linked beforehand).
             //    `links.import_bindings` maps local name -> provider BindingId.
-            if let Some(&bid) = links.import_bindings.get(name) {
+            if let Some(&bid) = lowering_ctx.links.import_bindings.get(name) {
                 let v = b.load_binding(bid, None);
                 return Ok(v);
             }
 
             // 5) Own export: read our own live binding cell.
             //    `links.export_bindings` maps our local export name -> our BindingId.
-            if let Some(&bid) = links.export_bindings.get(name) {
+            if let Some(&bid) = lowering_ctx.links.export_bindings.get(name) {
                 let v = b.load_binding(bid, None);
                 return Ok(v);
             }
 
             // 6) Namespace import cached in `__modinit__` (fast path).
-            if let Some(&cell) = links.namespace_cells.get(name) {
+            if let Some(&cell) = lowering_ctx.links.namespace_cells.get(name) {
                 let ns_obj = b.load_binding(cell, None);
                 return Ok(ns_obj);
             }
@@ -2595,7 +2545,7 @@ fn lower_expr_free<'m>(
             // 7) Compatibility path: declared namespace import but not cached yet.
             //    If the namespace alias is known, we can synthesize/return a namespace
             //    object lazily and memoize it into `locals` to avoid rebuilding it.
-            if links.namespace_imports.contains_key(name) {
+            if lowering_ctx.links.namespace_imports.contains_key(name) {
                 if let Some(&cached) = locals.get(name) {
                     return Ok(cached);
                 }
@@ -2615,7 +2565,7 @@ fn lower_expr_free<'m>(
 
         Expr::OptionalChain { base, access } => {
             let base_v =
-                lower_expr_free(b, locals, fields, next_field, base, funcs, lam_caps, links)?;
+                lower_expr_free(b, locals, fields, next_field, base, lowering_ctx)?;
             let cont = b.block();
             let res_param = b.add_block_param(cont, Type::Top);
             let null_v = b.const_null();
@@ -2644,7 +2594,7 @@ fn lower_expr_free<'m>(
                 }
                 OptionalAccess::Index(idx_expr) => {
                     let idx_val = lower_expr_free(
-                        b, locals, fields, next_field, idx_expr, funcs, lam_caps, links,
+                        b, locals, fields, next_field, idx_expr, lowering_ctx,
                     )?;
                     let (_nid_is, is_str) = b.push_node(
                         Inst::CallNative {
@@ -2715,13 +2665,13 @@ fn lower_expr_free<'m>(
                     }
                     if let Some(expr) = this_source {
                         let this_v = lower_expr_free(
-                            b, locals, fields, next_field, &expr, funcs, lam_caps, links,
+                            b, locals, fields, next_field, &expr, lowering_ctx,
                         )?;
                         argv.push(this_v);
                     }
                     for arg in args {
                         argv.push(lower_expr_free(
-                            b, locals, fields, next_field, arg, funcs, lam_caps, links,
+                            b, locals, fields, next_field, arg, lowering_ctx,
                         )?);
                     }
                     let (_nid, res) = b.push_node(
@@ -2744,11 +2694,11 @@ fn lower_expr_free<'m>(
         }
 
         Expr::Group(inner) => {
-            lower_expr_free(b, locals, fields, next_field, inner, funcs, lam_caps, links)
+            lower_expr_free(b, locals, fields, next_field, inner, lowering_ctx)
         }
 
         Expr::Unary { op, e } => {
-            let v = lower_expr_free(b, locals, fields, next_field, e, funcs, lam_caps, links)?;
+            let v = lower_expr_free(b, locals, fields, next_field, e, lowering_ctx)?;
             match op {
                 UnOp::Neg => {
                     let zero = b.const_i32(0);
@@ -2778,36 +2728,36 @@ fn lower_expr_free<'m>(
         }
 
         Expr::Binary { op, a, b: bb } => {
-            let va = lower_expr_free(b, locals, fields, next_field, a, funcs, lam_caps, links)?;
+            let va = lower_expr_free(b, locals, fields, next_field, a, lowering_ctx)?;
             match op {
                 Add => {
                     let vb =
-                        lower_expr_free(b, locals, fields, next_field, bb, funcs, lam_caps, links)?;
+                        lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
                     Ok(b.int_bin(IntBinOp::Add, va, vb))
                 }
                 Sub => {
                     let vb =
-                        lower_expr_free(b, locals, fields, next_field, bb, funcs, lam_caps, links)?;
+                        lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
                     Ok(b.int_bin(IntBinOp::Sub, va, vb))
                 }
                 Mul => {
                     let vb =
-                        lower_expr_free(b, locals, fields, next_field, bb, funcs, lam_caps, links)?;
+                        lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
                     Ok(b.int_bin(IntBinOp::Mul, va, vb))
                 }
                 Div => {
                     let vb =
-                        lower_expr_free(b, locals, fields, next_field, bb, funcs, lam_caps, links)?;
+                        lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
                     Ok(b.int_bin(IntBinOp::DivS, va, vb))
                 }
                 Rem => {
                     let vb =
-                        lower_expr_free(b, locals, fields, next_field, bb, funcs, lam_caps, links)?;
+                        lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
                     Ok(b.int_bin(IntBinOp::RemS, va, vb))
                 }
                 Eq | Ne | Lt | Le | Gt | Ge => {
                     let vb =
-                        lower_expr_free(b, locals, fields, next_field, bb, funcs, lam_caps, links)?;
+                        lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
                     let kind = match *op {
                         BinOp::Eq => crate::wir::CmpKind::Eq,
                         BinOp::Ne => crate::wir::CmpKind::Ne,
@@ -2839,7 +2789,7 @@ fn lower_expr_free<'m>(
 
                     b.position_at(then_b);
                     let tval = if *op == And {
-                        lower_expr_free(b, locals, fields, next_field, bb, funcs, lam_caps, links)?
+                        lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?
                     } else {
                         let (_nid, res) = b.push_node(
                             Inst::Const(Constant::Bool(true)),
@@ -2861,7 +2811,7 @@ fn lower_expr_free<'m>(
                         );
                         res[0]
                     } else {
-                        lower_expr_free(b, locals, fields, next_field, bb, funcs, lam_caps, links)?
+                        lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?
                     };
                     b.jump(cont, &[fval]);
 
@@ -2888,7 +2838,7 @@ fn lower_expr_free<'m>(
 
                     b.position_at(null_block);
                     let vb =
-                        lower_expr_free(b, locals, fields, next_field, bb, funcs, lam_caps, links)?;
+                        lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
                     b.jump(cont, &[vb]);
 
                     b.position_at(value_block);
@@ -2901,12 +2851,12 @@ fn lower_expr_free<'m>(
         }
 
         Expr::Assign(lv, rhs) => {
-            let rv = lower_expr_free(b, locals, fields, next_field, rhs, funcs, lam_caps, links)?;
+            let rv = lower_expr_free(b, locals, fields, next_field, rhs, lowering_ctx)?;
             match &**lv {
                 // o.a = rv      (dot write)
                 LValue::GetProp { recv, name } => {
                     let obj = lower_expr_free(
-                        b, locals, fields, next_field, recv, funcs, lam_caps, links,
+                        b, locals, fields, next_field, recv, lowering_ctx,
                     )?;
 
                     // Special-case: arr.length = n
@@ -2964,7 +2914,7 @@ fn lower_expr_free<'m>(
                 // o["a"] = rv     (bracket write with string)
                 LValue::Index { recv, index } if matches!(index, Expr::Str(_)) => {
                     let obj = lower_expr_free(
-                        b, locals, fields, next_field, recv, funcs, lam_caps, links,
+                        b, locals, fields, next_field, recv, lowering_ctx,
                     )?;
                     let s = if let Expr::Str(s) = index {
                         s
@@ -3011,10 +2961,10 @@ fn lower_expr_free<'m>(
                 // --- inside Expr::Assign(lv, rhs) match ---
                 LValue::Index { recv, index } if !matches!(index, Expr::Str(_)) => {
                     let obj = lower_expr_free(
-                        b, locals, fields, next_field, recv, funcs, lam_caps, links,
+                        b, locals, fields, next_field, recv, lowering_ctx,
                     )?;
                     let idxv = lower_expr_free(
-                        b, locals, fields, next_field, index, funcs, lam_caps, links,
+                        b, locals, fields, next_field, index, lowering_ctx,
                     )?;
 
                     let (_nid_is, is_str) = b.push_node(
@@ -3071,7 +3021,7 @@ fn lower_expr_free<'m>(
                 LValue::Ident(name) => {
                     // Primero resuelve RHS
                     let rv = lower_expr_free(
-                        b, locals, fields, next_field, rhs, funcs, lam_caps, links,
+                        b, locals, fields, next_field, rhs, lowering_ctx,
                     )?;
 
                     #[cfg(debug_assertions)]
@@ -3079,48 +3029,48 @@ fn lower_expr_free<'m>(
                         eprintln!("lower_expr_free() LValue::Ident({})", name);
                         eprintln!(
                             "[links] exports        : {:?}",
-                            links.export_bindings.keys().collect::<Vec<_>>()
+                            lowering_ctx.links.export_bindings.keys().collect::<Vec<_>>()
                         );
                         eprintln!(
                             "[links] imports        : {:?}",
-                            links.import_bindings.keys().collect::<Vec<_>>()
+                            lowering_ctx.links.import_bindings.keys().collect::<Vec<_>>()
                         );
                         eprintln!(
                             "[links] namespace_imps : {:?}",
-                            links.namespace_imports.keys().collect::<Vec<_>>()
+                            lowering_ctx.links.namespace_imports.keys().collect::<Vec<_>>()
                         );
-                        eprintln!("[links] namespace_cells: {:?}", links.namespace_cells);
+                        eprintln!("[links] namespace_cells: {:?}", lowering_ctx.links.namespace_cells);
                     }
 
                     // a) no se puede asignar a un import
-                    if links.import_bindings.contains_key(name) {
+                    if lowering_ctx.links.import_bindings.contains_key(name) {
                         return Err(LowerError::NotLowerable(
                             "cannot assign to imported binding",
                         ));
                     }
                     // b) tampoco a un namespace import
-                    if links.namespace_cells.contains_key(name)
-                        || links.namespace_imports.contains_key(name)
+                    if lowering_ctx.links.namespace_cells.contains_key(name)
+                        || lowering_ctx.links.namespace_imports.contains_key(name)
                     {
                         return Err(LowerError::NotLowerable(
                             "cannot assign to namespace import",
                         ));
                     }
                     // c) export propio: live update
-                    if let Some(&bid) = links.export_bindings.get(name) {
+                    if let Some(&bid) = lowering_ctx.links.export_bindings.get(name) {
                         b.store_binding(bid, rv);
                         return Ok(rv);
                     }
 
                     // import x from "m";  x = ...  → error de compilación
-                    if links.import_bindings.contains_key(name) {
+                    if lowering_ctx.links.import_bindings.contains_key(name) {
                         return Err(LowerError::NotLowerable(
                             "cannot assign to imported binding",
                         ));
                     }
 
                     // export let x;  x = rv  → StoreBinding(binding(this,x), rv)
-                    if let Some(&bid) = links.export_bindings.get(name) {
+                    if let Some(&bid) = lowering_ctx.links.export_bindings.get(name) {
                         b.store_binding(bid, rv);
                         return Ok(rv);
                     }
@@ -3160,7 +3110,7 @@ fn lower_expr_free<'m>(
         // obj.<propKey>  where propKey is an identifier or string
         Expr::GetProp { recv, name } => {
             if let Expr::Ident(cn) = &**recv {
-                if let Some(&mfid) = funcs.get(&format!("__static_{}_{}", cn, name)) {
+                if let Some(&mfid) = lowering_ctx.funcs.get(&format!("__static_{}_{}", cn, name)) {
                     let (_nid, env_null) =
                         b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
                     let (_nid, clos) = b.push_node(
@@ -3179,7 +3129,7 @@ fn lower_expr_free<'m>(
             // Special-case: arr.length
             if name == "length" {
                 let arr =
-                    lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps, links)?;
+                    lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
                 let (_nid, res) = b.push_node(
                     Inst::CallNative {
                         name: "wir_array_len".into(),
@@ -3194,7 +3144,7 @@ fn lower_expr_free<'m>(
                 return Ok(res[0]);
             }
 
-            let obj = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps, links)?;
+            let obj = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
             let value = lower_general_getprop(b, obj, name, fields, next_field);
             Ok(value)
         }
@@ -3202,8 +3152,8 @@ fn lower_expr_free<'m>(
         // obj.<propKey> = value   (identifier or string propKey)
         Expr::SetPropObj { obj, key, value } => {
             // Normalize inputs
-            let o = lower_expr_free(b, locals, fields, next_field, obj, funcs, lam_caps, links)?;
-            let v = lower_expr_free(b, locals, fields, next_field, value, funcs, lam_caps, links)?;
+            let o = lower_expr_free(b, locals, fields, next_field, obj, lowering_ctx)?;
+            let v = lower_expr_free(b, locals, fields, next_field, value, lowering_ctx)?;
             let field_name = match key {
                 PropKey::Ident(s) => s.clone(),
                 PropKey::Str(s) => s.clone(),
@@ -3307,16 +3257,16 @@ fn lower_expr_free<'m>(
             if let Expr::Index { recv, index } = &**callee {
                 if matches!(&**index, Expr::Str(_)) {
                     let this_v = lower_expr_free(
-                        b, locals, fields, next_field, recv, funcs, lam_caps, links,
+                        b, locals, fields, next_field, recv, lowering_ctx,
                     )?;
                     let fun_v = lower_expr_free(
-                        b, locals, fields, next_field, callee, funcs, lam_caps, links,
+                        b, locals, fields, next_field, callee, lowering_ctx,
                     )?;
                     let mut argv = Vec::with_capacity(args.len() + 1);
                     argv.push(this_v);
                     for a in args {
                         argv.push(lower_expr_free(
-                            b, locals, fields, next_field, a, funcs, lam_caps, links,
+                            b, locals, fields, next_field, a, lowering_ctx,
                         )?);
                     }
                     let (_nid, res) = b.push_node(
@@ -3341,7 +3291,7 @@ fn lower_expr_free<'m>(
                             return Err(LowerError::NotLowerable("import(spec) expects 1 arg"));
                         }
                         let spec = lower_expr_free(
-                            b, locals, fields, next_field, &args[0], funcs, lam_caps, links,
+                            b, locals, fields, next_field, &args[0], lowering_ctx,
                         )?;
                         let v = b.import_dynamic(spec);
                         return Ok(v);
@@ -3351,19 +3301,19 @@ fn lower_expr_free<'m>(
                 // 0a) Promise-style instance methods
                 if name == "then" {
                     let p = lower_expr_free(
-                        b, locals, fields, next_field, recv, funcs, lam_caps, links,
+                        b, locals, fields, next_field, recv, lowering_ctx,
                     )?;
                     let z = b.const_i32(0); // sentinel "no callback"
                     let onf = if args.len() >= 1 {
                         lower_expr_free(
-                            b, locals, fields, next_field, &args[0], funcs, lam_caps, links,
+                            b, locals, fields, next_field, &args[0], lowering_ctx,
                         )?
                     } else {
                         z
                     };
                     let onr = if args.len() >= 2 {
                         lower_expr_free(
-                            b, locals, fields, next_field, &args[1], funcs, lam_caps, links,
+                            b, locals, fields, next_field, &args[1], lowering_ctx,
                         )?
                     } else {
                         z
@@ -3383,12 +3333,12 @@ fn lower_expr_free<'m>(
                 }
                 if name == "catch" {
                     let p = lower_expr_free(
-                        b, locals, fields, next_field, recv, funcs, lam_caps, links,
+                        b, locals, fields, next_field, recv, lowering_ctx,
                     )?;
                     let z = b.const_i32(0);
                     let onr = if args.len() >= 1 {
                         lower_expr_free(
-                            b, locals, fields, next_field, &args[0], funcs, lam_caps, links,
+                            b, locals, fields, next_field, &args[0], lowering_ctx,
                         )?
                     } else {
                         z
@@ -3409,13 +3359,13 @@ fn lower_expr_free<'m>(
                 if name == "resolve" {
                     // deferred.resolve(value?)
                     let p = lower_expr_free(
-                        b, locals, fields, next_field, recv, funcs, lam_caps, links,
+                        b, locals, fields, next_field, recv, lowering_ctx,
                     )?;
                     let (_nid, nul) =
                         b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
                     let val = if args.len() >= 1 {
                         lower_expr_free(
-                            b, locals, fields, next_field, &args[0], funcs, lam_caps, links,
+                            b, locals, fields, next_field, &args[0], lowering_ctx,
                         )?
                     } else {
                         nul[0]
@@ -3436,13 +3386,13 @@ fn lower_expr_free<'m>(
                 if name == "reject" {
                     // deferred.reject(reason?)
                     let p = lower_expr_free(
-                        b, locals, fields, next_field, recv, funcs, lam_caps, links,
+                        b, locals, fields, next_field, recv, lowering_ctx
                     )?;
                     let (_nid, nul) =
                         b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
                     let reason = if args.len() >= 1 {
                         lower_expr_free(
-                            b, locals, fields, next_field, &args[0], funcs, lam_caps, links,
+                            b, locals, fields, next_field, &args[0], lowering_ctx
                         )?
                     } else {
                         nul[0]
@@ -3472,13 +3422,13 @@ fn lower_expr_free<'m>(
                                     ));
                                 }
                                 let req = lower_expr_free(
-                                    b, locals, fields, next_field, &args[0], funcs, lam_caps, links,
+                                    b, locals, fields, next_field, &args[0], lowering_ctx 
                                 )?;
                                 let status = lower_expr_free(
-                                    b, locals, fields, next_field, &args[1], funcs, lam_caps, links,
+                                    b, locals, fields, next_field, &args[1], lowering_ctx 
                                 )?;
                                 let hdrs = lower_expr_free(
-                                    b, locals, fields, next_field, &args[2], funcs, lam_caps, links,
+                                    b, locals, fields, next_field, &args[2], lowering_ctx 
                                 )?;
                                 let (_nid, res) = b.push_node(
                                     Inst::CallNative {
@@ -3500,13 +3450,13 @@ fn lower_expr_free<'m>(
                                     ));
                                 }
                                 let sid = lower_expr_free(
-                                    b, locals, fields, next_field, &args[0], funcs, lam_caps, links,
+                                    b, locals, fields, next_field, &args[0], lowering_ctx 
                                 )?;
                                 let rid = lower_expr_free(
-                                    b, locals, fields, next_field, &args[1], funcs, lam_caps, links,
+                                    b, locals, fields, next_field, &args[1], lowering_ctx 
                                 )?;
                                 let chunk = lower_expr_free(
-                                    b, locals, fields, next_field, &args[2], funcs, lam_caps, links,
+                                    b, locals, fields, next_field, &args[2], lowering_ctx 
                                 )?;
                                 let (_nid, res) = b.push_node(
                                     Inst::CallNative {
@@ -3528,10 +3478,10 @@ fn lower_expr_free<'m>(
                                     ));
                                 }
                                 let sid = lower_expr_free(
-                                    b, locals, fields, next_field, &args[0], funcs, lam_caps, links,
+                                    b, locals, fields, next_field, &args[0], lowering_ctx 
                                 )?;
                                 let rid = lower_expr_free(
-                                    b, locals, fields, next_field, &args[1], funcs, lam_caps, links,
+                                    b, locals, fields, next_field, &args[1], lowering_ctx 
                                 )?;
                                 let (_nid, res) = b.push_node(
                                     Inst::CallNative {
@@ -3553,7 +3503,7 @@ fn lower_expr_free<'m>(
 
                 // 0c) STATIC CLASS METHODS — check BEFORE anything that would lower `recv`
                 if let Expr::Ident(cn) = &**recv {
-                    if let Some(&fid) = funcs.get(&format!("__static_{}_{}", cn, name)) {
+                    if let Some(&fid) = lowering_ctx.funcs.get(&format!("__static_{}_{}", cn, name)) {
                         #[cfg(debug_assertions)]
                         {
                             eprintln!("[static] candidate {}.{}", cn, name);
@@ -3562,7 +3512,7 @@ fn lower_expr_free<'m>(
                         let mut argv = Vec::with_capacity(args.len());
                         for a in args {
                             argv.push(lower_expr_free(
-                                b, locals, fields, next_field, a, funcs, lam_caps, links,
+                                b, locals, fields, next_field, a, lowering_ctx 
                             )?);
                         }
                         let (_nid, res) = b.push_node(
@@ -3581,22 +3531,22 @@ fn lower_expr_free<'m>(
 
                 // 0d) Array instance methods (map/filter/etc.) — AFTER static check (this lowers `recv`)
                 if let Some(v) = lower_array_method_call(
-                    b, locals, fields, next_field, recv, name, args, funcs, lam_caps, links,
+                    b, locals, fields, next_field, recv, name, args, lowering_ctx 
                 )? {
                     return Ok(v);
                 }
 
                 // 0e) Generic property call: inject receiver as implicit first arg ("this")
                 let this_v =
-                    lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps, links)?;
+                    lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
                 let fun_v = lower_expr_free(
-                    b, locals, fields, next_field, callee, funcs, lam_caps, links,
+                    b, locals, fields, next_field, callee, lowering_ctx 
                 )?;
                 let mut argv = Vec::with_capacity(args.len() + 1);
                 argv.push(this_v);
                 for a in args {
                     argv.push(lower_expr_free(
-                        b, locals, fields, next_field, a, funcs, lam_caps, links,
+                        b, locals, fields, next_field, a, lowering_ctx 
                     )?);
                 }
                 let (_nid, res) = b.push_node(
@@ -3619,11 +3569,11 @@ fn lower_expr_free<'m>(
             if let Expr::Index { recv, index } = &**callee {
                 // Static: Class["M"](...)
                 if let (Expr::Ident(cn), Expr::Str(m)) = (&**recv, &**index) {
-                    if let Some(&fid) = funcs.get(&format!("__static_{}_{}", cn, m)) {
+                    if let Some(&fid) = lowering_ctx.funcs.get(&format!("__static_{}_{}", cn, m)) {
                         let mut argv = Vec::with_capacity(args.len());
                         for a in args {
                             argv.push(lower_expr_free(
-                                b, locals, fields, next_field, a, funcs, lam_caps, links,
+                                b, locals, fields, next_field, a, lowering_ctx 
                             )?);
                         }
                         let (_nid, res) = b.push_node(
@@ -3642,13 +3592,13 @@ fn lower_expr_free<'m>(
 
                 // General bracket-call
                 let obj =
-                    lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps, links)?;
+                    lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
                 let idxv =
-                    lower_expr_free(b, locals, fields, next_field, index, funcs, lam_caps, links)?;
+                    lower_expr_free(b, locals, fields, next_field, index, lowering_ctx)?;
                 let mut argvals = Vec::with_capacity(args.len());
                 for a in args {
                     argvals.push(lower_expr_free(
-                        b, locals, fields, next_field, a, funcs, lam_caps, links,
+                        b, locals, fields, next_field, a, lowering_ctx 
                     )?);
                 }
 
@@ -3737,10 +3687,10 @@ fn lower_expr_free<'m>(
                         return Err(LowerError::NotLowerable("setTimeout(fn, ms)"));
                     }
                     let fun = lower_expr_free(
-                        b, locals, fields, next_field, &args[0], funcs, lam_caps, links,
+                        b, locals, fields, next_field, &args[0], lowering_ctx,
                     )?;
                     let ms = lower_expr_free(
-                        b, locals, fields, next_field, &args[1], funcs, lam_caps, links,
+                        b, locals, fields, next_field, &args[1], lowering_ctx,
                     )?;
                     let (_nid, res) = b.push_node(
                         Inst::CallNative {
@@ -3760,10 +3710,10 @@ fn lower_expr_free<'m>(
                         return Err(LowerError::NotLowerable("setInterval(fn, ms)"));
                     }
                     let fun = lower_expr_free(
-                        b, locals, fields, next_field, &args[0], funcs, lam_caps, links,
+                        b, locals, fields, next_field, &args[0], lowering_ctx,
                     )?;
                     let ms = lower_expr_free(
-                        b, locals, fields, next_field, &args[1], funcs, lam_caps, links,
+                        b, locals, fields, next_field, &args[1], lowering_ctx,
                     )?;
                     let (_nid, res) = b.push_node(
                         Inst::CallNative {
@@ -3783,7 +3733,7 @@ fn lower_expr_free<'m>(
                         return Err(LowerError::NotLowerable("clearTimeout(id)"));
                     }
                     let id = lower_expr_free(
-                        b, locals, fields, next_field, &args[0], funcs, lam_caps, links,
+                        b, locals, fields, next_field, &args[0], lowering_ctx,
                     )?;
                     let (_nid, res) = b.push_node(
                         Inst::CallNative {
@@ -3803,7 +3753,7 @@ fn lower_expr_free<'m>(
                         return Err(LowerError::NotLowerable("clearInterval(id)"));
                     }
                     let id = lower_expr_free(
-                        b, locals, fields, next_field, &args[0], funcs, lam_caps, links,
+                        b, locals, fields, next_field, &args[0], lowering_ctx,
                     )?;
                     let (_nid, res) = b.push_node(
                         Inst::CallNative {
@@ -3825,7 +3775,7 @@ fn lower_expr_free<'m>(
                         return Err(LowerError::NotLowerable("Array(len) expects 1 arg"));
                     }
                     let len = lower_expr_free(
-                        b, locals, fields, next_field, &args[0], funcs, lam_caps, links,
+                        b, locals, fields, next_field, &args[0], lowering_ctx,
                     )?;
                     let (_nid, res) = b.push_node(
                         Inst::CallNative {
@@ -3845,7 +3795,7 @@ fn lower_expr_free<'m>(
                         return Err(LowerError::NotLowerable("Promise(executor) expects 1 arg"));
                     }
                     let exec = lower_expr_free(
-                        b, locals, fields, next_field, &args[0], funcs, lam_caps, links,
+                        b, locals, fields, next_field, &args[0], lowering_ctx,
                     )?;
                     let (_nid, res) = b.push_node(
                         Inst::CallNative {
@@ -3884,7 +3834,7 @@ fn lower_expr_free<'m>(
                         return Err(LowerError::NotLowerable("get(url) expects 1 arg"));
                     }
                     let url = lower_expr_free(
-                        b, locals, fields, next_field, &args[0], funcs, lam_caps, links,
+                        b, locals, fields, next_field, &args[0], lowering_ctx,
                     )?;
                     let (_nid, res) = b.push_node(
                         Inst::CallNative {
@@ -3904,7 +3854,7 @@ fn lower_expr_free<'m>(
                         return Err(LowerError::NotLowerable("getJSON(url) expects 1 arg"));
                     }
                     let url = lower_expr_free(
-                        b, locals, fields, next_field, &args[0], funcs, lam_caps, links,
+                        b, locals, fields, next_field, &args[0], lowering_ctx,
                     )?;
                     let (_nid, res) = b.push_node(
                         Inst::CallNative {
@@ -3924,16 +3874,16 @@ fn lower_expr_free<'m>(
                         return Err(LowerError::NotLowerable("postJSON(url, body, headers?)"));
                     }
                     let url = lower_expr_free(
-                        b, locals, fields, next_field, &args[0], funcs, lam_caps, links,
+                        b, locals, fields, next_field, &args[0], lowering_ctx,
                     )?;
                     let body = lower_expr_free(
-                        b, locals, fields, next_field, &args[1], funcs, lam_caps, links,
+                        b, locals, fields, next_field, &args[1], lowering_ctx,
                     )?;
                     let (_nid, nul) =
                         b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
                     let headers = if args.len() == 3 {
                         lower_expr_free(
-                            b, locals, fields, next_field, &args[2], funcs, lam_caps, links,
+                            b, locals, fields, next_field, &args[2], lowering_ctx,
                         )?
                     } else {
                         nul[0]
@@ -3958,29 +3908,29 @@ fn lower_expr_free<'m>(
                     let (status_v, body_v, headers_v) = match args.len() {
                         1 => {
                             let body = lower_expr_free(
-                                b, locals, fields, next_field, &args[0], funcs, lam_caps, links,
+                                b, locals, fields, next_field, &args[0], lowering_ctx,
                             )?;
                             let status = b.const_i32(200);
                             (status, body, nul[0])
                         }
                         2 => {
                             let status = lower_expr_free(
-                                b, locals, fields, next_field, &args[0], funcs, lam_caps, links,
+                                b, locals, fields, next_field, &args[0], lowering_ctx,
                             )?;
                             let body = lower_expr_free(
-                                b, locals, fields, next_field, &args[1], funcs, lam_caps, links,
+                                b, locals, fields, next_field, &args[1], lowering_ctx,
                             )?;
                             (status, body, nul[0])
                         }
                         3 => {
                             let status = lower_expr_free(
-                                b, locals, fields, next_field, &args[0], funcs, lam_caps, links,
+                                b, locals, fields, next_field, &args[0], lowering_ctx,
                             )?;
                             let body = lower_expr_free(
-                                b, locals, fields, next_field, &args[1], funcs, lam_caps, links,
+                                b, locals, fields, next_field, &args[1], lowering_ctx,
                             )?;
                             let headers = lower_expr_free(
-                                b, locals, fields, next_field, &args[2], funcs, lam_caps, links,
+                                b, locals, fields, next_field, &args[2], lowering_ctx,
                             )?;
                             (status, body, headers)
                         }
@@ -4014,7 +3964,7 @@ fn lower_expr_free<'m>(
                     // Fast path for string literals: avoid allocation/inspection.
                     if matches!(args[0], Expr::Str(_)) {
                         let v = lower_expr_free(
-                            b, locals, fields, next_field, &args[0], funcs, lam_caps, links,
+                            b, locals, fields, next_field, &args[0], lowering_ctx,
                         )?;
                         let (_nid, res) = b.push_node(
                             Inst::CallNative {
@@ -4032,7 +3982,7 @@ fn lower_expr_free<'m>(
 
                     // General case: let the runtime pretty-print *any* value.
                     let v = lower_expr_free(
-                        b, locals, fields, next_field, &args[0], funcs, lam_caps, links,
+                        b, locals, fields, next_field, &args[0], lowering_ctx,
                     )?;
                     let (_nid, res) = b.push_node(
                         Inst::CallNative {
@@ -4049,11 +3999,11 @@ fn lower_expr_free<'m>(
                 }
 
                 // Direct call to a known (hoisted/declared) function
-                if let Some(&fid) = funcs.get(name) {
+                if let Some(&fid) = lowering_ctx.funcs.get(name) {
                     let mut argv = Vec::with_capacity(args.len());
                     for a in args {
                         argv.push(lower_expr_free(
-                            b, locals, fields, next_field, a, funcs, lam_caps, links,
+                            b, locals, fields, next_field, a, lowering_ctx,
                         )?);
                     }
                     let (_nid, res) = b.push_node(
@@ -4072,12 +4022,12 @@ fn lower_expr_free<'m>(
 
             // --- 2) Fallback: general function value + CallClosure ---
             let funv = lower_expr_free(
-                b, locals, fields, next_field, callee, funcs, lam_caps, links,
+                b, locals, fields, next_field, callee, lowering_ctx,
             )?;
             let mut argv = Vec::with_capacity(args.len());
             for a in args {
                 argv.push(lower_expr_free(
-                    b, locals, fields, next_field, a, funcs, lam_caps, links,
+                    b, locals, fields, next_field, a, lowering_ctx,
                 )?);
             }
             let (_nid, res) = b.push_node(
@@ -4123,11 +4073,11 @@ fn lower_expr_free<'m>(
 
             // 1) ruta local (como ya tenías)
             let fname = format!("__class_new_{}", class);
-            if let Some(&fid) = funcs.get(&fname) {
+            if let Some(&fid) = lowering_ctx.funcs.get(&fname) {
                 let mut argv = Vec::with_capacity(args.len());
                 for a in args {
                     argv.push(lower_expr_free(
-                        b, locals, fields, next_field, a, funcs, lam_caps, links,
+                        b, locals, fields, next_field, a, lowering_ctx 
                     )?);
                 }
                 let (_nid, res) = b.push_node(
@@ -4148,25 +4098,25 @@ fn lower_expr_free<'m>(
                 eprintln!("lower_expr_free() Expr::Call(...) Expr::New({})", class);
                 eprintln!(
                     "[links] exports        : {:?}",
-                    links.export_bindings.keys().collect::<Vec<_>>()
+                    lowering_ctx.links.export_bindings.keys().collect::<Vec<_>>()
                 );
                 eprintln!(
                     "[links] imports        : {:?}",
-                    links.import_bindings.keys().collect::<Vec<_>>()
+                    lowering_ctx.links.import_bindings.keys().collect::<Vec<_>>()
                 );
                 eprintln!(
                     "[links] namespace_imps : {:?}",
-                    links.namespace_imports.keys().collect::<Vec<_>>()
+                    lowering_ctx.links.namespace_imports.keys().collect::<Vec<_>>()
                 );
-                eprintln!("[links] namespace_cells: {:?}", links.namespace_cells);
+                eprintln!("[links] namespace_cells: {:?}", lowering_ctx.links.namespace_cells);
             }
 
             // 2) ruta IMPORTADA/EXPORTADA: el identificador 'class' es un binding a un "class object"
-            if let Some(&bid) = links
+            if let Some(&bid) = lowering_ctx.links
                 .import_bindings
                 .get(class)
-                .or_else(|| links.export_bindings.get(class))
-                .or_else(|| links.namespace_cells.get(class))
+                .or_else(|| lowering_ctx.links.export_bindings.get(class))
+                .or_else(|| lowering_ctx.links.namespace_cells.get(class))
             {
                 #[cfg(debug_assertions)]
                 {
@@ -4198,7 +4148,7 @@ fn lower_expr_free<'m>(
                 let mut argv = Vec::with_capacity(args.len());
                 for a in args {
                     argv.push(lower_expr_free(
-                        b, locals, fields, next_field, a, funcs, lam_caps, links,
+                        b, locals, fields, next_field, a, lowering_ctx 
                     )?);
                 }
                 let (_nid, res) = b.push_node(
@@ -4221,7 +4171,7 @@ fn lower_expr_free<'m>(
             // If index is a string literal, prefer string-table FIRST, then fast-field as a fallback.
             if let Expr::Str(s) = &**index {
                 let obj =
-                    lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps, links)?;
+                    lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
 
                 // string path first
                 let (_nid_sc, ks) = b.push_node(
@@ -4305,9 +4255,9 @@ fn lower_expr_free<'m>(
             }
 
             // Generic path: decide at runtime. If index is a string → object["key"]; else → array[index].
-            let obj = lower_expr_free(b, locals, fields, next_field, recv, funcs, lam_caps, links)?;
+            let obj = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
             let idxv =
-                lower_expr_free(b, locals, fields, next_field, index, funcs, lam_caps, links)?;
+                lower_expr_free(b, locals, fields, next_field, index, lowering_ctx)?;
 
             let (_nid_is, is_str) = b.push_node(
                 Inst::CallNative {
@@ -4382,7 +4332,7 @@ fn lower_expr_free<'m>(
 
             // Fill it
             for (i, el) in elems.iter().enumerate() {
-                let v = lower_expr_free(b, locals, fields, next_field, el, funcs, lam_caps, links)?;
+                let v = lower_expr_free(b, locals, fields, next_field, el, lowering_ctx)?;
                 let idx = b.const_i32(i as i32);
                 let _ = b.push_node(
                     Inst::CallNative {
@@ -4402,10 +4352,10 @@ fn lower_expr_free<'m>(
 
         // Closure creation from hoisted lambda
         Expr::FnRef { name } => {
-            let fid = *funcs
+            let fid = *lowering_ctx.funcs
                 .get(name)
                 .ok_or_else(|| LowerError::UnknownFunc(name.clone()))?;
-            let caps = lam_caps.get(name).cloned().unwrap_or_default();
+            let caps = lowering_ctx.lam_captures.get(name).cloned().unwrap_or_default();
 
             // For each capture, if it is not boxed yet in this scope, box it now:
             //   box = Array(1); box[0] = current_value; rebind local to box; mark boxed.
@@ -4502,7 +4452,7 @@ fn lower_expr_free<'m>(
                 match item {
                     ObjItem::Prop(key, val_e) => {
                         let v = lower_expr_free(
-                            b, locals, fields, next_field, val_e, funcs, lam_caps, links,
+                            b, locals, fields, next_field, val_e, lowering_ctx 
                         )?;
                         match key {
                             PropKey::Ident(name) => {
@@ -4542,7 +4492,7 @@ fn lower_expr_free<'m>(
                     }
                     ObjItem::Spread(expr) => {
                         let spread_obj = lower_expr_free(
-                            b, locals, fields, next_field, expr, funcs, lam_caps, links,
+                            b, locals, fields, next_field, expr, lowering_ctx 
                         )?;
                         let _ = b.push_node(
                             Inst::CallNative {
@@ -4563,7 +4513,7 @@ fn lower_expr_free<'m>(
         }
 
         Expr::DeleteProp { obj, key } => {
-            let o = lower_expr_free(b, locals, fields, next_field, obj, funcs, lam_caps, links)?;
+            let o = lower_expr_free(b, locals, fields, next_field, obj, lowering_ctx)?;
 
             match key {
                 // delete o.a  — delete both field and string
@@ -4648,7 +4598,7 @@ fn lower_expr_free<'m>(
         }
 
         Expr::In { key, obj } => {
-            let o = lower_expr_free(b, locals, fields, next_field, obj, funcs, lam_caps, links)?;
+            let o = lower_expr_free(b, locals, fields, next_field, obj, lowering_ctx)?;
 
             match &**key {
                 // identifier key:  a in o
@@ -4764,7 +4714,7 @@ impl<'m> Lowerer<'m> {
         let mut class_exports: Vec<(BindingId, Option<FuncId>, Vec<(String, FuncId)>)> = Vec::new();
 
         for (name, &bid) in &links.export_bindings {
-            if let Some(&fid) = self.funcs.get(name) {
+            if let Some(&fid) = self.lowering_ctx.funcs.get(name) {
                 #[cfg(debug_assertions)]
                 eprintln!(
                     "[modinit] export function {} -> fid {:?} binding {:?}",
@@ -4774,12 +4724,12 @@ impl<'m> Lowerer<'m> {
                 fn_exports.push((bid, fid));
                 continue;
             }
-            if let Some(ci) = self.classes.get(name) {
+            if let Some(ci) = self.lowering_ctx.classes.get(name) {
                 // export class <name>
-                let alloc = self.funcs.get(&format!("__class_new_{}", name)).copied();
+                let alloc = self.lowering_ctx.funcs.get(&format!("__class_new_{}", name)).copied();
                 let mut statics = Vec::new();
                 for (mname, _, _, _) in &ci.static_methods {
-                    if let Some(&sfid) = self.funcs.get(&format!("__static_{}_{}", name, mname)) {
+                    if let Some(&sfid) = self.lowering_ctx.funcs.get(&format!("__static_{}_{}", name, mname)) {
                         statics.push((mname.clone(), sfid));
                     }
                 }
@@ -4924,7 +4874,7 @@ impl<'m> Lowerer<'m> {
         let cname = &c.name;
 
         // Own the collected class info (props/method lists, flags)
-        let ci = self.classes.get(cname).expect("class collected").clone();
+        let ci = self.lowering_ctx.classes.get(cname).expect("class collected").clone();
 
         // ---- IMPORTANT: one shared field-id table per class ----
         let mut cls_fields: HashMap<String, FieldId> = HashMap::new();
@@ -5069,10 +5019,8 @@ impl<'m> Lowerer<'m> {
                     &mut fields,
                     &mut next_field,
                     body,
-                    &self.funcs,
-                    &self.lam_captures,
-                    true,
-                    &self.links,
+                    &self.lowering_ctx,
+                    true
                 )?;
 
                 if !b.current_block_terminated() {
@@ -5097,9 +5045,7 @@ impl<'m> Lowerer<'m> {
                     &mut fields,
                     &mut next_field,
                     body,
-                    &self.funcs,
-                    &self.lam_captures,
-                    &self.links,
+                    &self.lowering_ctx
                 )?;
                 if !b.current_block_terminated() {
                     let zero = b.const_i32(0);
@@ -5111,7 +5057,7 @@ impl<'m> Lowerer<'m> {
         };
 
         // Set the reserved ID before pushing
-        let reserved_fid = *self.funcs.get(fname).expect("reserved");
+        let reserved_fid = *self.lowering_ctx.funcs.get(fname).expect("reserved");
         f.id = reserved_fid;
 
         // Publish into the module preserving the reserved ID
@@ -5123,7 +5069,7 @@ impl<'m> Lowerer<'m> {
     fn rewrite_privates_in_block(&self, class_name: &str, body: &Block) -> Block {
         // Resolve base class name once (if any). We’ll still rewrite even if there is none;
         // in that case unknown-func errors will be raised later if user wrote `super`.
-        let base_opt = self.classes.get(class_name).and_then(|ci| ci.base.clone());
+        let base_opt = self.lowering_ctx.classes.get(class_name).and_then(|ci| ci.base.clone());
 
         fn rw_block<F: Fn(&Expr) -> Expr + Copy>(b: &Block, f: F) -> Block {
             Block {
@@ -5365,10 +5311,8 @@ impl<'m> Lowerer<'m> {
                     fields,
                     next_field,
                     &body_rw,
-                    &self.funcs,
-                    &self.lam_captures,
+                    &self.lowering_ctx,
                     true,
-                    &self.links,
                 )?;
 
                 // Fallthrough: if the body didn’t explicitly return, resolve with 0 and return d.
@@ -5395,9 +5339,7 @@ impl<'m> Lowerer<'m> {
                     fields,
                     next_field,
                     &body_rw,
-                    &self.funcs,
-                    &self.lam_captures,
-                    &self.links,
+                    &self.lowering_ctx
                 )?;
                 if !b.current_block_terminated() {
                     let zero = b.const_i32(0);
@@ -5409,7 +5351,7 @@ impl<'m> Lowerer<'m> {
         };
 
         // Set the reserved ID before pushing
-        let reserved_fid = *self.funcs.get(fname).expect("reserved");
+        let reserved_fid = *self.lowering_ctx.funcs.get(fname).expect("reserved");
         f.id = reserved_fid;
 
         // Publish into the module preserving the reserved ID
@@ -5433,7 +5375,7 @@ impl<'m> Lowerer<'m> {
         let mut cur = ci.base.clone();
         while let Some(bn) = cur {
             base_chain.push(bn.clone());
-            cur = self.classes.get(&bn).and_then(|x| x.base.clone());
+            cur = self.lowering_ctx.classes.get(&bn).and_then(|x| x.base.clone());
         }
         base_chain.reverse();
 
@@ -5472,13 +5414,13 @@ impl<'m> Lowerer<'m> {
 
             // ---- Install inherited methods/accessors (root base first) ----
             for bn in &base_chain {
-                if let Some(bci) = self.classes.get(bn) {
+                if let Some(bci) = self.lowering_ctx.classes.get(bn) {
                     // methods (skip ctor/dtor)
                     for (mname, _ps, _body, _ia) in &bci.methods {
                         if *mname == "constructor" || *mname == "destructor" {
                             continue;
                         }
-                        if let Some(&mfid) = self.funcs.get(&format!("__method_{}_{}", bn, mname)) {
+                        if let Some(&mfid) = self.lowering_ctx.funcs.get(&format!("__method_{}_{}", bn, mname)) {
                             let (_nid_clo, clos) = b.push_node(
                                 Inst::MakeClosure {
                                     callee: mfid,
@@ -5510,7 +5452,7 @@ impl<'m> Lowerer<'m> {
                     // accessors: "__get__p" / "__set__p"
                     for (pname, getb, setb) in &bci.props {
                         if getb.is_some() {
-                            if let Some(&gid) = self.funcs.get(&format!("__get_{}_{}", bn, pname)) {
+                            if let Some(&gid) = self.lowering_ctx.funcs.get(&format!("__get_{}_{}", bn, pname)) {
                                 let (_nid_clo, clos) = b.push_node(
                                     Inst::MakeClosure {
                                         callee: gid,
@@ -5541,7 +5483,7 @@ impl<'m> Lowerer<'m> {
                             }
                         }
                         if setb.is_some() {
-                            if let Some(&sid) = self.funcs.get(&format!("__set_{}_{}", bn, pname)) {
+                            if let Some(&sid) = self.lowering_ctx.funcs.get(&format!("__set_{}_{}", bn, pname)) {
                                 let (_nid_clo, clos) = b.push_node(
                                     Inst::MakeClosure {
                                         callee: sid,
@@ -5580,7 +5522,7 @@ impl<'m> Lowerer<'m> {
                 if *mname == "constructor" || *mname == "destructor" {
                     continue;
                 }
-                if let Some(&mfid) = self.funcs.get(&format!("__method_{}_{}", ci.name, mname)) {
+                if let Some(&mfid) = self.lowering_ctx.funcs.get(&format!("__method_{}_{}", ci.name, mname)) {
                     let (_nid_clo, clos) = b.push_node(
                         Inst::MakeClosure {
                             callee: mfid,
@@ -5611,7 +5553,7 @@ impl<'m> Lowerer<'m> {
             }
             for (pname, getb, setb) in &ci.props {
                 if getb.is_some() {
-                    if let Some(&gid) = self.funcs.get(&format!("__get_{}_{}", ci.name, pname)) {
+                    if let Some(&gid) = self.lowering_ctx.funcs.get(&format!("__get_{}_{}", ci.name, pname)) {
                         let (_nid_clo, clos) = b.push_node(
                             Inst::MakeClosure {
                                 callee: gid,
@@ -5638,7 +5580,7 @@ impl<'m> Lowerer<'m> {
                     }
                 }
                 if setb.is_some() {
-                    if let Some(&sid) = self.funcs.get(&format!("__set_{}_{}", ci.name, pname)) {
+                    if let Some(&sid) = self.lowering_ctx.funcs.get(&format!("__set_{}_{}", ci.name, pname)) {
                         let (_nid_clo, clos) = b.push_node(
                             Inst::MakeClosure {
                                 callee: sid,
@@ -5677,9 +5619,7 @@ impl<'m> Lowerer<'m> {
                         fields,
                         next_field,
                         init_e,
-                        &self.funcs,
-                        &self.lam_captures,
-                        &self.links,
+                        &self.lowering_ctx
                     ) {
                         let field = intern_field_local(fields, next_field, fname);
                         let _ = b.push_node(
@@ -5717,7 +5657,7 @@ impl<'m> Lowerer<'m> {
 
             // ---- Call derived ctor if present ----
             if ci.has_ctor {
-                if let Some(&fid) = self.funcs.get(&format!("__ctor_{}", ci.name)) {
+                if let Some(&fid) = self.lowering_ctx.funcs.get(&format!("__ctor_{}", ci.name)) {
                     let mut argv = Vec::with_capacity(1 + ctor_params.len());
                     argv.push(obj);
                     for i in 0..ctor_params.len() {
@@ -5741,7 +5681,7 @@ impl<'m> Lowerer<'m> {
         };
 
         // Set the reserved ID before pushing
-        let reserved_fid = *self.funcs.get(&fname).expect("reserved");
+        let reserved_fid = *self.lowering_ctx.funcs.get(&fname).expect("reserved");
         f.id = reserved_fid;
 
         // Publish into the module preserving the reserved ID

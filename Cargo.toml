@@ -91,8 +91,19 @@ cranelift-frontend = "0.124.1"
 memmap2 = "0.9.8"
 target-lexicon = "0.13.3"
 
-polodb_core = "5.1.4" # Polodb embedded database
-chromadb = "2.3.0" # ChromaDB database
+#polodb_core = "5.1.4" # Polodb embedded database
+#chromadb = "2.3.0" # ChromaDB database
+
+#reactive_tui = "0.0.5" # TUI library
+#crossterm = "0.29.0" # Terminal handling
+
+#dioxus-core = "0.6.3" # Dioxus UI library
+#dioxus-desktop = "0.6.3" # Dioxus UI library
+#dioxus-mobile = "0.6.2" # Dioxus UI library
+#freya = "0.3.4" # Freya UI library
+#blitz = "0.1.1" # Blitz UI library
+#iced = "0.13.1" # Iced UI library
+#cushy = "0.4.0" # Cushy UI library
 
 [features]
 # Enable the real GC by default. For “no-GC” build use: --no-default-features

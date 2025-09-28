@@ -451,8 +451,7 @@ impl ProgramBuilder {
                         let mut m = crate::wir::Module::new();
 
                         let mut lowerer = Lowerer::new(&mut m);
-                        lowerer.set_links(job.links);
-                        lowerer
+                        lowerer.set_links(job.links)
                             .lower_program(&job.prog)
                             .map_err(|e| format!("lower error in {:?}: {:?}", &job.path, e))?;
 
