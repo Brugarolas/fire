@@ -1143,17 +1143,6 @@ pub unsafe fn obj_assign(dst_v: ValueRepr, src_v: ValueRepr) -> ValueRepr {
     let dst = &mut *as_obj_mut(dst_v);
     let src = &*as_obj_mut(src_v);
 
-    for (&fid, &val) in &src.by_id {
-        let entry = dst.by_id.entry(fid).or_insert(NULL);
-        *entry = val;
-
-        #[cfg(feature = "gc")]
-        {
-            let slot: *mut ValueRepr = entry as *mut ValueRepr;
-            NAPALM_GC.post_write_barrier(dst_v as *mut u8, slot, val);
-        }
-    }
-
     for (key, &val) in &src.by_str {
         let entry = dst.by_str.entry(key.clone()).or_insert(NULL);
         *entry = val;

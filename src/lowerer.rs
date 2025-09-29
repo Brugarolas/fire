@@ -4518,49 +4518,51 @@ fn lower_expr_free<'m>(
             for item in items {
                 match item {
                     ObjItem::Prop(key, val_e) => {
-                        let v = lower_expr_free(
-                            b, locals, fields, next_field, val_e, lowering_ctx 
-                        )?;
-                        match key {
-                            PropKey::Ident(name) => {
-                                let field = intern_field_local(fields, next_field, &name);
-                                let _ = b.push_node(
-                                    Inst::StoreField {
-                                        obj,
-                                        field,
-                                        val: v,
-                                        expected: None,
-                                    },
-                                    Some(Type::Top),
-                                    1,
-                                    true,
-                                );
-                            }
-                            PropKey::Str(s) => {
-                                let (_nid, ks) = b.push_node(
-                                    Inst::Const(Constant::Str(s.clone())),
-                                    Some(Type::Str),
-                                    1,
-                                    false,
-                                );
-                                let _ = b.push_node(
-                                    Inst::CallNative {
-                                        name: "wir_obj_set_str".into(),
-                                        args: vec![obj, ks[0], v],
-                                        pure: false,
-                                        can_throw: false,
-                                    },
-                                    Some(Type::Int32),
-                                    1,
-                                    true,
-                                );
-                            }
-                        }
+                        let v = lower_expr_free(b, locals, fields, next_field, val_e, lowering_ctx)?;
+
+                        // First, get the property name as a string, regardless of how it was defined.
+                        let name_str = match key {
+                            PropKey::Ident(name) => name.clone(),
+                            PropKey::Str(s) => s.clone(),
+                        };
+
+                        // --- CORRECT TWO-WAY STORE ---
+                        // 1. Store in the "fast path" using its FieldId.
+                        let field = intern_field_local(fields, next_field, &name_str);
+                        let _ = b.push_node(
+                            Inst::StoreField {
+                                obj,
+                                field,
+                                val: v,
+                                expected: None,
+                            },
+                            Some(Type::Top),
+                            1, // StoreField is effectful and produces a token
+                            true,
+                        );
+
+                        // 2. Mirror the store in the "dynamic path" using its string key.
+                        let (_nid_sconst, ks) = b.push_node(
+                            Inst::Const(Constant::Str(name_str)),
+                            Some(Type::Str),
+                            1,
+                            false,
+                        );
+                        let _ = b.push_node(
+                            Inst::CallNative {
+                                name: "wir_obj_set_str".into(),
+                                args: vec![obj, ks[0], v],
+                                pure: false,
+                                can_throw: false,
+                            },
+                            Some(Type::Int32), // Returns a status code
+                            1,
+                            true,
+                        );
                     }
                     ObjItem::Spread(expr) => {
-                        let spread_obj = lower_expr_free(
-                            b, locals, fields, next_field, expr, lowering_ctx 
-                        )?;
+                        // Your spread logic is already correct.
+                        let spread_obj = lower_expr_free(b, locals, fields, next_field, expr, lowering_ctx)?;
                         let _ = b.push_node(
                             Inst::CallNative {
                                 name: "wir_obj_assign".into(),
