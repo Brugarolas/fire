@@ -319,4 +319,12 @@ impl EventLoop {
             f(ptr);
         }
     }
+
+    /// Increments the active task counter to prevent the event loop from
+    /// becoming quiescent and exiting. This is used by long-running background
+    /// services like an HTTP server.
+    pub fn add_persistent_task(&self) {
+        let mut g = self.m.lock().unwrap();
+        g.active += 1;
+    }
 }
