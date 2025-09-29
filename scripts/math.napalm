@@ -5,21 +5,3 @@ export const ANSWER = 42;
 export function add(a, b) {
   return a + b;
 }
-
-export class Counter {
-  constructor() {
-    this.value = 0;
-  }
-
-  inc() {
-    this.value = this.value + 1;
-  }
-
-  getValue() {
-    return this.value;
-  }
-
-  static times3(n) {
-    return n * 3;
-  }
-}

@@ -1,6 +1,7 @@
 // import — importa del módulo anterior y usa lo importado
 
-import { ANSWER, add, Counter } from "./math";
+import { ANSWER, add } from "./math";
+import { Counter } from "./other";
 
 print("SMOKE");        // etiqueta del test
 print(ANSWER);         // 42

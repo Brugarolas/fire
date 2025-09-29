@@ -11,4 +11,3 @@ Cargo.lock
 .zig-cache
 zig-out
 log.txt
-todo.txt
