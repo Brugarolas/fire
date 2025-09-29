@@ -1,0 +1,16 @@
+// src/server.napalm
+
+print("===== HTTP =====");
+listen "0.0.0.0:3000" {
+  route "GET" ["/"] (req) => {
+    return { status: 200, body: "Hello!" };
+  };
+}
+
+async fn demo() {
+  let r1 = await get("http://127.0.0.1:3000/");
+  print(r1.status); print(r1.body);
+}
+
+setTimeout(| | { demo(); }, 500);
+//demo();

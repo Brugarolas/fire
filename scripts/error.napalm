@@ -3,3 +3,42 @@ var base = { a: 1, b: 2 };
 var extra = { b: 5, c: 9 };
 var merged = { greeting: "hi", ...base, ...extra, d: 10 };
 print(merged);
+
+// src/server.napalm
+
+print("===== HTTP =====");
+listen "0.0.0.0:3000" {
+  route "GET" ["/"] (req) => {
+    return { status: 200, body: "Hello!" };
+  };
+
+  route "GET" ["/sse"] (req) => {
+    // start stream (chunked)
+    var hdrs = [ ["Content-Type","text/plain; charset=utf-8"] ];
+    http.startStream(req, 200, hdrs);   // wrap wir_http_start_stream_from_req
+    var sid = req.serverId; var rid = req.reqId;
+
+    setTimeout(| | { http.streamWrite(sid, rid, "tick 1\n"); }, 0);
+    setTimeout(| | { http.streamWrite(sid, rid, "tick 2\n"); }, 100);
+    setTimeout(| | { http.streamEnd(sid, rid); }, 200);
+    return 0; // handled
+  };
+
+  route "POST" ["/echo"] (req) => {
+    var j = json.parse(req.body);
+    return { status: 200, body: "ok", headers: [ ["X-Echo","1"] ] };
+  };
+}
+
+async fn demo() {
+  let r1 = await get("http://127.0.0.1:3000/");
+  print(r1.status); print(r1.body);
+
+  let r2 = await getJSON("http://httpbin.org/json");
+  print(r2.status); // and r2.json if you want
+
+  let r3 = await postJSON("http://httpbin.org/post", "{\"a\":1}", [ ["X-Foo","Bar"] ]);
+  print(r3.status);
+}
+
+demo();

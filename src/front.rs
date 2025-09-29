@@ -1924,6 +1924,27 @@ impl<'src> Parser<'src> {
         self.parse_assign()
     }
 
+    /// Parses an identifier. Also accepts contextual keywords like 'get' and 'set'
+    /// and treats them as identifiers in this context.
+    fn parse_any_identifier(&mut self) -> PResult<String> {
+        if self.is_eof() {
+            return Err(self.err_here("expected an identifier"));
+        }
+        let t = self.next()?;
+        match t.tok {
+            Tok::Ident(s) => Ok(s),
+            // This is the key: if we see the Get/Set keywords where we expect
+            // a general-purpose identifier, we convert them to strings.
+            Tok::Get => Ok("get".to_string()),
+            Tok::Set => Ok("set".to_string()),
+            // Add any other contextual keywords here if needed in the future.
+            _ => Err(ParseError {
+                msg: format!("expected an identifier, but found {:?}", t.tok),
+                span: t.span,
+            }),
+        }
+    }
+
     fn parse_assign(&mut self) -> PResult<Expr> {
         let left = self.parse_conditional()?;
 
@@ -2309,6 +2330,15 @@ impl<'src> Parser<'src> {
         if self.is_eof() {
             return Err(self.err_here("expected primary expression"));
         }
+
+        // Check for contextual keywords FIRST, before consuming the token.
+        if self.check(&Tok::Get) || self.check(&Tok::Set) {
+            // Here we know for sure we are in an expression context, not a class body.
+            // So, we can safely treat `get`/`set` as an identifier.
+            let name = self.parse_any_identifier()?;
+            return Ok(Expr::Ident(name));
+        }
+
         let t = self.next()?;
         match t.tok {
             Tok::This => Ok(Expr::This),

@@ -1,4 +1,4 @@
-// runtime/event_loop.rs (new)
+// runtime/event_loop.rs
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 

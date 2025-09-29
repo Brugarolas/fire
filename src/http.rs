@@ -24,7 +24,9 @@ use tokio::{
     runtime::Runtime,
     sync::{mpsc, oneshot},
 };
+use axum::routing::get;
 use tokio_stream::wrappers::ReceiverStream;
+use std::thread;
 
 use crate::event_loop::EVENT_LOOP;
 use crate::gc::NAPALM_GC;
@@ -425,22 +427,47 @@ pub extern "C" fn wir_server_add_route(
     pattern_arr: i64,
     handler: i64,
 ) -> i64 {
+    // This part is correct: get the method string.
     let method = unsafe { boxedstr_to_string(method_ptr) };
 
     let mut tokens: Vec<Token> = Vec::new();
     unsafe {
+        // These FFI declarations are correct.
         unsafe extern "C" {
             fn wir_array_len(arr: i64) -> i64;
             fn wir_array_get(arr: i64, idx: i64) -> i64;
         }
+
+        // Get the number of path segments in the pattern array (e.g., ["/users", ":id"]).
         let n = smi_to_i64(wir_array_len(pattern_arr)).max(0) as usize;
+
         for i in 0..n {
-            let v = wir_array_get(pattern_arr, make_smi(i as i64));
-            if wir_is_str(v) == 0 {
+            let segment_value = wir_array_get(pattern_arr, make_smi(i as i64));
+            if wir_is_str(segment_value) == 0 {
+                // Ignore any non-string values in the pattern array.
                 continue;
             }
-            let s = boxedstr_to_string(v);
-            for seg in s.split('/').filter(|x| !x.is_empty()) {
+
+            let segment_str = boxedstr_to_string(segment_value);
+
+            // Handle the root path "/" as a special case.
+            if segment_str == "/" {
+                // If this is the only token, it represents the exact path "/".
+                // We represent this with a single empty literal token.
+                if n == 1 {
+                    tokens.push(Token::Lit("".to_string()));
+                    // Break here because ["/"] should not be combined with other tokens.
+                    break;
+                }
+                // If "/" is present with other tokens (e.g., ["/", "users"]), it's a no-op
+                // because paths are implicitly joined by slashes anyway. So, we just continue.
+                continue;
+            }
+
+            // For all other segments, split them by `/` in case a user writes something
+            // like "/users/posts". The `filter` correctly removes empty strings that
+            // result from leading/trailing slashes.
+            for seg in segment_str.split('/').filter(|x| !x.is_empty()) {
                 if let Some(name) = seg.strip_prefix(':') {
                     tokens.push(Token::Param(name.to_string()));
                 } else {
@@ -450,17 +477,22 @@ pub extern "C" fn wir_server_add_route(
         }
     }
 
+    // The rest of the function is correct: it finds the server entry
+    // and adds the newly parsed route to its list.
     let mut g = SERVERS.lock();
-    let entry = g.get_mut(&(server_id as u64)).expect("server");
-    Arc::get_mut(entry)
-        .expect("no other refs")
-        .routes
-        .push(Route {
-            method,
-            tokens,
-            handler_closure: handler,
-        });
-    0
+    let entry = g.get_mut(&(server_id as u64)).expect("server not found during add_route");
+
+    // `Arc::get_mut` is correct for ensuring we have exclusive access to modify the routes.
+    let server_entry = Arc::get_mut(entry)
+        .expect("Cannot modify server routes while it is actively being used");
+
+    server_entry.routes.push(Route {
+        method,
+        tokens,
+        handler_closure: handler,
+    });
+
+    0 // Return success
 }
 
 #[unsafe(no_mangle)]
@@ -468,123 +500,173 @@ pub extern "C" fn wir_server_listen(server_id: i64) -> i64 {
     let server_id = server_id as u64;
     let entry = SERVERS.lock().get(&server_id).cloned().expect("server");
     let addr = entry.addr.clone();
-    let dispatch_closure = entry.dispatch_closure;
 
-    TOKIO_RT.spawn(async move {
-        let app = Router::new().route(
-            "/{*path}",
-            any(
-                move |method: Method, uri: axum::http::Uri, headers: HeaderMap, body: Bytes| {
-                    let entry = entry.clone();
+    thread::Builder::new()
+        .name(format!("napalm-server-{}", server_id))
+        .spawn(move || {
+            #[cfg(debug_assertions)]
+            eprintln!("[http::listen] Server thread spawned for id={} on addr={}", server_id, addr);
+
+            TOKIO_RT.block_on(async move {
+                // --- THIS IS THE FINAL FIX ---
+                // We define an Axum handler as a closure that can be used for both routes.
+                let handler = move |method: Method, uri: axum::http::Uri, headers: HeaderMap, body: Bytes| {
+                    let entry = entry.clone(); // Clone the Arc for this specific request
                     async move {
-                        let req_id = next_req_id();
-                        let path = uri.path().to_string();
+                        #[cfg(debug_assertions)]
+                        eprintln!("[http::axum_handler] Received request: {} {}", method, uri.path());
 
+                        let req_id = next_req_id();
                         let (tx, rx) = oneshot::channel::<ResponseMsg>();
                         RESP_SENDERS.lock().insert((server_id, req_id), tx);
-
-                        let mut hdrs_vec = Vec::with_capacity(headers.len());
-                        for (k, v) in headers.iter() {
-                            let key = k.as_str().to_string();
-                            let val = v.to_str().unwrap_or_default().to_string();
-                            hdrs_vec.push((key, val));
-                        }
 
                         let msg = Box::new(ReqMsg {
                             server_id,
                             req_id,
                             method: method.as_str().to_string(),
-                            path,
+                            path: uri.path().to_string(),
                             body: body.to_vec(),
-                            headers: hdrs_vec,
+                            headers: headers.iter().map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string())).collect(),
                         });
-                        let arg = (&*msg as *const ReqMsg as usize) as i64;
-                        std::mem::forget(msg);
+                        let arg = Box::into_raw(msg) as i64;
 
                         EVENT_LOOP.enqueue_microtask(entry.dispatch_closure, arg);
 
                         match rx.await {
                             Ok(r) => {
-                                if let Some(rx_stream) =
-                                    STREAM_RX.lock().remove(&(server_id, req_id))
-                                {
-                                    use futures_util::stream::StreamExt;
-                                    let stream = tokio_stream::wrappers::ReceiverStream::new(
-                                        rx_stream,
-                                    )
-                                    .map(|chunk| Ok::<Bytes, std::io::Error>(Bytes::from(chunk)));
-                                    let mut resp = axum::response::Response::builder().status(
-                                        StatusCode::from_u16(r.status).unwrap_or(StatusCode::OK),
-                                    );
-                                    for (k, v) in r.headers {
-                                        resp = resp.header(k, v);
-                                    }
-                                    resp.body(Body::from_stream(stream)).unwrap()
-                                } else {
-                                    let mut res = axum::response::Response::builder().status(
-                                        StatusCode::from_u16(r.status).unwrap_or(StatusCode::OK),
-                                    );
-                                    for (k, v) in r.headers {
-                                        res = res.header(k, v);
-                                    }
-                                    res.body(Body::from(r.body)).unwrap()
+                                #[cfg(debug_assertions)]
+                                eprintln!("[http::axum_handler] Received response from VM for req_id={}: status={}", req_id, r.status);
+                                let mut res = axum::response::Response::builder()
+                                    .status(StatusCode::from_u16(r.status).unwrap_or(StatusCode::OK));
+                                for (k, v) in r.headers {
+                                    res = res.header(k, v);
                                 }
+                                res.body(Body::from(r.body)).unwrap()
                             }
-                            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "VM dropped response")
-                                .into_response(),
+                            Err(_) => {
+                                #[cfg(debug_assertions)]
+                                eprintln!("[http::axum_handler] VM dropped response sender for req_id={}", req_id);
+                                (StatusCode::INTERNAL_SERVER_ERROR, "VM dropped response").into_response()
+                            }
                         }
                     }
-                },
-            ),
-        );
+                };
 
-        // NEW: Axum 0.7 serve
-        let listener = TcpListener::bind(&addr).await.unwrap();
-        if let Err(e) = axum::serve(listener, app.into_make_service()).await {
-            eprintln!("[http] server error: {e}");
-        }
-    });
+                // We now create two routes. Axum checks them in order.
+                let app = Router::new()
+                    .route("/", any(handler.clone()))
+                    .fallback(any(handler));
+
+                let listener = TcpListener::bind(&addr).await.unwrap();
+
+                #[cfg(debug_assertions)]
+                eprintln!("[http::listen] Server for id={} now BLOCKING and LISTENING on {}", server_id, addr);
+
+                if let Err(e) = axum::serve(listener, app.into_make_service()).await {
+                    eprintln!("[http] server fatal error: {e}");
+                }
+            });
+        })
+        .expect("failed to spawn server thread");
 
     0
 }
+
 /// ---------- Route matching & VM dispatch (runs on VM thread) ----------
+
+use std::fmt::Debug;
+
+impl Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Token::Lit(s) => write!(f, "Lit({})", s),
+            Token::Param(name) => write!(f, "Param(:{})", name),
+        }
+    }
+}
 
 fn match_route<'a>(
     routes: &'a [Route],
     method: &str,
     path: &str,
 ) -> Option<(&'a Route, HashMap<String, String>)> {
-    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    for r in routes {
-        if !r.method.eq_ignore_ascii_case(method) {
+    #[cfg(debug_assertions)]
+    eprintln!("[http::match_route] Request: {} {}", method, path);
+
+    let request_segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    // LOG: Show how the path was segmented.
+    #[cfg(debug_assertions)]
+    eprintln!("[http::match_route] Request Segments: {:?}", request_segments);
+
+    'route_loop: for (i, route) in routes.iter().enumerate() {
+        // LOG: Print details for every route we are about to check.
+        #[cfg(debug_assertions)]
+        eprintln!("[http::match_route] Checking Route #{}: method='{}', tokens={:?}", i, route.method, route.tokens);
+
+        // 1. Check HTTP method.
+        if !route.method.eq_ignore_ascii_case(method) && route.method != "*" {
+            // LOG: Show why a route was skipped.
+            #[cfg(debug_assertions)]
+            eprintln!("[http::match_route] -> SKIP (method mismatch)");
             continue;
         }
-        let mut params = HashMap::new();
-        let mut i = 0usize;
-        let mut ok = true;
 
-        for t in &r.tokens {
-            if i >= segs.len() {
-                ok = false;
-                break;
+        // 2. Handle the special case for the root path "/"
+        if let Some(Token::Lit(s)) = route.tokens.get(0) {
+            if s.is_empty() && route.tokens.len() == 1 {
+                if request_segments.is_empty() {
+                    // LOG: Show a successful match on the root path.
+                    #[cfg(debug_assertions)]
+                    eprintln!("[http::match_route] -> MATCH (root path)");
+                    return Some((route, HashMap::new()));
+                } else {
+                    #[cfg(debug_assertions)]
+                    eprintln!("[http::match_route] -> SKIP (route is root, request is not)");
+                    continue 'route_loop;
+                }
             }
-            match t {
+        }
+
+        // 3. For all other routes, the number of segments must match exactly.
+        if route.tokens.len() != request_segments.len() {
+            #[cfg(debug_assertions)]
+            eprintln!("[http::match_route] -> SKIP (segment count mismatch: route={}, req={})", route.tokens.len(), request_segments.len());
+            continue;
+        }
+
+        // This check correctly handles an empty `tokens` array for non-root paths.
+        if route.tokens.is_empty() {
+            #[cfg(debug_assertions)]
+            eprintln!("[http::match_route] -> SKIP (empty route tokens for non-root path)");
+            continue;
+        }
+
+        // 4. Compare each segment one by one.
+        let mut params = HashMap::new();
+        for (token, segment) in route.tokens.iter().zip(request_segments.iter()) {
+            match token {
                 Token::Lit(s) => {
-                    if segs[i] != s {
-                        ok = false;
-                        break;
+                    if s != segment {
+                        #[cfg(debug_assertions)]
+                        eprintln!("[http::match_route] -> SKIP (literal mismatch: expected '{}', got '{}')", s, segment);
+                        continue 'route_loop; // Failed match, try next route
                     }
                 }
                 Token::Param(name) => {
-                    params.insert(name.clone(), segs[i].to_string());
+                    params.insert(name.clone(), (*segment).to_string());
                 }
             }
-            i += 1;
         }
-        if ok && i == segs.len() {
-            return Some((r, params));
-        }
+
+        // If we made it through the whole loop, it's a match.
+        #[cfg(debug_assertions)]
+        eprintln!("[http::match_route] -> MATCH (full path match)");
+        return Some((route, params));
     }
+
+    #[cfg(debug_assertions)]
+    eprintln!("[http::match_route] -> NO MATCH FOUND");
     None
 }
 
@@ -594,11 +676,28 @@ pub extern "C" fn vm_dispatch(argv: *const i64, _argc: usize) -> i64 {
     use crate::value::*;
     unsafe {
         let arg = argv_read(argv, 0);
-        let mut req: Box<ReqMsg> = Box::from_raw(arg as *mut ReqMsg); // take ownership
+        let mut req: Box<ReqMsg> = Box::from_raw(arg as *mut ReqMsg);
 
-        // 1) Build VM Request object
+        #[cfg(debug_assertions)]
+        eprintln!("[http::vm_dispatch] Dispatching request id={} for server id={}: {} {}", req.req_id, req.server_id, req.method, req.path);
+
+        // Step 1: Route matching.
+        // Use the owned Strings directly from the `req` message BEFORE they are moved.
+        let entry = SERVERS.lock().get(&req.server_id).cloned().expect("server entry not found");
+        let maybe_match = match_route(&entry.routes, &req.method, &req.path);
+
+        // Step 2: If no route matches, send a 404 immediately.
+        let (route, filled_params) = if let Some(m) = maybe_match {
+            m
+        } else {
+            send_response(req.server_id, req.req_id, 404, b"Not Found".to_vec(), vec![]);
+            return 0; // Stop processing
+        };
+
+        // Step 3: Now that matching is done, we can build the VM request object.
         let req_obj = wir_obj_new();
-        // method/path/body
+
+        // Move the method/path/body into BoxedStr values and set them on the object.
         let method_v = box_str_keepalive(std::mem::take(&mut req.method).into_bytes());
         let path_v = box_str_keepalive(std::mem::take(&mut req.path).into_bytes());
         let body_v = box_str_keepalive(std::mem::take(&mut req.body));
@@ -606,7 +705,7 @@ pub extern "C" fn vm_dispatch(argv: *const i64, _argc: usize) -> i64 {
         wir_obj_set_str(req_obj, static_str_value("path"), path_v);
         wir_obj_set_str(req_obj, static_str_value("body"), body_v);
 
-        // headers object
+        // Build the headers object.
         let hdrs_obj = wir_obj_new();
         for (k, v) in std::mem::take(&mut req.headers) {
             let kv = box_str_keepalive(k.into_bytes());
@@ -615,25 +714,8 @@ pub extern "C" fn vm_dispatch(argv: *const i64, _argc: usize) -> i64 {
         }
         wir_obj_set_str(req_obj, static_str_value("headers"), hdrs_obj);
 
-        // params = {} (filled after match)
+        // Build the params object from the matched route data.
         let params = wir_obj_new();
-
-        // 2) Route match
-        let entry = SERVERS.lock().get(&req.server_id).cloned().expect("server");
-        let Some((route, filled_params)) = match_route(
-            &entry.routes,
-            &method_to_str(method_v),
-            &value_to_str(path_v),
-        ) else {
-            send_response(
-                req.server_id,
-                req.req_id,
-                404,
-                b"Not Found".to_vec(),
-                vec![],
-            );
-            return 0;
-        };
         for (k, v) in filled_params {
             wir_obj_set_str(
                 params,
@@ -643,33 +725,18 @@ pub extern "C" fn vm_dispatch(argv: *const i64, _argc: usize) -> i64 {
         }
         wir_obj_set_str(req_obj, static_str_value("params"), params);
 
-        // expose ids for streaming helpers
-        wir_obj_set_str(
-            req_obj,
-            static_str_value("serverId"),
-            make_smi(req.server_id as i64),
-        );
-        wir_obj_set_str(
-            req_obj,
-            static_str_value("reqId"),
-            make_smi(req.req_id as i64),
-        );
+        // Expose server/req IDs for streaming helpers.
+        wir_obj_set_str(req_obj, static_str_value("serverId"), make_smi(req.server_id as i64));
+        wir_obj_set_str(req_obj, static_str_value("reqId"), make_smi(req.req_id as i64));
 
-        // 3) Call handler(req)
+        // Step 4: Call the user's Napalm handler.
         unsafe extern "C" {
             fn wir_call_closure(clo: i64, argv: *const i64, argc: i64) -> i64;
         }
         let argv = [req_obj];
         let ret = wir_call_closure(route.handler_closure, argv.as_ptr(), 1);
 
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[http] route returned v={} ({})",
-            dbg_addr(ret),
-            dbg_classify(ret)
-        );
-
-        // 4) Return mapping
+        // Step 5: Handle the return value (immediate response or promise).
         if is_promise_like(ret) {
             attach_then_catch(ret, req.server_id, req.req_id);
         } else {

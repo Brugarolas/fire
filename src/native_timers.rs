@@ -1,4 +1,4 @@
-// runtime/natives_timers.rs (new)
+// runtime/natives_timers.rs
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 #![allow(unused_unsafe)]
