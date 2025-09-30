@@ -566,8 +566,7 @@ pub extern "C" fn wir_server_listen(server_id: i64) -> i64 {
                     eprintln!("[http] server fatal error: {e}");
                 }
             });
-        })
-        .expect("failed to spawn server thread");
+        }).expect("failed to spawn server thread");
 
     // Prevent the event loop from exiting by marking this as a persistent task.
     EVENT_LOOP.add_persistent_task();

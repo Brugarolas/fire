@@ -75,7 +75,7 @@ print(others.country); // expect UK
 print("===== Object spread =====");
 var base = { a: 1, b: 2 };
 var extra = { b: 5, c: 9 };
-var merged = { greeting: "hi", ...base, ...extra, d: 10 }; // (WRONG PROPERTY NAMES)
+var merged = { greeting: "hi", ...base, ...extra, d: 10 };
 print(merged.a + merged.b + merged.c + merged.d); // expect 1 + 5 + 9 + 10 = 25
 print(merged);
 
@@ -192,8 +192,7 @@ class InitOnly {
 var b = new Base(10);
 print(b.m(5));          // expect 15
 
-// If your tiny patch added bracket-call 'this' injection, this should also be 15:
-print(b);       // expect 10 (or skip if not yet supported)
+print(b);       // expect 10
 
 print(Base.S(1));       // expect 101
 
@@ -217,6 +216,75 @@ fn make_adder(x) {
 var add42 = make_adder(42);
 print(add42(0));  // expect 42
 print(add42(100)); // expect 142
+
+print("===== Strings: length property =====");
+var s = "hello";
+print(s.length);       // expect 5
+var empty = "";
+print(empty.length);     // expect 0
+print("hello world".length); // expect 11
+
+print("===== Strings: concat =====");
+var s1 = "Hello, ";
+var s2 = "World!";
+var s3 = s1.concat(s2);
+print(s3);             // expect "Hello, World!"
+print("first".concat(" second")); // expect "first second"
+
+print("===== Strings: slice & substring =====");
+var longStr = "The quick brown fox jumps over the lazy dog.";
+print(longStr.slice(4, 19));        // expect "quick brown fox"
+print(longStr.substring(4, 19));    // expect "quick brown fox"
+print(longStr.slice(-9, -5));       // expect "lazy" (slice supports negative indices)
+print(longStr.substring(19, 4));    // expect "quick brown fox" (substring swaps args if start > end)
+print(longStr.slice(20));           // expect "jumps over the lazy dog." (to the end)
+
+print("===== Strings: case conversion =====");
+var mixed = "Napalm Is Awesome!";
+print(mixed.toUpperCase()); // expect "NAPALM IS AWESOME!"
+print(mixed.toLowerCase()); // expect "napalm is awesome!"
+
+print("===== Strings: searching (includes, startsWith, endsWith) =====");
+var sentence = "Be brave, be bold.";
+print(sentence.includes("brave"));    // expect 1
+print(sentence.includes("calm"));     // expect 0
+print(sentence.startsWith("Be"));       // expect 1
+print(sentence.startsWith("brave"));    // expect 0
+print(sentence.endsWith("."));        // expect 1
+print(sentence.endsWith("bold"));     // expect 0
+
+print("===== Strings: searching (indexOf, lastIndexOf) =====");
+var p = "The rain in Spain stays mainly in the plain.";
+print(p.indexOf("rain"));        // expect 4
+print(p.indexOf("zain"));        // expect -1
+print(p.indexOf("ain", 6));      // expect 14 (starts search from index 5)
+print(p.lastIndexOf("ain"));     // expect 40
+print(p.lastIndexOf("ain", 30)); // expect 25 (searches backwards from index 30)
+
+print("===== Strings: padding (padStart, padEnd) =====");
+var num = "5";
+print(num.padStart(4, "0"));    // expect "0005"
+print("abc".padEnd(5, "."));      // expect "abc.."
+print("long".padStart(2, "*"));   // expect "long" (no padding needed)
+
+print("===== Strings: repeat & split =====");
+print("*".repeat(5));             // expect "*****"
+var csv = "one,two,three";
+var parts = csv.split(",");
+print(parts[0]);                  // expect "one"
+print(parts[2]);                  // expect "three"
+print(parts.length);              // expect 3
+
+print("===== Strings: replace & replaceAll =====");
+var text = "I like cats. I think cats are great.";
+print(text.replace("cats", "dogs"));     // expect "I like dogs. I think cats are great."
+print(text.replaceAll("cats", "dogs")); // expect "I like dogs. I think dogs are great."
+
+print("===== Strings: trimming (trim, trimStart, trimEnd) =====");
+var padded = "   Hello, World!   ";
+print(padded.trim());       // expect "Hello, World!"
+print(padded.trimStart());  // expect "Hello, World!   "
+print(padded.trimEnd());    // expect "   Hello, World!"
 
 print("===== Promises ====="); // (VALIDATED UNTIL HERE)
 print("(async)");

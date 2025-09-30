@@ -1,17 +1,17 @@
 Hi! I am making a new scripting programming language named Napalm. I have like 20% of the language features already implemented and the most important: a very complex engine already set up, but there are still a lot of features still to implement as well as a few bugs and incorrect stuff.
 
 Features I still have not implemented:
-- Add a lot of error handling in the front and in the parser (a lot of errors still unreported to the user)
-- Make the error reporting to the user beautiful and eye-candy, using 'ariadne' and showing code and specific lines of code
+- Try/Catch/Finally (a là JavaScript)
+- Defer/Errdefer (a là Zig)
 - Add Dates (a là JavaScript)
 - Add Proxy (a là JavaScript)
 - Interfaces (a là TypeScript)
-- Optional static typing (a là TypeScript)
+- Optional static typing, add a type system (a là TypeScript)
 - Generics (a là TypeScript)
 - Generators and Generators inside Generators (a là JavaScript)
 - Fibers (a là Wren)/Coroutines (a là C++)
-- String class (I have strings as values) and string methods
-- Array class (I have arrays as values), Map, Set (everything a là JS), List (Doubly-linked)
+- String methods (a lá JS - concat, split, indexOf, lastIndexOf, padEnd, padStart, repeat, replace, replaceAll, slice, substring, startsWith, endsWith, contains, toLowerCase, toUpperCase, trim, trimEnd, trimStart and length property)
+- Map, Set (everything a là JS), List (Doubly-linked)
 - Ranges (a là Wren & custom: 1..100 -> 1, 2, 3, ...; 1..100::5 -> 5, 10, 15, ...; 1..100::-1 -> 100, 99, 98, ...;)
 - Decorators (a là TypeScript)
 - Extend existing Classes with computed properties and operator overloading (a là TypeScript)
@@ -19,7 +19,7 @@ Features I still have not implemented:
 - Add reactive programming
 
 Optimizations:
-- Implement CompactStr (inlined strings) where it makes sense
+- Implement CompactStr (inlined strings) - in the entire engine maybe?
 - Implement SmallVec where it makes sense
 - Implement SmallMap where it makes sense
 - Implement SmallBox where it makes sense
@@ -29,7 +29,7 @@ Optimizations:
 - Same for the optimizer and optimizations (probably big wins here)
 - Explore String interning
 - Explore creating Shapes/Hidden Classes and inline caches for keys of objects/classes
-- Explore blending classes/inheritance/objects/interfaces in a single HashMap for not having to loop the proto
+- Explore blending classes/inheritance/objects/interfaces in a single HashMap for not having to loop the proto to find properties
 - Create our own HashMap and HashSet using my AES hasher and hashbrown structures, and using them everywhere
 - Add Escape Analysis: and store those variables in the stack not in the GC
 - Add Inlining, for methods with 6 lines of code or less, that are called at least from 3 spots, or inside of a loop, or inside a method that's inside a loop, etc. This will be the first whole-program optimization
@@ -37,17 +37,19 @@ Optimizations:
 - Explore other IR optimizations pre-JIT, specially rare or very specific ones
 - Fork Cranelift repo for integrating more optimizations (both manual and in ISLE) and improving register allocation and instruction selection (and creating a protocol -e.g. several git branches- for being updated), as well as applying these same optimizations in Cranelift (also review unmerged Cranelift PRs for merging the interesting ones)
 - Explore Super-Instructions: can they make the code faster? (it's likely that we can manually generate better code to compile)
-- Explore "merged runtime methods": can they make the code faster? (it's likely, less trampoline calls)
+- Explore "merged runtime methods" aka "Super-Trampolines": can they make the code faster? (it's likely, less trampoline calls)
 
 Fixes to make:
-- Spread operator adding incorrect key-values
+- Spread operator adding incorrect extra key-values
 - Built-in memoization -> use-after-free if value is stored in GC
-- Crash when generating responses in the "Web server eDSL"
 
 Complex milestones:
-- Add parallel Tasks/Isolates/Workers (still to define, but Tasks like pre-emptive Fibers that do not share memory but one they end they behave like Promises and the result can be merged with a .then() or an await into the main execution branch; Isolates/Workers would be a là Dart/JavaScript, completely parallel and without even sharing the list of modules loaded)
-- Add a MobX/Pinia centralized state eDSL, that also parallel entities can access to (they would be to be saved with Arc<> or RwLock<> or something like that, or wait until MMTk's ConcurrentImmix is finished - and we would have 2 GCs: single-threaded ones for each execution branch like main thread/Isolate/Worker, and a single concurrent one for the centralized state). This can be done in phases: first a non-concurrent one, for example (pre-emptive concurrency will be the LAST stuff to be added to the language, except for maybe the Tasks that do not have access to centralized state)
-- Add an eDSL similar to Vue/Svelte for creating UIs with components and styles, that can render both to an independent Winit window (maybe using Iced, or Cushy, or Freya, or Blitz, or Rinf, or Tauri, or Slint), or to a TUI if you launch it from a terminal (using Ratatui, or Reactive TUI, or CrossTerm)
+- Add a lot of error handling in the front and in the parser (a lot of errors still unreported to the user)
+- Make the error reporting to the user beautiful and eye-candy, using 'ariadne' and showing code and the specific line of code
+- Add parallel Tasks/Isolates/Workers (still to define, but Tasks like pre-emptive Fibers that do not share memory but they behave like Promises and the result can be merged with a .then() or an await into the main execution branch; Isolates/Workers would be a là Dart/JavaScript, completely parallel and without even sharing the list of modules loaded)
+- Add a MobX/Pinia-like centralized state eDSL, that also parallel entities can access to (they would be to be saved with Arc<> or RwLock<> or something like that, or wait until MMTk's ConcurrentImmix is finished - and we would have 2 GCs: single-threaded ones for each execution branch like main thread/Isolate/Worker, and a single concurrent one for the centralized state). This can be done in phases: first a non-concurrent one, for example (pre-emptive concurrency will be the LAST stuff to be added to the language, except for maybe the Tasks that do not have access to centralized state)
+- Add
+- Add an eDSL similar to Vue/Svelte for creating UIs with components and styles, that can render both to an independent Winit window (maybe using Iced, or Cushy, or Freya, or Blitz, or Rinf, or Tauri, or Slint - very likely Slint which works on Android and iOS), or to a TUI if you launch it from a terminal (using Ratatui, or Reactive TUI, or CrossTerm)
 - Add a database (probably PoloDB) that's in-memory and embedded in the engine, and create an eDSL for accessing/updating/managing its content
 - Add an embedded terminal shell that runs on a different pipeline (I guess interpreted, maybe with Pulley? or something manual with indirect threading and register based) that's fast because instead of searching the programs physically on the storage looping the PATH (and piping arguments requires no re-parsing them in each program), it will have embedded all classic Unix commands and a lot more (like Git) so it just have to read a HashMap being a lot faster than regular terminal shells. Also these Unix commands can be used from the language, with special bindings to transform the response of the command into a structured Napalm object.
 - Create a standard library based on Node and Python, and also add a lot of embedded libraries (e.g. Iced, Iced with Alacritty component)

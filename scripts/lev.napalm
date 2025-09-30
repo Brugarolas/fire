@@ -59,7 +59,6 @@ fn levenshtein(a, b) {
     return prev[n];
 }
 
-// Demo (and correctness check)
 var A = "kitten";
 var B = "sitting";
 var d = levenshtein(A, B);

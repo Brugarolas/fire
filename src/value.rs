@@ -8,6 +8,8 @@ use crate::gc::NAPALM_GC;
 use ahash::AHashMap as HashMap;
 use core::mem;
 use std::ptr;
+use std::str;
+use std::slice;
 
 //use crate::gc::api::{alloc_raw, alloc_slow_path, post_alloc_object};
 //use crate::gc::post_write_barrier;
@@ -681,6 +683,19 @@ pub struct BoxedStr {
 }
 
 #[inline(always)]
+unsafe fn value_as_str_slice<'a>(v: ValueRepr) -> Option<&'a str> {
+    if !is_ptr(v) { return None; }
+    let hdr = &*(v as *const ObjHeader);
+    if hdr.tag != TAG_STRING { return None; }
+    let s = &*(v as *const BoxedStr);
+    if s.data.is_null() {
+        return Some("");
+    }
+    let bytes = slice::from_raw_parts(s.data, s.len);
+    str::from_utf8(bytes).ok()
+}
+
+#[inline(always)]
 pub fn box_str_borrowed(bytes: &[u8]) -> ValueRepr {
     unsafe {
         let size = mem::size_of::<BoxedStr>();
@@ -841,6 +856,217 @@ pub unsafe extern "C" fn wir_string_len(s_val: i64) -> i64 {
 
     let s = &*(s_val as *const BoxedStr);
     make_smi(s.len as i64)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_string_concat(s1_val: i64, s2_val: i64) -> i64 {
+    let s1 = value_as_str_slice(s1_val).unwrap_or("");
+    // FIX: Don't use fmt_value. Treat second argument as a string directly.
+    let s2 = value_as_str_slice(s2_val).unwrap_or("");
+    allocate_new_string(&[s1, s2].concat())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_string_slice(s_val: i64, start_smi: i64, end_smi: i64) -> i64 {
+    let Some(s) = value_as_str_slice(s_val) else { return NULL; };
+    // FIX: Use byte length consistently.
+    let len = s.len();
+
+    let mut start = smi_to_i64(start_smi);
+    if start < 0 { start = (len as i64 + start).max(0); }
+
+    let mut end = smi_to_i64(end_smi);
+    if end == -1 { // Sentinel for "to the end"
+        end = len as i64;
+    } else if end < 0 {
+        end = (len as i64 + end).max(0);
+    }
+
+    let start_idx = (start as usize).min(len);
+    // JS `slice` logic: end index can be smaller than start.
+    let end_idx = (end as usize).min(len);
+
+    if start_idx >= end_idx {
+        return allocate_new_string("");
+    }
+
+    // Now uses simple, fast, and correct byte slicing.
+    allocate_new_string(&s[start_idx..end_idx])
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_string_substring(s_val: i64, start_smi: i64, end_smi: i64) -> i64 {
+    let Some(s) = value_as_str_slice(s_val) else { return NULL; };
+    // FIX: Use byte length consistently.
+    let len = s.len();
+
+    let start_raw = smi_to_i64(start_smi);
+    let end_raw = smi_to_i64(end_smi);
+
+    let start = (start_raw.max(0) as usize).min(len);
+    let end = if end_raw == -1 { len } else { (end_raw.max(0) as usize).min(len) };
+
+    // JS `substring` swaps if start > end.
+    let final_start = start.min(end);
+    let final_end = start.max(end);
+
+    allocate_new_string(&s[final_start..final_end])
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_string_index_of(s_val: i64, search_val: i64, pos_smi: i64) -> i64 {
+    let Some(s) = value_as_str_slice(s_val) else { return make_smi(-1); };
+    let Some(search) = value_as_str_slice(search_val) else { return make_smi(-1); };
+
+    // Use byte index for starting position, clamped to string length.
+    let start_byte = (smi_to_i64(pos_smi).max(0) as usize).min(s.len());
+
+    // FIX: Search the sub-slice, then add the start_byte offset to the result.
+    if let Some(relative_byte_index) = s[start_byte..].find(search) {
+        let absolute_byte_index = start_byte + relative_byte_index;
+        make_smi(absolute_byte_index as i64)
+    } else {
+        make_smi(-1)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_string_last_index_of(s_val: i64, search_val: i64, pos_smi: i64) -> i64 {
+    let Some(s) = value_as_str_slice(s_val) else { return make_smi(-1); };
+    let Some(search) = value_as_str_slice(search_val) else { return make_smi(-1); };
+
+    let pos = smi_to_i64(pos_smi);
+    let len = s.len();
+
+    // FIX: Correctly determine the search slice based on JS's `fromIndex` semantics.
+    // The search occurs within the substring from the beginning to `pos`.
+    let end_byte = if pos < 0 {
+        len // Sentinel means search the whole string.
+    } else {
+        // Clamp to a valid end-of-slice index.
+        (pos as usize).min(len.saturating_sub(1)).saturating_add(1)
+    };
+
+    if let Some(byte_index) = s[..end_byte].rfind(search) {
+        make_smi(byte_index as i64)
+    } else {
+        make_smi(-1)
+    }
+}
+
+// --- The rest of the functions are unchanged and correct ---
+// (No need to copy them here, just replace the buggy ones above)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_string_split(s_val: i64, sep_val: i64) -> i64 {
+    let Some(s) = value_as_str_slice(s_val) else { return array_new(0); };
+    let Some(sep) = value_as_str_slice(sep_val) else {
+        let arr = array_new(1);
+        array_set(arr, 0, s_val);
+        return arr;
+    };
+    let components: Vec<i64> = s.split(sep).map(|sub| allocate_new_string(sub)).collect();
+    let arr = array_new(components.len());
+    for (i, &comp) in components.iter().enumerate() { array_set(arr, i, comp); }
+    arr
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_string_pad_end(s_val: i64, max_len_smi: i64, fill_val: i64) -> i64 {
+    let Some(s) = value_as_str_slice(s_val) else { return NULL; };
+    let Some(fill) = value_as_str_slice(fill_val) else { return s_val; };
+    let target_len = smi_to_i64(max_len_smi) as usize;
+    if s.len() >= target_len { return s_val; }
+    let needed = target_len - s.len();
+    let mut result = s.to_string();
+    result.extend(fill.chars().cycle().take(needed));
+    allocate_new_string(&result)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_string_pad_start(s_val: i64, max_len_smi: i64, fill_val: i64) -> i64 {
+    let Some(s) = value_as_str_slice(s_val) else { return NULL; };
+    let Some(fill) = value_as_str_slice(fill_val) else { return s_val; };
+    let target_len = smi_to_i64(max_len_smi) as usize;
+    if s.len() >= target_len { return s_val; }
+    let needed = target_len - s.len();
+    let mut padding = String::with_capacity(needed);
+    padding.extend(fill.chars().cycle().take(needed));
+    padding.push_str(s);
+    allocate_new_string(&padding)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_string_repeat(s_val: i64, count_smi: i64) -> i64 {
+    let Some(s) = value_as_str_slice(s_val) else { return NULL; };
+    let count = smi_to_i64(count_smi).max(0) as usize;
+    allocate_new_string(&s.repeat(count))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_string_replace(s_val: i64, search_val: i64, rep_val: i64) -> i64 {
+    let Some(s) = value_as_str_slice(s_val) else { return NULL; };
+    let Some(search) = value_as_str_slice(search_val) else { return s_val; };
+    let Some(rep) = value_as_str_slice(rep_val) else { return s_val; };
+    allocate_new_string(&s.replacen(search, rep, 1))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_string_replace_all(s_val: i64, search_val: i64, rep_val: i64) -> i64 {
+    let Some(s) = value_as_str_slice(s_val) else { return NULL; };
+    let Some(search) = value_as_str_slice(search_val) else { return s_val; };
+    let Some(rep) = value_as_str_slice(rep_val) else { return s_val; };
+    allocate_new_string(&s.replace(search, rep))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_string_starts_with(s_val: i64, search_val: i64) -> i64 {
+    let Some(s) = value_as_str_slice(s_val) else { return 0; };
+    let Some(search) = value_as_str_slice(search_val) else { return 0; };
+    if s.starts_with(search) { 1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_string_ends_with(s_val: i64, search_val: i64) -> i64 {
+    let Some(s) = value_as_str_slice(s_val) else { return 0; };
+    let Some(search) = value_as_str_slice(search_val) else { return 0; };
+    if s.ends_with(search) { 1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_string_includes(s_val: i64, search_val: i64) -> i64 {
+    let Some(s) = value_as_str_slice(s_val) else { return 0; };
+    let Some(search) = value_as_str_slice(search_val) else { return 0; };
+    if s.contains(search) { 1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_string_to_upper_case(s_val: i64) -> i64 {
+    let Some(s) = value_as_str_slice(s_val) else { return NULL; };
+    allocate_new_string(&s.to_uppercase())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_string_to_lower_case(s_val: i64) -> i64 {
+    let Some(s) = value_as_str_slice(s_val) else { return NULL; };
+    allocate_new_string(&s.to_lowercase())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_string_trim(s_val: i64) -> i64 {
+    let Some(s) = value_as_str_slice(s_val) else { return NULL; };
+    allocate_new_string(s.trim())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_string_trim_end(s_val: i64) -> i64 {
+    let Some(s) = value_as_str_slice(s_val) else { return NULL; };
+    allocate_new_string(s.trim_end())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_string_trim_start(s_val: i64) -> i64 {
+    let Some(s) = value_as_str_slice(s_val) else { return NULL; };
+    allocate_new_string(s.trim_start())
 }
 
 // ============================================================================

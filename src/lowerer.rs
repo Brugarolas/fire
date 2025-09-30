@@ -11,7 +11,7 @@ use std::{collections::BTreeSet, ops::Deref};
 // Bring in the WIR types from your other file/module.
 use crate::wir::{
     AccessorInfo, BindingId, Builder, Constant, FieldId, FuncId, Inst, IntBinOp, MethodInfo,
-    Module, Type, ValueId,
+    Module, Type, ValueId, next_id,
 };
 
 use crate::front::{
@@ -2381,6 +2381,163 @@ fn lower_array_method_call<'m>(
     }
 }
 
+fn lower_string_method_call<'m>(
+    b: &mut Builder<'m>,
+    locals: &mut HashMap<String, ValueId>,
+    _fields: &mut HashMap<String, FieldId>,
+    _next_field: &mut u32,
+    recv: &Expr,
+    name: &str,
+    args: &[Expr],
+    lowering_ctx: &LoweringContext,
+) -> LResult<Option<ValueId>> {
+    use crate::wir::{Inst, Type};
+
+    // Helper macro for creating `CallNative` instructions.
+    macro_rules! cn {
+        ($fname:expr, [$($argv:expr),*], $ty:expr) => {{
+            let (_nid, res) = b.push_node(
+                Inst::CallNative {
+                    name: $fname.into(),
+                    args: vec![$($argv),*],
+                    pure: false, // String operations can allocate, so they are not pure.
+                    can_throw: false,
+                },
+                $ty,
+                1,
+                true,
+            );
+            Ok(Some(res[0]))
+        }};
+    }
+
+    // List of all string methods we are implementing.
+    let is_string_method = matches!(name,
+        "concat" | "split" | "indexOf" | "lastIndexOf" | "padEnd" | "padStart" |
+        "repeat" | "replace" | "replaceAll" | "slice" | "substring" | "startsWith" |
+        "endsWith" | "includes" | "toLowerCase" | "toUpperCase" | "trim" |
+        "trimEnd" | "trimStart"
+    );
+
+    if !is_string_method {
+        return Ok(None); // Not a string method, do nothing.
+    }
+
+    // All string methods require lowering the receiver `s`.
+    let s = lower_expr_free(b, locals, _fields, _next_field, recv, lowering_ctx)?;
+
+    match name {
+        "concat" => {
+            if args.len() != 1 { return Err(LowerError::NotLowerable("concat expects 1 argument")); }
+            let other = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            cn!("wir_string_concat", [s, other], Some(Type::Str))
+        }
+        "split" => {
+            let separator = if let Some(sep_expr) = args.get(0) {
+                lower_expr_free(b, locals, _fields, _next_field, sep_expr, lowering_ctx)?
+            } else {
+                b.const_undef() // `undefined` separator splits by nothing.
+            };
+            cn!("wir_string_split", [s, separator], Some(Type::Array(Box::new(Some(Type::Str)))))
+        }
+        "indexOf" => {
+            if args.is_empty() || args.len() > 2 { return Err(LowerError::NotLowerable("indexOf expects 1 or 2 arguments")); }
+            let search = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let pos = if let Some(pos_expr) = args.get(1) {
+                lower_expr_free(b, locals, _fields, _next_field, pos_expr, lowering_ctx)?
+            } else {
+                b.const_i32(0) // Default start position is 0
+            };
+            cn!("wir_string_index_of", [s, search, pos], Some(Type::Int32))
+        }
+        "lastIndexOf" => {
+            if args.is_empty() || args.len() > 2 { return Err(LowerError::NotLowerable("lastIndexOf expects 1 or 2 arguments")); }
+            let search = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let pos = if let Some(pos_expr) = args.get(1) {
+                lower_expr_free(b, locals, _fields, _next_field, pos_expr, lowering_ctx)?
+            } else {
+                b.const_i32(-1) // Sentinel for "from the end"
+            };
+            cn!("wir_string_last_index_of", [s, search, pos], Some(Type::Int32))
+        }
+        "padEnd" | "padStart" => {
+            if args.is_empty() || args.len() > 2 { return Err(LowerError::NotLowerable("padEnd/padStart expect 1 or 2 arguments")); }
+            let max_len = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let fill_str = if let Some(fill_expr) = args.get(1) {
+                lower_expr_free(b, locals, _fields, _next_field, fill_expr, lowering_ctx)?
+            } else {
+                b.const_str(" ") // Default fill is a space
+            };
+            let native_name = if name == "padEnd" { "wir_string_pad_end" } else { "wir_string_pad_start" };
+            cn!(native_name, [s, max_len, fill_str], Some(Type::Str))
+        }
+        "repeat" => {
+            if args.len() != 1 { return Err(LowerError::NotLowerable("repeat expects 1 argument")); }
+            let count = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            cn!("wir_string_repeat", [s, count], Some(Type::Str))
+        }
+        "replace" => {
+            if args.len() != 2 { return Err(LowerError::NotLowerable("replace expects 2 arguments")); }
+            let search = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let replacement = lower_expr_free(b, locals, _fields, _next_field, &args[1], lowering_ctx)?;
+            cn!("wir_string_replace", [s, search, replacement], Some(Type::Str))
+        }
+        "replaceAll" => {
+            if args.len() != 2 { return Err(LowerError::NotLowerable("replaceAll expects 2 arguments")); }
+            let search = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let replacement = lower_expr_free(b, locals, _fields, _next_field, &args[1], lowering_ctx)?;
+            cn!("wir_string_replace_all", [s, search, replacement], Some(Type::Str))
+        }
+        "slice" | "substring" => {
+            let start = if let Some(start_expr) = args.get(0) {
+                lower_expr_free(b, locals, _fields, _next_field, start_expr, lowering_ctx)?
+            } else {
+                b.const_i32(0)
+            };
+            let end = if let Some(end_expr) = args.get(1) {
+                lower_expr_free(b, locals, _fields, _next_field, end_expr, lowering_ctx)?
+            } else {
+                b.const_i32(-1) // Use -1 SMI as a sentinel for "to the end".
+            };
+            let native_name = if name == "slice" { "wir_string_slice" } else { "wir_string_substring" };
+            cn!(native_name, [s, start, end], Some(Type::Str))
+        }
+        "toUpperCase" => {
+            if !args.is_empty() { return Err(LowerError::NotLowerable("toUpperCase expects 0 arguments")); }
+            cn!("wir_string_to_upper_case", [s], Some(Type::Str))
+        }
+        "toLowerCase" => {
+            if !args.is_empty() { return Err(LowerError::NotLowerable("toLowerCase expects 0 arguments")); }
+            cn!("wir_string_to_lower_case", [s], Some(Type::Str))
+        }
+        "startsWith" => {
+            if args.is_empty() || args.len() > 2 { return Err(LowerError::NotLowerable("startsWith expects 1 or 2 arguments")); }
+            let search = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            cn!("wir_string_starts_with", [s, search], Some(Type::Bool))
+        }
+        "endsWith" => {
+            if args.len() != 1 { return Err(LowerError::NotLowerable("endsWith expects 1 argument")); }
+            let search = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            cn!("wir_string_ends_with", [s, search], Some(Type::Bool))
+        }
+        "includes" => {
+            if args.len() != 1 { return Err(LowerError::NotLowerable("includes expects 1 argument")); }
+            let search = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            cn!("wir_string_includes", [s, search], Some(Type::Bool))
+        }
+        "trim" => {
+            if !args.is_empty() { return Err(LowerError::NotLowerable("trim expects 0 arguments")); }
+            cn!("wir_string_trim", [s], Some(Type::Str))
+        }
+        "trimEnd" | "trimStart" => {
+            if !args.is_empty() { return Err(LowerError::NotLowerable("trimEnd/trimStart expects 0 arguments")); }
+            let native_name = if name == "trimEnd" { "wir_string_trim_end" } else { "wir_string_trim_start" };
+            cn!(native_name, [s], Some(Type::Str))
+        }
+        _ => Ok(None)
+    }
+}
+
 fn lower_expr_free<'m>(
     b: &mut Builder<'m>,
     locals: &mut HashMap<String, ValueId>,
@@ -3624,6 +3781,12 @@ fn lower_expr_free<'m>(
                         );
                         return Ok(res[0]);
                     }
+                }
+
+                if let Some(v) = lower_string_method_call(
+                    b, locals, fields, next_field, recv, name, args, lowering_ctx
+                )? {
+                    return Ok(v);
                 }
 
                 // 0d) Array instance methods (map/filter/etc.) — AFTER static check (this lowers `recv`)

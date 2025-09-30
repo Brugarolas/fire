@@ -49,7 +49,12 @@ use crate::value::{
     wir_array_copy, wir_array_fill, wir_array_filter, wir_array_find, wir_array_find_index,
     wir_array_for_each, wir_array_get, wir_array_len, wir_array_map, wir_array_new, wir_array_pop,
     wir_array_push, wir_array_reduce, wir_array_set, wir_array_set_len, wir_array_shift,
-    wir_array_slice, wir_array_unshift, wir_string_get_char, wir_string_len
+    wir_array_slice, wir_array_unshift, wir_string_get_char, wir_string_len, wir_string_concat,
+    wir_string_index_of, wir_string_last_index_of, wir_string_to_upper_case,
+    wir_string_to_lower_case, wir_string_starts_with, wir_string_ends_with, wir_string_substring,
+    wir_string_trim, wir_string_trim_start, wir_string_trim_end, wir_string_replace,
+    wir_string_replace_all, wir_string_includes, wir_string_pad_start, wir_string_pad_end,
+    wir_string_split, wir_string_repeat, wir_string_slice
 };
 
 impl JIT {
@@ -391,6 +396,28 @@ impl Default for JIT {
         unsafe extern "C" {
             fn wir_binding_load(binding_id_smi: i64) -> i64;
             fn wir_binding_store(binding_id_smi: i64, val: i64) -> i64;
+        }
+
+        unsafe extern "C" {
+            fn wir_string_concat(s1: i64, s2: i64) -> i64;
+            fn wir_string_split(s: i64, sep: i64) -> i64;
+            fn wir_string_index_of(s: i64, search: i64, pos: i64) -> i64;
+            fn wir_string_last_index_of(s: i64, search: i64, pos: i64) -> i64;
+            fn wir_string_pad_end(s: i64, max_len: i64, fill: i64) -> i64;
+            fn wir_string_pad_start(s: i64, max_len: i64, fill: i64) -> i64;
+            fn wir_string_repeat(s: i64, count: i64) -> i64;
+            fn wir_string_replace(s: i64, search: i64, rep: i64) -> i64;
+            fn wir_string_replace_all(s: i64, search: i64, rep: i64) -> i64;
+            fn wir_string_slice(s: i64, start: i64, end: i64) -> i64;
+            fn wir_string_substring(s: i64, start: i64, end: i64) -> i64;
+            fn wir_string_starts_with(s: i64, search: i64) -> i64;
+            fn wir_string_ends_with(s: i64, search: i64) -> i64;
+            fn wir_string_includes(s: i64, search: i64) -> i64;
+            fn wir_string_to_upper_case(s: i64) -> i64;
+            fn wir_string_to_lower_case(s: i64) -> i64;
+            fn wir_string_trim(s: i64) -> i64;
+            fn wir_string_trim_end(s: i64) -> i64;
+            fn wir_string_trim_start(s: i64) -> i64;
         }
 
         unsafe {
@@ -817,6 +844,26 @@ impl Default for JIT {
                 "wir_binding_store",
                 wir_binding_store as *const extern "C" fn(i64, i64) -> i64 as *const u8,
             );
+
+            jb.symbol("wir_string_concat", wir_string_concat as *const u8);
+            jb.symbol("wir_string_split", wir_string_split as *const u8);
+            jb.symbol("wir_string_index_of", wir_string_index_of as *const u8);
+            jb.symbol("wir_string_last_index_of", wir_string_last_index_of as *const u8);
+            jb.symbol("wir_string_pad_end", wir_string_pad_end as *const u8);
+            jb.symbol("wir_string_pad_start", wir_string_pad_start as *const u8);
+            jb.symbol("wir_string_repeat", wir_string_repeat as *const u8);
+            jb.symbol("wir_string_replace", wir_string_replace as *const u8);
+            jb.symbol("wir_string_replace_all", wir_string_replace_all as *const u8);
+            jb.symbol("wir_string_slice", wir_string_slice as *const u8);
+            jb.symbol("wir_string_substring", wir_string_substring as *const u8);
+            jb.symbol("wir_string_starts_with", wir_string_starts_with as *const u8);
+            jb.symbol("wir_string_ends_with", wir_string_ends_with as *const u8);
+            jb.symbol("wir_string_includes", wir_string_includes as *const u8);
+            jb.symbol("wir_string_to_upper_case", wir_string_to_upper_case as *const u8);
+            jb.symbol("wir_string_to_lower_case", wir_string_to_lower_case as *const u8);
+            jb.symbol("wir_string_trim", wir_string_trim as *const u8);
+            jb.symbol("wir_string_trim_end", wir_string_trim_end as *const u8);
+            jb.symbol("wir_string_trim_start", wir_string_trim_start as *const u8);
         }
 
         let module = cranelift_jit::JITModule::new(jb);
