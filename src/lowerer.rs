@@ -2538,6 +2538,79 @@ fn lower_string_method_call<'m>(
     }
 }
 
+fn lower_map_set_method_call<'m>(
+    b: &mut Builder<'m>,
+    locals: &mut HashMap<String, ValueId>,
+    _fields: &mut HashMap<String, FieldId>,
+    _next_field: &mut u32,
+    recv: &Expr,
+    name: &str,
+    args: &[Expr],
+    lowering_ctx: &LoweringContext,
+) -> LResult<Option<ValueId>> {
+    use crate::wir::{Inst, Type};
+    
+    let is_map_set_method = matches!(name, "get" | "set" | "has" | "delete" | "clear" | "add");
+    if !is_map_set_method {
+        return Ok(None);
+    }
+    
+    macro_rules! cn {
+        ($fname:expr, [$($argv:expr),*], $ty:expr, $ret_count:expr) => {{
+            let (_nid, res) = b.push_node(
+                Inst::CallNative { name: $fname.into(), args: vec![$($argv),*], pure: false, can_throw: false, },
+                $ty, $ret_count, true,
+            );
+            Ok(if res.is_empty() { None } else { Some(res[0]) })
+        }};
+    }
+
+    let recv_val = lower_expr_free(b, locals, _fields, _next_field, recv, lowering_ctx)?;
+
+    // NOTE: For now, we rely on duck typing. If you call `.get()` on a string, it will
+    // fail gracefully at runtime. We can add type guards later.
+    match name {
+        // --- Map Methods ---
+        "get" => {
+            if args.len() != 1 { return Err(LowerError::NotLowerable("Map.get expects 1 argument")); }
+            let key = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            cn!("wir_map_get", [recv_val, key], None, 1)
+        }
+        "set" => {
+            if args.len() != 2 { return Err(LowerError::NotLowerable("Map.set expects 2 arguments")); }
+            let key = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let val = lower_expr_free(b, locals, _fields, _next_field, &args[1], lowering_ctx)?;
+            cn!("wir_map_set", [recv_val, key, val], Some(Type::AnyRef), 1) // Returns the map
+        }
+        "has" => {
+            if args.len() != 1 { return Err(LowerError::NotLowerable("Map.has/Set.has expects 1 argument")); }
+            let key = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let (_nid, res) = b.push_node(Inst::CallNative { name: "wir_map_has".into(), args: vec![recv_val, key], pure: false, can_throw: false }, Some(Type::Bool), 1, true);
+            let (_nid2, res2) = b.push_node(Inst::CallNative { name: "wir_set_has".into(), args: vec![recv_val, key], pure: false, can_throw: false }, Some(Type::Bool), 1, true);
+            Ok(Some(build_bool_or(b, res[0], res2[0]))) // Try both
+        }
+        "delete" => {
+            if args.len() != 1 { return Err(LowerError::NotLowerable("Map.delete/Set.delete expects 1 argument")); }
+            let key = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let (_nid, res) = b.push_node(Inst::CallNative { name: "wir_map_delete".into(), args: vec![recv_val, key], pure: false, can_throw: false }, Some(Type::Bool), 1, true);
+            let (_nid2, res2) = b.push_node(Inst::CallNative { name: "wir_set_delete".into(), args: vec![recv_val, key], pure: false, can_throw: false }, Some(Type::Bool), 1, true);
+            Ok(Some(build_bool_or(b, res[0], res2[0]))) // Try both
+        }
+        "clear" => {
+            if !args.is_empty() { return Err(LowerError::NotLowerable("clear expects 0 arguments")); }
+            cn!("wir_map_clear", [recv_val], None, 0)?;
+            cn!("wir_set_clear", [recv_val], None, 0)
+        }
+        // --- Set Method ---
+        "add" => {
+            if args.len() != 1 { return Err(LowerError::NotLowerable("Set.add expects 1 argument")); }
+            let val = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            cn!("wir_set_add", [recv_val, val], Some(Type::AnyRef), 1) // Returns the set
+        }
+        _ => Ok(None)
+    }
+}
+
 fn lower_expr_free<'m>(
     b: &mut Builder<'m>,
     locals: &mut HashMap<String, ValueId>,
@@ -3397,6 +3470,17 @@ fn lower_expr_free<'m>(
                 return Ok(result_phi);
             }
 
+            if name == "size" {
+                let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
+
+                // Call both and let the runtime figure it out. Since size is a number and
+                // a non-map/set will return SMI 0, we can just add them.
+                let (_nid1, map_size) = b.push_node( Inst::CallNative { name: "wir_map_size".into(), args: vec![recv_v], pure: true, can_throw: false, }, Some(Type::Int32), 1, false);
+                let (_nid2, set_size) = b.push_node( Inst::CallNative { name: "wir_set_size".into(), args: vec![recv_v], pure: true, can_throw: false, }, Some(Type::Int32), 1, false);
+
+                return Ok(b.int_bin(IntBinOp::Or, map_size[0], set_size[0]));
+            }
+
             // Fallback to the generic property getter for all other property names.
             let obj = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
             let value = lower_general_getprop(b, obj, name, fields, next_field);
@@ -3783,16 +3867,22 @@ fn lower_expr_free<'m>(
                     }
                 }
 
+                // 0d) String instance methods
                 if let Some(v) = lower_string_method_call(
                     b, locals, fields, next_field, recv, name, args, lowering_ctx
                 )? {
                     return Ok(v);
                 }
 
-                // 0d) Array instance methods (map/filter/etc.) — AFTER static check (this lowers `recv`)
+                // 0e) Array instance methods (map/filter/etc.)
                 if let Some(v) = lower_array_method_call(
                     b, locals, fields, next_field, recv, name, args, lowering_ctx
                 )? {
+                    return Ok(v);
+                }
+
+                // 0f) Map and Set instance methods (add/has/delete/clear)
+                if let Some(v) = lower_map_set_method_call(b, locals, fields, next_field, recv, name, args, lowering_ctx)? {
                     return Ok(v);
                 }
 
@@ -4348,7 +4438,25 @@ fn lower_expr_free<'m>(
                 );
             }
 
-            // 1) ruta local (como ya tenías)
+            // Handle `new Map()` and `new Set()` as special builtins
+            let native_ctor = match class.as_str() {
+                "Map" => Some("wir_map_new"),
+                "Set" => Some("wir_set_new"),
+                _ => None
+            };
+
+            if let Some(ctor_name) = native_ctor {
+                // For now, we don't support initial values like `new Map([...])`.
+                if !args.is_empty() { return Err(LowerError::NotLowerable("Map/Set constructors with arguments not yet supported")); }
+
+                let (_nid, res) = b.push_node(
+                    Inst::CallNative { name: ctor_name.into(), args: vec![], pure: false, can_throw: false, },
+                    Some(Type::AnyRef), 1, true
+                );
+                return Ok(res[0]);
+            }
+
+            // 1) ruta local
             let fname = format!("__class_new_{}", class);
             if let Some(&fid) = lowering_ctx.funcs.get(&fname) {
                 let mut argv = Vec::with_capacity(args.len());

@@ -5,7 +5,7 @@
 #![allow(unused_unsafe)]
 
 use crate::gc::NAPALM_GC;
-use ahash::AHashMap as HashMap;
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use core::mem;
 use std::ptr;
 use std::str;
@@ -71,6 +71,8 @@ pub const TAG_STRING: u32 = 2;
 pub const TAG_ARRAY: u32 = 3;
 pub const TAG_CLOSURE: u32 = 4;
 pub const TAG_OBJECT: u32 = 5;
+pub const TAG_MAP: u32 = 6;
+pub const TAG_SET: u32 = 7;
 
 // ============================================================================
 // Boxed f64
@@ -1402,6 +1404,90 @@ pub unsafe fn obj_clone_shallow(src_v: ValueRepr) -> ValueRepr {
 
     obj_assign(clone_v, src_v);
     clone_v
+}
+
+// ============================================================================
+// Map & Set
+// ============================================================================
+
+#[repr(C)]
+pub struct BoxedMap {
+    pub hdr: ObjHeader,
+    pub map: HashMap<ValueRepr, ValueRepr>,
+}
+
+#[repr(C)]
+pub struct BoxedSet {
+    pub hdr: ObjHeader,
+    pub set: HashSet<ValueRepr>,
+}
+
+#[inline(always)]
+pub fn map_new() -> ValueRepr {
+    unsafe {
+        let size = mem::size_of::<BoxedMap>();
+        let align = mem::align_of::<BoxedMap>();
+
+        #[cfg(feature = "gc")]
+        let p = {
+            let mut p = NAPALM_GC.alloc_raw(size, align);
+            if p.is_null() { p = NAPALM_GC.alloc_slow_path(size, align); }
+            p
+        };
+        #[cfg(not(feature = "gc"))]
+        let p = {
+            use std::alloc::{Layout, alloc, handle_alloc_error};
+            let layout = Layout::from_size_align_unchecked(size, align);
+            let p = alloc(layout);
+            if p.is_null() { handle_alloc_error(layout); }
+            p
+        };
+
+        let obj = p as *mut BoxedMap;
+        ptr::write(obj, BoxedMap {
+            hdr: ObjHeader { tag: TAG_MAP, aux: 0 },
+            map: HashMap::new(),
+        });
+
+        #[cfg(feature = "gc")]
+        NAPALM_GC.post_alloc_object(p, size);
+
+        p as ValueRepr
+    }
+}
+
+#[inline(always)]
+pub fn set_new() -> ValueRepr {
+    unsafe {
+        let size = mem::size_of::<BoxedSet>();
+        let align = mem::align_of::<BoxedSet>();
+
+        #[cfg(feature = "gc")]
+        let p = {
+            let mut p = NAPALM_GC.alloc_raw(size, align);
+            if p.is_null() { p = NAPALM_GC.alloc_slow_path(size, align); }
+            p
+        };
+        #[cfg(not(feature = "gc"))]
+        let p = {
+            use std::alloc::{Layout, alloc, handle_alloc_error};
+            let layout = Layout::from_size_align_unchecked(size, align);
+            let p = alloc(layout);
+            if p.is_null() { handle_alloc_error(layout); }
+            p
+        };
+
+        let obj = p as *mut BoxedSet;
+        ptr::write(obj, BoxedSet {
+            hdr: ObjHeader { tag: TAG_SET, aux: 0 },
+            set: HashSet::new(),
+        });
+
+        #[cfg(feature = "gc")]
+        NAPALM_GC.post_alloc_object(p, size);
+
+        p as ValueRepr
+    }
 }
 
 // ============================================================================

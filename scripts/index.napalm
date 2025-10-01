@@ -286,6 +286,52 @@ print(padded.trim());       // expect "Hello, World!"
 print(padded.trimStart());  // expect "Hello, World!   "
 print(padded.trimEnd());    // expect "   Hello, World!"
 
+// ===========================
+// Map
+// ===========================
+
+print("===== Map: create, set, get, size =====");
+var m = new Map();
+m.set("name", "Napalm");
+m.set("year", 2024);
+m.set(123, "is a number key");
+
+print(m.get("name"));       // expect "Napalm"
+print(m.get("year"));       // expect 2024 (as SMI)
+print(m.get(123));          // expect "is a number key"
+print(m.size);              // expect 3
+print(m.get("missing"));    // expect null
+
+print("===== Map: has, delete, clear =====");
+print(m.has("year"));       // expect 1 (true)
+print(m.delete("year"));    // expect 1 (true, as it existed)
+print(m.has("year"));       // expect 0 (false)
+print(m.size);              // expect 2
+m.clear();
+print(m.size);              // expect 0
+
+// ===========================
+// Set
+// ===========================
+
+print("===== Set: create, add, has, size =====");
+var s = new Set();
+s.add("first");
+s.add(42);
+s.add("first"); // Duplicate, should be ignored
+
+print(s.size);              // expect 2
+print(s.has("first"));      // expect 1 (true)
+print(s.has(42));           // expect 1 (true)
+print(s.has("second"));     // expect 0 (false)
+
+print("===== Set: delete, clear =====");
+print(s.delete(42));        // expect 1 (true, as it existed)
+print(s.has(42));           // expect 0 (false)
+print(s.size);              // expect 1
+s.clear();
+print(s.size);              // expect 0
+
 print("===== Promises ====="); // (VALIDATED UNTIL HERE)
 print("(async)");
 

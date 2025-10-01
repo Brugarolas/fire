@@ -12,6 +12,7 @@
         "cargo::run::classes": "RUSTFLAGS=\"-Awarnings\" cargo run > log.txt 2>&1 -- scripts/classes.napalm",
         "cargo::run::imports": "RUSTFLAGS=\"-Awarnings\" cargo run > log.txt 2>&1 -- scripts/import.napalm",
         "cargo::run::lev": "RUSTFLAGS=\"-Awarnings\" cargo run > log.txt 2>&1 -- scripts/lev.napalm",
+        "cargo::run::map": "RUSTFLAGS=\"-Awarnings\" cargo run > log.txt 2>&1 -- scripts/map.napalm",
         "cargo::run::error": "RUSTFLAGS=\"-Awarnings\" cargo run > log.txt 2>&1 -- scripts/error.napalm",
         "cargo::build": "RUSTFLAGS=\"-Awarnings\" cargo build --release"
     },

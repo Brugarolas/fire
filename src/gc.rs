@@ -648,10 +648,25 @@ impl Scanning<NapalmVM> for VMScanning {
             }
         }
 
-        // Promises – closures stored off-heap
+        // 4) Promises – closures stored off-heap
         {
             let mut edges: SmallVec<[SlotItem; 64]> = SmallVec::new();
             crate::native_promises::promises_with_root_slots(|slot| {
+                edges.push(SlotItem(Address::from_ptr(slot.cast::<u8>())));
+                if edges.len() == 64 {
+                    factory.create_process_roots_work(edges.to_vec());
+                    edges.clear();
+                }
+            });
+            if !edges.is_empty() {
+                factory.create_process_roots_work(edges.to_vec());
+            }
+        }
+
+        // 5) Map and Set roots
+        {
+            let mut edges: SmallVec<[SlotItem; 64]> = SmallVec::new();
+            crate::runtime::collections_with_root_slots(|slot| {
                 edges.push(SlotItem(Address::from_ptr(slot.cast::<u8>())));
                 if edges.len() == 64 {
                     factory.create_process_roots_work(edges.to_vec());

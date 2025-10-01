@@ -42,6 +42,8 @@ use crate::runtime::{
     wir_obj_get_method, wir_obj_get_proto, wir_obj_get_str, wir_obj_get_str_deep,
     wir_obj_has_field, wir_obj_has_str, wir_obj_new, wir_obj_set_field, wir_obj_set_proto,
     wir_obj_set_str, wir_super_get_method, wir_string_equals,
+    wir_map_new, wir_map_get, wir_map_set, wir_map_has, wir_map_delete, wir_map_clear, wir_map_size,
+    wir_set_new, wir_set_add, wir_set_has, wir_set_delete, wir_set_clear, wir_set_size,
 };
 #[allow(unused_imports)]
 use crate::value::{
@@ -418,6 +420,23 @@ impl Default for JIT {
             fn wir_string_trim(s: i64) -> i64;
             fn wir_string_trim_end(s: i64) -> i64;
             fn wir_string_trim_start(s: i64) -> i64;
+        }
+
+        unsafe extern "C" {
+            fn wir_map_new() -> i64;
+            fn wir_map_get(map: i64, key: i64) -> i64;
+            fn wir_map_set(map: i64, key: i64, val: i64) -> i64;
+            fn wir_map_has(map: i64, key: i64) -> i64;
+            fn wir_map_delete(map: i64, key: i64) -> i64;
+            fn wir_map_clear(map: i64);
+            fn wir_map_size(map: i64) -> i64;
+
+            fn wir_set_new() -> i64;
+            fn wir_set_add(set: i64, val: i64) -> i64;
+            fn wir_set_has(set: i64, val: i64) -> i64;
+            fn wir_set_delete(set: i64, val: i64) -> i64;
+            fn wir_set_clear(set: i64);
+            fn wir_set_size(set: i64) -> i64;
         }
 
         unsafe {
@@ -864,6 +883,21 @@ impl Default for JIT {
             jb.symbol("wir_string_trim", wir_string_trim as *const u8);
             jb.symbol("wir_string_trim_end", wir_string_trim_end as *const u8);
             jb.symbol("wir_string_trim_start", wir_string_trim_start as *const u8);
+
+            jb.symbol("wir_map_new", wir_map_new as *const u8);
+            jb.symbol("wir_map_get", wir_map_get as *const u8);
+            jb.symbol("wir_map_set", wir_map_set as *const u8);
+            jb.symbol("wir_map_has", wir_map_has as *const u8);
+            jb.symbol("wir_map_delete", wir_map_delete as *const u8);
+            jb.symbol("wir_map_clear", wir_map_clear as *const u8);
+            jb.symbol("wir_map_size", wir_map_size as *const u8);
+
+            jb.symbol("wir_set_new", wir_set_new as *const u8);
+            jb.symbol("wir_set_add", wir_set_add as *const u8);
+            jb.symbol("wir_set_has", wir_set_has as *const u8);
+            jb.symbol("wir_set_delete", wir_set_delete as *const u8);
+            jb.symbol("wir_set_clear", wir_set_clear as *const u8);
+            jb.symbol("wir_set_size", wir_set_size as *const u8);
         }
 
         let module = cranelift_jit::JITModule::new(jb);

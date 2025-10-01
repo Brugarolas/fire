@@ -115,6 +115,10 @@ pub enum Tok {
     PromiseBuiltin,
     #[token("Deferred")]
     DeferredBuiltin,
+    #[token("Map")]
+    MapBuiltin,
+    #[token("Set")]
+    SetBuiltin,
 
     // Identifiers & literals
     #[regex(r"[A-Za-z_][A-Za-z0-9_]*", |lex| lex.slice().to_string())]
@@ -1937,6 +1941,12 @@ impl<'src> Parser<'src> {
             // a general-purpose identifier, we convert them to strings.
             Tok::Get => Ok("get".to_string()),
             Tok::Set => Ok("set".to_string()),
+
+            Tok::MapBuiltin => Ok("Map".to_string()),
+            Tok::SetBuiltin => Ok("Set".to_string()),
+
+            Tok::Delete => Ok("delete".to_string()),
+
             // Add any other contextual keywords here if needed in the future.
             _ => Err(ParseError {
                 msg: format!("expected an identifier, but found {:?}", t.tok),
@@ -2299,16 +2309,7 @@ impl<'src> Parser<'src> {
                     };
                 }
             } else if self.matches(&Tok::Dot) {
-                let t = self.next()?;
-                let name = match t.tok {
-                    Tok::Ident(s) => s,
-                    ref tok => {
-                        return Err(ParseError {
-                            msg: format!("expected identifier after '.', found {:?}", tok),
-                            span: t.span,
-                        });
-                    }
-                };
+                let name = self.parse_any_identifier()?;
                 e = Expr::GetProp {
                     recv: SmallBox::new(e),
                     name,
@@ -2385,20 +2386,10 @@ impl<'src> Parser<'src> {
             }
 
             Tok::New => {
-                // new <Ident>(args...)
-                let t = self.next()?;
-                let class = match t.tok {
-                    Tok::Ident(s) => s,
-                    ref tok => {
-                        return Err(ParseError {
-                            msg: format!(
-                                "expected class name (identifier) after 'new', found {:?}",
-                                tok
-                            ),
-                            span: t.span,
-                        });
-                    }
-                };
+                // new <AnyIdent>(...)
+                // Use `parse_any_identifier` to correctly handle `new Map()`, `new Set()`, etc.
+                let class_name = self.parse_any_identifier()?;
+
                 self.expect(
                     Tok::LParen,
                     "expected '(' after class name in new expression",
@@ -2419,7 +2410,7 @@ impl<'src> Parser<'src> {
                     }
                     self.expect(Tok::Comma, "expected ',' in new arguments")?;
                 }
-                Ok(Expr::New { class, args })
+                Ok(Expr::New { class: class_name, args })
             }
 
             Tok::Int(x) => Ok(Expr::LitInt(x)),
@@ -2429,9 +2420,13 @@ impl<'src> Parser<'src> {
             Tok::Null => Ok(Expr::LitNull),
             Tok::Str(s) => Ok(Expr::Str(s)),
             Tok::Ident(s) => Ok(Expr::Ident(s)),
+
             Tok::ListBuiltin => Ok(Expr::Ident("Array".into())),
             Tok::PromiseBuiltin => Ok(Expr::Ident("Promise".into())),
             Tok::DeferredBuiltin => Ok(Expr::Ident("Deferred".into())),
+            Tok::MapBuiltin => Ok(Expr::Ident("Map".into())),
+            Tok::SetBuiltin => Ok(Expr::Ident("Set".into())),
+
             Tok::LParen => {
                 let e = self.expr()?;
                 self.expect(Tok::RParen, "expected ')' to close grouped expression")?;

@@ -10,6 +10,7 @@ use crate::value::{
     BoxedArray, BoxedClosure, BoxedF64, BoxedObj, BoxedStr, NULL, ObjHeader, TAG_ARRAY,
     TAG_BOXED_F64, TAG_CLOSURE, TAG_OBJECT, TAG_STRING, is_bool, is_imm, obj_assign,
     obj_clone_shallow, obj_get_field_deep, obj_get_proto, obj_get_str_deep, obj_set_proto, to_bool,
+    BoxedMap, BoxedSet, TAG_MAP, TAG_SET, map_new, set_new,
 };
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
@@ -651,6 +652,140 @@ fn pp(v: i64, depth: usize, max_depth: usize, max_elems: usize, seen: &mut HashS
     // allow other branches to render this address again elsewhere
     seen.remove(&addr);
     out
+}
+
+// -----------------------------------------------------------------------------
+// Map & Set
+// -----------------------------------------------------------------------------
+
+
+// A global list of all live Map and Set objects, storing their addresses as `usize`.
+// `usize` is Send + Sync, making it safe to use in a static Mutex.
+static LIVE_COLLECTIONS: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+fn live_collections() -> &'static Mutex<HashSet<usize>> {
+    LIVE_COLLECTIONS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// A GC-callable function to scan all live Maps and Sets as roots.
+pub fn collections_with_root_slots<F: FnMut(*mut i64)>(mut f: F) {
+    let guard = live_collections().lock();
+    for &addr in guard.iter() {
+        if addr == 0 { continue; }
+        let ptr = addr as *const u8;
+        unsafe {
+            let hdr = &*(ptr as *const ObjHeader);
+            if hdr.tag == TAG_MAP {
+                let map = &mut *(ptr as *mut BoxedMap);
+                for (k, v) in map.map.iter_mut() {
+                    // Get a mutable pointer to the slots inside the HashMap's buffers.
+                    // This is safe because we are in a stop-the-world GC phase.
+                    f(k as *const i64 as *mut i64);
+                    f(v as *mut i64);
+                }
+            } else if hdr.tag == TAG_SET {
+                let set = &mut *(ptr as *mut BoxedSet);
+                // CORRECTED: Use .iter() and cast to get a mutable pointer for the GC slot visitor.
+                for v in set.set.iter() {
+                    f(v as *const i64 as *mut i64);
+                }
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_map_new() -> i64 {
+    let map_val = map_new();
+    // Register the new map's address as a `usize`.
+    live_collections().lock().insert(map_val as usize);
+    map_val
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_map_get(map_val: i64, key: i64) -> i64 {
+    if !is_heap_ptr(map_val) { return NULL; }
+    let map = &* (map_val as *const BoxedMap);
+    map.map.get(&key).copied().unwrap_or(NULL)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_map_set(map_val: i64, key: i64, val: i64) -> i64 {
+    if !is_heap_ptr(map_val) { return map_val; }
+    let map = &mut * (map_val as *mut BoxedMap);
+    map.map.insert(key, val);
+    map_val
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_map_has(map_val: i64, key: i64) -> i64 {
+    if !is_heap_ptr(map_val) { return 0; }
+    let map = &* (map_val as *const BoxedMap);
+    if map.map.contains_key(&key) { 1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_map_delete(map_val: i64, key: i64) -> i64 {
+    if !is_heap_ptr(map_val) { return 0; }
+    let map = &mut * (map_val as *mut BoxedMap);
+    if map.map.remove(&key).is_some() { 1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_map_clear(map_val: i64) {
+    if !is_heap_ptr(map_val) { return; }
+    let map = &mut * (map_val as *mut BoxedMap);
+    map.map.clear();
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_map_size(map_val: i64) -> i64 {
+    if !is_heap_ptr(map_val) { return v::make_smi(0); }
+    let map = &* (map_val as *const BoxedMap);
+    v::make_smi(map.map.len() as i64)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_set_new() -> i64 {
+    let set_val = set_new();
+    // Register the new set's address as a `usize`.
+    live_collections().lock().insert(set_val as usize);
+    set_val
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_set_add(set_val: i64, val: i64) -> i64 {
+    if !is_heap_ptr(set_val) { return set_val; }
+    let set = &mut * (set_val as *mut BoxedSet);
+    set.set.insert(val);
+    set_val
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_set_has(set_val: i64, val: i64) -> i64 {
+    if !is_heap_ptr(set_val) { return 0; }
+    let set = &* (set_val as *const BoxedSet);
+    if set.set.contains(&val) { 1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_set_delete(set_val: i64, val: i64) -> i64 {
+    if !is_heap_ptr(set_val) { return 0; }
+    let set = &mut * (set_val as *mut BoxedSet);
+    if set.set.remove(&val) { 1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_set_clear(set_val: i64) {
+    if !is_heap_ptr(set_val) { return; }
+    let set = &mut * (set_val as *mut BoxedSet);
+    set.set.clear();
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_set_size(set_val: i64) -> i64 {
+    if !is_heap_ptr(set_val) { return v::make_smi(0); }
+    let set = &* (set_val as *const BoxedSet);
+    v::make_smi(set.set.len() as i64)
 }
 
 // -----------------------------------------------------------------------------

@@ -3,7 +3,7 @@ Hi! I am making a new scripting programming language named Napalm. I have like 2
 Features I still have not implemented:
 - Try/Catch/Finally (a là JavaScript)
 - Defer/Errdefer (a là Zig)
-- Add Dates (a là JavaScript)
+- Add Dates (a là JavaScript: get/set of properties .date, .day, .fullYear, .hours, .milliseconds, .seconds, .time; constructors new Date(), Date(), Date.now(), Date.parse())
 - Add Proxy (a là JavaScript)
 - Interfaces (a là TypeScript)
 - Optional static typing, add a type system (a là TypeScript)
