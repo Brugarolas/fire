@@ -1,7 +1,7 @@
 Hi! I am making a new scripting programming language named Napalm. I have like 20% of the language features already implemented and the most important: a very complex engine already set up, but there are still a lot of features still to implement as well as a few bugs and incorrect stuff.
 
 Features I still have not implemented:
-- Add boolean value, Boolean class, and BoxedBool (a lá JS)
+- Add boolean value, Boolean class (for example: new Boolean(a && b || c) -or without 'new'-), and internal BoxedBool (a lá JS)
 - Map, Set (everything a là JS), List (Doubly-linked)
 - Add .values(), .keys(), .entries() for objects, class instances, Maps, and Sets (except .keys() and .entries() on Sets), and add .size property to objects/class instances
 - Try/Catch/Finally (a là JavaScript)
@@ -37,8 +37,8 @@ Optimizations:
 - Add Loop Fusion, Deforestation when functional programming is added
 - Explore other IR optimizations pre-JIT, specially rare or very specific ones
 - Fork Cranelift repo for integrating more optimizations (both manual and in ISLE) and improving register allocation and instruction selection (and creating a protocol -e.g. several git branches- for being updated), as well as applying these same optimizations in Cranelift (also review unmerged Cranelift PRs for merging the interesting ones)
-- Explore Super-Instructions: can they make the code faster? (it's likely that we can manually generate better code to compile)
-- Explore "merged runtime methods" aka "Super-Trampolines": can they make the code faster? (it's likely, less trampoline calls)
+- Explore Super-Instructions: can they make the code faster? (it's likely that we can manually generate better code to compile in larger methods)
+- Explore "merged runtime methods" aka "Super-Trampolines": can they make the code faster? (it's likely, less trampoline calls, better code in larger methods)
 
 Fixes to make:
 - Spread operator adding incorrect extra key-values

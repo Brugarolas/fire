@@ -377,10 +377,10 @@ impl SimdHashMap {
 
 // A Hash-able wrapper for f64, stored as u64 bits.
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, Default, PartialOrd, Ord)]
-pub struct HashF64(u64);
+pub struct BoxedF64(u64);
 
-impl HashF64 {
-    /// Creates a new HashF64 from an f64.
+impl BoxedF64 {
+    /// Creates a new BoxedF64 from an f64.
     pub fn new(f: f64) -> Self {
         Self(f.to_bits())
     }
@@ -394,10 +394,26 @@ impl HashF64 {
     pub fn save(&mut self, f: f64) {
         self.0 = f.to_bits();
     }
+
+    /// Operations with a closure.
+    pub fn op<F>(&mut self, f: F)
+    where
+        F: FnOnce(f64) -> f64,
+    {
+        let v = self.float();
+        let r = f(v);
+        self.save(r);
+    }
 }
 
-impl From<f64> for HashF64 {
+impl From<f64> for BoxedF64 {
     fn from(f: f64) -> Self {
         Self::new(f)
+    }
+}
+
+impl From<u64> for BoxedF64 {
+    fn from(u: u64) -> Self {
+        Self(u)
     }
 }
