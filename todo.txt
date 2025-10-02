@@ -1,6 +1,9 @@
 Hi! I am making a new scripting programming language named Napalm. I have like 20% of the language features already implemented and the most important: a very complex engine already set up, but there are still a lot of features still to implement as well as a few bugs and incorrect stuff.
 
 Features I still have not implemented:
+- Add boolean value, Boolean class, and BoxedBool (a lá JS)
+- Map, Set (everything a là JS), List (Doubly-linked)
+- Add .values(), .keys(), .entries() for objects, class instances, Maps, and Sets (except .keys() and .entries() on Sets), and add .size property to objects/class instances
 - Try/Catch/Finally (a là JavaScript)
 - Defer/Errdefer (a là Zig)
 - Add Dates (a là JavaScript: get/set of properties .date, .day, .fullYear, .hours, .milliseconds, .seconds, .time; constructors new Date(), Date(), Date.now(), Date.parse())
@@ -10,13 +13,11 @@ Features I still have not implemented:
 - Generics (a là TypeScript)
 - Generators and Generators inside Generators (a là JavaScript)
 - Fibers (a là Wren)/Coroutines (a là C++)
-- String methods (a lá JS - concat, split, indexOf, lastIndexOf, padEnd, padStart, repeat, replace, replaceAll, slice, substring, startsWith, endsWith, contains, toLowerCase, toUpperCase, trim, trimEnd, trimStart and length property)
-- Map, Set (everything a là JS), List (Doubly-linked)
 - Ranges (a là Wren & custom: 1..100 -> 1, 2, 3, ...; 1..100::5 -> 5, 10, 15, ...; 1..100::-1 -> 100, 99, 98, ...;)
 - Decorators (a là TypeScript)
 - Extend existing Classes with computed properties and operator overloading (a là TypeScript)
-- Add functional programming
-- Add reactive programming
+- Add functional programming (a là fp-core)
+- Add reactive programming (pure reactive programming - and patterns like Stream, Sinks (a là Carboxyl), Event/Emitter/Pipe/Listener)
 
 Optimizations:
 - Implement CompactStr (inlined strings) - in the entire engine maybe?
@@ -48,7 +49,6 @@ Complex milestones:
 - Make the error reporting to the user beautiful and eye-candy, using 'ariadne' and showing code and the specific line of code
 - Add parallel Tasks/Isolates/Workers (still to define, but Tasks like pre-emptive Fibers that do not share memory but they behave like Promises and the result can be merged with a .then() or an await into the main execution branch; Isolates/Workers would be a là Dart/JavaScript, completely parallel and without even sharing the list of modules loaded)
 - Add a MobX/Pinia-like centralized state eDSL, that also parallel entities can access to (they would be to be saved with Arc<> or RwLock<> or something like that, or wait until MMTk's ConcurrentImmix is finished - and we would have 2 GCs: single-threaded ones for each execution branch like main thread/Isolate/Worker, and a single concurrent one for the centralized state). This can be done in phases: first a non-concurrent one, for example (pre-emptive concurrency will be the LAST stuff to be added to the language, except for maybe the Tasks that do not have access to centralized state)
-- Add
 - Add an eDSL similar to Vue/Svelte for creating UIs with components and styles, that can render both to an independent Winit window (maybe using Iced, or Cushy, or Freya, or Blitz, or Rinf, or Tauri, or Slint - very likely Slint which works on Android and iOS), or to a TUI if you launch it from a terminal (using Ratatui, or Reactive TUI, or CrossTerm)
 - Add a database (probably PoloDB) that's in-memory and embedded in the engine, and create an eDSL for accessing/updating/managing its content
 - Add an embedded terminal shell that runs on a different pipeline (I guess interpreted, maybe with Pulley? or something manual with indirect threading and register based) that's fast because instead of searching the programs physically on the storage looping the PATH (and piping arguments requires no re-parsing them in each program), it will have embedded all classic Unix commands and a lot more (like Git) so it just have to read a HashMap being a lot faster than regular terminal shells. Also these Unix commands can be used from the language, with special bindings to transform the response of the command into a structured Napalm object.

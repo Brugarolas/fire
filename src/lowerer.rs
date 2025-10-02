@@ -2548,67 +2548,104 @@ fn lower_map_set_method_call<'m>(
     args: &[Expr],
     lowering_ctx: &LoweringContext,
 ) -> LResult<Option<ValueId>> {
-    use crate::wir::{Inst, Type};
-    
+    use crate::wir::{Inst, Type, IntBinOp, CmpKind};
+
     let is_map_set_method = matches!(name, "get" | "set" | "has" | "delete" | "clear" | "add");
     if !is_map_set_method {
         return Ok(None);
     }
-    
-    macro_rules! cn {
-        ($fname:expr, [$($argv:expr),*], $ty:expr, $ret_count:expr) => {{
-            let (_nid, res) = b.push_node(
-                Inst::CallNative { name: $fname.into(), args: vec![$($argv),*], pure: false, can_throw: false, },
-                $ty, $ret_count, true,
-            );
-            Ok(if res.is_empty() { None } else { Some(res[0]) })
-        }};
-    }
 
     let recv_val = lower_expr_free(b, locals, _fields, _next_field, recv, lowering_ctx)?;
 
-    // NOTE: For now, we rely on duck typing. If you call `.get()` on a string, it will
-    // fail gracefully at runtime. We can add type guards later.
-    match name {
-        // --- Map Methods ---
+    // Check if the receiver is a Map or Set at runtime
+    let (_nid, is_map_res) = b.push_node(Inst::CallNative { name: "wir_is_map".into(), args: vec![recv_val], pure: true, can_throw: false }, Some(Type::Bool), 1, false);
+    let (_nid2, is_set_res) = b.push_node(Inst::CallNative { name: "wir_is_set".into(), args: vec![recv_val], pure: true, can_throw: false }, Some(Type::Bool), 1, false);
+
+    let map_path = b.block();
+    let set_path = b.block();
+    let fallthrough_path = b.block(); // Path if it's neither
+    let join_path = b.block();
+    let result_phi = b.add_block_param(join_path, Type::Top);
+
+    b.branch(is_map_res[0], map_path, set_path);
+
+    b.position_at(set_path);
+    b.branch(is_set_res[0], set_path, fallthrough_path); // Chained check
+
+    // --- MAP PATH ---
+    b.position_at(map_path);
+    let map_res = match name {
         "get" => {
-            if args.len() != 1 { return Err(LowerError::NotLowerable("Map.get expects 1 argument")); }
+            if args.len() != 1 { return Err(LowerError::NotLowerable("Map.get expects 1 arg")); }
             let key = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
-            cn!("wir_map_get", [recv_val, key], None, 1)
+            let (_nid, res) = b.push_node(Inst::CallNative { name: "wir_map_get".into(), args: vec![recv_val, key], pure: false, can_throw: false}, None, 1, true);
+            res[0]
         }
         "set" => {
-            if args.len() != 2 { return Err(LowerError::NotLowerable("Map.set expects 2 arguments")); }
+            if args.len() != 2 { return Err(LowerError::NotLowerable("Map.set expects 2 args")); }
             let key = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
             let val = lower_expr_free(b, locals, _fields, _next_field, &args[1], lowering_ctx)?;
-            cn!("wir_map_set", [recv_val, key, val], Some(Type::AnyRef), 1) // Returns the map
+            let (_nid, res) = b.push_node(Inst::CallNative { name: "wir_map_set".into(), args: vec![recv_val, key, val], pure: false, can_throw: false}, Some(Type::AnyRef), 1, true);
+            res[0]
         }
         "has" => {
-            if args.len() != 1 { return Err(LowerError::NotLowerable("Map.has/Set.has expects 1 argument")); }
+            if args.len() != 1 { return Err(LowerError::NotLowerable("Map.has expects 1 arg")); }
             let key = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
-            let (_nid, res) = b.push_node(Inst::CallNative { name: "wir_map_has".into(), args: vec![recv_val, key], pure: false, can_throw: false }, Some(Type::Bool), 1, true);
-            let (_nid2, res2) = b.push_node(Inst::CallNative { name: "wir_set_has".into(), args: vec![recv_val, key], pure: false, can_throw: false }, Some(Type::Bool), 1, true);
-            Ok(Some(build_bool_or(b, res[0], res2[0]))) // Try both
+            let (_nid, res) = b.push_node(Inst::CallNative { name: "wir_map_has".into(), args: vec![recv_val, key], pure: false, can_throw: false}, Some(Type::Bool), 1, true);
+            res[0]
         }
         "delete" => {
-            if args.len() != 1 { return Err(LowerError::NotLowerable("Map.delete/Set.delete expects 1 argument")); }
+            if args.len() != 1 { return Err(LowerError::NotLowerable("Map.delete expects 1 arg")); }
             let key = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
-            let (_nid, res) = b.push_node(Inst::CallNative { name: "wir_map_delete".into(), args: vec![recv_val, key], pure: false, can_throw: false }, Some(Type::Bool), 1, true);
-            let (_nid2, res2) = b.push_node(Inst::CallNative { name: "wir_set_delete".into(), args: vec![recv_val, key], pure: false, can_throw: false }, Some(Type::Bool), 1, true);
-            Ok(Some(build_bool_or(b, res[0], res2[0]))) // Try both
+            let (_nid, res) = b.push_node(Inst::CallNative { name: "wir_map_delete".into(), args: vec![recv_val, key], pure: false, can_throw: false}, Some(Type::Bool), 1, true);
+            res[0]
         }
         "clear" => {
             if !args.is_empty() { return Err(LowerError::NotLowerable("clear expects 0 arguments")); }
-            cn!("wir_map_clear", [recv_val], None, 0)?;
-            cn!("wir_set_clear", [recv_val], None, 0)
+            b.push_node(Inst::CallNative { name: "wir_map_clear".into(), args: vec![recv_val], pure: false, can_throw: false}, None, 0, true);
+            b.const_null()
         }
-        // --- Set Method ---
+        _ => b.const_null() // A Map doesn't have `.add`
+    };
+    if !b.current_block_terminated() { b.jump(join_path, &[map_res]); }
+
+    // --- SET PATH ---
+    b.position_at(set_path);
+    let set_res = match name {
         "add" => {
             if args.len() != 1 { return Err(LowerError::NotLowerable("Set.add expects 1 argument")); }
             let val = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
-            cn!("wir_set_add", [recv_val, val], Some(Type::AnyRef), 1) // Returns the set
+            let (_nid, res) = b.push_node(Inst::CallNative { name: "wir_set_add".into(), args: vec![recv_val, val], pure: false, can_throw: false}, Some(Type::AnyRef), 1, true);
+            res[0]
         }
-        _ => Ok(None)
-    }
+        "has" => {
+            if args.len() != 1 { return Err(LowerError::NotLowerable("Set.has expects 1 argument")); }
+            let key = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let (_nid, res) = b.push_node(Inst::CallNative { name: "wir_set_has".into(), args: vec![recv_val, key], pure: false, can_throw: false}, Some(Type::Bool), 1, true);
+            res[0]
+        }
+        "delete" => {
+            if args.len() != 1 { return Err(LowerError::NotLowerable("Set.delete expects 1 argument")); }
+            let key = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let (_nid, res) = b.push_node(Inst::CallNative { name: "wir_set_delete".into(), args: vec![recv_val, key], pure: false, can_throw: false}, Some(Type::Bool), 1, true);
+            res[0]
+        }
+        "clear" => {
+            if !args.is_empty() { return Err(LowerError::NotLowerable("clear expects 0 arguments")); }
+            b.push_node(Inst::CallNative { name: "wir_set_clear".into(), args: vec![recv_val], pure: false, can_throw: false}, None, 0, true);
+            b.const_null()
+        }
+        _ => b.const_null() // A Set doesn't have `.get` or `.set`
+    };
+    if !b.current_block_terminated() { b.jump(join_path, &[set_res]); }
+
+    // --- FALLTHROUGH ---
+    b.position_at(fallthrough_path);
+    let null_val = b.const_null();
+    b.jump(join_path, &[null_val]);
+
+    b.position_at(join_path);
+    Ok(Some(result_phi))
 }
 
 fn lower_expr_free<'m>(
@@ -3473,12 +3510,35 @@ fn lower_expr_free<'m>(
             if name == "size" {
                 let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
 
-                // Call both and let the runtime figure it out. Since size is a number and
-                // a non-map/set will return SMI 0, we can just add them.
-                let (_nid1, map_size) = b.push_node( Inst::CallNative { name: "wir_map_size".into(), args: vec![recv_v], pure: true, can_throw: false, }, Some(Type::Int32), 1, false);
-                let (_nid2, set_size) = b.push_node( Inst::CallNative { name: "wir_set_size".into(), args: vec![recv_v], pure: true, can_throw: false, }, Some(Type::Int32), 1, false);
+                // At runtime, check if it's a Map, else check if it's a Set.
+                let (_nid, is_map_res) = b.push_node(Inst::CallNative { name: "wir_is_map".into(), args: vec![recv_v], pure: true, can_throw: false }, Some(Type::Bool), 1, false);
+                let (_nid2, is_set_res) = b.push_node(Inst::CallNative { name: "wir_is_set".into(), args: vec![recv_v], pure: true, can_throw: false }, Some(Type::Bool), 1, false);
 
-                return Ok(b.int_bin(IntBinOp::Or, map_size[0], set_size[0]));
+                let map_path = b.block();
+                let set_path = b.block();
+                let otherwise_path = b.block();
+                let join_path = b.block();
+                let result_phi = b.add_block_param(join_path, Type::Int32);
+
+                b.branch(is_map_res[0], map_path, set_path);
+
+                b.position_at(set_path);
+                b.branch(is_set_res[0], set_path, otherwise_path);
+
+                b.position_at(map_path);
+                let (_nid_map_size, map_size_res) = b.push_node(Inst::CallNative { name: "wir_map_size".into(), args: vec![recv_v], pure: true, can_throw: false }, Some(Type::Int32), 1, false);
+                b.jump(join_path, &[map_size_res[0]]);
+
+                b.position_at(set_path);
+                let (_nid_set_size, set_size_res) = b.push_node(Inst::CallNative { name: "wir_set_size".into(), args: vec![recv_v], pure: true, can_throw: false }, Some(Type::Int32), 1, false);
+                b.jump(join_path, &[set_size_res[0]]);
+
+                b.position_at(otherwise_path);
+                let zero_smi = b.const_i32(0);
+                b.jump(join_path, &[zero_smi]);
+
+                b.position_at(join_path);
+                return Ok(result_phi);
             }
 
             // Fallback to the generic property getter for all other property names.

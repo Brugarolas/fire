@@ -41,7 +41,7 @@ use crate::runtime::{
     wir_obj_clone, wir_obj_del_field, wir_obj_del_str, wir_obj_get_field, wir_obj_get_field_deep,
     wir_obj_get_method, wir_obj_get_proto, wir_obj_get_str, wir_obj_get_str_deep,
     wir_obj_has_field, wir_obj_has_str, wir_obj_new, wir_obj_set_field, wir_obj_set_proto,
-    wir_obj_set_str, wir_super_get_method, wir_string_equals,
+    wir_obj_set_str, wir_super_get_method, wir_string_equals, wir_is_map, wir_is_set,
     wir_map_new, wir_map_get, wir_map_set, wir_map_has, wir_map_delete, wir_map_clear, wir_map_size,
     wir_set_new, wir_set_add, wir_set_has, wir_set_delete, wir_set_clear, wir_set_size,
 };
@@ -423,6 +423,9 @@ impl Default for JIT {
         }
 
         unsafe extern "C" {
+            fn wir_is_map(v: i64) -> i64;
+            fn wir_is_set(v: i64) -> i64;
+
             fn wir_map_new() -> i64;
             fn wir_map_get(map: i64, key: i64) -> i64;
             fn wir_map_set(map: i64, key: i64, val: i64) -> i64;
@@ -884,6 +887,8 @@ impl Default for JIT {
             jb.symbol("wir_string_trim_end", wir_string_trim_end as *const u8);
             jb.symbol("wir_string_trim_start", wir_string_trim_start as *const u8);
 
+            jb.symbol("wir_is_map", wir_is_map as *const u8);
+            jb.symbol("wir_is_set", wir_is_set as *const u8);
             jb.symbol("wir_map_new", wir_map_new as *const u8);
             jb.symbol("wir_map_get", wir_map_get as *const u8);
             jb.symbol("wir_map_set", wir_map_set as *const u8);
@@ -891,7 +896,6 @@ impl Default for JIT {
             jb.symbol("wir_map_delete", wir_map_delete as *const u8);
             jb.symbol("wir_map_clear", wir_map_clear as *const u8);
             jb.symbol("wir_map_size", wir_map_size as *const u8);
-
             jb.symbol("wir_set_new", wir_set_new as *const u8);
             jb.symbol("wir_set_add", wir_set_add as *const u8);
             jb.symbol("wir_set_has", wir_set_has as *const u8);

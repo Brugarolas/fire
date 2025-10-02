@@ -658,6 +658,19 @@ fn pp(v: i64, depth: usize, max_depth: usize, max_elems: usize, seen: &mut HashS
 // Map & Set
 // -----------------------------------------------------------------------------
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_is_map(v: i64) -> i64 {
+    if !is_heap_ptr(v) { return 0; }
+    let hdr = &*(v as *const ObjHeader);
+    if hdr.tag == TAG_MAP { 1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wir_is_set(v: i64) -> i64 {
+    if !is_heap_ptr(v) { return 0; }
+    let hdr = &*(v as *const ObjHeader);
+    if hdr.tag == TAG_SET { 1 } else { 0 }
+}
 
 // A global list of all live Map and Set objects, storing their addresses as `usize`.
 // `usize` is Send + Sync, making it safe to use in a static Mutex.
