@@ -2,11 +2,12 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
-use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use crate::collections::{HashMap, HashSet};
 use ariadne::{Color, FileCache, FnCache, Label, Report, ReportKind, Source};
 use hybrid_rc::Arc;
 use logos::Logos;
 use smallbox::SmallBox;
+use smallvec::{smallvec, SmallVec};
 use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 use std::{collections::BTreeSet, ops::Deref};
@@ -351,6 +352,30 @@ pub enum ObjItem {
     Spread(Expr),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinType {
+    Map,
+    Set,
+    // We can add Array, String, Date, etc. here later
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinMapMethod {
+    Get,
+    Set,
+    Has,
+    Delete,
+    Clear,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinSetMethod {
+    Add,
+    Has,
+    Delete,
+    Clear,
+}
+
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Var {
@@ -463,6 +488,25 @@ pub enum Expr {
     OptionalChain {
         base: SmallBox<Expr, u8>,
         access: OptionalAccess,
+    },
+
+    CreateBuiltin {
+        kind: BuiltinType,
+        args: Vec<Expr>,
+    },
+
+    // REPLACES calls like `myMap.get(key)`
+    CallBuiltinMapMethod {
+        recv: SmallBox<Expr, u8>,
+        method: BuiltinMapMethod,
+        args: Vec<Expr>,
+    },
+
+    // REPLACES calls like `mySet.add(value)`
+    CallBuiltinSetMethod {
+        recv: SmallBox<Expr, u8>,
+        method: BuiltinSetMethod,
+        args: Vec<Expr>,
     },
 }
 
@@ -882,7 +926,7 @@ impl<'src> Parser<'src> {
                         eprintln!("    [imports] (none)");
                     } else {
                         eprintln!("    [imports]");
-                        for (key_path, req) in &m.imports {
+                        for (key_path, req) in m.imports.get_internals() {
                             let names = if req.names.is_empty() {
                                 "(side-effect only)".to_string()
                             } else {
@@ -901,7 +945,7 @@ impl<'src> Parser<'src> {
                         eprintln!("    [exports] (none)");
                     } else {
                         eprintln!("    [exports]");
-                        for (name, item) in &m.exports {
+                        for (name, item) in m.exports.get_internals() {
                             eprintln!("      - {} -> binding {:?}", name, item.binding);
                         }
                     }
@@ -2309,12 +2353,57 @@ impl<'src> Parser<'src> {
                     };
                 }
             } else if self.matches(&Tok::Dot) {
-                let name = self.parse_any_identifier()?;
-                e = Expr::GetProp {
-                    recv: SmallBox::new(e),
-                    name,
+            let name_str = self.parse_any_identifier()?;
+            
+            // Check if this is a method call or a property access
+            if self.matches(&Tok::LParen) {
+                let map_method = match name_str.as_str() {
+                    "get" => Some(BuiltinMapMethod::Get), "set" => Some(BuiltinMapMethod::Set),
+                    "has" => Some(BuiltinMapMethod::Has), "delete" => Some(BuiltinMapMethod::Delete),
+                    "clear" => Some(BuiltinMapMethod::Clear), _ => None,
                 };
-            } else if self.matches(&Tok::LBracket) {
+                if let Some(method) = map_method {
+                    let args = self.parse_arg_list()?; // This now consumes ')'
+                    // REMOVED `self.expect(Tok::RParen, ...)`
+                    e = Expr::CallBuiltinMapMethod { recv: SmallBox::new(e), method, args };
+                    continue;
+                }
+
+                let set_method = match name_str.as_str() {
+                    "add" => Some(BuiltinSetMethod::Add), "has" => Some(BuiltinSetMethod::Has),
+                    "delete" => Some(BuiltinSetMethod::Delete), "clear" => Some(BuiltinSetMethod::Clear),
+                     _ => None
+                };
+                if let Some(method) = set_method {
+                     let args = self.parse_arg_list()?; // This now consumes ')'
+                     // REMOVED `self.expect(Tok::RParen, ...)`
+                     e = Expr::CallBuiltinSetMethod { recv: SmallBox::new(e), method, args };
+                     continue;
+                }
+                
+                // Fallback for your original, working code (Array, String, etc.)
+                // Your existing code is already structured to call an arg parser and then continue.
+                // To keep this surgical, we'll put the arguments back for the original code to parse.
+                // A better refactor would merge them, but this adheres to the "no changes" rule.
+                self.i -= 1; // Un-consume the `(`.
+                
+                let callee = Expr::GetProp { recv: SmallBox::new(e), name: name_str };
+                let t_e = self.next()?; // This will now be `LParen`
+                let mut args = vec![];
+                // Manually re-implementing your original arg loop here to be safe
+                loop {
+                    if self.check(&Tok::RParen) { self.next()?; break; }
+                    if self.is_eof() { return Err(self.err_here("unexpected end of file in argument list")); }
+                    args.push(self.expr()?);
+                    if self.check(&Tok::RParen) { self.next()?; break; }
+                    self.expect(Tok::Comma, "expected ',' in argument list")?;
+                }
+                e = Expr::Call { callee: SmallBox::new(callee), args, };
+
+            } else {
+                e = Expr::GetProp { recv: SmallBox::new(e), name: name_str, };
+            }
+        } else if self.matches(&Tok::LBracket) {
                 let idx = self.expr()?;
                 self.expect(Tok::RBracket, "expected ']' after index")?;
                 e = Expr::Index {
@@ -2327,6 +2416,7 @@ impl<'src> Parser<'src> {
         }
         Ok(e)
     }
+
     fn parse_primary(&mut self) -> PResult<Expr> {
         if self.is_eof() {
             return Err(self.err_here("expected primary expression"));
@@ -2386,31 +2476,38 @@ impl<'src> Parser<'src> {
             }
 
             Tok::New => {
-                // new <AnyIdent>(...)
-                // Use `parse_any_identifier` to correctly handle `new Map()`, `new Set()`, etc.
-                let class_name = self.parse_any_identifier()?;
+                // Peek to see if it's a built-in we recognize
+                let kind = if let Some(peeked) = self.peek() {
+                    match peeked.tok {
+                        Tok::MapBuiltin => Some(BuiltinType::Map),
+                        Tok::SetBuiltin => Some(BuiltinType::Set),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
 
-                self.expect(
-                    Tok::LParen,
-                    "expected '(' after class name in new expression",
-                )?;
-                let mut args = Vec::new();
+                if let Some(kind) = kind {
+                    self.next()?; // Consume the MapBuiltin/SetBuiltin token
+                    self.expect(Tok::LParen, "expected '(' after built-in type name")?;
+                    // Built-ins currently take no constructor args
+                    self.expect(Tok::RParen, "expected ')' after built-in constructor arguments")?;
+
+                    return Ok(Expr::CreateBuiltin { kind, args: Vec::new() });
+                }
+
+                // --- Fallback to your original, working code for user classes ---
+                let class = self.parse_any_identifier()?;
+                self.expect(Tok::LParen, "expected '(' after class name in new expression")?;
+                let mut args = Vec::new(); // User class args
                 loop {
-                    if self.check(&Tok::RParen) {
-                        let _ = self.next()?; // consume RParen
-                        break;
-                    }
-                    if self.is_eof() {
-                        return Err(self.err_here("unexpected end of file in new arguments"));
-                    }
+                    if self.check(&Tok::RParen) { self.next()?; break; }
+                    if self.is_eof() { return Err(self.err_here("unexpected end of file in new arguments")); }
                     args.push(self.expr()?);
-                    if self.check(&Tok::RParen) {
-                        let _ = self.next()?; // consume RParen
-                        break;
-                    }
+                    if self.check(&Tok::RParen) { self.next()?; break; }
                     self.expect(Tok::Comma, "expected ',' in new arguments")?;
                 }
-                Ok(Expr::New { class: class_name, args })
+                Ok(Expr::New { class, args })
             }
 
             Tok::Int(x) => Ok(Expr::LitInt(x)),
@@ -2879,6 +2976,22 @@ impl<'src> Parser<'src> {
         }
 
         Err(self.err_here("delete expects a property access (obj.x or obj[...])"))
+    }
+
+    fn parse_arg_list(&mut self) -> PResult<Vec<Expr>> {
+        let mut args = Vec::new();
+        if self.check(&Tok::RParen) {
+            self.next()?; // consume ')'
+            return Ok(args);
+        }
+        loop {
+            args.push(self.expr()?);
+            if self.matches(&Tok::RParen) {
+                break;
+            }
+            self.expect(Tok::Comma, "expected ',' or ')' in argument list")?;
+        }
+        Ok(args)
     }
 }
 

@@ -2,7 +2,7 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
-use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use crate::collections::{HashMap, HashSet};
 use logos::Logos;
 use smallbox::SmallBox;
 use std::collections::hash_map::Entry;
@@ -192,6 +192,24 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
 
             Expr::SuperProp(_) => { /* no local uses */ }
             Expr::SuperCall(args) => {
+                for a in args {
+                    collect_uses_expr(a, uses);
+                }
+            }
+
+            Expr::CreateBuiltin { args, .. } => {
+                for a in args {
+                    collect_uses_expr(a, uses);
+                }
+            }
+            Expr::CallBuiltinMapMethod { recv, args, .. } => {
+                collect_uses_expr(recv, uses);
+                for a in args {
+                    collect_uses_expr(a, uses);
+                }
+            }
+            Expr::CallBuiltinSetMethod { recv, args, .. } => {
+                collect_uses_expr(recv, uses);
                 for a in args {
                     collect_uses_expr(a, uses);
                 }
@@ -807,6 +825,44 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
 
             Expr::New { class, args } => Expr::New {
                 class: class.clone(),
+                args: args
+                    .iter()
+                    .map(|a| rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out))
+                    .collect(),
+            },
+
+            Expr::CreateBuiltin { kind, args } => Expr::CreateBuiltin {
+                kind: *kind,
+                args: args
+                    .iter()
+                    .map(|a| rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out))
+                    .collect(),
+            },
+            Expr::CallBuiltinMapMethod { recv, method, args } => Expr::CallBuiltinMapMethod {
+                recv: SmallBox::new(rw_expr(
+                    recv,
+                    used,
+                    counter,
+                    enclosing_locals,
+                    out_funcs,
+                    lam_caps_out,
+                )),
+                method: *method,
+                args: args
+                    .iter()
+                    .map(|a| rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out))
+                    .collect(),
+            },
+            Expr::CallBuiltinSetMethod { recv, method, args } => Expr::CallBuiltinSetMethod {
+                recv: SmallBox::new(rw_expr(
+                    recv,
+                    used,
+                    counter,
+                    enclosing_locals,
+                    out_funcs,
+                    lam_caps_out,
+                )),
+                method: *method,
                 args: args
                     .iter()
                     .map(|a| rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out))

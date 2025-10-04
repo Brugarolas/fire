@@ -14,6 +14,7 @@ use crate::value::{
 };
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use crate::collections::{ConcurrentHashMap};
 use core::cmp::min;
 use parking_lot::Mutex;
 use std::slice;
@@ -301,13 +302,7 @@ pub extern "C" fn wir_obj_clone(obj: i64) -> i64 {
     unsafe { obj_clone_shallow(obj) }
 }
 
-// Global: func_id -> (key -> value)
-static MEMO_TABLE: OnceLock<Mutex<HashMap<u32, HashMap<i64, i64>>>> = OnceLock::new();
-
-fn memo_lock() -> &'static Mutex<HashMap<u32, HashMap<i64, i64>>> {
-    MEMO_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
+// --- Definiciones de claves para funciones de 2, 3 y 4 argumentos ---
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Key2(i64, i64);
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -315,37 +310,41 @@ struct Key3(i64, i64, i64);
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Key4(i64, i64, i64, i64);
 
-static MEMO1: OnceLock<Mutex<HashMap<u32, HashMap<i64, i64>>>> = OnceLock::new();
-static MEMO2: OnceLock<Mutex<HashMap<u32, HashMap<Key2, i64>>>> = OnceLock::new();
-static MEMO3: OnceLock<Mutex<HashMap<u32, HashMap<Key3, i64>>>> = OnceLock::new();
-static MEMO4: OnceLock<Mutex<HashMap<u32, HashMap<Key4, i64>>>> = OnceLock::new();
+// --- Tablas de memoización globales, lock-free y con el hasher AES ---
+static MEMO1: OnceLock<ConcurrentHashMap<(u32, i64), i64>> = OnceLock::new();
+static MEMO2: OnceLock<ConcurrentHashMap<(u32, Key2), i64>> = OnceLock::new();
+static MEMO3: OnceLock<ConcurrentHashMap<(u32, Key3), i64>> = OnceLock::new();
+static MEMO4: OnceLock<ConcurrentHashMap<(u32, Key4), i64>> = OnceLock::new();
 
-fn memo1() -> &'static Mutex<HashMap<u32, HashMap<i64, i64>>> {
-    MEMO1.get_or_init(|| Mutex::new(HashMap::new()))
+// --- Inicializadores para las tablas de memoización ---
+fn memo1() -> &'static ConcurrentHashMap<(u32, i64), i64> {
+    MEMO1.get_or_init(|| ConcurrentHashMap::new())
 }
-fn memo2() -> &'static Mutex<HashMap<u32, HashMap<Key2, i64>>> {
-    MEMO2.get_or_init(|| Mutex::new(HashMap::new()))
+fn memo2() -> &'static ConcurrentHashMap<(u32, Key2), i64> {
+    MEMO2.get_or_init(|| ConcurrentHashMap::new())
 }
-fn memo3() -> &'static Mutex<HashMap<u32, HashMap<Key3, i64>>> {
-    MEMO3.get_or_init(|| Mutex::new(HashMap::new()))
+fn memo3() -> &'static ConcurrentHashMap<(u32, Key3), i64> {
+    MEMO3.get_or_init(|| ConcurrentHashMap::new())
 }
-fn memo4() -> &'static Mutex<HashMap<u32, HashMap<Key4, i64>>> {
-    MEMO4.get_or_init(|| Mutex::new(HashMap::new()))
+fn memo4() -> &'static ConcurrentHashMap<(u32, Key4), i64> {
+    MEMO4.get_or_init(|| ConcurrentHashMap::new())
 }
 
+// --- API C para el Runtime de Napalm ---
+
+// -- Funciones para 1 argumento --
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_memo_get(fid: i64, key: i64, out_ptr: *mut i64) -> i64 {
     let fid_u = fid as u32;
-    let guard = memo_lock().lock();
-    if let Some(map) = guard.get(&fid_u) {
-        if let Some(&val) = map.get(&key) {
-            unsafe {
-                if !out_ptr.is_null() {
-                    *out_ptr = val;
-                }
+    let guard = &mut memo1().guard();
+
+    if let Some(val) = memo1().get(&(fid_u, key), guard) {
+        unsafe {
+            if !out_ptr.is_null() {
+                *out_ptr = *val;
             }
-            return 1; // found
         }
+        return 1; // found
     }
     0 // miss
 }
@@ -353,91 +352,87 @@ pub extern "C" fn wir_memo_get(fid: i64, key: i64, out_ptr: *mut i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_memo_put(fid: i64, key: i64, val: i64) -> i64 {
     let fid_u = fid as u32;
-    let mut guard = memo_lock().lock();
-    let entry = guard.entry(fid_u).or_insert_with(HashMap::new);
-    entry.insert(key, val);
+    let guard = &mut memo1().guard();
+
+    memo1().insert((fid_u, key), val, guard);
     0
 }
 
+// -- Funciones para 2 argumentos --
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_memo_get2(fid: i64, k0: i64, k1: i64, out_ptr: *mut i64) -> i64 {
     let fid_u = fid as u32;
-    let guard = memo2().lock();
-    if let Some(map) = guard.get(&fid_u) {
-        if let Some(&val) = map.get(&Key2(k0, k1)) {
-            unsafe {
-                if !out_ptr.is_null() {
-                    *out_ptr = val;
-                }
+    let guard = &mut memo2().guard();
+
+    if let Some(val) = memo2().get(&(fid_u, Key2(k0, k1)), guard) {
+        unsafe {
+            if !out_ptr.is_null() {
+                *out_ptr = *val;
             }
-            return 1;
         }
+        return 1;
     }
     0
 }
+
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_memo_put2(fid: i64, k0: i64, k1: i64, val: i64) -> i64 {
     let fid_u = fid as u32;
-    let mut guard = memo2().lock();
-    let entry = guard.entry(fid_u).or_insert_with(HashMap::new);
-    entry.insert(Key2(k0, k1), val);
+    let guard = &mut memo2().guard();
+
+    memo2().insert((fid_u, Key2(k0, k1)), val, guard);
     0
 }
 
+// -- Funciones para 3 argumentos --
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_memo_get3(fid: i64, k0: i64, k1: i64, k2: i64, out_ptr: *mut i64) -> i64 {
     let fid_u = fid as u32;
-    let guard = memo3().lock();
-    if let Some(map) = guard.get(&fid_u) {
-        if let Some(&val) = map.get(&Key3(k0, k1, k2)) {
-            unsafe {
-                if !out_ptr.is_null() {
-                    *out_ptr = val;
-                }
+    let guard = &mut memo3().guard();
+
+    if let Some(val) = memo3().get(&(fid_u, Key3(k0, k1, k2)), guard) {
+        unsafe {
+            if !out_ptr.is_null() {
+                *out_ptr = *val;
             }
-            return 1;
         }
+        return 1;
     }
-    0
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn wir_memo_put3(fid: i64, k0: i64, k1: i64, k2: i64, val: i64) -> i64 {
-    let fid_u = fid as u32;
-    let mut guard = memo3().lock();
-    let entry = guard.entry(fid_u).or_insert_with(HashMap::new);
-    entry.insert(Key3(k0, k1, k2), val);
     0
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn wir_memo_get4(
-    fid: i64,
-    k0: i64,
-    k1: i64,
-    k2: i64,
-    k3: i64,
-    out_ptr: *mut i64,
-) -> i64 {
+pub extern "C" fn wir_memo_put3(fid: i64, k0: i64, k1: i64, k2: i64, val: i64) -> i64 {
     let fid_u = fid as u32;
-    let guard = memo4().lock();
-    if let Some(map) = guard.get(&fid_u) {
-        if let Some(&val) = map.get(&Key4(k0, k1, k2, k3)) {
-            unsafe {
-                if !out_ptr.is_null() {
-                    *out_ptr = val;
-                }
+    let guard = &mut memo3().guard();
+
+    memo3().insert((fid_u, Key3(k0, k1, k2)), val, guard);
+    0
+}
+
+// -- Funciones para 4 argumentos --
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_memo_get4(fid: i64, k0: i64, k1: i64, k2: i64, k3: i64, out_ptr: *mut i64) -> i64 {
+    let fid_u = fid as u32;
+    let guard = &mut memo4().guard();
+
+    if let Some(val) = memo4().get(&(fid_u, Key4(k0, k1, k2, k3)), guard) {
+        unsafe {
+            if !out_ptr.is_null() {
+                *out_ptr = *val;
             }
-            return 1;
         }
+        return 1;
     }
     0
 }
+
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_memo_put4(fid: i64, k0: i64, k1: i64, k2: i64, k3: i64, val: i64) -> i64 {
     let fid_u = fid as u32;
-    let mut guard = memo4().lock();
-    let entry = guard.entry(fid_u).or_insert_with(HashMap::new);
-    entry.insert(Key4(k0, k1, k2, k3), val);
+    let guard = &mut memo4().guard();
+
+    memo4().insert((fid_u, Key4(k0, k1, k2, k3)), val, guard);
     0
 }
 

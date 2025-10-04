@@ -2,7 +2,6 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
-use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use bumpalo::Bump;
 use hybrid_rc::Arc;
 use may::coroutine;
@@ -13,6 +12,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::collections::{HashMap, HashSet};
 use crate::front::{ExportDecl, ImportItem, ModuleAST, Parser, Program};
 use crate::lowerer::{LinkInfo, Lowerer};
 use crate::opt::optimization::optimization_passes;
@@ -257,7 +257,7 @@ impl ProgramBuilder {
 
         // 3. Populate this module's OWN exports. The BindingIds were already created correctly by the parser
         //    and stored in this module's ModuleAST. We just copy them over.
-        for (name, item) in &module_ast.exports {
+        for (name, item) in module_ast.exports.get_internals() {
             links
                 .export_bindings
                 .insert((*name).to_string(), item.binding);
@@ -491,9 +491,9 @@ impl ProgramBuilder {
         }
 
         // tgt imports from src  =>  src -> tgt
-        for (tgt_path, tgt_box) in &self.ctx.registry {
+        for (tgt_path, tgt_box) in self.ctx.registry.get_internals() {
             let tgt = &**tgt_box;
-            for (_k, req) in &tgt.imports {
+            for (_k, req) in tgt.imports.get_internals() {
                 let src = req.from_path.clone();
                 outgoing
                     .entry(src.clone())
@@ -637,7 +637,7 @@ impl ProgramBuilder {
                     eprintln!("  [imports] (none)");
                 } else {
                     eprintln!("  [imports]");
-                    for (key_path, req) in &m.imports {
+                    for (key_path, req) in m.imports.get_internals() {
                         let names = if req.names.is_empty() {
                             "(side-effect only)".to_string()
                         } else {
@@ -656,7 +656,7 @@ impl ProgramBuilder {
                     eprintln!("  [exports] (none)");
                 } else {
                     eprintln!("  [exports]");
-                    for (name, item) in &m.exports {
+                    for (name, item) in m.exports.get_internals() {
                         eprintln!("    - {} -> binding {:?}", name, item.binding);
                     }
                 }
@@ -677,9 +677,9 @@ impl ProgramBuilder {
         // Snapshot all jobs to avoid borrow conflicts.
         let mut jobs: Vec<(Arc<PathBuf>, Arc<PathBuf>, Vec<&'static str>)> = Vec::new();
 
-        for (tgt_path, tgt_box) in &self.ctx.registry {
+        for (tgt_path, tgt_box) in self.ctx.registry.get_internals() {
             let tgt: &ModuleAST<'static> = &**tgt_box;
-            for (_k, req) in &tgt.imports {
+            for (_k, req) in tgt.imports.get_internals() {
                 jobs.push((
                     tgt_path.clone(),
                     req.from_path.clone(),

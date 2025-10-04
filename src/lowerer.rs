@@ -1,7 +1,7 @@
 // src/lowerer.rs
 #![allow(unused_variables)]
 
-use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use crate::collections::{HashMap, HashSet};
 use logos::Logos;
 use smallbox::SmallBox;
 use std::cell::Cell;
@@ -2538,63 +2538,6 @@ fn lower_string_method_call<'m>(
     }
 }
 
-fn lower_map_set_method_call<'m>(
-    b: &mut Builder<'m>,
-    locals: &mut HashMap<String, ValueId>,
-    fields: &mut HashMap<String, FieldId>,
-    next_field: &mut u32,
-    recv: &Expr,
-    name: &str,
-    args: &[Expr],
-    lowering_ctx: &LoweringContext,
-) -> LResult<Option<ValueId>> {
-    use crate::wir::{Inst, Type};
-
-    if !matches!(name, "get" | "set" | "has" | "delete" | "clear" | "add") {
-        return Ok(None);
-    }
-
-    let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
-
-    let result = match name {
-        "get" => {
-            let key = lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
-            let (_nid, res) = b.push_node(Inst::CallNative { name: "wir_map_get".into(), args: vec![recv_v, key], pure: false, can_throw: false }, None, 1, true);
-            res[0]
-        }
-        "set" => {
-            let key = lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
-            let val = lower_expr_free(b, locals, fields, next_field, &args[1], lowering_ctx)?;
-            // Perform the operation for its side effect. Ignore the result from the native.
-            let (_nid, _res) = b.push_node(Inst::CallNative { name: "wir_map_set".into(), args: vec![recv_v, key, val], pure: false, can_throw: false }, Some(Type::AnyRef), 1, true);
-
-            recv_v
-        }
-        "add" => {
-            let val = lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
-            // Perform the operation for its side effect.
-            let (_nid, _res) = b.push_node(Inst::CallNative { name: "wir_set_add".into(), args: vec![recv_v, val], pure: false, can_throw: false }, Some(Type::AnyRef), 1, true);
-
-            recv_v
-        }
-        "has" | "delete" => {
-            let key = lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
-            let (map_native, set_native) = if name == "has" { ("wir_map_has", "wir_set_has") } else { ("wir_map_delete", "wir_set_delete") };
-            let (_nid, map_res) = b.push_node(Inst::CallNative { name: map_native.into(), args: vec![recv_v, key], pure: true, can_throw: false }, Some(Type::Bool), 1, false);
-            let (_nid, set_res) = b.push_node(Inst::CallNative { name: set_native.into(), args: vec![recv_v, key], pure: true, can_throw: false }, Some(Type::Bool), 1, false);
-            build_bool_or(b, map_res[0], set_res[0])
-        }
-        "clear" => {
-            b.push_node(Inst::CallNative { name: "wir_map_clear".into(), args: vec![recv_v], pure: false, can_throw: false }, None, 0, true);
-            b.push_node(Inst::CallNative { name: "wir_set_clear".into(), args: vec![recv_v], pure: false, can_throw: false }, None, 0, true);
-            b.const_null()
-        }
-        _ => return Ok(None),
-    };
-
-    Ok(Some(result))
-}
-
 fn lower_expr_free<'m>(
     b: &mut Builder<'m>,
     locals: &mut HashMap<String, ValueId>,
@@ -3630,96 +3573,6 @@ fn lower_expr_free<'m>(
 
             // --- Property-call fast paths ---
             if let Expr::GetProp { recv, name } = &**callee {
-                                // --- START of SURGICAL ADDITION for Map/Set ---
-                let is_map_set_method = matches!(name.as_str(), "get" | "set" | "has" | "delete" | "clear" | "add");
-                
-                if is_map_set_method {
-                    let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
-
-                    // Efficiently branch at runtime to handle either Map or Set.
-                    let map_path = b.block();
-                    let set_path = b.block();
-                    let fallthrough_path = b.block(); // Not a map or set, do nothing.
-                    let join_path = b.block();
-                    let result_phi = b.add_block_param(join_path, Type::Top);
-
-                    let check_set_path = b.block();
-                    let (_nid, is_map) = b.push_node(Inst::CallNative { name: "wir_is_map".into(), args: vec![recv_v], pure: true, can_throw: false }, Some(Type::Bool), 1, false);
-                    b.branch(is_map[0], map_path, check_set_path);
-
-                    b.position_at(check_set_path);
-                    let (_nid, is_set) = b.push_node(Inst::CallNative { name: "wir_is_set".into(), args: vec![recv_v], pure: true, can_throw: false }, Some(Type::Bool), 1, false);
-                    b.branch(is_set[0], set_path, fallthrough_path);
-
-                    // MAP PATH
-                    b.position_at(map_path);
-                    {
-                        let map_res = match name.as_str() {
-                            "get" => {
-                                let key = lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
-                                let (_nid, res) = b.push_node(Inst::CallNative { name: "wir_map_get".into(), args: vec![recv_v, key], pure: false, can_throw: false}, None, 1, true);
-                                res[0]
-                            }
-                            "set" => {
-                                let key = lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
-                                let val = lower_expr_free(b, locals, fields, next_field, &args[1], lowering_ctx)?;
-                                b.push_node(Inst::CallNative { name: "wir_map_set".into(), args: vec![recv_v, key, val], pure: false, can_throw: false}, Some(Type::AnyRef), 1, true);
-                                recv_v // Return the original receiver for chaining.
-                            }
-                            "has" => {
-                                let key = lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
-                                let (_nid, res) = b.push_node(Inst::CallNative { name: "wir_map_has".into(), args: vec![recv_v, key], pure: true, can_throw: false}, Some(Type::Bool), 1, false);
-                                res[0]
-                            }
-                            "delete" => {
-                                let key = lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
-                                let (_nid, res) = b.push_node(Inst::CallNative { name: "wir_map_delete".into(), args: vec![recv_v, key], pure: false, can_throw: false}, Some(Type::Bool), 1, true);
-                                res[0]
-                            }
-                            "clear" => {
-                                b.push_node(Inst::CallNative { name: "wir_map_clear".into(), args: vec![recv_v], pure: false, can_throw: false}, None, 0, true);
-                                b.const_null()
-                            }
-                            _ => b.const_null(), // Calling .add() on a Map is a no-op that returns null.
-                        };
-                        if !b.current_block_terminated() { b.jump(join_path, &[map_res]); }
-                    }
-
-                    // SET PATH
-                    b.position_at(set_path);
-                    {
-                        let set_res = match name.as_str() {
-                            "add" => {
-                                let val = lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
-                                b.push_node(Inst::CallNative { name: "wir_set_add".into(), args: vec![recv_v, val], pure: false, can_throw: false}, Some(Type::AnyRef), 1, true);
-                                recv_v // Return the original receiver for chaining.
-                            }
-                            "has" => {
-                                let key = lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
-                                let (_nid, res) = b.push_node(Inst::CallNative { name: "wir_set_has".into(), args: vec![recv_v, key], pure: true, can_throw: false}, Some(Type::Bool), 1, false);
-                                res[0]
-                            }
-                            "delete" => {
-                                let key = lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
-                                let (_nid, res) = b.push_node(Inst::CallNative { name: "wir_set_delete".into(), args: vec![recv_v, key], pure: false, can_throw: false}, Some(Type::Bool), 1, true);
-                                res[0]
-                            }
-                            "clear" => {
-                                b.push_node(Inst::CallNative { name: "wir_set_clear".into(), args: vec![recv_v], pure: false, can_throw: false}, None, 0, true);
-                                b.const_null()
-                            }
-                             _ => b.const_null(),
-                        };
-                        if !b.current_block_terminated() { b.jump(join_path, &[set_res]); }
-                    }
-                    
-                    b.position_at(fallthrough_path);
-                    let null = b.const_null();
-                    b.jump(join_path, &[null]);
-
-                    b.position_at(join_path);
-                    return Ok(result_phi);
-                }
 
                 if let Expr::Ident(name) = &**callee {
                     if name == "import" {
@@ -3978,11 +3831,6 @@ fn lower_expr_free<'m>(
                 )? {
                     return Ok(v);
                 }
-
-                // 0f) Map and Set instance methods (add/has/delete/clear)
-                /* if let Some(v) = lower_map_set_method_call(b, locals, fields, next_field, recv, name, args, lowering_ctx)? {
-                    return Ok(v);
-                } */
 
                 // 0e) Generic property call: Distinguish between static and instance calls.
                 let is_static_call = if let Expr::Ident(id_name) = &**recv {
@@ -5121,6 +4969,88 @@ fn lower_expr_free<'m>(
             }
         }
 
+        Expr::CreateBuiltin { kind, args } => {
+            // This is beautifully simple. We know exactly what to do.
+            let ctor_name = match kind {
+                crate::front::BuiltinType::Map => "wir_map_new",
+                crate::front::BuiltinType::Set => "wir_set_new",
+            };
+            // For now, args are ignored, but this is ready for the future.
+            let (_nid, res) = b.push_node(
+                Inst::CallNative { name: ctor_name.into(), args: vec![], pure: false, can_throw: false },
+                Some(Type::AnyRef), 1, true
+            );
+            Ok(res[0])
+        }
+
+        Expr::CallBuiltinMapMethod { recv, method, args } => {
+            let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
+
+            let (native_name, num_args, is_chainable) = match method {
+                crate::front::BuiltinMapMethod::Get => ("wir_map_get", 1, false),
+                crate::front::BuiltinMapMethod::Set => ("wir_map_set", 2, true),
+                crate::front::BuiltinMapMethod::Has => ("wir_map_has", 1, false),
+                crate::front::BuiltinMapMethod::Delete => ("wir_map_delete", 1, false),
+                crate::front::BuiltinMapMethod::Clear => ("wir_map_clear", 0, false),
+            };
+
+            // This single block of code now handles ALL map methods correctly.
+            if args.len() != num_args {
+                return Err(LowerError::NotLowerable("Incorrect number of arguments for map method"));
+            }
+
+            let mut call_args: smallvec::SmallVec<[ValueId; 4]> = smallvec::smallvec![recv_v];
+            for arg_expr in args {
+                call_args.push(lower_expr_free(b, locals, fields, next_field, arg_expr, lowering_ctx)?);
+            }
+
+            let (_nid, res) = b.push_node(
+                Inst::CallNative { name: native_name.into(), args: call_args.into_vec(), pure: false, can_throw: false },
+                None, 1, true
+            );
+
+            let result_val = res[0];
+            if is_chainable {
+                if let Expr::Ident(var_name) = &**recv {
+                    locals.insert(var_name.clone(), result_val);
+                }
+            }
+            Ok(result_val)
+        }
+
+        Expr::CallBuiltinSetMethod { recv, method, args } => {
+            let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
+
+            let (native_name, num_args, is_chainable) = match method {
+                crate::front::BuiltinSetMethod::Add => ("wir_set_add", 1, true),
+                crate::front::BuiltinSetMethod::Has => ("wir_set_has", 1, false),
+                crate::front::BuiltinSetMethod::Delete => ("wir_set_delete", 1, false),
+                crate::front::BuiltinSetMethod::Clear => ("wir_set_clear", 0, false),
+            };
+
+            if args.len() != num_args {
+                return Err(LowerError::NotLowerable("Incorrect number of arguments for set method"));
+            }
+
+            let mut call_args: smallvec::SmallVec<[ValueId; 4]> = smallvec::smallvec![recv_v];
+            for arg_expr in args {
+                call_args.push(lower_expr_free(b, locals, fields, next_field, arg_expr, lowering_ctx)?);
+            }
+
+            let (_nid, res) = b.push_node(
+                Inst::CallNative { name: native_name.into(), args: call_args.into_vec(), pure: false, can_throw: false },
+                None, 1, true
+            );
+
+            let result_val = res[0];
+            if is_chainable {
+                if let Expr::Ident(var_name) = &**recv {
+                    locals.insert(var_name.clone(), result_val);
+                }
+            }
+            Ok(result_val)
+        }
+
         _ => Err(LowerError::NotLowerable("expression type not supported")),
     }
 }
@@ -5151,7 +5081,7 @@ impl<'m> Lowerer<'m> {
         let mut fn_exports: Vec<(BindingId, FuncId)> = Vec::new();
         let mut class_exports: Vec<(BindingId, Option<FuncId>, Vec<(String, FuncId)>)> = Vec::new();
 
-        for (name, &bid) in &links.export_bindings {
+        for (name, &bid) in links.export_bindings.get_internals() {
             if let Some(&fid) = self.lowering_ctx.funcs.get(name) {
                 #[cfg(debug_assertions)]
                 eprintln!(
@@ -5284,7 +5214,7 @@ impl<'m> Lowerer<'m> {
 
             // 3) Cachea namespaces importados (si existen celdas locales para ellos)
             //    Esto sólo escribe en nuestras celdas de namespace (locales), no en el proveedor.
-            for (ns, exports) in &links.namespace_imports {
+            for (ns, exports) in links.namespace_imports.get_internals() {
                 if let Some(&cell) = links.namespace_cells.get(ns) {
                     let ns_obj = b.make_namespace(exports.clone());
                     b.store_binding(cell, ns_obj);

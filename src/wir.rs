@@ -22,9 +22,8 @@
 #![allow(clippy::large_enum_variant)]
 #![allow(clippy::too_many_arguments)]
 
+use crate::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
-// use std::collections::{BTreeMap, BTreeSet};
-use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use std::fmt;
 
 #[derive(Default, Clone, Copy)]

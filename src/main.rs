@@ -17,11 +17,12 @@ mod opt;
 mod runtime;
 mod value;
 mod wir;
+mod collections;
 
 use crate::native_timers::invoke_and_pump;
 use crate::opt::Optimize;
 use crate::opt::optimization::optimization_passes;
-use ahash::AHashMap as HashMap;
+use crate::collections::HashMap;
 use front::Parser;
 use mimalloc::MiMalloc;
 use std::path::Path;
