@@ -5,7 +5,7 @@
 #![allow(unused_unsafe)]
 
 use crate::gc::NAPALM_GC;
-use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use crate::helpers::collections::{HashMap, HashSet};
 use core::mem;
 use std::ptr;
 use std::str;
@@ -1371,7 +1371,7 @@ pub unsafe fn obj_assign(dst_v: ValueRepr, src_v: ValueRepr) -> ValueRepr {
     let dst = &mut *as_obj_mut(dst_v);
     let src = &*as_obj_mut(src_v);
 
-    for (key, &val) in &src.by_str {
+    for (key, &val) in src.by_str.get_internals() {
         let entry = dst.by_str.entry(key.clone()).or_insert(NULL);
         *entry = val;
 

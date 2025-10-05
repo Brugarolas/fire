@@ -2,7 +2,7 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
-use crate::collections::{HashMap, HashSet};
+use crate::helpers::collections::{HashMap, HashSet};
 use ariadne::{Color, FileCache, FnCache, Label, Report, ReportKind, Source};
 use hybrid_rc::Arc;
 use logos::Logos;

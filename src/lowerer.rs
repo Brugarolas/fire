@@ -1,7 +1,7 @@
 // src/lowerer.rs
 #![allow(unused_variables)]
 
-use crate::collections::{HashMap, HashSet};
+use crate::helpers::collections::{HashMap, HashSet};
 use logos::Logos;
 use smallbox::SmallBox;
 use std::cell::Cell;
@@ -4970,12 +4970,12 @@ fn lower_expr_free<'m>(
         }
 
         Expr::CreateBuiltin { kind, args } => {
-            // This is beautifully simple. We know exactly what to do.
+            // No more string matching. The AST gives us the exact type.
             let ctor_name = match kind {
                 crate::front::BuiltinType::Map => "wir_map_new",
                 crate::front::BuiltinType::Set => "wir_set_new",
             };
-            // For now, args are ignored, but this is ready for the future.
+            // Currently ignoring `args`, but this is ready for `new Map([...])` in the future.
             let (_nid, res) = b.push_node(
                 Inst::CallNative { name: ctor_name.into(), args: vec![], pure: false, can_throw: false },
                 Some(Type::AnyRef), 1, true
@@ -4986,18 +4986,14 @@ fn lower_expr_free<'m>(
         Expr::CallBuiltinMapMethod { recv, method, args } => {
             let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
 
-            let (native_name, num_args, is_chainable) = match method {
-                crate::front::BuiltinMapMethod::Get => ("wir_map_get", 1, false),
-                crate::front::BuiltinMapMethod::Set => ("wir_map_set", 2, true),
-                crate::front::BuiltinMapMethod::Has => ("wir_map_has", 1, false),
-                crate::front::BuiltinMapMethod::Delete => ("wir_map_delete", 1, false),
-                crate::front::BuiltinMapMethod::Clear => ("wir_map_clear", 0, false),
+            // The AST gives us the exact method. No string matching, no runtime checks.
+            let (native_name, is_chainable) = match method {
+                crate::front::BuiltinMapMethod::Get => ("wir_map_get", false),
+                crate::front::BuiltinMapMethod::Set => ("wir_map_set", true),
+                crate::front::BuiltinMapMethod::Has => ("wir_map_has", false),
+                crate::front::BuiltinMapMethod::Delete => ("wir_map_delete", false),
+                crate::front::BuiltinMapMethod::Clear => ("wir_map_clear", false),
             };
-
-            // This single block of code now handles ALL map methods correctly.
-            if args.len() != num_args {
-                return Err(LowerError::NotLowerable("Incorrect number of arguments for map method"));
-            }
 
             let mut call_args: smallvec::SmallVec<[ValueId; 4]> = smallvec::smallvec![recv_v];
             for arg_expr in args {
@@ -5009,46 +5005,36 @@ fn lower_expr_free<'m>(
                 None, 1, true
             );
 
-            let result_val = res[0];
             if is_chainable {
-                if let Expr::Ident(var_name) = &**recv {
-                    locals.insert(var_name.clone(), result_val);
-                }
+                // For `set`, the value of the expression is the map itself.
+                Ok(recv_v)
+            } else {
+                Ok(res[0])
             }
-            Ok(result_val)
         }
 
         Expr::CallBuiltinSetMethod { recv, method, args } => {
             let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
 
-            let (native_name, num_args, is_chainable) = match method {
-                crate::front::BuiltinSetMethod::Add => ("wir_set_add", 1, true),
-                crate::front::BuiltinSetMethod::Has => ("wir_set_has", 1, false),
-                crate::front::BuiltinSetMethod::Delete => ("wir_set_delete", 1, false),
-                crate::front::BuiltinSetMethod::Clear => ("wir_set_clear", 0, false),
+            let (native_name, is_chainable) = match method {
+                crate::front::BuiltinSetMethod::Add => ("wir_set_add", true),
+                crate::front::BuiltinSetMethod::Has => ("wir_set_has", false),
+                crate::front::BuiltinSetMethod::Delete => ("wir_set_delete", false),
+                crate::front::BuiltinSetMethod::Clear => ("wir_set_clear", false),
             };
-
-            if args.len() != num_args {
-                return Err(LowerError::NotLowerable("Incorrect number of arguments for set method"));
-            }
 
             let mut call_args: smallvec::SmallVec<[ValueId; 4]> = smallvec::smallvec![recv_v];
             for arg_expr in args {
                 call_args.push(lower_expr_free(b, locals, fields, next_field, arg_expr, lowering_ctx)?);
             }
 
-            let (_nid, res) = b.push_node(
+            let (_nid, _res) = b.push_node(
                 Inst::CallNative { name: native_name.into(), args: call_args.into_vec(), pure: false, can_throw: false },
                 None, 1, true
             );
 
-            let result_val = res[0];
-            if is_chainable {
-                if let Expr::Ident(var_name) = &**recv {
-                    locals.insert(var_name.clone(), result_val);
-                }
-            }
-            Ok(result_val)
+            // For `add`, the value of the expression is the set itself.
+            Ok(recv_v)
         }
 
         _ => Err(LowerError::NotLowerable("expression type not supported")),

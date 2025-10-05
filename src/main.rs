@@ -17,12 +17,11 @@ mod opt;
 mod runtime;
 mod value;
 mod wir;
-mod collections;
 
 use crate::native_timers::invoke_and_pump;
 use crate::opt::Optimize;
 use crate::opt::optimization::optimization_passes;
-use crate::collections::HashMap;
+use crate::helpers::collections::HashMap;
 use front::Parser;
 use mimalloc::MiMalloc;
 use std::path::Path;
@@ -69,6 +68,7 @@ fn main() {
     }
 
     let build_start = Instant::now();
+
     let (module, build_label) = if args.len() > 1 {
         let input_path = &args[1];
         #[cfg(debug_assertions)]
@@ -98,14 +98,24 @@ fn main() {
     let build_elapsed = build_start.elapsed();
     #[cfg(debug_assertions)]
     eprintln!(
-        "(Debug build) Build for {} took {:.6} seconds",
+        "(Debug build) Build WIR for {} took {:.6} seconds",
         build_label,
         build_elapsed.as_secs_f64()
     );
 
+    let jit_start = Instant::now();
+
     // 4.2) JIT compile ALL functions
     let mut jit = jit::JIT::default();
     let mut fptrs = HashMap::new();
+
+    let jit_elapsed = jit_start.elapsed();
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "(Debug build) JIT compilation for {} took {:.6} seconds",
+        build_label,
+        jit_elapsed.as_secs_f64()
+    );
 
     #[cfg(debug_assertions)]
     {

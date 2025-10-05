@@ -13,8 +13,7 @@ use crate::value::{
     BoxedMap, BoxedSet, TAG_MAP, TAG_SET, map_new, set_new,
 };
 
-use ahash::{AHashMap as HashMap, AHashSet as HashSet};
-use crate::collections::{ConcurrentHashMap};
+use crate::helpers::collections::{ConcurrentHashMap, HashMap, HashSet};
 use core::cmp::min;
 use parking_lot::Mutex;
 use std::slice;

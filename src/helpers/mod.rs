@@ -1,3 +1,3 @@
-mod copy;
-mod hash;
-mod array;
+pub mod collections;
+pub mod compact_map;
+pub mod hash;

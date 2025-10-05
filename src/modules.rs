@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::collections::{HashMap, HashSet};
+use crate::helpers::collections::{HashMap, HashSet};
 use crate::front::{ExportDecl, ImportItem, ModuleAST, Parser, Program};
 use crate::lowerer::{LinkInfo, Lowerer};
 use crate::opt::optimization::optimization_passes;
@@ -418,6 +418,8 @@ impl ProgramBuilder {
             links: LinkInfo,
         }
 
+        let build_start = std::time::Instant::now();
+
         let mut jobs: Vec<Job> = Vec::new();
         let mut export_kind_cache: HashMap<Arc<PathBuf>, HashMap<String, ExportSymbolKind>> =
             HashMap::default();
@@ -476,6 +478,14 @@ impl ProgramBuilder {
             out.insert(p, m);
             coroutine_counter += 1;
         }
+
+        let build_elapsed = build_start.elapsed();
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "(Debug build) Lowering the program took {:.6} seconds with {} workers",
+            build_elapsed.as_secs_f64(),
+            num_cpus
+        );
 
         Ok(out)
     }
@@ -537,19 +547,6 @@ impl ProgramBuilder {
             return Err("cycle detected in module imports".into());
         }
         Ok(out)
-    }
-
-    pub fn build_bundle(&mut self, entry: &str) -> Result<BuiltBundle, String> {
-        // 1) parser + bind imports
-        self.build_from_entry(entry)?; // ya parsea cola y hace `bind_imports()`
-
-        // 2) lowering and optimization (parallel)
-        let shards = self.lower_all_modules_parallel_sharded()?;
-
-        // 3) init order (topological sort)
-        let init_order = self.topo_order()?;
-
-        Ok(BuiltBundle { shards, init_order })
     }
 
     // ------------------------

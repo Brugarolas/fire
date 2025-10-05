@@ -2,7 +2,7 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
-use crate::collections::{HashMap, HashSet};
+use crate::helpers::collections::{HashMap, HashSet};
 use logos::Logos;
 use smallbox::SmallBox;
 use std::collections::hash_map::Entry;

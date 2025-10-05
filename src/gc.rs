@@ -3,7 +3,7 @@
 #![allow(unused_variables)]
 #![allow(unused_unsafe)]
 
-use ahash::AHashMap as HashMap;
+use crate::helpers::collections::HashMap;
 use core::mem::{self, size_of};
 use core::ptr;
 use likely_stable::{likely, unlikely};
