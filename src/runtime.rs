@@ -712,29 +712,53 @@ pub unsafe extern "C" fn wir_map_set(map_val: i64, key: i64, val: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_map_has(map_val: i64, key: i64) -> i64 {
     if !is_heap_ptr(map_val) { return bool_to_value(false); }
-    let map = &* (map_val as *const BoxedMap);
-    bool_to_value(map.map.contains_key(&Value(key)))
+    match heap_tag(map_val) {
+        Some(TAG_MAP) => {
+            let map = &*(map_val as *const BoxedMap);
+            bool_to_value(map.map.contains_key(&Value(key)))
+        }
+        Some(TAG_SET) => wir_set_has(map_val, key),
+        _ => bool_to_value(false),
+    }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_map_delete(map_val: i64, key: i64) -> i64 {
     if !is_heap_ptr(map_val) { return bool_to_value(false); }
-    let map = &mut * (map_val as *mut BoxedMap);
-    bool_to_value(map.map.remove(&Value(key)).is_some())
+    match heap_tag(map_val) {
+        Some(TAG_MAP) => {
+            let map = &mut *(map_val as *mut BoxedMap);
+            bool_to_value(map.map.remove(&Value(key)).is_some())
+        }
+        Some(TAG_SET) => wir_set_delete(map_val, key),
+        _ => bool_to_value(false),
+    }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_map_clear(map_val: i64) {
     if !is_heap_ptr(map_val) { return; }
-    let map = &mut * (map_val as *mut BoxedMap);
-    map.map.clear();
+    match heap_tag(map_val) {
+        Some(TAG_MAP) => {
+            let map = &mut *(map_val as *mut BoxedMap);
+            map.map.clear();
+        }
+        Some(TAG_SET) => wir_set_clear(map_val),
+        _ => {}
+    }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_map_size(map_val: i64) -> i64 {
     if !is_heap_ptr(map_val) { return v::make_smi(0); }
-    let map = &* (map_val as *const BoxedMap);
-    v::make_smi(map.map.len() as i64)
+    match heap_tag(map_val) {
+        Some(TAG_MAP) => {
+            let map = &*(map_val as *const BoxedMap);
+            v::make_smi(map.map.len() as i64)
+        }
+        Some(TAG_SET) => wir_set_size(map_val),
+        _ => v::make_smi(0),
+    }
 }
 
 #[unsafe(no_mangle)]

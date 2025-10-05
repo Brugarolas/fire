@@ -5028,13 +5028,17 @@ fn lower_expr_free<'m>(
                 call_args.push(lower_expr_free(b, locals, fields, next_field, arg_expr, lowering_ctx)?);
             }
 
-            let (_nid, _res) = b.push_node(
+            let (_nid, res) = b.push_node(
                 Inst::CallNative { name: native_name.into(), args: call_args.into_vec(), pure: false, can_throw: false },
                 None, 1, true
             );
 
             // For `add`, the value of the expression is the set itself.
-            Ok(recv_v)
+            if is_chainable {
+                Ok(recv_v)
+            } else {
+                Ok(res[0])
+            }
         }
 
         _ => Err(LowerError::NotLowerable("expression type not supported")),
