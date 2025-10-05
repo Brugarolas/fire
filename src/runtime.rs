@@ -7,10 +7,10 @@ use crate::gc::NAPALM_GC;
 use crate::jit::wir_make_method_closure;
 use crate::value as v;
 use crate::value::{
-    BoxedArray, BoxedClosure, BoxedF64, BoxedObj, BoxedStr, NULL, ObjHeader, TAG_ARRAY,
-    TAG_BOXED_F64, TAG_CLOSURE, TAG_OBJECT, TAG_STRING, is_bool, is_imm, obj_assign,
-    obj_clone_shallow, obj_get_field_deep, obj_get_proto, obj_get_str_deep, obj_set_proto, to_bool,
-    BoxedMap, BoxedSet, TAG_MAP, TAG_SET, map_new, set_new, Value,
+    BoxedArray, BoxedClosure, BoxedF64, BoxedMap, BoxedObj, BoxedSet, BoxedStr, Value,
+    NULL, ObjHeader, TAG_ARRAY, TAG_BOXED_F64, TAG_CLOSURE, TAG_MAP, TAG_OBJECT, TAG_SET,
+    TAG_STRING, bool_to_value, is_imm, map_new, obj_assign, obj_clone_shallow,
+    obj_get_field_deep, obj_get_proto, obj_get_str_deep, obj_set_proto, set_new, value_to_bool,
 };
 
 use crate::helpers::collections::{ConcurrentHashMap, HashMap, HashSet};
@@ -37,7 +37,7 @@ fn decode_field_smi(v: i64) -> u32 {
 
 #[inline(always)]
 fn is_heap_ptr(v: i64) -> bool {
-    v != 0 && (v & 1) == 0
+    v::is_ptr(v)
 }
 
 #[inline(always)]
@@ -72,13 +72,13 @@ pub extern "C" fn wir_obj_new() -> i64 {
 #[unsafe(no_mangle)] // or #[unsafe(no_mangle)] if you're using that everywhere else
 pub extern "C" fn wir_is_str(v: i64) -> i64 {
     // Immediates (SMIs) and null are not strings
-    if v == 0 || (v & 1) == 1 {
-        return 0;
+    if v == NULL || is_imm(v) || v::is_bool(v) {
+        return bool_to_value(false);
     }
     // v is an even (pointer) ValueRepr. Read its header tag.
     unsafe {
         let hdr = &*(v as *const ObjHeader);
-        if hdr.tag == TAG_STRING { 1 } else { 0 }
+        bool_to_value(hdr.tag == TAG_STRING)
     }
 }
 
@@ -118,7 +118,7 @@ pub extern "C" fn wir_obj_set_field(obj: i64, field_id_smi: i64, val: i64) -> i6
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_obj_has_field(obj: i64, field_id_smi: i64) -> i64 {
     if obj == 0 {
-        return 0;
+        return bool_to_value(false);
     }
     let id = decode_field_smi(field_id_smi);
     unsafe { v::obj_has_field(obj, id) }
@@ -127,7 +127,7 @@ pub extern "C" fn wir_obj_has_field(obj: i64, field_id_smi: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_obj_del_field(obj: i64, field_id_smi: i64) -> i64 {
     if obj == 0 {
-        return 0;
+        return bool_to_value(false);
     }
     let id = decode_field_smi(field_id_smi);
     unsafe { v::obj_del_field(obj, id) }
@@ -228,10 +228,10 @@ pub extern "C" fn wir_obj_set_str(obj: i64, key_ptr: i64, val: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_obj_has_str(obj: i64, key_ptr: i64) -> i64 {
     if obj == 0 {
-        return 0;
+        return bool_to_value(false);
     }
     let Some(k) = (unsafe { boxedstr_to_string(key_ptr) }) else {
-        return 0;
+        return bool_to_value(false);
     };
     unsafe { v::obj_has_str(obj, &k) }
 }
@@ -239,10 +239,10 @@ pub extern "C" fn wir_obj_has_str(obj: i64, key_ptr: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_obj_del_str(obj: i64, key_ptr: i64) -> i64 {
     if obj == 0 {
-        return 0;
+        return bool_to_value(false);
     }
     let Some(k) = (unsafe { boxedstr_to_string(key_ptr) }) else {
-        return 0;
+        return bool_to_value(false);
     };
     unsafe { v::obj_del_str(obj, &k) }
 }
@@ -251,35 +251,32 @@ pub extern "C" fn wir_obj_del_str(obj: i64, key_ptr: i64) -> i64 {
 pub unsafe extern "C" fn wir_string_equals(s1_val: i64, s2_val: i64) -> i64 {
     // Fast path: if the values are identical (e.g., two SMIs, two pointers to the
     // same object, or both null), they are equal.
-    if s1_val == s2_val { return 1; }
-
-    // Check if both values are valid, non-null pointers to string objects.
-    // If one isn't a string, they can't be equal (since the pointer equality check failed).
-    if wir_is_str(s1_val) == 0 || wir_is_str(s2_val) == 0 {
-        return 0;
+    if s1_val == s2_val {
+        return bool_to_value(true);
     }
 
-    // At this point, we know both are valid pointers to BoxedStr headers.
+    if !is_heap_ptr(s1_val) || !is_heap_ptr(s2_val) {
+        return bool_to_value(false);
+    }
+
+    if heap_tag(s1_val) != Some(TAG_STRING) || heap_tag(s2_val) != Some(TAG_STRING) {
+        return bool_to_value(false);
+    }
+
     let s1 = &*(s1_val as *const BoxedStr);
     let s2 = &*(s2_val as *const BoxedStr);
 
-    // Fast path 2: If the byte lengths are different, they cannot be equal.
     if s1.len != s2.len {
-        return 0;
+        return bool_to_value(false);
     }
 
-    // If both strings are empty, they are equal.
     if s1.len == 0 {
-        return 1;
+        return bool_to_value(true);
     }
 
-    // This is the correct way to compare the content using your struct definition.
-    // We create temporary slices from the raw `data` pointer and `len` field.
     let slice1 = std::slice::from_raw_parts(s1.data, s1.len);
     let slice2 = std::slice::from_raw_parts(s2.data, s2.len);
-
-    // Let Rust perform a fast, bytewise comparison on the slices.
-    if slice1 == slice2 { 1 } else { 0 }
+    bool_to_value(slice1 == slice2)
 }
 
 #[unsafe(no_mangle)]
@@ -289,11 +286,7 @@ pub extern "C" fn wir_obj_assign(dst: i64, src: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_is_nullish(v: i64) -> i64 {
-    if v == NULL {
-        1
-    } else {
-        0
-    }
+    bool_to_value(v == NULL)
 }
 
 #[unsafe(no_mangle)]
@@ -343,9 +336,9 @@ pub extern "C" fn wir_memo_get(fid: i64, key: i64, out_ptr: *mut i64) -> i64 {
                 *out_ptr = *val;
             }
         }
-        return 1; // found
+        return bool_to_value(true);
     }
-    0 // miss
+    bool_to_value(false)
 }
 
 #[unsafe(no_mangle)]
@@ -369,9 +362,9 @@ pub extern "C" fn wir_memo_get2(fid: i64, k0: i64, k1: i64, out_ptr: *mut i64) -
                 *out_ptr = *val;
             }
         }
-        return 1;
+        return bool_to_value(true);
     }
-    0
+    bool_to_value(false)
 }
 
 #[unsafe(no_mangle)]
@@ -395,9 +388,9 @@ pub extern "C" fn wir_memo_get3(fid: i64, k0: i64, k1: i64, k2: i64, out_ptr: *m
                 *out_ptr = *val;
             }
         }
-        return 1;
+        return bool_to_value(true);
     }
-    0
+    bool_to_value(false)
 }
 
 #[unsafe(no_mangle)]
@@ -421,9 +414,9 @@ pub extern "C" fn wir_memo_get4(fid: i64, k0: i64, k1: i64, k2: i64, k3: i64, ou
                 *out_ptr = *val;
             }
         }
-        return 1;
+        return bool_to_value(true);
     }
-    0
+    bool_to_value(false)
 }
 
 #[unsafe(no_mangle)]
@@ -470,13 +463,8 @@ pub fn fmt_value(v: i64) -> String {
 }
 
 fn pp(v: i64, depth: usize, max_depth: usize, max_elems: usize, seen: &mut HashSet<u64>) -> String {
-    // Booleans are raw 0/1 in this runtime
-    if is_bool(v) {
-        return if to_bool(v) {
-            "1".to_string()
-        } else {
-            "0".to_string()
-        };
+    if let Some(b) = value_to_bool(v) {
+        return if b { "true".to_string() } else { "false".to_string() };
     }
 
     // Small ints (SMI)
@@ -654,16 +642,16 @@ fn pp(v: i64, depth: usize, max_depth: usize, max_elems: usize, seen: &mut HashS
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_is_map(v: i64) -> i64 {
-    if !is_heap_ptr(v) { return 0; }
+    if !is_heap_ptr(v) { return bool_to_value(false); }
     let hdr = &*(v as *const ObjHeader);
-    if hdr.tag == TAG_MAP { 1 } else { 0 }
+    bool_to_value(hdr.tag == TAG_MAP)
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_is_set(v: i64) -> i64 {
-    if !is_heap_ptr(v) { return 0; }
+    if !is_heap_ptr(v) { return bool_to_value(false); }
     let hdr = &*(v as *const ObjHeader);
-    if hdr.tag == TAG_SET { 1 } else { 0 }
+    bool_to_value(hdr.tag == TAG_SET)
 }
 
 // A global list of all live Map and Set objects, storing their addresses as `usize`.
@@ -723,16 +711,16 @@ pub unsafe extern "C" fn wir_map_set(map_val: i64, key: i64, val: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_map_has(map_val: i64, key: i64) -> i64 {
-    if !is_heap_ptr(map_val) { return 0; }
+    if !is_heap_ptr(map_val) { return bool_to_value(false); }
     let map = &* (map_val as *const BoxedMap);
-    if map.map.contains_key(&Value(key)) { 1 } else { 0 }
+    bool_to_value(map.map.contains_key(&Value(key)))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_map_delete(map_val: i64, key: i64) -> i64 {
-    if !is_heap_ptr(map_val) { return 0; }
+    if !is_heap_ptr(map_val) { return bool_to_value(false); }
     let map = &mut * (map_val as *mut BoxedMap);
-    if map.map.remove(&Value(key)).is_some() { 1 } else { 0 }
+    bool_to_value(map.map.remove(&Value(key)).is_some())
 }
 
 #[unsafe(no_mangle)]
@@ -767,16 +755,16 @@ pub unsafe extern "C" fn wir_set_add(set_val: i64, val: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_set_has(set_val: i64, val: i64) -> i64 {
-    if !is_heap_ptr(set_val) { return 0; }
+    if !is_heap_ptr(set_val) { return bool_to_value(false); }
     let set = &* (set_val as *const BoxedSet);
-    if set.set.contains(&Value(val)) { 1 } else { 0 }
+    bool_to_value(set.set.contains(&Value(val)))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_set_delete(set_val: i64, val: i64) -> i64 {
-    if !is_heap_ptr(set_val) { return 0; }
+    if !is_heap_ptr(set_val) { return bool_to_value(false); }
     let set = &mut * (set_val as *mut BoxedSet);
-    if set.set.remove(&Value(val)) { 1 } else { 0 }
+    bool_to_value(set.set.remove(&Value(val)))
 }
 
 #[unsafe(no_mangle)]

@@ -1,0 +1,22 @@
+print("===== Boolean basics =====");
+let t = true;
+let f = false;
+print(t);           // expect true
+print(f);           // expect false
+print(!t);          // expect false
+print(!f);          // expect true
+
+print("===== Boolean control flow =====");
+if (t) {
+    print("true branch");   // expect "true branch"
+}
+
+if (f) {
+    print("unreachable");
+} else {
+    print("false branch");  // expect "false branch"
+}
+
+print("===== Boolean equality =====");
+print(t == f);      // expect false
+print(t != f);      // expect true

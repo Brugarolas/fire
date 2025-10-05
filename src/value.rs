@@ -23,10 +23,12 @@ use std::borrow::Borrow;
 
 pub type ValueRepr = i64;
 
+const PTR_TAG_MASK: ValueRepr = 0b111;
+
 // ---- Pointer / immediate tests ----
 #[inline(always)]
 pub fn is_ptr(v: ValueRepr) -> bool {
-    (v & 1) == 0
+    v != NULL && (v & PTR_TAG_MASK) == 0
 }
 #[inline(always)]
 pub fn is_imm(v: ValueRepr) -> bool {
@@ -46,15 +48,32 @@ pub fn smi_to_i64(v: ValueRepr) -> i64 {
 // ---- Null (boxed-null) ----
 pub const NULL: ValueRepr = 0;
 
-// ---- Booleans: raw 0/1 (not SMIs) ----
-// (Kept for now to match your lowerer’s behavior)
+// ---- Booleans (non-pointer immediates) ----
+pub const BOOL_FALSE: ValueRepr = 0b010;
+pub const BOOL_TRUE: ValueRepr = 0b110;
+
 #[inline(always)]
-pub fn is_bool(v: i64) -> bool {
-    v == 0 || v == 1
+pub fn is_bool(v: ValueRepr) -> bool {
+    matches!(v, BOOL_FALSE | BOOL_TRUE)
 }
+
 #[inline(always)]
-pub fn to_bool(v: i64) -> bool {
-    v != 0
+pub fn bool_to_value(b: bool) -> ValueRepr {
+    if b { BOOL_TRUE } else { BOOL_FALSE }
+}
+
+#[inline(always)]
+pub fn value_to_bool(v: ValueRepr) -> Option<bool> {
+    match v {
+        BOOL_FALSE => Some(false),
+        BOOL_TRUE => Some(true),
+        _ => None,
+    }
+}
+
+#[inline(always)]
+pub fn to_bool(v: ValueRepr) -> bool {
+    value_to_bool(v).unwrap_or(v != NULL)
 }
 
 // ============================================================================
@@ -75,7 +94,7 @@ impl Hash for Value {
             return;
         }
 
-        if !is_ptr(v) || v == NULL { // Booleans (0,1) or Null
+        if !is_ptr(v) || v == NULL { // Non-pointer immediates (bool) or Null
             v.hash(state);
             return;
         }
@@ -1121,23 +1140,23 @@ pub unsafe extern "C" fn wir_string_replace_all(s_val: i64, search_val: i64, rep
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_string_starts_with(s_val: i64, search_val: i64) -> i64 {
-    let Some(s) = value_as_str_slice(s_val) else { return 0; };
-    let Some(search) = value_as_str_slice(search_val) else { return 0; };
-    if s.starts_with(search) { 1 } else { 0 }
+    let Some(s) = value_as_str_slice(s_val) else { return bool_to_value(false); };
+    let Some(search) = value_as_str_slice(search_val) else { return bool_to_value(false); };
+    bool_to_value(s.starts_with(search))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_string_ends_with(s_val: i64, search_val: i64) -> i64 {
-    let Some(s) = value_as_str_slice(s_val) else { return 0; };
-    let Some(search) = value_as_str_slice(search_val) else { return 0; };
-    if s.ends_with(search) { 1 } else { 0 }
+    let Some(s) = value_as_str_slice(s_val) else { return bool_to_value(false); };
+    let Some(search) = value_as_str_slice(search_val) else { return bool_to_value(false); };
+    bool_to_value(s.ends_with(search))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_string_includes(s_val: i64, search_val: i64) -> i64 {
-    let Some(s) = value_as_str_slice(s_val) else { return 0; };
-    let Some(search) = value_as_str_slice(search_val) else { return 0; };
-    if s.contains(search) { 1 } else { 0 }
+    let Some(s) = value_as_str_slice(s_val) else { return bool_to_value(false); };
+    let Some(search) = value_as_str_slice(search_val) else { return bool_to_value(false); };
+    bool_to_value(s.contains(search))
 }
 
 #[unsafe(no_mangle)]
@@ -1395,13 +1414,13 @@ pub unsafe fn obj_set_field(obj_v: ValueRepr, fid: u32, val: ValueRepr) -> Value
 #[inline(always)]
 pub unsafe fn obj_has_field(obj_v: ValueRepr, fid: u32) -> ValueRepr {
     let o = &*as_obj_mut(obj_v);
-    if o.by_id.contains_key(&fid) { 1 } else { 0 }
+    bool_to_value(o.by_id.contains_key(&fid))
 }
 
 #[inline(always)]
 pub unsafe fn obj_del_field(obj_v: ValueRepr, fid: u32) -> ValueRepr {
     let o = &mut *as_obj_mut(obj_v);
-    if o.by_id.remove(&fid).is_some() { 1 } else { 0 }
+    bool_to_value(o.by_id.remove(&fid).is_some())
 }
 
 #[inline(always)]
@@ -1440,13 +1459,13 @@ pub unsafe fn obj_set_str(obj_v: ValueRepr, key: &str, val: ValueRepr) -> ValueR
 #[inline(always)]
 pub unsafe fn obj_has_str(obj_v: ValueRepr, key: &str) -> ValueRepr {
     let o = &*as_obj_mut(obj_v);
-    if o.by_str.contains_key(key) { 1 } else { 0 }
+    bool_to_value(o.by_str.contains_key(key))
 }
 
 #[inline(always)]
 pub unsafe fn obj_del_str(obj_v: ValueRepr, key: &str) -> ValueRepr {
     let o = &mut *as_obj_mut(obj_v);
-    if o.by_str.remove(key).is_some() { 1 } else { 0 }
+    bool_to_value(o.by_str.remove(key).is_some())
 }
 
 #[inline(always)]
@@ -1596,13 +1615,8 @@ pub fn set_new() -> ValueRepr {
 /// Try to pretty-print a runtime value according to our tags.
 /// Keep this conservative; it’s only for `print` and debugging.
 pub fn fmt_value(v: i64) -> String {
-    // Booleans are raw 0/1
-    if is_bool(v) {
-        return if v != 0 {
-            "1".to_string()
-        } else {
-            "0".to_string()
-        };
+    if let Some(b) = value_to_bool(v) {
+        return if b { "true".to_string() } else { "false".to_string() };
     }
 
     // Small ints are odd (SMI)

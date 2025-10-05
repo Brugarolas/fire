@@ -47,7 +47,8 @@ use crate::runtime::{
 };
 #[allow(unused_imports)]
 use crate::value::{
-    BoxedArray, BoxedClosure, ObjHeader, TAG_ARRAY, closure_new, closure_set_env_slot,
+    BoxedArray, BoxedClosure, ObjHeader, TAG_ARRAY, BOOL_FALSE, BOOL_TRUE, closure_new,
+    closure_set_env_slot,
     wir_array_copy, wir_array_fill, wir_array_filter, wir_array_find, wir_array_find_index,
     wir_array_for_each, wir_array_get, wir_array_len, wir_array_map, wir_array_new, wir_array_pop,
     wir_array_push, wir_array_reduce, wir_array_set, wir_array_set_len, wir_array_shift,
@@ -1224,9 +1225,25 @@ impl JIT {
                             let a = vmap.get_or_emit(*a, &mut fb, fun_ir);
                             let b = vmap.get_or_emit(*b, &mut fb, fun_ir);
 
-                            // decode SMIs
-                            let ra = fb.ins().sshr_imm(a, 1);
-                            let rb = fb.ins().sshr_imm(b, 1);
+                            // Decode operands that might be SMIs or boolean immediates.
+                            let bool_true_val = fb.ins().iconst(types::I64, BOOL_TRUE);
+                            let bool_false_val = fb.ins().iconst(types::I64, BOOL_FALSE);
+                            let int_one = fb.ins().iconst(types::I64, 1);
+                            let int_zero = fb.ins().iconst(types::I64, 0);
+
+                            let a_is_true = fb.ins().icmp(IntCC::Equal, a, bool_true_val);
+                            let a_is_false = fb.ins().icmp(IntCC::Equal, a, bool_false_val);
+                            let a_bool_raw = fb.ins().select(a_is_true, int_one, int_zero);
+                            let a_any_bool = fb.ins().bor(a_is_true, a_is_false);
+                            let a_smi = fb.ins().sshr_imm(a, 1);
+                            let ra = fb.ins().select(a_any_bool, a_bool_raw, a_smi);
+
+                            let b_is_true = fb.ins().icmp(IntCC::Equal, b, bool_true_val);
+                            let b_is_false = fb.ins().icmp(IntCC::Equal, b, bool_false_val);
+                            let b_bool_raw = fb.ins().select(b_is_true, int_one, int_zero);
+                            let b_any_bool = fb.ins().bor(b_is_true, b_is_false);
+                            let b_smi = fb.ins().sshr_imm(b, 1);
+                            let rb = fb.ins().select(b_any_bool, b_bool_raw, b_smi);
 
                             // raw compare → 0/1 (NOT SMI)
                             let cc = match kind {
@@ -1238,9 +1255,7 @@ impl JIT {
                                 crate::wir::CmpKind::Ge => IntCC::SignedGreaterThanOrEqual,
                             };
                             let cond = fb.ins().icmp(cc, ra, rb);
-                            let one = fb.ins().iconst(types::I64, 1);
-                            let zero = fb.ins().iconst(types::I64, 0);
-                            let fast_res = fb.ins().select(cond, one, zero);
+                            let fast_res = fb.ins().select(cond, bool_true_val, bool_false_val);
 
                             if res_count == 1 {
                                 vmap.bind(node.results[0], fast_res);
@@ -2066,8 +2081,8 @@ impl JIT {
                         } => {
                             use cranelift::prelude::{IntCC, types};
                             let ci64 = vmap.get_or_emit(*cond, &mut fb, fun);
-                            let z = fb.ins().iconst(types::I64, 0);
-                            let cb1 = fb.ins().icmp(IntCC::NotEqual, ci64, z);
+                            let tval = fb.ins().iconst(types::I64, BOOL_TRUE);
+                            let cb1 = fb.ins().icmp(IntCC::Equal, ci64, tval);
                             use cranelift::codegen::ir::instructions::BlockArg;
                             fb.ins().brif(
                                 cb1,
@@ -2419,8 +2434,8 @@ impl JIT {
             // small ints as SMIs (odd)
             Constant::Int32(x) => fb.ins().iconst(types::I64, ((*x as i64) << 1) | 1),
 
-            // bools as 0/1 (unchanged)
-            Constant::Bool(b) => fb.ins().iconst(types::I64, if *b { 1 } else { 0 }),
+            // bools as tagged immediates
+            Constant::Bool(b) => fb.ins().iconst(types::I64, if *b { BOOL_TRUE } else { BOOL_FALSE }),
 
             // null as 0
             Constant::Null => fb.ins().iconst(types::I64, 0),
@@ -2583,7 +2598,7 @@ fn synth_const(values: &Vec<WirValue>, id: ValueId, fb: &mut FunctionBuilder) ->
                 // (Simplest: return None for F64 here.)
                 None
             }
-            Constant::Bool(b) => Some(fb.ins().iconst(types::I64, if *b { 1 } else { 0 })),
+            Constant::Bool(b) => Some(fb.ins().iconst(types::I64, if *b { BOOL_TRUE } else { BOOL_FALSE })),
             Constant::Null => Some(fb.ins().iconst(types::I64, 0)),
             Constant::Str(_) => None,
             Constant::Undefined => Some(fb.ins().iconst(types::I64, 0)),

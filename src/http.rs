@@ -34,7 +34,7 @@ use crate::native_promises::{wir_deferred_new, wir_deferred_reject, wir_deferred
 use crate::runtime::{wir_is_str, wir_obj_get_str, wir_obj_new, wir_obj_set_str};
 use crate::value::{
     BoxedStr, ObjHeader, TAG_OBJECT, TAG_STRING, dbg_addr, dbg_classify, fmt_value, is_imm,
-    make_smi, smi_to_i64,
+    make_smi, smi_to_i64, value_to_bool,
 };
 
 /// -------- Tokio runtime on a dedicated thread (net/io) --------
@@ -67,6 +67,11 @@ fn rand_id() -> u64 {
 }
 fn next_req_id() -> u64 {
     NEXT_REQ_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+#[inline(always)]
+fn runtime_bool(val: i64) -> bool {
+    value_to_bool(val).unwrap_or(false)
 }
 
 /// -------- route registry (kept as GC roots; see http_with_root_slots()) --------
@@ -207,7 +212,7 @@ fn value_to_response(v: i64) -> (u16, Vec<u8>, Vec<(String, String)>) {
             // treat as empty body (or 204 if you prefer)
             return (200, Vec::new(), vec![]);
         }
-        if wir_is_str(v) != 0 {
+        if runtime_bool(wir_is_str(v)) {
             let s = &*(v as *const BoxedStr);
             let bytes = std::slice::from_raw_parts(s.data, s.len);
             return (200, bytes.to_vec(), vec![]);
@@ -239,7 +244,7 @@ fn value_to_response(v: i64) -> (u16, Vec<u8>, Vec<(String, String)>) {
 
         // body
         let b = wir_obj_get_str(v, body_key);
-        if b != 0 && wir_is_str(b) != 0 {
+        if b != 0 && runtime_bool(wir_is_str(b)) {
             let bs = &*(b as *const BoxedStr);
             let bytes = std::slice::from_raw_parts(bs.data, bs.len);
             body_out = bytes.to_vec();
@@ -259,7 +264,7 @@ fn value_to_response(v: i64) -> (u16, Vec<u8>, Vec<(String, String)>) {
                 let pair = wir_array_get(h, make_smi(i as i64));
                 let k = wir_array_get(pair, make_smi(0));
                 let val = wir_array_get(pair, make_smi(1));
-                if wir_is_str(k) != 0 && wir_is_str(val) != 0 {
+                if runtime_bool(wir_is_str(k)) && runtime_bool(wir_is_str(val)) {
                     let ks = &*(k as *const BoxedStr);
                     let vs = &*(val as *const BoxedStr);
                     let kb = std::slice::from_raw_parts(ks.data, ks.len);
@@ -443,7 +448,7 @@ pub extern "C" fn wir_server_add_route(
 
         for i in 0..n {
             let segment_value = wir_array_get(pattern_arr, make_smi(i as i64));
-            if wir_is_str(segment_value) == 0 {
+            if !runtime_bool(wir_is_str(segment_value)) {
                 // Ignore any non-string values in the pattern array.
                 continue;
             }
@@ -846,7 +851,7 @@ fn collect_headers_from_arr(arr: i64) -> Vec<(String, String)> {
             let pair = wir_array_get(arr, make_smi(i as i64));
             let k = wir_array_get(pair, make_smi(0));
             let v = wir_array_get(pair, make_smi(1));
-            if wir_is_str(k) != 0 && wir_is_str(v) != 0 {
+            if runtime_bool(wir_is_str(k)) && runtime_bool(wir_is_str(v)) {
                 let ks = &*(k as *const BoxedStr);
                 let vs = &*(v as *const BoxedStr);
                 let kb = std::slice::from_raw_parts(ks.data, ks.len);
@@ -1121,7 +1126,7 @@ fn json_bytes_to_vm(bytes: &[u8]) -> Option<i64> {
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_json_parse(str_ptr: i64) -> i64 {
     unsafe {
-        if str_ptr == 0 || wir_is_str(str_ptr) == 0 {
+        if str_ptr == 0 || !runtime_bool(wir_is_str(str_ptr)) {
             return 0;
         }
         let s = &*(str_ptr as *const BoxedStr);
@@ -1155,7 +1160,7 @@ pub extern "C" fn wir_http_send_json(status_smi: i64, body_val: i64, headers_arr
     // 3) Encode body: if it's already a VM string, reuse it; otherwise fall back
     //    to fmt_value(..) (best-effort; upgrade to a real JSON serializer later).
     let body_str_val = unsafe {
-        if wir_is_str(body_val) != 0 {
+        if runtime_bool(wir_is_str(body_val)) {
             // Already a string → use as-is
             body_val
         } else {
