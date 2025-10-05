@@ -495,9 +495,9 @@ impl ObjectModel<NapalmVM> for VMObjModel {
                     #[cfg(debug_assertions)]
                     {
                         eprintln!(
-                            "[napalm:mmtk] Object @ {addr:?} slots={{by_id: {}, by_str: {}}}",
-                            (*o).by_id.len(),
-                            (*o).by_str.len()
+                            "[napalm:mmtk] Object @ {addr:?} slots={{vec: {}, dict: {}}}",
+                            (*o).slots.len(),
+                            (*o).dict.len()
                         );
                     }
                 }
@@ -570,15 +570,18 @@ impl Scanning<NapalmVM> for VMScanning {
                         slot_visitor.visit_slot(SlotItem(Address::from_ptr(slot.cast::<u8>())));
                     }
 
-                    for v in obj.by_id.values_mut() {
-                        let slot_ptr: *mut i64 = v as *mut i64;
+                    let len = obj.slots.len();
+                    let ptr = obj.slots.as_mut_ptr();
+                    for i in 0..len {
+                        let slot_ptr: *mut i64 = ptr.add(i);
                         let val = *slot_ptr;
                         if is_ptr(val) && val != NULL {
                             let edge = SlotItem(Address::from_ptr(slot_ptr.cast::<u8>()));
                             slot_visitor.visit_slot(edge);
                         }
                     }
-                    for v in obj.by_str.values_mut() {
+
+                    for v in obj.dict.values_mut() {
                         let slot_ptr: *mut i64 = v as *mut i64;
                         let val = *slot_ptr;
                         if is_ptr(val) && val != NULL {

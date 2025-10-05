@@ -6,6 +6,7 @@
 
 use crate::gc::NAPALM_GC;
 use crate::helpers::collections::{HashMap, HashSet};
+use parking_lot::RwLock;
 use crate::helpers::compact_map::CompactMap;
 use core::mem;
 use std::ptr;
@@ -13,6 +14,7 @@ use std::str;
 use std::slice;
 use std::hash::{Hash, Hasher};
 use std::borrow::Borrow;
+use std::sync::OnceLock;
 
 //use crate::gc::api::{alloc_raw, alloc_slow_path, post_alloc_object};
 //use crate::gc::post_write_barrier;
@@ -1301,9 +1303,136 @@ pub unsafe fn closure_set_env_slot(v: ValueRepr, idx: usize, val: ValueRepr) {
 pub struct BoxedObj {
     pub hdr: ObjHeader,
     pub proto: ValueRepr,
-    pub by_id: HashMap<u32, ValueRepr>,     // FieldId fast path
-    pub by_str: HashMap<String, ValueRepr>, // string-key path
+    pub shape: u32,
+    pub slots: Vec<ValueRepr>,
+    pub dict: HashMap<String, ValueRepr>,
 }
+
+#[derive(Default, Clone)]
+struct Shape {
+    fields: Vec<u32>,
+    field_map: HashMap<u32, usize>,
+    add_transitions: HashMap<u32, u32>,
+    del_transitions: HashMap<u32, u32>,
+}
+
+impl Shape {
+    fn empty() -> Self {
+        Self {
+            fields: Vec::new(),
+            field_map: HashMap::default(),
+            add_transitions: HashMap::default(),
+            del_transitions: HashMap::default(),
+        }
+    }
+}
+
+struct ShapeTable {
+    shapes: Vec<Shape>,
+}
+
+impl ShapeTable {
+    fn new() -> Self {
+        Self {
+            shapes: vec![Shape::empty()],
+        }
+    }
+
+    fn slot(&self, shape_id: u32, fid: u32) -> Option<usize> {
+        self.shapes
+            .get(shape_id as usize)
+            .and_then(|shape| shape.field_map.get(&fid).copied())
+    }
+
+    fn field_count(&self, shape_id: u32) -> usize {
+        self.shapes
+            .get(shape_id as usize)
+            .map(|shape| shape.fields.len())
+            .unwrap_or(0)
+    }
+
+    fn fields(&self, shape_id: u32) -> &[u32] {
+        self.shapes
+            .get(shape_id as usize)
+            .map(|shape| shape.fields.as_slice())
+            .unwrap_or(&[])
+    }
+
+    fn ensure_add(&mut self, shape_id: u32, fid: u32) -> (u32, usize) {
+        if let Some(slot) = self.slot(shape_id, fid) {
+            return (shape_id, slot);
+        }
+
+        let shape = &self.shapes[shape_id as usize];
+        if let Some(&target) = shape.add_transitions.get(&fid) {
+            let slot = self.shapes[target as usize].field_map[&fid];
+            return (target, slot);
+        }
+
+        let mut new_shape = shape.clone();
+        let slot = new_shape.fields.len();
+        new_shape.fields.push(fid);
+        new_shape.field_map.insert(fid, slot);
+        new_shape.add_transitions.clear();
+        new_shape.del_transitions.clear();
+
+        let new_shape_id = self.shapes.len() as u32;
+        self.shapes.push(new_shape);
+        self.shapes[shape_id as usize]
+            .add_transitions
+            .insert(fid, new_shape_id);
+
+        (new_shape_id, slot)
+    }
+
+    fn ensure_remove(&mut self, shape_id: u32, fid: u32) -> Option<(u32, Vec<usize>)> {
+        if self.slot(shape_id, fid).is_none() {
+            return None;
+        }
+
+        let shape = &self.shapes[shape_id as usize];
+        if let Some(&target) = shape.del_transitions.get(&fid) {
+            let new_shape = &self.shapes[target as usize];
+            let remap = new_shape
+                .fields
+                .iter()
+                .map(|f| shape.field_map[f])
+                .collect();
+            return Some((target, remap));
+        }
+
+        let mut fields = Vec::with_capacity(shape.fields.len().saturating_sub(1));
+        let mut remap = Vec::with_capacity(fields.capacity());
+        for &f in &shape.fields {
+            if f != fid {
+                fields.push(f);
+                remap.push(shape.field_map[&f]);
+            }
+        }
+
+        let mut new_shape = Shape::empty();
+        for (idx, &f) in fields.iter().enumerate() {
+            new_shape.fields.push(f);
+            new_shape.field_map.insert(f, idx);
+        }
+
+        let new_shape_id = self.shapes.len() as u32;
+        self.shapes.push(new_shape);
+        self.shapes[shape_id as usize]
+            .del_transitions
+            .insert(fid, new_shape_id);
+
+        Some((new_shape_id, remap))
+    }
+}
+
+static SHAPE_TABLE: OnceLock<RwLock<ShapeTable>> = OnceLock::new();
+
+fn shapes() -> &'static RwLock<ShapeTable> {
+    SHAPE_TABLE.get_or_init(|| RwLock::new(ShapeTable::new()))
+}
+
+const EMPTY_SHAPE_ID: u32 = 0;
 
 #[inline(always)]
 pub fn obj_new() -> ValueRepr {
@@ -1326,9 +1455,10 @@ pub fn obj_new() -> ValueRepr {
                         tag: TAG_OBJECT,
                         aux: 0,
                     },
-                    proto: NULL, // NEW
-                    by_id: HashMap::new(),
-                    by_str: HashMap::new(),
+                    proto: NULL,
+                    shape: EMPTY_SHAPE_ID,
+                    slots: Vec::new(),
+                    dict: HashMap::new(),
                 },
             );
 
@@ -1357,8 +1487,9 @@ pub fn obj_new() -> ValueRepr {
                         aux: 0,
                     },
                     proto: NULL,
-                    by_id: HashMap::new(),
-                    by_str: HashMap::new(),
+                    shape: EMPTY_SHAPE_ID,
+                    slots: Vec::new(),
+                    dict: HashMap::new(),
                 },
             );
 
@@ -1370,6 +1501,47 @@ pub fn obj_new() -> ValueRepr {
 #[inline(always)]
 pub unsafe fn as_obj_mut(v: ValueRepr) -> *mut BoxedObj {
     v as *mut BoxedObj
+}
+
+#[inline(always)]
+pub unsafe fn obj_shape(obj_v: ValueRepr) -> u32 {
+    let o = &*as_obj_mut(obj_v);
+    o.shape
+}
+
+#[inline(always)]
+pub fn shape_slot(shape_id: u32, fid: u32) -> Option<usize> {
+    shapes().read().slot(shape_id, fid)
+}
+
+#[inline(always)]
+pub fn shape_field_count(shape_id: u32) -> usize {
+    shapes().read().field_count(shape_id)
+}
+
+#[inline(always)]
+pub fn shape_fields(shape_id: u32) -> Vec<u32> {
+    shapes().read().fields(shape_id).to_vec()
+}
+
+#[inline(always)]
+pub unsafe fn obj_get_slot(obj_v: ValueRepr, slot: usize) -> ValueRepr {
+    let o = &*as_obj_mut(obj_v);
+    o.slots.get(slot).copied().unwrap_or(NULL)
+}
+
+#[inline(always)]
+pub unsafe fn obj_set_slot_known(obj_v: ValueRepr, slot: usize, val: ValueRepr) {
+    let o = &mut *as_obj_mut(obj_v);
+    if o.slots.len() <= slot {
+        o.slots.resize(slot + 1, NULL);
+    }
+    o.slots[slot] = val;
+    #[cfg(feature = "gc")]
+    {
+        let slot_ptr = o.slots.as_mut_ptr().add(slot);
+        NAPALM_GC.post_write_barrier(obj_v as *mut u8, slot_ptr, val);
+    }
 }
 
 #[inline(always)]
@@ -1393,42 +1565,87 @@ pub unsafe fn obj_get_proto(obj_v: ValueRepr) -> ValueRepr {
 
 #[inline(always)]
 pub unsafe fn obj_get_field(obj_v: ValueRepr, fid: u32) -> ValueRepr {
-    let o = &*as_obj_mut(obj_v); // Error
-    o.by_id.get(&fid).cloned().unwrap_or(NULL)
+    let o = &*as_obj_mut(obj_v);
+    if let Some(slot) = shape_slot(o.shape, fid) {
+        o.slots.get(slot).copied().unwrap_or(NULL)
+    } else {
+        NULL
+    }
 }
 
 #[inline(always)]
 pub unsafe fn obj_set_field(obj_v: ValueRepr, fid: u32, val: ValueRepr) -> ValueRepr {
     let o = &mut *as_obj_mut(obj_v);
-    let cell = o.by_id.entry(fid).or_insert(NULL);
-    let slot: *mut ValueRepr = cell as *mut ValueRepr;
-    *cell = val;
+    let mut slot = shape_slot(o.shape, fid);
 
-    // Post-write barrier
+    if slot.is_none() {
+        let (new_shape, new_slot, new_len) = {
+            let mut shapes = shapes().write();
+            let (shape_id, slot_idx) = shapes.ensure_add(o.shape, fid);
+            let len = shapes.field_count(shape_id);
+            (shape_id, slot_idx, len)
+        };
+
+        if o.shape != new_shape {
+            o.shape = new_shape;
+        }
+
+        if o.slots.len() < new_len {
+            o.slots.resize(new_len, NULL);
+        }
+
+        slot = Some(new_slot);
+    }
+
+    let slot = slot.expect("slot must exist after ensure_add");
+    if o.slots.len() <= slot {
+        o.slots.resize(slot + 1, NULL);
+    }
+    o.slots[slot] = val;
     #[cfg(feature = "gc")]
-    NAPALM_GC.post_write_barrier(obj_v as *mut u8, slot, val);
-
+    {
+        let slot_ptr = o.slots.as_mut_ptr().add(slot);
+        NAPALM_GC.post_write_barrier(obj_v as *mut u8, slot_ptr, val);
+    }
     val
 }
 
 #[inline(always)]
 pub unsafe fn obj_has_field(obj_v: ValueRepr, fid: u32) -> ValueRepr {
     let o = &*as_obj_mut(obj_v);
-    bool_to_value(o.by_id.contains_key(&fid))
+    bool_to_value(shape_slot(o.shape, fid).is_some())
 }
 
 #[inline(always)]
 pub unsafe fn obj_del_field(obj_v: ValueRepr, fid: u32) -> ValueRepr {
     let o = &mut *as_obj_mut(obj_v);
-    bool_to_value(o.by_id.remove(&fid).is_some())
+    let removal = {
+        let mut shapes = shapes().write();
+        shapes
+            .ensure_remove(o.shape, fid)
+            .map(|(new_shape, remap)| (new_shape, remap, shapes.field_count(new_shape)))
+    };
+
+    match removal {
+        Some((new_shape, remap, new_len)) => {
+            let mut new_slots = Vec::with_capacity(new_len);
+            for idx in remap {
+                new_slots.push(o.slots.get(idx).copied().unwrap_or(NULL));
+            }
+            o.slots = new_slots;
+            o.shape = new_shape;
+            bool_to_value(true)
+        }
+        None => bool_to_value(false),
+    }
 }
 
 #[inline(always)]
 pub unsafe fn obj_get_field_deep(mut obj_v: ValueRepr, fid: u32) -> ValueRepr {
     while obj_v != NULL {
         let o = &*(obj_v as *const BoxedObj);
-        if let Some(&v) = o.by_id.get(&fid) {
-            return v;
+        if let Some(slot) = shape_slot(o.shape, fid) {
+            return o.slots.get(slot).copied().unwrap_or(NULL);
         }
         obj_v = o.proto;
     }
@@ -1440,13 +1657,13 @@ pub unsafe fn obj_get_field_deep(mut obj_v: ValueRepr, fid: u32) -> ValueRepr {
 #[inline(always)]
 pub unsafe fn obj_get_str(obj_v: ValueRepr, key: &str) -> ValueRepr {
     let o = &*as_obj_mut(obj_v);
-    o.by_str.get(key).cloned().unwrap_or(NULL)
+    o.dict.get(key).cloned().unwrap_or(NULL)
 }
 
 #[inline(always)]
 pub unsafe fn obj_set_str(obj_v: ValueRepr, key: &str, val: ValueRepr) -> ValueRepr {
     let o = &mut *as_obj_mut(obj_v);
-    let cell = o.by_str.entry(key.to_string()).or_insert(NULL);
+    let cell = o.dict.entry(key.to_string()).or_insert(NULL);
     let slot: *mut ValueRepr = cell as *mut ValueRepr;
     *cell = val;
 
@@ -1459,20 +1676,20 @@ pub unsafe fn obj_set_str(obj_v: ValueRepr, key: &str, val: ValueRepr) -> ValueR
 #[inline(always)]
 pub unsafe fn obj_has_str(obj_v: ValueRepr, key: &str) -> ValueRepr {
     let o = &*as_obj_mut(obj_v);
-    bool_to_value(o.by_str.contains_key(key))
+    bool_to_value(o.dict.contains_key(key))
 }
 
 #[inline(always)]
 pub unsafe fn obj_del_str(obj_v: ValueRepr, key: &str) -> ValueRepr {
     let o = &mut *as_obj_mut(obj_v);
-    bool_to_value(o.by_str.remove(key).is_some())
+    bool_to_value(o.dict.remove(key).is_some())
 }
 
 #[inline(always)]
 pub unsafe fn obj_get_str_deep(mut obj_v: ValueRepr, key: &str) -> ValueRepr {
     while obj_v != NULL {
         let o = &*(obj_v as *const BoxedObj);
-        if let Some(&v) = o.by_str.get(key) {
+        if let Some(&v) = o.dict.get(key) {
             return v;
         }
         obj_v = o.proto;
@@ -1489,8 +1706,8 @@ pub unsafe fn obj_assign(dst_v: ValueRepr, src_v: ValueRepr) -> ValueRepr {
     let dst = &mut *as_obj_mut(dst_v);
     let src = &*as_obj_mut(src_v);
 
-    for (key, &val) in src.by_str.get_internals() {
-        let entry = dst.by_str.entry(key.clone()).or_insert(NULL);
+    for (key, &val) in src.dict.get_internals() {
+        let entry = dst.dict.entry(key.clone()).or_insert(NULL);
         *entry = val;
 
         #[cfg(feature = "gc")]
@@ -1498,6 +1715,13 @@ pub unsafe fn obj_assign(dst_v: ValueRepr, src_v: ValueRepr) -> ValueRepr {
             let slot: *mut ValueRepr = entry as *mut ValueRepr;
             NAPALM_GC.post_write_barrier(dst_v as *mut u8, slot, val);
         }
+    }
+
+    let fields = shape_fields(src.shape);
+    let slot_values = src.slots.clone();
+    for (idx, fid) in fields.into_iter().enumerate() {
+        let val = slot_values.get(idx).copied().unwrap_or(NULL);
+        obj_set_field(dst_v, fid, val);
     }
 
     0
@@ -1514,13 +1738,30 @@ pub unsafe fn obj_clone_shallow(src_v: ValueRepr) -> ValueRepr {
     let src = &*as_obj_mut(src_v);
 
     clone.proto = src.proto;
+    clone.shape = src.shape;
+    clone.slots = src.slots.clone();
+    clone.dict = src.dict.clone();
 
     #[cfg(feature = "gc")]
     {
         NAPALM_GC.post_write_barrier(clone_v as *mut u8, &mut clone.proto, src.proto);
+        let len = clone.slots.len();
+        let ptr = clone.slots.as_mut_ptr();
+        for i in 0..len {
+            let slot_ptr = ptr.add(i);
+            let val = *slot_ptr;
+            if is_ptr(val) && val != NULL {
+                NAPALM_GC.post_write_barrier(clone_v as *mut u8, slot_ptr, val);
+            }
+        }
+        for val in clone.dict.values_mut() {
+            let slot_ptr = val as *mut ValueRepr;
+            let v = *val;
+            if is_ptr(v) && v != NULL {
+                NAPALM_GC.post_write_barrier(clone_v as *mut u8, slot_ptr, v);
+            }
+        }
     }
-
-    obj_assign(clone_v, src_v);
     clone_v
 }
 

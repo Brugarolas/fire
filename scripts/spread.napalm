@@ -1,0 +1,17 @@
+print("===== Object destructuring =====");
+var user = { name: "Ada", age: 32, country: "UK" };
+var { name, age } = user;
+print(name);          // expect Ada
+print(age);           // expect 32
+
+print("===== Object rest =====");
+var { name: displayName, ...others } = user;
+print(displayName);   // expect Ada
+print(others.country); // expect UK
+
+print("===== Object spread =====");
+var base = { a: 1, b: 2 };
+var extra = { b: 5, c: 9 };
+var merged = { greeting: "hi", ...base, ...extra, d: 10 };
+print(merged.a + merged.b + merged.c + merged.d); // expect 1 + 5 + 9 + 10 = 25
+print(merged);

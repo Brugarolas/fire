@@ -10,21 +10,15 @@ use crate::value::{
     BoxedArray, BoxedClosure, BoxedF64, BoxedMap, BoxedObj, BoxedSet, BoxedStr, Value,
     NULL, ObjHeader, TAG_ARRAY, TAG_BOXED_F64, TAG_CLOSURE, TAG_MAP, TAG_OBJECT, TAG_SET,
     TAG_STRING, bool_to_value, is_imm, map_new, obj_assign, obj_clone_shallow,
-    obj_get_field_deep, obj_get_proto, obj_get_str_deep, obj_set_proto, set_new, value_to_bool,
+    obj_get_field_deep, obj_get_proto, obj_get_slot, obj_get_str_deep, obj_set_proto, obj_shape,
+    obj_set_slot_known, set_new, shape_slot, value_to_bool,
 };
 
 use crate::helpers::collections::{ConcurrentHashMap, HashMap, HashSet};
 use core::cmp::min;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::slice;
 use std::sync::OnceLock;
-
-// Simple object storage: fast slots by FieldId (u32) + string-key map.
-#[repr(C)]
-struct WirObj {
-    by_id: HashMap<u32, i64>,
-    by_str: HashMap<String, i64>,
-}
 
 #[inline(always)]
 fn smi_to_i64(v: i64) -> i64 {
@@ -64,6 +58,17 @@ unsafe fn boxedstr_to_string(p: i64) -> Option<String> {
     Some(String::from_utf8_lossy(bytes).into_owned())
 }
 
+#[derive(Clone, Copy)]
+struct FieldCacheEntry {
+    shape: u32,
+    slot: usize,
+}
+
+fn field_cache() -> &'static RwLock<HashMap<u32, FieldCacheEntry>> {
+    static CACHE: OnceLock<RwLock<HashMap<u32, FieldCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::default()))
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_obj_new() -> i64 {
     v::obj_new()
@@ -100,7 +105,22 @@ pub extern "C" fn wir_obj_get_field(obj: i64, field_id_smi: i64) -> i64 {
         return 0;
     }
     let id = decode_field_smi(field_id_smi);
-    unsafe { v::obj_get_field(obj, id) }
+    unsafe {
+        let shape = obj_shape(obj);
+        if let Some(entry) = field_cache().read().get(&id).copied() {
+            if entry.shape == shape {
+                return obj_get_slot(obj, entry.slot);
+            }
+        }
+
+        let val = v::obj_get_field(obj, id);
+        if let Some(slot) = shape_slot(obj_shape(obj), id) {
+            field_cache()
+                .write()
+                .insert(id, FieldCacheEntry { shape: obj_shape(obj), slot });
+        }
+        val
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -110,7 +130,21 @@ pub extern "C" fn wir_obj_set_field(obj: i64, field_id_smi: i64, val: i64) -> i6
     }
     let id = decode_field_smi(field_id_smi);
     unsafe {
+        let shape = obj_shape(obj);
+        if let Some(entry) = field_cache().read().get(&id).copied() {
+            if entry.shape == shape {
+                obj_set_slot_known(obj, entry.slot, val);
+                return 0;
+            }
+        }
+
         v::obj_set_field(obj, id, val);
+        let new_shape = obj_shape(obj);
+        if let Some(slot) = shape_slot(new_shape, id) {
+            field_cache()
+                .write()
+                .insert(id, FieldCacheEntry { shape: new_shape, slot });
+        }
     }
     0
 }
@@ -121,7 +155,24 @@ pub extern "C" fn wir_obj_has_field(obj: i64, field_id_smi: i64) -> i64 {
         return bool_to_value(false);
     }
     let id = decode_field_smi(field_id_smi);
-    unsafe { v::obj_has_field(obj, id) }
+    unsafe {
+        let shape = obj_shape(obj);
+        if let Some(entry) = field_cache().read().get(&id).copied() {
+            if entry.shape == shape {
+                return bool_to_value(true);
+            }
+        }
+
+        let res = v::obj_has_field(obj, id);
+        if value_to_bool(res).unwrap_or(false) {
+            if let Some(slot) = shape_slot(obj_shape(obj), id) {
+                field_cache()
+                    .write()
+                    .insert(id, FieldCacheEntry { shape: obj_shape(obj), slot });
+            }
+        }
+        res
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -130,7 +181,13 @@ pub extern "C" fn wir_obj_del_field(obj: i64, field_id_smi: i64) -> i64 {
         return bool_to_value(false);
     }
     let id = decode_field_smi(field_id_smi);
-    unsafe { v::obj_del_field(obj, id) }
+    unsafe {
+        let res = v::obj_del_field(obj, id);
+        if value_to_bool(res).unwrap_or(false) {
+            field_cache().write().remove(&id);
+        }
+        res
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -428,28 +485,6 @@ pub extern "C" fn wir_memo_put4(fid: i64, k0: i64, k1: i64, k2: i64, k3: i64, va
     0
 }
 
-#[inline(always)]
-unsafe fn as_wirobj_const(obj: i64) -> Option<*const WirObj> {
-    if obj == 0 || (obj & 1) == 1 {
-        return None;
-    } // null or SMI
-    let base = obj as *const u8;
-
-    // Read a possible header tag without creating a typed reference.
-    let tag = core::ptr::read_unaligned(base as *const u32);
-    if tag == TAG_OBJECT {
-        // BoxedObj { ObjHeader, by_id, by_str } → skip header
-        Some(base.add(core::mem::size_of::<ObjHeader>()) as *const WirObj)
-    } else {
-        // Header-less WirObj starts at base
-        Some(base as *const WirObj)
-    }
-}
-#[inline(always)]
-unsafe fn as_wirobj_mut(obj: i64) -> Option<*mut WirObj> {
-    as_wirobj_const(obj).map(|p| p as *mut WirObj)
-}
-
 // -----------------------------------------------------------------------------
 // Pretty printer (safe for cycles; bounded depth/width)
 // -----------------------------------------------------------------------------
@@ -534,7 +569,7 @@ fn pp(v: i64, depth: usize, max_depth: usize, max_elems: usize, seen: &mut HashS
                         let mut first = true;
 
                         // Print string-keyed props first (sorted for stability)
-                        let mut skeys: Vec<&String> = o.by_str.keys().collect();
+                        let mut skeys: Vec<&String> = o.dict.keys().collect();
                         skeys.sort_unstable();
                         let is_class_instance = skeys
                             .iter()
@@ -547,7 +582,7 @@ fn pp(v: i64, depth: usize, max_depth: usize, max_elems: usize, seen: &mut HashS
                             if key_str.starts_with("__get__") || key_str.starts_with("__set__") {
                                 continue;
                             }
-                            let val = o.by_str.get(k).copied().unwrap_or(NULL);
+                            let val = o.dict.get(k).copied().unwrap_or(NULL);
                             if is_class_instance && is_closure_value(val) {
                                 continue;
                             }
@@ -565,10 +600,9 @@ fn pp(v: i64, depth: usize, max_depth: usize, max_elems: usize, seen: &mut HashS
                         }
 
                         // Then FieldId (u32) props (also sorted)
-                        if wrote < max_elems && !is_class_instance {
-                            let mut fids: Vec<u32> = o.by_id.keys().copied().collect();
-                            fids.sort_unstable();
-                            for id in fids {
+                        if wrote < max_elems && !is_class_instance && o.dict.is_empty() {
+                            let fields = crate::value::shape_fields(o.shape);
+                            for (idx, fid) in fields.into_iter().enumerate() {
                                 if wrote >= max_elems {
                                     break;
                                 }
@@ -577,10 +611,10 @@ fn pp(v: i64, depth: usize, max_depth: usize, max_elems: usize, seen: &mut HashS
                                 } else {
                                     first = false;
                                 }
-                                let val = o.by_id.get(&id).copied().unwrap_or(NULL);
+                                let val = o.slots.get(idx).copied().unwrap_or(NULL);
                                 s.push_str(&format!(
                                     "f{}: {}",
-                                    id,
+                                    fid,
                                     pp(val, depth + 1, max_depth, max_elems, seen)
                                 ));
                                 wrote += 1;

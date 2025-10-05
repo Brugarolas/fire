@@ -1,7 +1,6 @@
 Hi! I am making a new scripting programming language named Napalm. I have like 20% of the language features already implemented and the most important: a very complex engine already set up, but there are still a lot of features still to implement as well as a few bugs and incorrect stuff.
 
 Features I still have not implemented:
-- Add boolean value, Boolean class (for example: new Boolean(a && b || c) -or without 'new'-), and internal BoxedBool (a lá JS)
 - Add .values(), .keys(), .entries() for objects, class instances, Maps, and Sets (except .keys() and .entries() on Sets), and add .size property to objects/class instances
 - Try/Catch/Finally (a là JavaScript)
 - Defer/Errdefer (a là Zig)
@@ -40,8 +39,6 @@ Optimizations:
 - Explore "merged runtime methods" aka "Super-Trampolines": can they make the code faster? (it's likely, less trampoline calls, better code in larger methods)
 
 Fixes to make:
-- Spread operator adding incorrect extra key-values
-- Map and Set returning incorrect values in many tests
 - Built-in memoization -> use-after-free if value is stored in GC
 
 Complex milestones:
