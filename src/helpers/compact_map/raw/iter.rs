@@ -84,3 +84,38 @@ impl<T> Drop for RawIntoIter<T> {
         }
     }
 }
+
+pub(crate) struct RawIterMut<'a, T> {
+    pub(crate) inner: RawIterInner<T>,
+    pub(crate) aligned_groups: &'a AlignedGroups,
+    pub(crate) data: &'a mut [MaybeUninit<T>; INLINE_CAPACITY],
+}
+
+impl<'a, T> Iterator for RawIterMut<'a, T> {
+    type Item = &'a mut T;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        unsafe {
+            let base = Bucket::from_base_index(
+                NonNull::new_unchecked(self.data.as_mut_ptr() as *mut _),
+                0,
+            );
+            Some(self.inner.next(self.aligned_groups.as_ptr(), base)?.as_mut())
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<T> ExactSizeIterator for RawIterMut<'_, T> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
+impl<T> FusedIterator for RawIterMut<'_, T> {}

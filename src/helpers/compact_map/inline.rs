@@ -1,5 +1,6 @@
 use crate::helpers::compact_map::INLINE_CAPACITY;
 use crate::helpers::compact_map::AesBuildHasher;
+use crate::helpers::compact_map::raw::iter::RawIterMut;
 
 use core::{
     hash::{BuildHasher, Hash},
@@ -43,12 +44,20 @@ struct RawInline<T> {
 impl<T: Clone> Clone for RawInline<T> {
     #[inline]
     fn clone(&self) -> Self {
-        let mut data = unsafe { MaybeUninit::<[MaybeUninit<T>; INLINE_CAPACITY]>::uninit().assume_init() };
-        for (idx, d) in self.data.iter().take(self.len).enumerate() {
-            unsafe {
-                data[idx] = MaybeUninit::new(d.assume_init_ref().clone());
+        let mut data: [MaybeUninit<T>; INLINE_CAPACITY] =
+            unsafe { MaybeUninit::uninit().assume_init() };
+
+        // Copy only buckets that are really full (not EMPTY/DELETED).
+        for i in 0..INLINE_CAPACITY {
+            let ctrl = unsafe { *self.aligned_groups.ctrl(i) };
+            if ctrl != EMPTY && ctrl != DELETED {
+                unsafe {
+                    let src = self.data.get_unchecked(i).assume_init_ref();
+                    data[i] = MaybeUninit::new(src.clone());
+                }
             }
         }
+
         Self {
             aligned_groups: self.aligned_groups,
             len: self.len,
@@ -453,7 +462,7 @@ impl<K, V> Inline<K, V> {
 
     #[inline]
     pub(crate) fn is_full(&self) -> bool {
-        self.raw.len == 64
+        self.raw.len == INLINE_CAPACITY
     }
 
     #[inline]
@@ -566,6 +575,46 @@ where
         } else {
             let hash = make_hash::<Q>(self.hash_builder(), k);
             self.raw.get_mut(hash, equivalent_key(k))
+        }
+    }
+}
+
+pub struct IterMut<'a, K, V> {
+    inner: RawIterMut<'a, (K, V)>,
+}
+
+impl<'a, K, V> Iterator for IterMut<'a, K, V> {
+    type Item = (&'a K, &'a mut V);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let kv: &mut (K, V) = self.inner.next()?;
+        let k: &K = unsafe { &*(&kv.0 as *const K) };
+        let v: &mut V = unsafe { &mut *(&mut kv.1 as *mut V) };
+        Some((k, v))
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<'a, K, V> ExactSizeIterator for IterMut<'a, K, V> {
+    #[inline]
+    fn len(&self) -> usize { self.inner.len() }
+}
+impl<'a, K, V> FusedIterator for IterMut<'a, K, V> {}
+
+impl<K, V> Inline<K, V> {
+    #[inline]
+    pub(crate) fn iter_mut(&mut self) -> IterMut<'_, K, V> {
+        IterMut {
+            inner: RawIterMut {
+                inner: unsafe { self.raw.raw_iter_inner() },
+                aligned_groups: &self.raw.aligned_groups,
+                data: &mut self.raw.data,
+            },
         }
     }
 }

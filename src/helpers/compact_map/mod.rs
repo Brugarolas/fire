@@ -157,7 +157,9 @@ where
                 if raw::util::likely(!inner.is_full()) {
                     return inner.insert(key, value);
                 }
-                let heap = HashMap::with_capacity_and_hasher(INLINE_CAPACITY * 2, AesBuildHasher::default());
+
+                let hb = unsafe { inner.take_hasher() };
+                let heap = HashMap::with_capacity_and_hasher(INLINE_CAPACITY * 2, hb);
 
                 let heap = match core::mem::replace(self, CompactMap::Heap(heap)) {
                     CompactMap::Heap(_) => unsafe { unreachable_unchecked() },
@@ -349,6 +351,67 @@ impl<K, V> CompactMap<K, V> {
         match self {
             CompactMap::Heap(inner) => Iter::Heap(inner.iter()),
             CompactMap::Inline(inner) => Iter::Inline(inner.iter()),
+        }
+    }
+}
+
+pub enum IterMut<'a, K, V> {
+    Heap(hashbrown::hash_map::IterMut<'a, K, V>),
+    Inline(inline::IterMut<'a, K, V>),
+}
+
+impl<'a, K, V> Iterator for IterMut<'a, K, V> {
+    type Item = (&'a K, &'a mut V);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            IterMut::Heap(i) => i.next(),
+            IterMut::Inline(i) => i.next(),
+        }
+    }
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            IterMut::Heap(i) => i.size_hint(),
+            IterMut::Inline(i) => i.size_hint(),
+        }
+    }
+}
+impl<'a, K, V> ExactSizeIterator for IterMut<'a, K, V> {
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            IterMut::Heap(i) => i.len(),
+            IterMut::Inline(i) => i.len(),
+        }
+    }
+}
+impl<'a, K, V> FusedIterator for IterMut<'a, K, V> {}
+
+
+impl<K, V> CompactMap<K, V> {
+    #[inline]
+    pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
+        match self {
+            CompactMap::Heap(inner) => IterMut::Heap(inner.iter_mut()),
+            CompactMap::Inline(inner) => IterMut::Inline(inner.iter_mut()),
+        }
+    }
+}
+
+impl<K, V> CompactMap<K, V>
+where
+    K: Eq + Hash,
+{
+    #[inline]
+    pub fn contains_key<Q: ?Sized>(&self, k: &Q) -> bool
+    where
+        Q: Hash + Equivalent<K>,
+    {
+        match self {
+            CompactMap::Heap(inner) => inner.contains_key(k),
+            CompactMap::Inline(inner) => inner.get(k).is_some(),
         }
     }
 }
