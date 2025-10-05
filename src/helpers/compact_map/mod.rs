@@ -55,7 +55,7 @@ impl<K, V: Default> Default for CompactMap<K, V> {
 impl<K, V: Default> CompactMap<K, V> {
     /// Creates an empty `CompactMap`.
     #[inline]
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 

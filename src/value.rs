@@ -6,10 +6,13 @@
 
 use crate::gc::NAPALM_GC;
 use crate::helpers::collections::{HashMap, HashSet};
+use crate::helpers::compact_map::CompactMap;
 use core::mem;
 use std::ptr;
 use std::str;
 use std::slice;
+use std::hash::{Hash, Hasher};
+use std::borrow::Borrow;
 
 //use crate::gc::api::{alloc_raw, alloc_slow_path, post_alloc_object};
 //use crate::gc::post_write_barrier;
@@ -52,6 +55,102 @@ pub fn is_bool(v: i64) -> bool {
 #[inline(always)]
 pub fn to_bool(v: i64) -> bool {
     v != 0
+}
+
+// ============================================================================
+// Complex Value representation
+// ============================================================================
+
+#[derive(Debug, Clone, Copy)]
+#[repr(transparent)]
+pub struct Value(pub ValueRepr);
+
+// --- Custom Hash & Eq for Value ---
+
+impl Hash for Value {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let v = self.0;
+        if is_imm(v) { // It's an SMI
+            v.hash(state); // Hash the raw integer value.
+            return;
+        }
+
+        if !is_ptr(v) || v == NULL { // Booleans (0,1) or Null
+            v.hash(state);
+            return;
+        }
+
+        unsafe {
+            let hdr = &*(v as *const ObjHeader);
+            match hdr.tag {
+                TAG_STRING => {
+                    let s = &*(v as *const BoxedStr);
+                    let bytes = std::slice::from_raw_parts(s.data, s.len);
+                    bytes.hash(state);
+                }
+                _ => {
+                    // For all other object types (Arrays, Maps, custom Objects),
+                    // identity is based on the pointer address.
+                    (v as usize).hash(state);
+                }
+            }
+        }
+    }
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        let v1 = self.0;
+        let v2 = other.0;
+
+        if is_imm(v1) || is_imm(v2) {
+            return v1 == v2; // Simple integer comparison for SMIs.
+        }
+
+        if v1 == v2 {
+            return true; // Pointers are identical or both are null/booleans.
+        }
+
+        // If we reach here, v1 != v2 and at least one is a pointer.
+        // If one isn't a valid pointer, they can't be equal.
+        if !is_ptr(v1) || v1 == NULL || !is_ptr(v2) || v2 == NULL {
+            return false;
+        }
+
+        unsafe {
+            let h1 = &*(v1 as *const ObjHeader);
+            let h2 = &*(v2 as *const ObjHeader);
+
+            if h1.tag != h2.tag {
+                return false; // Different object types cannot be equal.
+            }
+
+            // We must compare string content.
+            if h1.tag == TAG_STRING {
+                let s1 = &*(v1 as *const BoxedStr);
+                let s2 = &*(v2 as *const BoxedStr);
+
+                if s1.len != s2.len { return false; }
+
+                let bytes1 = std::slice::from_raw_parts(s1.data, s1.len);
+                let bytes2 = std::slice::from_raw_parts(s2.data, s2.len);
+                return bytes1 == bytes2;
+            }
+
+            // For all other object types, since their pointers were not equal,
+            // the objects are not considered equal.
+            false
+        }
+    }
+}
+
+impl Eq for Value {}
+
+impl Borrow<Value> for i64 {
+    #[inline(always)]
+    fn borrow(&self) -> &Value {
+        unsafe { &*(self as *const i64 as *const Value) }
+    }
 }
 
 // ============================================================================
@@ -1413,13 +1512,13 @@ pub unsafe fn obj_clone_shallow(src_v: ValueRepr) -> ValueRepr {
 #[repr(C)]
 pub struct BoxedMap {
     pub hdr: ObjHeader,
-    pub map: HashMap<ValueRepr, ValueRepr>,
+    pub map: HashMap<Value, Value>,
 }
 
 #[repr(C)]
 pub struct BoxedSet {
     pub hdr: ObjHeader,
-    pub set: HashSet<ValueRepr>,
+    pub set: HashSet<Value>,
 }
 
 #[inline(always)]
