@@ -27,7 +27,6 @@ Optimizations:
 - Same for the lowerer
 - Same for the optimizer and optimizations (probably big wins here)
 - Explore String interning
-- Explore creating Shapes/Hidden Classes and inline caches for keys of objects/classes
 - Explore blending classes/inheritance/objects/interfaces in a single HashMap for not having to loop the proto to find properties
 - Create our own HashMap and HashSet using my AES hasher and hashbrown structures, and using them everywhere
 - Add Escape Analysis: and store those variables in the stack not in the GC

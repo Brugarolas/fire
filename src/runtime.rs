@@ -64,9 +64,75 @@ struct FieldCacheEntry {
     slot: usize,
 }
 
-fn field_cache() -> &'static RwLock<HashMap<u32, FieldCacheEntry>> {
-    static CACHE: OnceLock<RwLock<HashMap<u32, FieldCacheEntry>>> = OnceLock::new();
+#[derive(Default)]
+struct FieldCacheList {
+    entries: Vec<FieldCacheEntry>,
+}
+
+impl FieldCacheList {
+    fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    fn lookup(&self, shape: u32) -> Option<usize> {
+        self.entries
+            .iter()
+            .find(|entry| entry.shape == shape)
+            .map(|entry| entry.slot)
+    }
+
+    fn record(&mut self, shape: u32, slot: usize) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.shape == shape)
+        {
+            entry.slot = slot;
+            return;
+        }
+
+        const MAX_CACHE_ENTRIES: usize = 4;
+        if self.entries.len() >= MAX_CACHE_ENTRIES {
+            self.entries.remove(0);
+        }
+        self.entries.push(FieldCacheEntry { shape, slot });
+    }
+
+    fn invalidate(&mut self, shape: u32) {
+        self.entries.retain(|entry| entry.shape != shape);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+fn field_cache() -> &'static RwLock<HashMap<u32, FieldCacheList>> {
+    static CACHE: OnceLock<RwLock<HashMap<u32, FieldCacheList>>> = OnceLock::new();
     CACHE.get_or_init(|| RwLock::new(HashMap::default()))
+}
+
+fn cache_lookup(fid: u32, shape: u32) -> Option<usize> {
+    let guard = field_cache().read();
+    guard.get(&fid).and_then(|list| list.lookup(shape))
+}
+
+fn cache_record(fid: u32, shape: u32, slot: usize) {
+    let mut guard = field_cache().write();
+    guard
+        .entry(fid)
+        .or_insert_with(FieldCacheList::new)
+        .record(shape, slot);
+}
+
+fn cache_invalidate(fid: u32, shape: u32) {
+    let mut guard = field_cache().write();
+    if let Some(list) = guard.get_mut(&fid) {
+        list.invalidate(shape);
+        if list.is_empty() {
+            guard.remove(&fid);
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -107,17 +173,13 @@ pub extern "C" fn wir_obj_get_field(obj: i64, field_id_smi: i64) -> i64 {
     let id = decode_field_smi(field_id_smi);
     unsafe {
         let shape = obj_shape(obj);
-        if let Some(entry) = field_cache().read().get(&id).copied() {
-            if entry.shape == shape {
-                return obj_get_slot(obj, entry.slot);
-            }
+        if let Some(slot) = cache_lookup(id, shape) {
+            return obj_get_slot(obj, slot);
         }
 
         let val = v::obj_get_field(obj, id);
-        if let Some(slot) = shape_slot(obj_shape(obj), id) {
-            field_cache()
-                .write()
-                .insert(id, FieldCacheEntry { shape: obj_shape(obj), slot });
+        if let Some(slot) = shape_slot(shape, id) {
+            cache_record(id, shape, slot);
         }
         val
     }
@@ -130,20 +192,16 @@ pub extern "C" fn wir_obj_set_field(obj: i64, field_id_smi: i64, val: i64) -> i6
     }
     let id = decode_field_smi(field_id_smi);
     unsafe {
-        let shape = obj_shape(obj);
-        if let Some(entry) = field_cache().read().get(&id).copied() {
-            if entry.shape == shape {
-                obj_set_slot_known(obj, entry.slot, val);
-                return 0;
-            }
+        let shape_before = obj_shape(obj);
+        if let Some(slot) = cache_lookup(id, shape_before) {
+            obj_set_slot_known(obj, slot, val);
+            return 0;
         }
 
         v::obj_set_field(obj, id, val);
-        let new_shape = obj_shape(obj);
-        if let Some(slot) = shape_slot(new_shape, id) {
-            field_cache()
-                .write()
-                .insert(id, FieldCacheEntry { shape: new_shape, slot });
+        let shape_after = obj_shape(obj);
+        if let Some(slot) = shape_slot(shape_after, id) {
+            cache_record(id, shape_after, slot);
         }
     }
     0
@@ -157,18 +215,14 @@ pub extern "C" fn wir_obj_has_field(obj: i64, field_id_smi: i64) -> i64 {
     let id = decode_field_smi(field_id_smi);
     unsafe {
         let shape = obj_shape(obj);
-        if let Some(entry) = field_cache().read().get(&id).copied() {
-            if entry.shape == shape {
-                return bool_to_value(true);
-            }
+        if cache_lookup(id, shape).is_some() {
+            return bool_to_value(true);
         }
 
         let res = v::obj_has_field(obj, id);
         if value_to_bool(res).unwrap_or(false) {
-            if let Some(slot) = shape_slot(obj_shape(obj), id) {
-                field_cache()
-                    .write()
-                    .insert(id, FieldCacheEntry { shape: obj_shape(obj), slot });
+            if let Some(slot) = shape_slot(shape, id) {
+                cache_record(id, shape, slot);
             }
         }
         res
@@ -182,9 +236,10 @@ pub extern "C" fn wir_obj_del_field(obj: i64, field_id_smi: i64) -> i64 {
     }
     let id = decode_field_smi(field_id_smi);
     unsafe {
+        let shape_before = obj_shape(obj);
         let res = v::obj_del_field(obj, id);
         if value_to_bool(res).unwrap_or(false) {
-            field_cache().write().remove(&id);
+            cache_invalidate(id, shape_before);
         }
         res
     }
