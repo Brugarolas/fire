@@ -3,7 +3,8 @@
 #![allow(unused_variables)]
 #![allow(unused_unsafe)]
 #![allow(unsafe_op_in_unsafe_fn)]
-use ahash::AHashMap as HashMap;
+use crate::helpers::collections::HashMap;
+use axum::routing::get;
 use axum::{
     Router,
     body::{Body, Bytes},
@@ -19,14 +20,13 @@ use rclite::Arc;
 use reqwest;
 use serde_json;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 use tokio::net::TcpListener;
 use tokio::{
     runtime::Runtime,
     sync::{mpsc, oneshot},
 };
-use axum::routing::get;
 use tokio_stream::wrappers::ReceiverStream;
-use std::thread;
 
 use crate::event_loop::EVENT_LOOP;
 use crate::gc::NAPALM_GC;
@@ -485,11 +485,13 @@ pub extern "C" fn wir_server_add_route(
     // The rest of the function is correct: it finds the server entry
     // and adds the newly parsed route to its list.
     let mut g = SERVERS.lock();
-    let entry = g.get_mut(&(server_id as u64)).expect("server not found during add_route");
+    let entry = g
+        .get_mut(&(server_id as u64))
+        .expect("server not found during add_route");
 
     // `Arc::get_mut` is correct for ensuring we have exclusive access to modify the routes.
-    let server_entry = Arc::get_mut(entry)
-        .expect("Cannot modify server routes while it is actively being used");
+    let server_entry =
+        Arc::get_mut(entry).expect("Cannot modify server routes while it is actively being used");
 
     server_entry.routes.push(Route {
         method,
@@ -580,7 +582,6 @@ pub extern "C" fn wir_server_listen(server_id: i64) -> i64 {
 }
 
 /// ---------- Route matching & VM dispatch (runs on VM thread) ----------
-
 use std::fmt::Debug;
 
 impl Debug for Token {
@@ -604,12 +605,18 @@ fn match_route<'a>(
 
     // LOG: Show how the path was segmented.
     #[cfg(debug_assertions)]
-    eprintln!("[http::match_route] Request Segments: {:?}", request_segments);
+    eprintln!(
+        "[http::match_route] Request Segments: {:?}",
+        request_segments
+    );
 
     'route_loop: for (i, route) in routes.iter().enumerate() {
         // LOG: Print details for every route we are about to check.
         #[cfg(debug_assertions)]
-        eprintln!("[http::match_route] Checking Route #{}: method='{}', tokens={:?}", i, route.method, route.tokens);
+        eprintln!(
+            "[http::match_route] Checking Route #{}: method='{}', tokens={:?}",
+            i, route.method, route.tokens
+        );
 
         // 1. Check HTTP method.
         if !route.method.eq_ignore_ascii_case(method) && route.method != "*" {
@@ -638,7 +645,11 @@ fn match_route<'a>(
         // 3. For all other routes, the number of segments must match exactly.
         if route.tokens.len() != request_segments.len() {
             #[cfg(debug_assertions)]
-            eprintln!("[http::match_route] -> SKIP (segment count mismatch: route={}, req={})", route.tokens.len(), request_segments.len());
+            eprintln!(
+                "[http::match_route] -> SKIP (segment count mismatch: route={}, req={})",
+                route.tokens.len(),
+                request_segments.len()
+            );
             continue;
         }
 
@@ -656,7 +667,10 @@ fn match_route<'a>(
                 Token::Lit(s) => {
                     if s != segment {
                         #[cfg(debug_assertions)]
-                        eprintln!("[http::match_route] -> SKIP (literal mismatch: expected '{}', got '{}')", s, segment);
+                        eprintln!(
+                            "[http::match_route] -> SKIP (literal mismatch: expected '{}', got '{}')",
+                            s, segment
+                        );
                         continue 'route_loop; // Failed match, try next route
                     }
                 }
@@ -686,18 +700,31 @@ pub extern "C" fn vm_dispatch(argv: *const i64, _argc: usize) -> i64 {
         let mut req: Box<ReqMsg> = Box::from_raw(arg as *mut ReqMsg);
 
         #[cfg(debug_assertions)]
-        eprintln!("[http::vm_dispatch] Dispatching request id={} for server id={}: {} {}", req.req_id, req.server_id, req.method, req.path);
+        eprintln!(
+            "[http::vm_dispatch] Dispatching request id={} for server id={}: {} {}",
+            req.req_id, req.server_id, req.method, req.path
+        );
 
         // Step 1: Route matching.
         // Use the owned Strings directly from the `req` message BEFORE they are moved.
-        let entry = SERVERS.lock().get(&req.server_id).cloned().expect("server entry not found");
+        let entry = SERVERS
+            .lock()
+            .get(&req.server_id)
+            .cloned()
+            .expect("server entry not found");
         let maybe_match = match_route(&entry.routes, &req.method, &req.path);
 
         // Step 2: If no route matches, send a 404 immediately.
         let (route, filled_params) = if let Some(m) = maybe_match {
             m
         } else {
-            send_response(req.server_id, req.req_id, 404, b"Not Found".to_vec(), vec![]);
+            send_response(
+                req.server_id,
+                req.req_id,
+                404,
+                b"Not Found".to_vec(),
+                vec![],
+            );
             return 0; // Stop processing
         };
 
@@ -733,8 +760,16 @@ pub extern "C" fn vm_dispatch(argv: *const i64, _argc: usize) -> i64 {
         wir_obj_set_str(req_obj, static_str_value("params"), params);
 
         // Expose server/req IDs for streaming helpers.
-        wir_obj_set_str(req_obj, static_str_value("serverId"), make_smi(req.server_id as i64));
-        wir_obj_set_str(req_obj, static_str_value("reqId"), make_smi(req.req_id as i64));
+        wir_obj_set_str(
+            req_obj,
+            static_str_value("serverId"),
+            make_smi(req.server_id as i64),
+        );
+        wir_obj_set_str(
+            req_obj,
+            static_str_value("reqId"),
+            make_smi(req.req_id as i64),
+        );
 
         // Step 4: Call the user's Napalm handler.
         unsafe extern "C" {

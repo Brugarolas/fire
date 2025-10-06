@@ -268,7 +268,11 @@ impl<'m> Lowerer<'m> {
         let mut extra_names: Vec<String> = Vec::new();
         for c in &prog.classes {
             let fid_raw = c.name.clone();
-            let ci = self.lowering_ctx.classes.get(&fid_raw).expect("class collected");
+            let ci = self
+                .lowering_ctx
+                .classes
+                .get(&fid_raw)
+                .expect("class collected");
 
             // Accessors
             for (pname, get, set) in &ci.props {
@@ -501,25 +505,39 @@ fn lower_stmt_free<'m>(
                 eprintln!("lower_stmt_free() Stmt::Var {{ {} }}", name);
                 eprintln!(
                     "[links] exports        : {:?}",
-                    lowering_ctx.links.export_bindings.keys().collect::<Vec<_>>()
+                    lowering_ctx
+                        .links
+                        .export_bindings
+                        .keys()
+                        .collect::<Vec<_>>()
                 );
                 eprintln!(
                     "[links] imports        : {:?}",
-                    lowering_ctx.links.import_bindings.keys().collect::<Vec<_>>()
+                    lowering_ctx
+                        .links
+                        .import_bindings
+                        .keys()
+                        .collect::<Vec<_>>()
                 );
                 eprintln!(
                     "[links] namespace_imps : {:?}",
-                    lowering_ctx.links.namespace_imports.keys().collect::<Vec<_>>()
+                    lowering_ctx
+                        .links
+                        .namespace_imports
+                        .keys()
+                        .collect::<Vec<_>>()
                 );
-                eprintln!("[links] namespace_cells: {:?}", lowering_ctx.links.namespace_cells);
+                eprintln!(
+                    "[links] namespace_cells: {:?}",
+                    lowering_ctx.links.namespace_cells
+                );
             }
             if let Some(&bid) = lowering_ctx.links.export_bindings.get(name) {
                 b.store_binding(bid, val);
             }
         }
         Stmt::VarDestruct { pattern, init } => {
-            let obj_val =
-                lower_expr_free(b, locals, fields, next_field, init, lowering_ctx)?;
+            let obj_val = lower_expr_free(b, locals, fields, next_field, init, lowering_ctx)?;
 
             for field in &pattern.fields {
                 let prop_name = match &field.key {
@@ -634,7 +652,7 @@ fn lower_stmt_free<'m>(
                 fields,
                 next_field,
                 then_b,
-                lowering_ctx
+                lowering_ctx,
             )?; // <-- pass
             if !b.current_block_terminated() {
                 b.jump(then_end, &[]);
@@ -644,14 +662,7 @@ fn lower_stmt_free<'m>(
             b.position_at(else_id);
             let mut locals_else = incoming.clone();
             if let Some(eb) = else_b {
-                lower_block_free(
-                    b,
-                    &mut locals_else,
-                    fields,
-                    next_field,
-                    eb,
-                    lowering_ctx
-                )?; // <-- pass
+                lower_block_free(b, &mut locals_else, fields, next_field, eb, lowering_ctx)?; // <-- pass
             }
             if !b.current_block_terminated() {
                 b.jump(else_end, &[]);
@@ -827,22 +838,10 @@ fn lower_stmt_free<'m>(
 
             // add routes
             for rt in &ld.routes {
-                let pat_v = lower_expr_free(
-                    b,
-                    locals,
-                    fields,
-                    next_field,
-                    &rt.pattern,
-                    lowering_ctx
-                )?;
-                let hnd_v = lower_expr_free(
-                    b,
-                    locals,
-                    fields,
-                    next_field,
-                    &rt.handler,
-                    lowering_ctx
-                )?;
+                let pat_v =
+                    lower_expr_free(b, locals, fields, next_field, &rt.pattern, lowering_ctx)?;
+                let hnd_v =
+                    lower_expr_free(b, locals, fields, next_field, &rt.handler, lowering_ctx)?;
                 let (_mid, mr) = b.push_node(
                     Inst::Const(Constant::Str(rt.method.clone())),
                     Some(Type::Str),
@@ -901,6 +900,56 @@ fn lower_general_getprop<'m>(
         1,
         false,
     );
+
+    let field = intern_field_local(fields, next_field, &name_string);
+    let fid_smi = b.const_i32(field.0 as i32);
+
+    let _ = b.push_node(
+        Inst::CallNative {
+            name: "wir_field_register_name".into(),
+            args: vec![fid_smi, ks[0]],
+            pure: false,
+            can_throw: false,
+        },
+        Some(Type::Int32),
+        1,
+        true,
+    );
+
+    let (_nid_is_proxy, is_proxy) = b.push_node(
+        Inst::CallNative {
+            name: "wir_is_proxy".into(),
+            args: vec![obj],
+            pure: true,
+            can_throw: false,
+        },
+        Some(Type::Bool),
+        1,
+        false,
+    );
+
+    let proxy_block = b.block();
+    let normal_block = b.block();
+    let cont = b.block();
+    let out_val = b.add_block_param(cont, Type::Int32);
+
+    b.branch(is_proxy[0], proxy_block, normal_block);
+
+    b.position_at(proxy_block);
+    let (_nid_proxy_get, proxy_res) = b.push_node(
+        Inst::CallNative {
+            name: "wir_obj_get_str".into(),
+            args: vec![obj, ks[0]],
+            pure: false,
+            can_throw: false,
+        },
+        None,
+        1,
+        true,
+    );
+    b.jump(cont, &[proxy_res[0]]);
+
+    b.position_at(normal_block);
     let (_nid_hs, has_str) = b.push_node(
         Inst::CallNative {
             name: "wir_obj_has_str".into(),
@@ -915,10 +964,6 @@ fn lower_general_getprop<'m>(
 
     let str_hit = b.block();
     let try_fast = b.block();
-    let cont = b.block();
-    let out_ptr = cont;
-    let out_val = b.add_block_param(cont, Type::Int32);
-
     b.branch(has_str[0], str_hit, try_fast);
 
     b.position_at(str_hit);
@@ -936,8 +981,6 @@ fn lower_general_getprop<'m>(
     b.jump(cont, &[sv[0]]);
 
     b.position_at(try_fast);
-    let field = intern_field_local(fields, next_field, &name_string);
-    let fid_smi = b.const_i32(field.0 as i32);
     let (_nid_hf, hasf) = b.push_node(
         Inst::CallNative {
             name: "wir_obj_has_field".into(),
@@ -1175,9 +1218,7 @@ fn lower_block_free_async<'m>(
     in_async: bool,
 ) -> LResult<()> {
     for s in &blk.stmts {
-        lower_stmt_free_async(
-            b, locals, fields, next_field, s, lowering_ctx, in_async,
-        )?;
+        lower_stmt_free_async(b, locals, fields, next_field, s, lowering_ctx, in_async)?;
     }
     Ok(())
 }
@@ -1195,9 +1236,7 @@ fn lower_stmt_free_async<'m>(
         Stmt::Return(eopt) if in_async => {
             let d = *locals.get("__deferred").expect("__deferred present");
             let v = if let Some(e) = eopt {
-                lower_expr_free_async(
-                    b, locals, fields, next_field, e, lowering_ctx, in_async,
-                )?
+                lower_expr_free_async(b, locals, fields, next_field, e, lowering_ctx, in_async)?
             } else {
                 b.const_i32(0)
             };
@@ -1299,7 +1338,13 @@ fn lower_stmt_free_async<'m>(
                 Stmt::Var { name, init } => {
                     let val = if let Some(e) = init {
                         lower_expr_free_async(
-                            b, locals, fields, next_field, e, lowering_ctx, in_async,
+                            b,
+                            locals,
+                            fields,
+                            next_field,
+                            e,
+                            lowering_ctx,
+                            in_async,
                         )?
                     } else {
                         b.const_i32(0)
@@ -1312,7 +1357,13 @@ fn lower_stmt_free_async<'m>(
                 }
                 Stmt::VarDestruct { pattern, init } => {
                     let obj_val = lower_expr_free_async(
-                        b, locals, fields, next_field, init, lowering_ctx, in_async,
+                        b,
+                        locals,
+                        fields,
+                        next_field,
+                        init,
+                        lowering_ctx,
+                        in_async,
                     )?;
 
                     for field in &pattern.fields {
@@ -1412,7 +1463,13 @@ fn lower_stmt_free_async<'m>(
                     else_b,
                 } => {
                     let c = lower_expr_free_async(
-                        b, locals, fields, next_field, cond, lowering_ctx, in_async,
+                        b,
+                        locals,
+                        fields,
+                        next_field,
+                        cond,
+                        lowering_ctx,
+                        in_async,
                     )?;
                     // (rest identical to your If lowering, but using lower_block_free_async)
                     // ...
@@ -1522,13 +1579,25 @@ fn lower_stmt_free_async<'m>(
                         locals.insert(nm.clone(), *p);
                     }
                     let c = lower_expr_free_async(
-                        b, locals, fields, next_field, cond, lowering_ctx, in_async,
+                        b,
+                        locals,
+                        fields,
+                        next_field,
+                        cond,
+                        lowering_ctx,
+                        in_async,
                     )?;
                     b.branch(c, body_b, exit);
 
                     b.position_at(body_b);
                     lower_block_free_async(
-                        b, locals, fields, next_field, body, lowering_ctx, in_async,
+                        b,
+                        locals,
+                        fields,
+                        next_field,
+                        body,
+                        lowering_ctx,
+                        in_async,
                     )?;
                     let back_args: Vec<ValueId> =
                         mut_names.iter().map(|n| *locals.get(n).unwrap()).collect();
@@ -1548,7 +1617,13 @@ fn lower_stmt_free_async<'m>(
                 } => {
                     if let Some(i) = init {
                         lower_stmt_free_async(
-                            b, locals, fields, next_field, i, lowering_ctx, in_async,
+                            b,
+                            locals,
+                            fields,
+                            next_field,
+                            i,
+                            lowering_ctx,
+                            in_async,
                         )?;
                     }
 
@@ -1583,7 +1658,13 @@ fn lower_stmt_free_async<'m>(
                     }
                     let c = if let Some(e) = cond {
                         lower_expr_free_async(
-                            b, locals, fields, next_field, e, lowering_ctx, in_async,
+                            b,
+                            locals,
+                            fields,
+                            next_field,
+                            e,
+                            lowering_ctx,
+                            in_async,
                         )?
                     } else {
                         let (_nid, res) = b.push_node(
@@ -1598,11 +1679,23 @@ fn lower_stmt_free_async<'m>(
 
                     b.position_at(body_b);
                     lower_block_free_async(
-                        b, locals, fields, next_field, body, lowering_ctx, in_async,
+                        b,
+                        locals,
+                        fields,
+                        next_field,
+                        body,
+                        lowering_ctx,
+                        in_async,
                     )?;
                     if let Some(se) = step {
                         let _ = lower_expr_free_async(
-                            b, locals, fields, next_field, se, lowering_ctx, in_async,
+                            b,
+                            locals,
+                            fields,
+                            next_field,
+                            se,
+                            lowering_ctx,
+                            in_async,
                         )?;
                     }
                     let back_args: Vec<ValueId> =
@@ -1617,7 +1710,13 @@ fn lower_stmt_free_async<'m>(
                 }
                 Stmt::Expr(e) => {
                     let _ = lower_expr_free_async(
-                        b, locals, fields, next_field, e, lowering_ctx, in_async,
+                        b,
+                        locals,
+                        fields,
+                        next_field,
+                        e,
+                        lowering_ctx,
+                        in_async,
                     )?;
                     Ok(())
                 }
@@ -1658,14 +1757,7 @@ fn lower_array_method_call<'m>(
 ) -> LResult<Option<ValueId>> {
     use crate::wir::{Inst, Type};
 
-    let arr = lower_expr_free(
-        b,
-        locals,
-        _fields,
-        _next_field,
-        recv,
-        lowering_ctx,
-    )?;
+    let arr = lower_expr_free(b, locals, _fields, _next_field, recv, lowering_ctx)?;
 
     // Small helper to call a simple native
     macro_rules! cn {
@@ -1699,28 +1791,14 @@ fn lower_array_method_call<'m>(
             if args.len() != 1 {
                 return Err(LowerError::NotLowerable("setLength expects 1 arg"));
             }
-            let n = lower_expr_free(
-                b,
-                locals,
-                _fields,
-                _next_field,
-                &args[0],
-                lowering_ctx
-            )?;
+            let n = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
             return cn!("wir_array_set_len", [arr, n], Some(Type::Int32));
         }
         "push" => {
             if args.len() != 1 {
                 return Err(LowerError::NotLowerable("push expects 1 arg"));
             }
-            let v = lower_expr_free(
-                b,
-                locals,
-                _fields,
-                _next_field,
-                &args[0],
-                lowering_ctx
-            )?;
+            let v = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
             return cn!("wir_array_push", [arr, v], Some(Type::Int32));
         }
         "pop" => {
@@ -1739,14 +1817,7 @@ fn lower_array_method_call<'m>(
             if args.len() != 1 {
                 return Err(LowerError::NotLowerable("unshift expects 1 arg"));
             }
-            let v = lower_expr_free(
-                b,
-                locals,
-                _fields,
-                _next_field,
-                &args[0],
-                lowering_ctx
-            )?;
+            let v = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
             return cn!("wir_array_unshift", [arr, v], Some(Type::Int32));
         }
 
@@ -1755,14 +1826,7 @@ fn lower_array_method_call<'m>(
             if args.len() != 1 {
                 return Err(LowerError::NotLowerable("map expects 1 arg"));
             }
-            let fun = lower_expr_free(
-                b,
-                locals,
-                _fields,
-                _next_field,
-                &args[0],
-                lowering_ctx
-            )?;
+            let fun = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
 
             // len
             let (_nid, len_res) = b.push_node(
@@ -1865,14 +1929,7 @@ fn lower_array_method_call<'m>(
             if args.len() != 1 {
                 return Err(LowerError::NotLowerable("filter expects 1 arg"));
             }
-            let fun = lower_expr_free(
-                b,
-                locals,
-                _fields,
-                _next_field,
-                &args[0],
-                lowering_ctx
-            )?;
+            let fun = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
 
             let (_nid, len_res) = b.push_node(
                 Inst::CallNative {
@@ -1979,14 +2036,7 @@ fn lower_array_method_call<'m>(
             if args.len() != 1 {
                 return Err(LowerError::NotLowerable("forEach expects 1 arg"));
             }
-            let fun = lower_expr_free(
-                b,
-                locals,
-                _fields,
-                _next_field,
-                &args[0],
-                lowering_ctx
-            )?;
+            let fun = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
 
             let (_nid, len_res) = b.push_node(
                 Inst::CallNative {
@@ -2066,14 +2116,7 @@ fn lower_array_method_call<'m>(
                 ));
             }
 
-            let fun = lower_expr_free(
-                b,
-                locals,
-                _fields,
-                _next_field,
-                &args[0],
-                lowering_ctx
-            )?;
+            let fun = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
 
             let (_nid, len_res) = b.push_node(
                 Inst::CallNative {
@@ -2098,14 +2141,8 @@ fn lower_array_method_call<'m>(
             let seed_acc = b.add_block_param(seed_join, Type::Int32);
 
             if args.len() == 2 {
-                let init = lower_expr_free(
-                    b,
-                    locals,
-                    _fields,
-                    _next_field,
-                    &args[1],
-                    lowering_ctx
-                )?;
+                let init =
+                    lower_expr_free(b, locals, _fields, _next_field, &args[1], lowering_ctx)?;
                 b.jump(seed_join, &[zero, init]);
             } else {
                 let empty_b = b.block();
@@ -2207,14 +2244,7 @@ fn lower_array_method_call<'m>(
             if args.len() != 1 {
                 return Err(LowerError::NotLowerable("find expects 1 arg"));
             }
-            let fun = lower_expr_free(
-                b,
-                locals,
-                _fields,
-                _next_field,
-                &args[0],
-                lowering_ctx
-            )?;
+            let fun = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
 
             let (_nid, len_res) = b.push_node(
                 Inst::CallNative {
@@ -2302,14 +2332,7 @@ fn lower_array_method_call<'m>(
             if args.len() != 1 {
                 return Err(LowerError::NotLowerable("findIndex expects 1 arg"));
             }
-            let fun = lower_expr_free(
-                b,
-                locals,
-                _fields,
-                _next_field,
-                &args[0],
-                lowering_ctx
-            )?;
+            let fun = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
 
             let (_nid, len_res) = b.push_node(
                 Inst::CallNative {
@@ -2428,11 +2451,27 @@ fn lower_string_method_call<'m>(
     }
 
     // List of all string methods we are implementing.
-    let is_string_method = matches!(name,
-        "concat" | "split" | "indexOf" | "lastIndexOf" | "padEnd" | "padStart" |
-        "repeat" | "replace" | "replaceAll" | "slice" | "substring" | "startsWith" |
-        "endsWith" | "includes" | "toLowerCase" | "toUpperCase" | "trim" |
-        "trimEnd" | "trimStart"
+    let is_string_method = matches!(
+        name,
+        "concat"
+            | "split"
+            | "indexOf"
+            | "lastIndexOf"
+            | "padEnd"
+            | "padStart"
+            | "repeat"
+            | "replace"
+            | "replaceAll"
+            | "slice"
+            | "substring"
+            | "startsWith"
+            | "endsWith"
+            | "includes"
+            | "toLowerCase"
+            | "toUpperCase"
+            | "trim"
+            | "trimEnd"
+            | "trimStart"
     );
 
     if !is_string_method {
@@ -2444,7 +2483,9 @@ fn lower_string_method_call<'m>(
 
     match name {
         "concat" => {
-            if args.len() != 1 { return Err(LowerError::NotLowerable("concat expects 1 argument")); }
+            if args.len() != 1 {
+                return Err(LowerError::NotLowerable("concat expects 1 argument"));
+            }
             let other = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
             cn!("wir_string_concat", [s, other], Some(Type::Str))
         }
@@ -2454,10 +2495,16 @@ fn lower_string_method_call<'m>(
             } else {
                 b.const_undef() // `undefined` separator splits by nothing.
             };
-            cn!("wir_string_split", [s, separator], Some(Type::Array(Box::new(Some(Type::Str)))))
+            cn!(
+                "wir_string_split",
+                [s, separator],
+                Some(Type::Array(Box::new(Some(Type::Str))))
+            )
         }
         "indexOf" => {
-            if args.is_empty() || args.len() > 2 { return Err(LowerError::NotLowerable("indexOf expects 1 or 2 arguments")); }
+            if args.is_empty() || args.len() > 2 {
+                return Err(LowerError::NotLowerable("indexOf expects 1 or 2 arguments"));
+            }
             let search = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
             let pos = if let Some(pos_expr) = args.get(1) {
                 lower_expr_free(b, locals, _fields, _next_field, pos_expr, lowering_ctx)?
@@ -2467,42 +2514,74 @@ fn lower_string_method_call<'m>(
             cn!("wir_string_index_of", [s, search, pos], Some(Type::Int32))
         }
         "lastIndexOf" => {
-            if args.is_empty() || args.len() > 2 { return Err(LowerError::NotLowerable("lastIndexOf expects 1 or 2 arguments")); }
+            if args.is_empty() || args.len() > 2 {
+                return Err(LowerError::NotLowerable(
+                    "lastIndexOf expects 1 or 2 arguments",
+                ));
+            }
             let search = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
             let pos = if let Some(pos_expr) = args.get(1) {
                 lower_expr_free(b, locals, _fields, _next_field, pos_expr, lowering_ctx)?
             } else {
                 b.const_i32(-1) // Sentinel for "from the end"
             };
-            cn!("wir_string_last_index_of", [s, search, pos], Some(Type::Int32))
+            cn!(
+                "wir_string_last_index_of",
+                [s, search, pos],
+                Some(Type::Int32)
+            )
         }
         "padEnd" | "padStart" => {
-            if args.is_empty() || args.len() > 2 { return Err(LowerError::NotLowerable("padEnd/padStart expect 1 or 2 arguments")); }
+            if args.is_empty() || args.len() > 2 {
+                return Err(LowerError::NotLowerable(
+                    "padEnd/padStart expect 1 or 2 arguments",
+                ));
+            }
             let max_len = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
             let fill_str = if let Some(fill_expr) = args.get(1) {
                 lower_expr_free(b, locals, _fields, _next_field, fill_expr, lowering_ctx)?
             } else {
                 b.const_str(" ") // Default fill is a space
             };
-            let native_name = if name == "padEnd" { "wir_string_pad_end" } else { "wir_string_pad_start" };
+            let native_name = if name == "padEnd" {
+                "wir_string_pad_end"
+            } else {
+                "wir_string_pad_start"
+            };
             cn!(native_name, [s, max_len, fill_str], Some(Type::Str))
         }
         "repeat" => {
-            if args.len() != 1 { return Err(LowerError::NotLowerable("repeat expects 1 argument")); }
+            if args.len() != 1 {
+                return Err(LowerError::NotLowerable("repeat expects 1 argument"));
+            }
             let count = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
             cn!("wir_string_repeat", [s, count], Some(Type::Str))
         }
         "replace" => {
-            if args.len() != 2 { return Err(LowerError::NotLowerable("replace expects 2 arguments")); }
+            if args.len() != 2 {
+                return Err(LowerError::NotLowerable("replace expects 2 arguments"));
+            }
             let search = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
-            let replacement = lower_expr_free(b, locals, _fields, _next_field, &args[1], lowering_ctx)?;
-            cn!("wir_string_replace", [s, search, replacement], Some(Type::Str))
+            let replacement =
+                lower_expr_free(b, locals, _fields, _next_field, &args[1], lowering_ctx)?;
+            cn!(
+                "wir_string_replace",
+                [s, search, replacement],
+                Some(Type::Str)
+            )
         }
         "replaceAll" => {
-            if args.len() != 2 { return Err(LowerError::NotLowerable("replaceAll expects 2 arguments")); }
+            if args.len() != 2 {
+                return Err(LowerError::NotLowerable("replaceAll expects 2 arguments"));
+            }
             let search = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
-            let replacement = lower_expr_free(b, locals, _fields, _next_field, &args[1], lowering_ctx)?;
-            cn!("wir_string_replace_all", [s, search, replacement], Some(Type::Str))
+            let replacement =
+                lower_expr_free(b, locals, _fields, _next_field, &args[1], lowering_ctx)?;
+            cn!(
+                "wir_string_replace_all",
+                [s, search, replacement],
+                Some(Type::Str)
+            )
         }
         "slice" | "substring" => {
             let start = if let Some(start_expr) = args.get(0) {
@@ -2515,42 +2594,68 @@ fn lower_string_method_call<'m>(
             } else {
                 b.const_i32(-1) // Use -1 SMI as a sentinel for "to the end".
             };
-            let native_name = if name == "slice" { "wir_string_slice" } else { "wir_string_substring" };
+            let native_name = if name == "slice" {
+                "wir_string_slice"
+            } else {
+                "wir_string_substring"
+            };
             cn!(native_name, [s, start, end], Some(Type::Str))
         }
         "toUpperCase" => {
-            if !args.is_empty() { return Err(LowerError::NotLowerable("toUpperCase expects 0 arguments")); }
+            if !args.is_empty() {
+                return Err(LowerError::NotLowerable("toUpperCase expects 0 arguments"));
+            }
             cn!("wir_string_to_upper_case", [s], Some(Type::Str))
         }
         "toLowerCase" => {
-            if !args.is_empty() { return Err(LowerError::NotLowerable("toLowerCase expects 0 arguments")); }
+            if !args.is_empty() {
+                return Err(LowerError::NotLowerable("toLowerCase expects 0 arguments"));
+            }
             cn!("wir_string_to_lower_case", [s], Some(Type::Str))
         }
         "startsWith" => {
-            if args.is_empty() || args.len() > 2 { return Err(LowerError::NotLowerable("startsWith expects 1 or 2 arguments")); }
+            if args.is_empty() || args.len() > 2 {
+                return Err(LowerError::NotLowerable(
+                    "startsWith expects 1 or 2 arguments",
+                ));
+            }
             let search = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
             cn!("wir_string_starts_with", [s, search], Some(Type::Bool))
         }
         "endsWith" => {
-            if args.len() != 1 { return Err(LowerError::NotLowerable("endsWith expects 1 argument")); }
+            if args.len() != 1 {
+                return Err(LowerError::NotLowerable("endsWith expects 1 argument"));
+            }
             let search = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
             cn!("wir_string_ends_with", [s, search], Some(Type::Bool))
         }
         "includes" => {
-            if args.len() != 1 { return Err(LowerError::NotLowerable("includes expects 1 argument")); }
+            if args.len() != 1 {
+                return Err(LowerError::NotLowerable("includes expects 1 argument"));
+            }
             let search = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
             cn!("wir_string_includes", [s, search], Some(Type::Bool))
         }
         "trim" => {
-            if !args.is_empty() { return Err(LowerError::NotLowerable("trim expects 0 arguments")); }
+            if !args.is_empty() {
+                return Err(LowerError::NotLowerable("trim expects 0 arguments"));
+            }
             cn!("wir_string_trim", [s], Some(Type::Str))
         }
         "trimEnd" | "trimStart" => {
-            if !args.is_empty() { return Err(LowerError::NotLowerable("trimEnd/trimStart expects 0 arguments")); }
-            let native_name = if name == "trimEnd" { "wir_string_trim_end" } else { "wir_string_trim_start" };
+            if !args.is_empty() {
+                return Err(LowerError::NotLowerable(
+                    "trimEnd/trimStart expects 0 arguments",
+                ));
+            }
+            let native_name = if name == "trimEnd" {
+                "wir_string_trim_end"
+            } else {
+                "wir_string_trim_start"
+            };
             cn!(native_name, [s], Some(Type::Str))
         }
-        _ => Ok(None)
+        _ => Ok(None),
     }
 }
 
@@ -2591,8 +2696,7 @@ fn lower_expr_free<'m>(
             then_branch,
             else_branch,
         } => {
-            let cond_v =
-                lower_expr_free(b, locals, fields, next_field, cond, lowering_ctx)?;
+            let cond_v = lower_expr_free(b, locals, fields, next_field, cond, lowering_ctx)?;
             let then_b = b.block();
             let else_b = b.block();
             let cont = b.block();
@@ -2600,25 +2704,11 @@ fn lower_expr_free<'m>(
             b.branch(cond_v, then_b, else_b);
 
             b.position_at(then_b);
-            let tval = lower_expr_free(
-                b,
-                locals,
-                fields,
-                next_field,
-                then_branch,
-                lowering_ctx
-            )?;
+            let tval = lower_expr_free(b, locals, fields, next_field, then_branch, lowering_ctx)?;
             b.jump(cont, &[tval]);
 
             b.position_at(else_b);
-            let fval = lower_expr_free(
-                b,
-                locals,
-                fields,
-                next_field,
-                else_branch,
-                lowering_ctx
-            )?;
+            let fval = lower_expr_free(b, locals, fields, next_field, else_branch, lowering_ctx)?;
             b.jump(cont, &[fval]);
 
             b.position_at(cont);
@@ -2737,8 +2827,7 @@ fn lower_expr_free<'m>(
         }
 
         Expr::OptionalChain { base, access } => {
-            let base_v =
-                lower_expr_free(b, locals, fields, next_field, base, lowering_ctx)?;
+            let base_v = lower_expr_free(b, locals, fields, next_field, base, lowering_ctx)?;
             let cont = b.block();
             let res_param = b.add_block_param(cont, Type::Top);
             let null_v = b.const_null();
@@ -2766,9 +2855,8 @@ fn lower_expr_free<'m>(
                     lower_general_getprop(b, base_v, name, fields, next_field)
                 }
                 OptionalAccess::Index(idx_expr) => {
-                    let idx_val = lower_expr_free(
-                        b, locals, fields, next_field, idx_expr, lowering_ctx,
-                    )?;
+                    let idx_val =
+                        lower_expr_free(b, locals, fields, next_field, idx_expr, lowering_ctx)?;
                     let (_nid_is, is_str) = b.push_node(
                         Inst::CallNative {
                             name: "wir_is_str".into(),
@@ -2837,14 +2925,18 @@ fn lower_expr_free<'m>(
                         _ => {}
                     }
                     if let Some(expr) = this_source {
-                        let this_v = lower_expr_free(
-                            b, locals, fields, next_field, &expr, lowering_ctx,
-                        )?;
+                        let this_v =
+                            lower_expr_free(b, locals, fields, next_field, &expr, lowering_ctx)?;
                         argv.push(this_v);
                     }
                     for arg in args {
                         argv.push(lower_expr_free(
-                            b, locals, fields, next_field, arg, lowering_ctx,
+                            b,
+                            locals,
+                            fields,
+                            next_field,
+                            arg,
+                            lowering_ctx,
                         )?);
                     }
                     let (_nid, res) = b.push_node(
@@ -2866,9 +2958,7 @@ fn lower_expr_free<'m>(
             Ok(res_param)
         }
 
-        Expr::Group(inner) => {
-            lower_expr_free(b, locals, fields, next_field, inner, lowering_ctx)
-        }
+        Expr::Group(inner) => lower_expr_free(b, locals, fields, next_field, inner, lowering_ctx),
 
         Expr::Unary { op, e } => {
             let v = lower_expr_free(b, locals, fields, next_field, e, lowering_ctx)?;
@@ -2904,28 +2994,23 @@ fn lower_expr_free<'m>(
             let va = lower_expr_free(b, locals, fields, next_field, a, lowering_ctx)?;
             match op {
                 Add => {
-                    let vb =
-                        lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
+                    let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
                     Ok(b.int_bin(IntBinOp::Add, va, vb))
                 }
                 Sub => {
-                    let vb =
-                        lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
+                    let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
                     Ok(b.int_bin(IntBinOp::Sub, va, vb))
                 }
                 Mul => {
-                    let vb =
-                        lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
+                    let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
                     Ok(b.int_bin(IntBinOp::Mul, va, vb))
                 }
                 Div => {
-                    let vb =
-                        lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
+                    let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
                     Ok(b.int_bin(IntBinOp::DivS, va, vb))
                 }
                 Rem => {
-                    let vb =
-                        lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
+                    let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
                     Ok(b.int_bin(IntBinOp::RemS, va, vb))
                 }
                 Eq | Ne | Lt | Le | Gt | Ge => {
@@ -2936,12 +3021,26 @@ fn lower_expr_free<'m>(
                     if *op == BinOp::Eq || *op == BinOp::Ne {
                         // At runtime, check if either operand is a string.
                         let (_nid1, is_a_str) = b.push_node(
-                            Inst::CallNative { name: "wir_is_str".into(), args: vec![va], pure: false, can_throw: false },
-                            Some(Type::Bool), 1, true,
+                            Inst::CallNative {
+                                name: "wir_is_str".into(),
+                                args: vec![va],
+                                pure: false,
+                                can_throw: false,
+                            },
+                            Some(Type::Bool),
+                            1,
+                            true,
                         );
                         let (_nid2, is_b_str) = b.push_node(
-                            Inst::CallNative { name: "wir_is_str".into(), args: vec![vb], pure: false, can_throw: false },
-                            Some(Type::Bool), 1, true,
+                            Inst::CallNative {
+                                name: "wir_is_str".into(),
+                                args: vec![vb],
+                                pure: false,
+                                can_throw: false,
+                            },
+                            Some(Type::Bool),
+                            1,
+                            true,
                         );
                         let is_either_str = build_bool_or(b, is_a_str[0], is_b_str[0]);
 
@@ -2955,8 +3054,15 @@ fn lower_expr_free<'m>(
                         // PATH 1: At least one operand is a string. Use content comparison.
                         b.position_at(string_path);
                         let (_nid_streq, str_eq_res) = b.push_node(
-                            Inst::CallNative { name: "wir_string_equals".into(), args: vec![va, vb], pure: false, can_throw: false },
-                            Some(Type::Bool), 1, true,
+                            Inst::CallNative {
+                                name: "wir_string_equals".into(),
+                                args: vec![va, vb],
+                                pure: false,
+                                can_throw: false,
+                            },
+                            Some(Type::Bool),
+                            1,
+                            true,
                         );
                         let str_res = if *op == BinOp::Ne {
                             let one = b.const_i32(1); // Your bools are 0/1
@@ -2975,14 +3081,15 @@ fn lower_expr_free<'m>(
                         };
                         let (_nid_int, int_res) = b.push_node(
                             Inst::CmpInt { kind, a: va, b: vb }, // Generate the correct WIR instruction
-                            Some(Type::Bool), 1, false,
+                            Some(Type::Bool),
+                            1,
+                            false,
                         );
                         b.jump(cont, &[int_res[0]]);
 
                         // Join the paths and return the result.
                         b.position_at(cont);
                         return Ok(result_phi);
-
                     } else {
                         // For Lt, Gt, etc., we keep the original, simple integer comparison logic for now.
                         // This preserves the existing functionality.
@@ -3064,8 +3171,7 @@ fn lower_expr_free<'m>(
                     b.branch(is_nullish[0], null_block, value_block);
 
                     b.position_at(null_block);
-                    let vb =
-                        lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
+                    let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
                     b.jump(cont, &[vb]);
 
                     b.position_at(value_block);
@@ -3082,9 +3188,7 @@ fn lower_expr_free<'m>(
             match &**lv {
                 // o.a = rv      (dot write)
                 LValue::GetProp { recv, name } => {
-                    let obj = lower_expr_free(
-                        b, locals, fields, next_field, recv, lowering_ctx,
-                    )?;
+                    let obj = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
 
                     // Special-case: arr.length = n
                     if name == "length" {
@@ -3140,9 +3244,7 @@ fn lower_expr_free<'m>(
 
                 // o["a"] = rv     (bracket write with string)
                 LValue::Index { recv, index } if matches!(index, Expr::Str(_)) => {
-                    let obj = lower_expr_free(
-                        b, locals, fields, next_field, recv, lowering_ctx,
-                    )?;
+                    let obj = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
                     let s = if let Expr::Str(s) = index {
                         s
                     } else {
@@ -3187,12 +3289,8 @@ fn lower_expr_free<'m>(
 
                 // --- inside Expr::Assign(lv, rhs) match ---
                 LValue::Index { recv, index } if !matches!(index, Expr::Str(_)) => {
-                    let obj = lower_expr_free(
-                        b, locals, fields, next_field, recv, lowering_ctx,
-                    )?;
-                    let idxv = lower_expr_free(
-                        b, locals, fields, next_field, index, lowering_ctx,
-                    )?;
+                    let obj = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
+                    let idxv = lower_expr_free(b, locals, fields, next_field, index, lowering_ctx)?;
 
                     let (_nid_is, is_str) = b.push_node(
                         Inst::CallNative {
@@ -3247,26 +3345,39 @@ fn lower_expr_free<'m>(
                 // x = rv          (local write, with capture boxing support)
                 LValue::Ident(name) => {
                     // Primero resuelve RHS
-                    let rv = lower_expr_free(
-                        b, locals, fields, next_field, rhs, lowering_ctx,
-                    )?;
+                    let rv = lower_expr_free(b, locals, fields, next_field, rhs, lowering_ctx)?;
 
                     #[cfg(debug_assertions)]
                     {
                         eprintln!("lower_expr_free() LValue::Ident({})", name);
                         eprintln!(
                             "[links] exports        : {:?}",
-                            lowering_ctx.links.export_bindings.keys().collect::<Vec<_>>()
+                            lowering_ctx
+                                .links
+                                .export_bindings
+                                .keys()
+                                .collect::<Vec<_>>()
                         );
                         eprintln!(
                             "[links] imports        : {:?}",
-                            lowering_ctx.links.import_bindings.keys().collect::<Vec<_>>()
+                            lowering_ctx
+                                .links
+                                .import_bindings
+                                .keys()
+                                .collect::<Vec<_>>()
                         );
                         eprintln!(
                             "[links] namespace_imps : {:?}",
-                            lowering_ctx.links.namespace_imports.keys().collect::<Vec<_>>()
+                            lowering_ctx
+                                .links
+                                .namespace_imports
+                                .keys()
+                                .collect::<Vec<_>>()
                         );
-                        eprintln!("[links] namespace_cells: {:?}", lowering_ctx.links.namespace_cells);
+                        eprintln!(
+                            "[links] namespace_cells: {:?}",
+                            lowering_ctx.links.namespace_cells
+                        );
                     }
 
                     // a) no se puede asignar a un import
@@ -3356,7 +3467,31 @@ fn lower_expr_free<'m>(
             if name == "length" {
                 let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
 
+                let (_nid_is_proxy, is_proxy_res) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_is_proxy".into(),
+                        args: vec![recv_v],
+                        pure: true,
+                        can_throw: false,
+                    },
+                    Some(Type::Bool),
+                    1,
+                    false,
+                );
+
+                let proxy_block = b.block();
+                let normal_block = b.block();
+                let cont = b.block();
+                let result_phi = b.add_block_param(cont, Type::Int32);
+
+                b.branch(is_proxy_res[0], proxy_block, normal_block);
+
+                b.position_at(proxy_block);
+                let proxy_value = lower_general_getprop(b, recv_v, name, fields, next_field);
+                b.jump(cont, &[proxy_value]);
+
                 // At runtime, check if the receiver `recv_v` is a string.
+                b.position_at(normal_block);
                 let (_nid_is_s, is_string_res) = b.push_node(
                     Inst::CallNative {
                         name: "wir_is_str".into(),
@@ -3370,15 +3505,11 @@ fn lower_expr_free<'m>(
                 );
                 let is_string = is_string_res[0];
 
-                // Create blocks for the two paths and a join block.
                 let string_path = b.block();
                 let array_path = b.block();
-                let cont = b.block();
-                let result_phi = b.add_block_param(cont, Type::Int32);
 
                 b.branch(is_string, string_path, array_path);
 
-                // Path 1: It's a string. Call our new `wir_string_len` helper.
                 b.position_at(string_path);
                 let (_nid_len, len_res) = b.push_node(
                     Inst::CallNative {
@@ -3387,13 +3518,12 @@ fn lower_expr_free<'m>(
                         pure: false,
                         can_throw: false,
                     },
-                    None, // Returns a SMI (i64)
+                    None,
                     1,
                     true,
                 );
                 b.jump(cont, &[len_res[0]]);
 
-                // Path 2: Not a string. Assume it's an array and use the original `wir_array_len`.
                 b.position_at(array_path);
                 let (_nid_a, arr_res) = b.push_node(
                     Inst::CallNative {
@@ -3402,13 +3532,12 @@ fn lower_expr_free<'m>(
                         pure: false,
                         can_throw: false,
                     },
-                    None, // Returns a SMI (i64)
+                    None,
                     1,
                     true,
                 );
                 b.jump(cont, &[arr_res[0]]);
 
-                // Join and return the result from the appropriate path.
                 b.position_at(cont);
                 return Ok(result_phi);
             }
@@ -3416,32 +3545,101 @@ fn lower_expr_free<'m>(
             if name == "size" {
                 let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
 
-                let (_nid, is_map) = b.push_node(Inst::CallNative { name: "wir_is_map".into(), args: vec![recv_v], pure: true, can_throw: false }, Some(Type::Bool), 1, false);
+                let (_nid_is_proxy, is_proxy_res) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_is_proxy".into(),
+                        args: vec![recv_v],
+                        pure: true,
+                        can_throw: false,
+                    },
+                    Some(Type::Bool),
+                    1,
+                    false,
+                );
+
+                let proxy_block = b.block();
+                let normal_block = b.block();
+                let join_path = b.block();
+                let result_phi = b.add_block_param(join_path, Type::Int32);
+
+                b.branch(is_proxy_res[0], proxy_block, normal_block);
+
+                b.position_at(proxy_block);
+                let value = lower_general_getprop(b, recv_v, name, fields, next_field);
+                b.jump(join_path, &[value]);
+
+                b.position_at(normal_block);
+
+                let (_nid, is_map) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_is_map".into(),
+                        args: vec![recv_v],
+                        pure: true,
+                        can_throw: false,
+                    },
+                    Some(Type::Bool),
+                    1,
+                    false,
+                );
 
                 let map_path = b.block();
                 let set_path = b.block();
                 let otherwise_path = b.block();
-                let join_path = b.block();
-                let check_set_path = b.block(); 
-                let result_phi = b.add_block_param(join_path, Type::Int32);
+                let check_set_path = b.block();
 
                 b.branch(is_map[0], map_path, check_set_path);
 
                 b.position_at(check_set_path);
-                let (_nid, is_set) = b.push_node(Inst::CallNative { name: "wir_is_set".into(), args: vec![recv_v], pure: true, can_throw: false }, Some(Type::Bool), 1, false);
+                let (_nid, is_set) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_is_set".into(),
+                        args: vec![recv_v],
+                        pure: true,
+                        can_throw: false,
+                    },
+                    Some(Type::Bool),
+                    1,
+                    false,
+                );
                 b.branch(is_set[0], set_path, otherwise_path);
 
                 b.position_at(map_path);
-                let (_nid, map_size_res) = b.push_node(Inst::CallNative { name: "wir_map_size".into(), args: vec![recv_v], pure: true, can_throw: false }, Some(Type::Int32), 1, false);
-                if !b.current_block_terminated() { b.jump(join_path, &[map_size_res[0]]); }
+                let (_nid, map_size_res) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_map_size".into(),
+                        args: vec![recv_v],
+                        pure: true,
+                        can_throw: false,
+                    },
+                    Some(Type::Int32),
+                    1,
+                    false,
+                );
+                if !b.current_block_terminated() {
+                    b.jump(join_path, &[map_size_res[0]]);
+                }
 
                 b.position_at(set_path);
-                let (_nid, set_size_res) = b.push_node(Inst::CallNative { name: "wir_set_size".into(), args: vec![recv_v], pure: true, can_throw: false }, Some(Type::Int32), 1, false);
-                if !b.current_block_terminated() { b.jump(join_path, &[set_size_res[0]]); }
+                let (_nid, set_size_res) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_set_size".into(),
+                        args: vec![recv_v],
+                        pure: true,
+                        can_throw: false,
+                    },
+                    Some(Type::Int32),
+                    1,
+                    false,
+                );
+                if !b.current_block_terminated() {
+                    b.jump(join_path, &[set_size_res[0]]);
+                }
 
                 b.position_at(otherwise_path);
                 let zero_smi = b.const_i32(0);
-                if !b.current_block_terminated() { b.jump(join_path, &[zero_smi]); }
+                if !b.current_block_terminated() {
+                    b.jump(join_path, &[zero_smi]);
+                }
 
                 b.position_at(join_path);
                 return Ok(result_phi);
@@ -3455,7 +3653,6 @@ fn lower_expr_free<'m>(
 
         // obj.<propKey> = value   (identifier or string propKey)
         Expr::SetPropObj { obj, key, value } => {
-            // Normalize inputs
             let o = lower_expr_free(b, locals, fields, next_field, obj, lowering_ctx)?;
             let v = lower_expr_free(b, locals, fields, next_field, value, lowering_ctx)?;
             let field_name = match key {
@@ -3463,8 +3660,62 @@ fn lower_expr_free<'m>(
                 PropKey::Str(s) => s.clone(),
             };
 
-            // If a setter "__set__<name>" exists on the object, call it as setter(obj, value)
-            // and return the assigned value. Otherwise, perform default store (fast+string mirror).
+            let field = intern_field_local(fields, next_field, &field_name);
+            let fid_smi = b.const_i32(field.0 as i32);
+            let (_nid_field_str, field_str) = b.push_node(
+                Inst::Const(Constant::Str(field_name.clone())),
+                Some(Type::Str),
+                1,
+                false,
+            );
+
+            let _ = b.push_node(
+                Inst::CallNative {
+                    name: "wir_field_register_name".into(),
+                    args: vec![fid_smi, field_str[0]],
+                    pure: false,
+                    can_throw: false,
+                },
+                Some(Type::Int32),
+                1,
+                true,
+            );
+
+            let (_nid_is_proxy, is_proxy) = b.push_node(
+                Inst::CallNative {
+                    name: "wir_is_proxy".into(),
+                    args: vec![o],
+                    pure: true,
+                    can_throw: false,
+                },
+                Some(Type::Bool),
+                1,
+                false,
+            );
+
+            let proxy_block = b.block();
+            let non_proxy_block = b.block();
+            let cont = b.block();
+            let result_phi = b.add_block_param(cont, Type::Int32);
+
+            b.branch(is_proxy[0], proxy_block, non_proxy_block);
+
+            b.position_at(proxy_block);
+            let (_nid_proxy_set, _) = b.push_node(
+                Inst::CallNative {
+                    name: "wir_obj_set_str".into(),
+                    args: vec![o, field_str[0], v],
+                    pure: false,
+                    can_throw: false,
+                },
+                Some(Type::Int32),
+                1,
+                true,
+            );
+            b.jump(cont, &[v]);
+
+            b.position_at(non_proxy_block);
+
             let setter_key = format!("__set__{}", field_name);
             let (_nid_sk, sk) = b.push_node(
                 Inst::Const(Constant::Str(setter_key)),
@@ -3484,12 +3735,12 @@ fn lower_expr_free<'m>(
                 true,
             );
 
-            let z = b.const_i32(0);
+            let zero = b.const_i32(0);
             let (_nid_has_set, has_set) = b.push_node(
                 Inst::CmpInt {
                     kind: crate::wir::CmpKind::Ne,
                     a: sv[0],
-                    b: z,
+                    b: zero,
                 },
                 Some(Type::Bool),
                 1,
@@ -3498,11 +3749,10 @@ fn lower_expr_free<'m>(
 
             let call_set_b = b.block();
             let store_b = b.block();
-            let cont = b.block();
+            let join = b.block();
 
             b.branch(has_set[0], call_set_b, store_b);
 
-            // Use custom setter
             b.position_at(call_set_b);
             let (_nid_call, _r) = b.push_node(
                 Inst::CallClosure {
@@ -3514,11 +3764,9 @@ fn lower_expr_free<'m>(
                 1,
                 true,
             );
-            b.jump(cont, &[]);
+            b.jump(join, &[]);
 
-            // Default storage path (fast field + mirror into string table)
             b.position_at(store_b);
-            let field = intern_field_local(fields, next_field, &field_name);
             let _ = b.push_node(
                 Inst::StoreField {
                     obj: o,
@@ -3531,16 +3779,10 @@ fn lower_expr_free<'m>(
                 true,
             );
 
-            let (_nid_sc, ks) = b.push_node(
-                Inst::Const(Constant::Str(field_name)),
-                Some(Type::Str),
-                1,
-                false,
-            );
             let _ = b.push_node(
                 Inst::CallNative {
                     name: "wir_obj_set_str".into(),
-                    args: vec![o, ks[0], v],
+                    args: vec![o, field_str[0], v],
                     pure: false,
                     can_throw: false,
                 },
@@ -3548,11 +3790,13 @@ fn lower_expr_free<'m>(
                 1,
                 true,
             );
-            b.jump(cont, &[]);
+            b.jump(join, &[]);
+
+            b.position_at(join);
+            b.jump(cont, &[v]);
 
             b.position_at(cont);
-            // The expression value of an assignment is the assigned value.
-            Ok(v)
+            Ok(result_phi)
         }
 
         // Calls / builtins
@@ -3560,17 +3804,20 @@ fn lower_expr_free<'m>(
             // --- Bracket-literal method call: o["m"](... ) -> inject receiver as first arg ---
             if let Expr::Index { recv, index } = &**callee {
                 if matches!(&**index, Expr::Str(_)) {
-                    let this_v = lower_expr_free(
-                        b, locals, fields, next_field, recv, lowering_ctx,
-                    )?;
-                    let fun_v = lower_expr_free(
-                        b, locals, fields, next_field, callee, lowering_ctx,
-                    )?;
+                    let this_v =
+                        lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
+                    let fun_v =
+                        lower_expr_free(b, locals, fields, next_field, callee, lowering_ctx)?;
                     let mut argv = Vec::with_capacity(args.len() + 1);
                     argv.push(this_v);
                     for a in args {
                         argv.push(lower_expr_free(
-                            b, locals, fields, next_field, a, lowering_ctx,
+                            b,
+                            locals,
+                            fields,
+                            next_field,
+                            a,
+                            lowering_ctx,
                         )?);
                     }
                     let (_nid, res) = b.push_node(
@@ -3589,15 +3836,13 @@ fn lower_expr_free<'m>(
 
             // --- Property-call fast paths ---
             if let Expr::GetProp { recv, name } = &**callee {
-
                 if let Expr::Ident(name) = &**callee {
                     if name == "import" {
                         if args.len() != 1 {
                             return Err(LowerError::NotLowerable("import(spec) expects 1 arg"));
                         }
-                        let spec = lower_expr_free(
-                            b, locals, fields, next_field, &args[0], lowering_ctx,
-                        )?;
+                        let spec =
+                            lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
                         let v = b.import_dynamic(spec);
                         return Ok(v);
                     }
@@ -3605,21 +3850,15 @@ fn lower_expr_free<'m>(
 
                 // 0a) Promise-style instance methods
                 if name == "then" {
-                    let p = lower_expr_free(
-                        b, locals, fields, next_field, recv, lowering_ctx,
-                    )?;
+                    let p = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
                     let z = b.const_i32(0); // sentinel "no callback"
                     let onf = if args.len() >= 1 {
-                        lower_expr_free(
-                            b, locals, fields, next_field, &args[0], lowering_ctx,
-                        )?
+                        lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?
                     } else {
                         z
                     };
                     let onr = if args.len() >= 2 {
-                        lower_expr_free(
-                            b, locals, fields, next_field, &args[1], lowering_ctx,
-                        )?
+                        lower_expr_free(b, locals, fields, next_field, &args[1], lowering_ctx)?
                     } else {
                         z
                     };
@@ -3637,14 +3876,10 @@ fn lower_expr_free<'m>(
                     return Ok(res[0]);
                 }
                 if name == "catch" {
-                    let p = lower_expr_free(
-                        b, locals, fields, next_field, recv, lowering_ctx,
-                    )?;
+                    let p = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
                     let z = b.const_i32(0);
                     let onr = if args.len() >= 1 {
-                        lower_expr_free(
-                            b, locals, fields, next_field, &args[0], lowering_ctx,
-                        )?
+                        lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?
                     } else {
                         z
                     };
@@ -3663,15 +3898,11 @@ fn lower_expr_free<'m>(
                 }
                 if name == "resolve" {
                     // deferred.resolve(value?)
-                    let p = lower_expr_free(
-                        b, locals, fields, next_field, recv, lowering_ctx,
-                    )?;
+                    let p = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
                     let (_nid, nul) =
                         b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
                     let val = if args.len() >= 1 {
-                        lower_expr_free(
-                            b, locals, fields, next_field, &args[0], lowering_ctx,
-                        )?
+                        lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?
                     } else {
                         nul[0]
                     };
@@ -3690,15 +3921,11 @@ fn lower_expr_free<'m>(
                 }
                 if name == "reject" {
                     // deferred.reject(reason?)
-                    let p = lower_expr_free(
-                        b, locals, fields, next_field, recv, lowering_ctx
-                    )?;
+                    let p = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
                     let (_nid, nul) =
                         b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
                     let reason = if args.len() >= 1 {
-                        lower_expr_free(
-                            b, locals, fields, next_field, &args[0], lowering_ctx
-                        )?
+                        lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?
                     } else {
                         nul[0]
                     };
@@ -3727,13 +3954,28 @@ fn lower_expr_free<'m>(
                                     ));
                                 }
                                 let req = lower_expr_free(
-                                    b, locals, fields, next_field, &args[0], lowering_ctx 
+                                    b,
+                                    locals,
+                                    fields,
+                                    next_field,
+                                    &args[0],
+                                    lowering_ctx,
                                 )?;
                                 let status = lower_expr_free(
-                                    b, locals, fields, next_field, &args[1], lowering_ctx 
+                                    b,
+                                    locals,
+                                    fields,
+                                    next_field,
+                                    &args[1],
+                                    lowering_ctx,
                                 )?;
                                 let hdrs = lower_expr_free(
-                                    b, locals, fields, next_field, &args[2], lowering_ctx 
+                                    b,
+                                    locals,
+                                    fields,
+                                    next_field,
+                                    &args[2],
+                                    lowering_ctx,
                                 )?;
                                 let (_nid, res) = b.push_node(
                                     Inst::CallNative {
@@ -3755,13 +3997,28 @@ fn lower_expr_free<'m>(
                                     ));
                                 }
                                 let sid = lower_expr_free(
-                                    b, locals, fields, next_field, &args[0], lowering_ctx 
+                                    b,
+                                    locals,
+                                    fields,
+                                    next_field,
+                                    &args[0],
+                                    lowering_ctx,
                                 )?;
                                 let rid = lower_expr_free(
-                                    b, locals, fields, next_field, &args[1], lowering_ctx 
+                                    b,
+                                    locals,
+                                    fields,
+                                    next_field,
+                                    &args[1],
+                                    lowering_ctx,
                                 )?;
                                 let chunk = lower_expr_free(
-                                    b, locals, fields, next_field, &args[2], lowering_ctx 
+                                    b,
+                                    locals,
+                                    fields,
+                                    next_field,
+                                    &args[2],
+                                    lowering_ctx,
                                 )?;
                                 let (_nid, res) = b.push_node(
                                     Inst::CallNative {
@@ -3783,10 +4040,20 @@ fn lower_expr_free<'m>(
                                     ));
                                 }
                                 let sid = lower_expr_free(
-                                    b, locals, fields, next_field, &args[0], lowering_ctx 
+                                    b,
+                                    locals,
+                                    fields,
+                                    next_field,
+                                    &args[0],
+                                    lowering_ctx,
                                 )?;
                                 let rid = lower_expr_free(
-                                    b, locals, fields, next_field, &args[1], lowering_ctx 
+                                    b,
+                                    locals,
+                                    fields,
+                                    next_field,
+                                    &args[1],
+                                    lowering_ctx,
                                 )?;
                                 let (_nid, res) = b.push_node(
                                     Inst::CallNative {
@@ -3808,7 +4075,8 @@ fn lower_expr_free<'m>(
 
                 // 0c) STATIC CLASS METHODS — check BEFORE anything that would lower `recv`
                 if let Expr::Ident(cn) = &**recv {
-                    if let Some(&fid) = lowering_ctx.funcs.get(&format!("__static_{}_{}", cn, name)) {
+                    if let Some(&fid) = lowering_ctx.funcs.get(&format!("__static_{}_{}", cn, name))
+                    {
                         #[cfg(debug_assertions)]
                         {
                             eprintln!("[static] candidate {}.{}", cn, name);
@@ -3817,7 +4085,12 @@ fn lower_expr_free<'m>(
                         let mut argv = Vec::with_capacity(args.len());
                         for a in args {
                             argv.push(lower_expr_free(
-                                b, locals, fields, next_field, a, lowering_ctx 
+                                b,
+                                locals,
+                                fields,
+                                next_field,
+                                a,
+                                lowering_ctx,
                             )?);
                         }
                         let (_nid, res) = b.push_node(
@@ -3836,14 +4109,28 @@ fn lower_expr_free<'m>(
 
                 // 0d) String instance methods
                 if let Some(v) = lower_string_method_call(
-                    b, locals, fields, next_field, recv, name, args, lowering_ctx
+                    b,
+                    locals,
+                    fields,
+                    next_field,
+                    recv,
+                    name,
+                    args,
+                    lowering_ctx,
                 )? {
                     return Ok(v);
                 }
 
                 // 0e) Array instance methods (map/filter/etc.)
                 if let Some(v) = lower_array_method_call(
-                    b, locals, fields, next_field, recv, name, args, lowering_ctx
+                    b,
+                    locals,
+                    fields,
+                    next_field,
+                    recv,
+                    name,
+                    args,
+                    lowering_ctx,
                 )? {
                     return Ok(v);
                 }
@@ -3857,9 +4144,7 @@ fn lower_expr_free<'m>(
                 };
 
                 // The function to be called is the result of the property lookup.
-                let fun_v = lower_expr_free(
-                    b, locals, fields, next_field, callee, lowering_ctx
-                )?;
+                let fun_v = lower_expr_free(b, locals, fields, next_field, callee, lowering_ctx)?;
 
                 let mut argv = Vec::new();
 
@@ -3869,13 +4154,21 @@ fn lower_expr_free<'m>(
                 } else {
                     // Instance call: `c.inc()` -> args are `[c]`
                     argv.reserve(args.len() + 1);
-                    let this_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
+                    let this_v =
+                        lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
                     argv.push(this_v);
                 }
 
                 // Append the explicit arguments.
                 for a in args {
-                    argv.push(lower_expr_free(b, locals, fields, next_field, a, lowering_ctx)?);
+                    argv.push(lower_expr_free(
+                        b,
+                        locals,
+                        fields,
+                        next_field,
+                        a,
+                        lowering_ctx,
+                    )?);
                 }
 
                 let (_nid, res) = b.push_node(
@@ -3902,7 +4195,12 @@ fn lower_expr_free<'m>(
                         let mut argv = Vec::with_capacity(args.len());
                         for a in args {
                             argv.push(lower_expr_free(
-                                b, locals, fields, next_field, a, lowering_ctx 
+                                b,
+                                locals,
+                                fields,
+                                next_field,
+                                a,
+                                lowering_ctx,
                             )?);
                         }
                         let (_nid, res) = b.push_node(
@@ -3920,14 +4218,17 @@ fn lower_expr_free<'m>(
                 }
 
                 // General bracket-call
-                let obj =
-                    lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
-                let idxv =
-                    lower_expr_free(b, locals, fields, next_field, index, lowering_ctx)?;
+                let obj = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
+                let idxv = lower_expr_free(b, locals, fields, next_field, index, lowering_ctx)?;
                 let mut argvals = Vec::with_capacity(args.len());
                 for a in args {
                     argvals.push(lower_expr_free(
-                        b, locals, fields, next_field, a, lowering_ctx 
+                        b,
+                        locals,
+                        fields,
+                        next_field,
+                        a,
+                        lowering_ctx,
                     )?);
                 }
 
@@ -4015,12 +4316,10 @@ fn lower_expr_free<'m>(
                     if args.len() != 2 {
                         return Err(LowerError::NotLowerable("setTimeout(fn, ms)"));
                     }
-                    let fun = lower_expr_free(
-                        b, locals, fields, next_field, &args[0], lowering_ctx,
-                    )?;
-                    let ms = lower_expr_free(
-                        b, locals, fields, next_field, &args[1], lowering_ctx,
-                    )?;
+                    let fun =
+                        lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
+                    let ms =
+                        lower_expr_free(b, locals, fields, next_field, &args[1], lowering_ctx)?;
                     let (_nid, res) = b.push_node(
                         Inst::CallNative {
                             name: "wir_set_timeout".into(),
@@ -4038,12 +4337,10 @@ fn lower_expr_free<'m>(
                     if args.len() != 2 {
                         return Err(LowerError::NotLowerable("setInterval(fn, ms)"));
                     }
-                    let fun = lower_expr_free(
-                        b, locals, fields, next_field, &args[0], lowering_ctx,
-                    )?;
-                    let ms = lower_expr_free(
-                        b, locals, fields, next_field, &args[1], lowering_ctx,
-                    )?;
+                    let fun =
+                        lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
+                    let ms =
+                        lower_expr_free(b, locals, fields, next_field, &args[1], lowering_ctx)?;
                     let (_nid, res) = b.push_node(
                         Inst::CallNative {
                             name: "wir_set_interval".into(),
@@ -4061,9 +4358,8 @@ fn lower_expr_free<'m>(
                     if args.len() != 1 {
                         return Err(LowerError::NotLowerable("clearTimeout(id)"));
                     }
-                    let id = lower_expr_free(
-                        b, locals, fields, next_field, &args[0], lowering_ctx,
-                    )?;
+                    let id =
+                        lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
                     let (_nid, res) = b.push_node(
                         Inst::CallNative {
                             name: "wir_clear_timeout".into(),
@@ -4081,9 +4377,8 @@ fn lower_expr_free<'m>(
                     if args.len() != 1 {
                         return Err(LowerError::NotLowerable("clearInterval(id)"));
                     }
-                    let id = lower_expr_free(
-                        b, locals, fields, next_field, &args[0], lowering_ctx,
-                    )?;
+                    let id =
+                        lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
                     let (_nid, res) = b.push_node(
                         Inst::CallNative {
                             name: "wir_clear_interval".into(),
@@ -4103,9 +4398,8 @@ fn lower_expr_free<'m>(
                     if args.len() != 1 {
                         return Err(LowerError::NotLowerable("Array(len) expects 1 arg"));
                     }
-                    let len = lower_expr_free(
-                        b, locals, fields, next_field, &args[0], lowering_ctx,
-                    )?;
+                    let len =
+                        lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
                     let (_nid, res) = b.push_node(
                         Inst::CallNative {
                             name: "wir_array_new".into(),
@@ -4123,9 +4417,8 @@ fn lower_expr_free<'m>(
                     if args.len() != 1 {
                         return Err(LowerError::NotLowerable("Promise(executor) expects 1 arg"));
                     }
-                    let exec = lower_expr_free(
-                        b, locals, fields, next_field, &args[0], lowering_ctx,
-                    )?;
+                    let exec =
+                        lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
                     let (_nid, res) = b.push_node(
                         Inst::CallNative {
                             name: "wir_promise_new".into(),
@@ -4162,9 +4455,8 @@ fn lower_expr_free<'m>(
                     if args.len() != 1 {
                         return Err(LowerError::NotLowerable("get(url) expects 1 arg"));
                     }
-                    let url = lower_expr_free(
-                        b, locals, fields, next_field, &args[0], lowering_ctx,
-                    )?;
+                    let url =
+                        lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
                     let (_nid, res) = b.push_node(
                         Inst::CallNative {
                             name: "wir_http_get".into(),
@@ -4182,9 +4474,8 @@ fn lower_expr_free<'m>(
                     if args.len() != 1 {
                         return Err(LowerError::NotLowerable("getJSON(url) expects 1 arg"));
                     }
-                    let url = lower_expr_free(
-                        b, locals, fields, next_field, &args[0], lowering_ctx,
-                    )?;
+                    let url =
+                        lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
                     let (_nid, res) = b.push_node(
                         Inst::CallNative {
                             name: "wir_http_get_json".into(),
@@ -4202,18 +4493,14 @@ fn lower_expr_free<'m>(
                     if !(args.len() == 2 || args.len() == 3) {
                         return Err(LowerError::NotLowerable("postJSON(url, body, headers?)"));
                     }
-                    let url = lower_expr_free(
-                        b, locals, fields, next_field, &args[0], lowering_ctx,
-                    )?;
-                    let body = lower_expr_free(
-                        b, locals, fields, next_field, &args[1], lowering_ctx,
-                    )?;
+                    let url =
+                        lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
+                    let body =
+                        lower_expr_free(b, locals, fields, next_field, &args[1], lowering_ctx)?;
                     let (_nid, nul) =
                         b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
                     let headers = if args.len() == 3 {
-                        lower_expr_free(
-                            b, locals, fields, next_field, &args[2], lowering_ctx,
-                        )?
+                        lower_expr_free(b, locals, fields, next_field, &args[2], lowering_ctx)?
                     } else {
                         nul[0]
                     };
@@ -4237,29 +4524,59 @@ fn lower_expr_free<'m>(
                     let (status_v, body_v, headers_v) = match args.len() {
                         1 => {
                             let body = lower_expr_free(
-                                b, locals, fields, next_field, &args[0], lowering_ctx,
+                                b,
+                                locals,
+                                fields,
+                                next_field,
+                                &args[0],
+                                lowering_ctx,
                             )?;
                             let status = b.const_i32(200);
                             (status, body, nul[0])
                         }
                         2 => {
                             let status = lower_expr_free(
-                                b, locals, fields, next_field, &args[0], lowering_ctx,
+                                b,
+                                locals,
+                                fields,
+                                next_field,
+                                &args[0],
+                                lowering_ctx,
                             )?;
                             let body = lower_expr_free(
-                                b, locals, fields, next_field, &args[1], lowering_ctx,
+                                b,
+                                locals,
+                                fields,
+                                next_field,
+                                &args[1],
+                                lowering_ctx,
                             )?;
                             (status, body, nul[0])
                         }
                         3 => {
                             let status = lower_expr_free(
-                                b, locals, fields, next_field, &args[0], lowering_ctx,
+                                b,
+                                locals,
+                                fields,
+                                next_field,
+                                &args[0],
+                                lowering_ctx,
                             )?;
                             let body = lower_expr_free(
-                                b, locals, fields, next_field, &args[1], lowering_ctx,
+                                b,
+                                locals,
+                                fields,
+                                next_field,
+                                &args[1],
+                                lowering_ctx,
                             )?;
                             let headers = lower_expr_free(
-                                b, locals, fields, next_field, &args[2], lowering_ctx,
+                                b,
+                                locals,
+                                fields,
+                                next_field,
+                                &args[2],
+                                lowering_ctx,
                             )?;
                             (status, body, headers)
                         }
@@ -4292,9 +4609,8 @@ fn lower_expr_free<'m>(
                     // Fast string-literal path
                     // Fast path for string literals: avoid allocation/inspection.
                     if matches!(args[0], Expr::Str(_)) {
-                        let v = lower_expr_free(
-                            b, locals, fields, next_field, &args[0], lowering_ctx,
-                        )?;
+                        let v =
+                            lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
                         let (_nid, res) = b.push_node(
                             Inst::CallNative {
                                 name: "wir_print_str".into(),
@@ -4310,9 +4626,7 @@ fn lower_expr_free<'m>(
                     }
 
                     // General case: let the runtime pretty-print *any* value.
-                    let v = lower_expr_free(
-                        b, locals, fields, next_field, &args[0], lowering_ctx,
-                    )?;
+                    let v = lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
                     let (_nid, res) = b.push_node(
                         Inst::CallNative {
                             name: "wir_print_any".into(),
@@ -4332,7 +4646,12 @@ fn lower_expr_free<'m>(
                     let mut argv = Vec::with_capacity(args.len());
                     for a in args {
                         argv.push(lower_expr_free(
-                            b, locals, fields, next_field, a, lowering_ctx,
+                            b,
+                            locals,
+                            fields,
+                            next_field,
+                            a,
+                            lowering_ctx,
                         )?);
                     }
                     let (_nid, res) = b.push_node(
@@ -4350,13 +4669,16 @@ fn lower_expr_free<'m>(
             }
 
             // --- 2) Fallback: general function value + CallClosure ---
-            let funv = lower_expr_free(
-                b, locals, fields, next_field, callee, lowering_ctx,
-            )?;
+            let funv = lower_expr_free(b, locals, fields, next_field, callee, lowering_ctx)?;
             let mut argv = Vec::with_capacity(args.len());
             for a in args {
                 argv.push(lower_expr_free(
-                    b, locals, fields, next_field, a, lowering_ctx,
+                    b,
+                    locals,
+                    fields,
+                    next_field,
+                    a,
+                    lowering_ctx,
                 )?);
             }
             let (_nid, res) = b.push_node(
@@ -4404,16 +4726,27 @@ fn lower_expr_free<'m>(
             let native_ctor = match class.as_str() {
                 "Map" => Some("wir_map_new"),
                 "Set" => Some("wir_set_new"),
-                _ => None
+                _ => None,
             };
 
             if let Some(ctor_name) = native_ctor {
                 // For now, we don't support initial values like `new Map([...])`.
-                if !args.is_empty() { return Err(LowerError::NotLowerable("Map/Set constructors with arguments not yet supported")); }
+                if !args.is_empty() {
+                    return Err(LowerError::NotLowerable(
+                        "Map/Set constructors with arguments not yet supported",
+                    ));
+                }
 
                 let (_nid, res) = b.push_node(
-                    Inst::CallNative { name: ctor_name.into(), args: vec![], pure: false, can_throw: false, },
-                    Some(Type::AnyRef), 1, true
+                    Inst::CallNative {
+                        name: ctor_name.into(),
+                        args: vec![],
+                        pure: false,
+                        can_throw: false,
+                    },
+                    Some(Type::AnyRef),
+                    1,
+                    true,
                 );
                 return Ok(res[0]);
             }
@@ -4424,7 +4757,12 @@ fn lower_expr_free<'m>(
                 let mut argv = Vec::with_capacity(args.len());
                 for a in args {
                     argv.push(lower_expr_free(
-                        b, locals, fields, next_field, a, lowering_ctx 
+                        b,
+                        locals,
+                        fields,
+                        next_field,
+                        a,
+                        lowering_ctx,
                     )?);
                 }
                 let (_nid, res) = b.push_node(
@@ -4445,21 +4783,37 @@ fn lower_expr_free<'m>(
                 eprintln!("lower_expr_free() Expr::Call(...) Expr::New({})", class);
                 eprintln!(
                     "[links] exports        : {:?}",
-                    lowering_ctx.links.export_bindings.keys().collect::<Vec<_>>()
+                    lowering_ctx
+                        .links
+                        .export_bindings
+                        .keys()
+                        .collect::<Vec<_>>()
                 );
                 eprintln!(
                     "[links] imports        : {:?}",
-                    lowering_ctx.links.import_bindings.keys().collect::<Vec<_>>()
+                    lowering_ctx
+                        .links
+                        .import_bindings
+                        .keys()
+                        .collect::<Vec<_>>()
                 );
                 eprintln!(
                     "[links] namespace_imps : {:?}",
-                    lowering_ctx.links.namespace_imports.keys().collect::<Vec<_>>()
+                    lowering_ctx
+                        .links
+                        .namespace_imports
+                        .keys()
+                        .collect::<Vec<_>>()
                 );
-                eprintln!("[links] namespace_cells: {:?}", lowering_ctx.links.namespace_cells);
+                eprintln!(
+                    "[links] namespace_cells: {:?}",
+                    lowering_ctx.links.namespace_cells
+                );
             }
 
             // 2) ruta IMPORTADA/EXPORTADA: el identificador 'class' es un binding a un "class object"
-            if let Some(&bid) = lowering_ctx.links
+            if let Some(&bid) = lowering_ctx
+                .links
                 .import_bindings
                 .get(class)
                 .or_else(|| lowering_ctx.links.export_bindings.get(class))
@@ -4495,7 +4849,12 @@ fn lower_expr_free<'m>(
                 let mut argv = Vec::with_capacity(args.len());
                 for a in args {
                     argv.push(lower_expr_free(
-                        b, locals, fields, next_field, a, lowering_ctx 
+                        b,
+                        locals,
+                        fields,
+                        next_field,
+                        a,
+                        lowering_ctx,
                     )?);
                 }
                 let (_nid, res) = b.push_node(
@@ -4534,14 +4893,17 @@ fn lower_expr_free<'m>(
                 Inst::CallNative {
                     name: "wir_is_str".into(),
                     args: vec![idx_v],
-                    pure: false, can_throw: false,
+                    pure: false,
+                    can_throw: false,
                 },
-                Some(Type::Bool), 1, true,
+                Some(Type::Bool),
+                1,
+                true,
             );
             let is_idx_string = is_idx_string_res[0];
 
-            let obj_key_path = b.block();      // Path for obj[string_key]
-            let numeric_key_path = b.block();  // Path for string[i] or array[i]
+            let obj_key_path = b.block(); // Path for obj[string_key]
+            let numeric_key_path = b.block(); // Path for string[i] or array[i]
             let cont = b.block();
             let result_phi = b.add_block_param(cont, Type::Int32);
 
@@ -4554,9 +4916,12 @@ fn lower_expr_free<'m>(
                 Inst::CallNative {
                     name: "wir_obj_get_str".into(),
                     args: vec![recv_v, idx_v],
-                    pure: false, can_throw: false,
+                    pure: false,
+                    can_throw: false,
                 },
-                None, 1, true,
+                None,
+                1,
+                true,
             );
             b.jump(cont, &[obj_res[0]]);
 
@@ -4567,14 +4932,17 @@ fn lower_expr_free<'m>(
                 Inst::CallNative {
                     name: "wir_is_str".into(),
                     args: vec![recv_v],
-                    pure: false, can_throw: false,
+                    pure: false,
+                    can_throw: false,
                 },
-                Some(Type::Bool), 1, true,
+                Some(Type::Bool),
+                1,
+                true,
             );
             let is_recv_string = is_recv_string_res[0];
 
             let string_recv_path = b.block(); // Path for "string"[i]
-            let array_recv_path = b.block();  // Path for array[i]
+            let array_recv_path = b.block(); // Path for array[i]
 
             // We need a nested join block here.
             let numeric_cont = b.block();
@@ -4587,9 +4955,12 @@ fn lower_expr_free<'m>(
                 Inst::CallNative {
                     name: "wir_string_get_char".into(),
                     args: vec![recv_v, idx_v],
-                    pure: false, can_throw: false,
+                    pure: false,
+                    can_throw: false,
                 },
-                None, 1, true,
+                None,
+                1,
+                true,
             );
             b.jump(numeric_cont, &[char_res[0]]);
 
@@ -4598,9 +4969,12 @@ fn lower_expr_free<'m>(
                 Inst::CallNative {
                     name: "wir_array_get".into(),
                     args: vec![recv_v, idx_v],
-                    pure: false, can_throw: false,
+                    pure: false,
+                    can_throw: false,
                 },
-                None, 1, true,
+                None,
+                1,
+                true,
             );
             b.jump(numeric_cont, &[arr_res[0]]);
 
@@ -4652,10 +5026,15 @@ fn lower_expr_free<'m>(
 
         // Closure creation from hoisted lambda
         Expr::FnRef { name } => {
-            let fid = *lowering_ctx.funcs
+            let fid = *lowering_ctx
+                .funcs
                 .get(name)
                 .ok_or_else(|| LowerError::UnknownFunc(name.clone()))?;
-            let caps = lowering_ctx.lam_captures.get(name).cloned().unwrap_or_default();
+            let caps = lowering_ctx
+                .lam_captures
+                .get(name)
+                .cloned()
+                .unwrap_or_default();
 
             // For each capture, if it is not boxed yet in this scope, box it now:
             //   box = Array(1); box[0] = current_value; rebind local to box; mark boxed.
@@ -4751,7 +5130,8 @@ fn lower_expr_free<'m>(
             for item in items {
                 match item {
                     ObjItem::Prop(key, val_e) => {
-                        let v = lower_expr_free(b, locals, fields, next_field, val_e, lowering_ctx)?;
+                        let v =
+                            lower_expr_free(b, locals, fields, next_field, val_e, lowering_ctx)?;
 
                         // First, get the property name as a string, regardless of how it was defined.
                         let name_str = match key {
@@ -4795,7 +5175,8 @@ fn lower_expr_free<'m>(
                     }
                     ObjItem::Spread(expr) => {
                         // Your spread logic is already correct.
-                        let spread_obj = lower_expr_free(b, locals, fields, next_field, expr, lowering_ctx)?;
+                        let spread_obj =
+                            lower_expr_free(b, locals, fields, next_field, expr, lowering_ctx)?;
                         let _ = b.push_node(
                             Inst::CallNative {
                                 name: "wir_obj_assign".into(),
@@ -4823,6 +5204,24 @@ fn lower_expr_free<'m>(
                     let field = intern_field_local(fields, next_field, name);
                     let fid_smi = b.const_i32(field.0 as i32);
 
+                    let (_nid_sc, ks) = b.push_node(
+                        Inst::Const(Constant::Str(name.clone())),
+                        Some(Type::Str),
+                        1,
+                        false,
+                    );
+                    let _ = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_field_register_name".into(),
+                            args: vec![fid_smi, ks[0]],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::Int32),
+                        1,
+                        true,
+                    );
+
                     // del fast field
                     let (_nid_f, _rf) = b.push_node(
                         Inst::CallNative {
@@ -4837,12 +5236,6 @@ fn lower_expr_free<'m>(
                     );
 
                     // del string key (mirror)
-                    let (_nid_sc, ks) = b.push_node(
-                        Inst::Const(Constant::Str(name.clone())),
-                        Some(Type::Str),
-                        1,
-                        false,
-                    );
                     let (_nid_s, rs) = b.push_node(
                         Inst::CallNative {
                             name: "wir_obj_del_str".into(),
@@ -4908,6 +5301,24 @@ fn lower_expr_free<'m>(
                     let field = intern_field_local(fields, next_field, name);
                     let fid_smi = b.const_i32(field.0 as i32);
 
+                    let (_nid_sc, ks) = b.push_node(
+                        Inst::Const(Constant::Str(name.clone())),
+                        Some(Type::Str),
+                        1,
+                        false,
+                    );
+                    let _ = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_field_register_name".into(),
+                            args: vec![fid_smi, ks[0]],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::Int32),
+                        1,
+                        true,
+                    );
+
                     // fast-slot check
                     let (_nid_f, hf) = b.push_node(
                         Inst::CallNative {
@@ -4922,12 +5333,6 @@ fn lower_expr_free<'m>(
                     );
 
                     // string-table check
-                    let (_nid_sc, ks) = b.push_node(
-                        Inst::Const(Constant::Str(name.clone())),
-                        Some(Type::Str),
-                        1,
-                        false,
-                    );
                     let (_nid_s, hs) = b.push_node(
                         Inst::CallNative {
                             name: "wir_obj_has_str".into(),
@@ -4985,19 +5390,69 @@ fn lower_expr_free<'m>(
             }
         }
 
-        Expr::CreateBuiltin { kind, args } => {
-            // No more string matching. The AST gives us the exact type.
-            let ctor_name = match kind {
-                crate::front::BuiltinType::Map => "wir_map_new",
-                crate::front::BuiltinType::Set => "wir_set_new",
-            };
-            // Currently ignoring `args`, but this is ready for `new Map([...])` in the future.
-            let (_nid, res) = b.push_node(
-                Inst::CallNative { name: ctor_name.into(), args: vec![], pure: false, can_throw: false },
-                Some(Type::AnyRef), 1, true
-            );
-            Ok(res[0])
-        }
+        Expr::CreateBuiltin { kind, args } => match kind {
+            crate::front::BuiltinType::Map => {
+                if !args.is_empty() {
+                    return Err(LowerError::NotLowerable(
+                        "Map constructors do not accept arguments",
+                    ));
+                }
+                let (_nid, res) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_map_new".into(),
+                        args: vec![],
+                        pure: false,
+                        can_throw: false,
+                    },
+                    Some(Type::AnyRef),
+                    1,
+                    true,
+                );
+                Ok(res[0])
+            }
+            crate::front::BuiltinType::Set => {
+                if !args.is_empty() {
+                    return Err(LowerError::NotLowerable(
+                        "Set constructors do not accept arguments",
+                    ));
+                }
+                let (_nid, res) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_set_new".into(),
+                        args: vec![],
+                        pure: false,
+                        can_throw: false,
+                    },
+                    Some(Type::AnyRef),
+                    1,
+                    true,
+                );
+                Ok(res[0])
+            }
+            crate::front::BuiltinType::Proxy => {
+                if args.len() != 2 {
+                    return Err(LowerError::NotLowerable(
+                        "Proxy constructor expects exactly 2 arguments",
+                    ));
+                }
+                let target =
+                    lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
+                let handler =
+                    lower_expr_free(b, locals, fields, next_field, &args[1], lowering_ctx)?;
+                let (_nid, res) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_proxy_new".into(),
+                        args: vec![target, handler],
+                        pure: false,
+                        can_throw: false,
+                    },
+                    Some(Type::AnyRef),
+                    1,
+                    true,
+                );
+                Ok(res[0])
+            }
+        },
 
         Expr::CallBuiltinMapMethod { recv, method, args } => {
             let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
@@ -5016,12 +5471,26 @@ fn lower_expr_free<'m>(
 
             let mut call_args: smallvec::SmallVec<[ValueId; 4]> = smallvec::smallvec![recv_v];
             for arg_expr in args {
-                call_args.push(lower_expr_free(b, locals, fields, next_field, arg_expr, lowering_ctx)?);
+                call_args.push(lower_expr_free(
+                    b,
+                    locals,
+                    fields,
+                    next_field,
+                    arg_expr,
+                    lowering_ctx,
+                )?);
             }
 
             let (_nid, res) = b.push_node(
-                Inst::CallNative { name: native_name.into(), args: call_args.into_vec(), pure: false, can_throw: false },
-                None, 1, true
+                Inst::CallNative {
+                    name: native_name.into(),
+                    args: call_args.into_vec(),
+                    pure: false,
+                    can_throw: false,
+                },
+                None,
+                1,
+                true,
             );
 
             if is_chainable {
@@ -5045,20 +5514,30 @@ fn lower_expr_free<'m>(
 
             let mut call_args: smallvec::SmallVec<[ValueId; 4]> = smallvec::smallvec![recv_v];
             for arg_expr in args {
-                call_args.push(lower_expr_free(b, locals, fields, next_field, arg_expr, lowering_ctx)?);
+                call_args.push(lower_expr_free(
+                    b,
+                    locals,
+                    fields,
+                    next_field,
+                    arg_expr,
+                    lowering_ctx,
+                )?);
             }
 
             let (_nid, res) = b.push_node(
-                Inst::CallNative { name: native_name.into(), args: call_args.into_vec(), pure: false, can_throw: false },
-                None, 1, true
+                Inst::CallNative {
+                    name: native_name.into(),
+                    args: call_args.into_vec(),
+                    pure: false,
+                    can_throw: false,
+                },
+                None,
+                1,
+                true,
             );
 
             // For `add`, the value of the expression is the set itself.
-            if is_chainable {
-                Ok(recv_v)
-            } else {
-                Ok(res[0])
-            }
+            if is_chainable { Ok(recv_v) } else { Ok(res[0]) }
         }
 
         Expr::CallBuiltinCommonMethod { recv, method } => {
@@ -5141,10 +5620,18 @@ impl<'m> Lowerer<'m> {
             }
             if let Some(ci) = self.lowering_ctx.classes.get(name) {
                 // export class <name>
-                let alloc = self.lowering_ctx.funcs.get(&format!("__class_new_{}", name)).copied();
+                let alloc = self
+                    .lowering_ctx
+                    .funcs
+                    .get(&format!("__class_new_{}", name))
+                    .copied();
                 let mut statics = Vec::new();
                 for (mname, _, _, _) in &ci.static_methods {
-                    if let Some(&sfid) = self.lowering_ctx.funcs.get(&format!("__static_{}_{}", name, mname)) {
+                    if let Some(&sfid) = self
+                        .lowering_ctx
+                        .funcs
+                        .get(&format!("__static_{}_{}", name, mname))
+                    {
                         statics.push((mname.clone(), sfid));
                     }
                 }
@@ -5289,7 +5776,12 @@ impl<'m> Lowerer<'m> {
         let cname = &c.name;
 
         // Own the collected class info (props/method lists, flags)
-        let ci = self.lowering_ctx.classes.get(cname).expect("class collected").clone();
+        let ci = self
+            .lowering_ctx
+            .classes
+            .get(cname)
+            .expect("class collected")
+            .clone();
 
         // ---- IMPORTANT: one shared field-id table per class ----
         let mut cls_fields: HashMap<String, FieldId> = HashMap::new();
@@ -5435,7 +5927,7 @@ impl<'m> Lowerer<'m> {
                     &mut next_field,
                     body,
                     &self.lowering_ctx,
-                    true
+                    true,
                 )?;
 
                 if !b.current_block_terminated() {
@@ -5460,7 +5952,7 @@ impl<'m> Lowerer<'m> {
                     &mut fields,
                     &mut next_field,
                     body,
-                    &self.lowering_ctx
+                    &self.lowering_ctx,
                 )?;
                 if !b.current_block_terminated() {
                     let zero = b.const_i32(0);
@@ -5484,7 +5976,11 @@ impl<'m> Lowerer<'m> {
     fn rewrite_privates_in_block(&self, class_name: &str, body: &Block) -> Block {
         // Resolve base class name once (if any). We’ll still rewrite even if there is none;
         // in that case unknown-func errors will be raised later if user wrote `super`.
-        let base_opt = self.lowering_ctx.classes.get(class_name).and_then(|ci| ci.base.clone());
+        let base_opt = self
+            .lowering_ctx
+            .classes
+            .get(class_name)
+            .and_then(|ci| ci.base.clone());
 
         fn rw_block<F: Fn(&Expr) -> Expr + Copy>(b: &Block, f: F) -> Block {
             Block {
@@ -5754,7 +6250,7 @@ impl<'m> Lowerer<'m> {
                     fields,
                     next_field,
                     &body_rw,
-                    &self.lowering_ctx
+                    &self.lowering_ctx,
                 )?;
                 if !b.current_block_terminated() {
                     let zero = b.const_i32(0);
@@ -5790,7 +6286,11 @@ impl<'m> Lowerer<'m> {
         let mut cur = ci.base.clone();
         while let Some(bn) = cur {
             base_chain.push(bn.clone());
-            cur = self.lowering_ctx.classes.get(&bn).and_then(|x| x.base.clone());
+            cur = self
+                .lowering_ctx
+                .classes
+                .get(&bn)
+                .and_then(|x| x.base.clone());
         }
         base_chain.reverse();
 
@@ -5835,7 +6335,11 @@ impl<'m> Lowerer<'m> {
                         if *mname == "constructor" || *mname == "destructor" {
                             continue;
                         }
-                        if let Some(&mfid) = self.lowering_ctx.funcs.get(&format!("__method_{}_{}", bn, mname)) {
+                        if let Some(&mfid) = self
+                            .lowering_ctx
+                            .funcs
+                            .get(&format!("__method_{}_{}", bn, mname))
+                        {
                             let (_nid_clo, clos) = b.push_node(
                                 Inst::MakeClosure {
                                     callee: mfid,
@@ -5867,7 +6371,11 @@ impl<'m> Lowerer<'m> {
                     // accessors: "__get__p" / "__set__p"
                     for (pname, getb, setb) in &bci.props {
                         if getb.is_some() {
-                            if let Some(&gid) = self.lowering_ctx.funcs.get(&format!("__get_{}_{}", bn, pname)) {
+                            if let Some(&gid) = self
+                                .lowering_ctx
+                                .funcs
+                                .get(&format!("__get_{}_{}", bn, pname))
+                            {
                                 let (_nid_clo, clos) = b.push_node(
                                     Inst::MakeClosure {
                                         callee: gid,
@@ -5898,7 +6406,11 @@ impl<'m> Lowerer<'m> {
                             }
                         }
                         if setb.is_some() {
-                            if let Some(&sid) = self.lowering_ctx.funcs.get(&format!("__set_{}_{}", bn, pname)) {
+                            if let Some(&sid) = self
+                                .lowering_ctx
+                                .funcs
+                                .get(&format!("__set_{}_{}", bn, pname))
+                            {
                                 let (_nid_clo, clos) = b.push_node(
                                     Inst::MakeClosure {
                                         callee: sid,
@@ -5937,7 +6449,11 @@ impl<'m> Lowerer<'m> {
                 if *mname == "constructor" || *mname == "destructor" {
                     continue;
                 }
-                if let Some(&mfid) = self.lowering_ctx.funcs.get(&format!("__method_{}_{}", ci.name, mname)) {
+                if let Some(&mfid) = self
+                    .lowering_ctx
+                    .funcs
+                    .get(&format!("__method_{}_{}", ci.name, mname))
+                {
                     let (_nid_clo, clos) = b.push_node(
                         Inst::MakeClosure {
                             callee: mfid,
@@ -5968,7 +6484,11 @@ impl<'m> Lowerer<'m> {
             }
             for (pname, getb, setb) in &ci.props {
                 if getb.is_some() {
-                    if let Some(&gid) = self.lowering_ctx.funcs.get(&format!("__get_{}_{}", ci.name, pname)) {
+                    if let Some(&gid) = self
+                        .lowering_ctx
+                        .funcs
+                        .get(&format!("__get_{}_{}", ci.name, pname))
+                    {
                         let (_nid_clo, clos) = b.push_node(
                             Inst::MakeClosure {
                                 callee: gid,
@@ -5995,7 +6515,11 @@ impl<'m> Lowerer<'m> {
                     }
                 }
                 if setb.is_some() {
-                    if let Some(&sid) = self.lowering_ctx.funcs.get(&format!("__set_{}_{}", ci.name, pname)) {
+                    if let Some(&sid) = self
+                        .lowering_ctx
+                        .funcs
+                        .get(&format!("__set_{}_{}", ci.name, pname))
+                    {
                         let (_nid_clo, clos) = b.push_node(
                             Inst::MakeClosure {
                                 callee: sid,
@@ -6034,7 +6558,7 @@ impl<'m> Lowerer<'m> {
                         fields,
                         next_field,
                         init_e,
-                        &self.lowering_ctx
+                        &self.lowering_ctx,
                     ) {
                         let field = intern_field_local(fields, next_field, fname);
                         let _ = b.push_node(

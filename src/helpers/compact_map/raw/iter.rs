@@ -1,8 +1,8 @@
 use core::{iter::FusedIterator, mem::MaybeUninit, ptr::NonNull};
 
 use super::RawIterInner;
-use crate::helpers::compact_map::{inline::AlignedGroups, raw::util::Bucket};
 use crate::helpers::compact_map::INLINE_CAPACITY;
+use crate::helpers::compact_map::{inline::AlignedGroups, raw::util::Bucket};
 
 pub(crate) struct RawIter<'a, T> {
     pub(crate) inner: RawIterInner<T>,
@@ -101,7 +101,11 @@ impl<'a, T> Iterator for RawIterMut<'a, T> {
                 NonNull::new_unchecked(self.data.as_mut_ptr() as *mut _),
                 0,
             );
-            Some(self.inner.next(self.aligned_groups.as_ptr(), base)?.as_mut())
+            Some(
+                self.inner
+                    .next(self.aligned_groups.as_ptr(), base)?
+                    .as_mut(),
+            )
         }
     }
 

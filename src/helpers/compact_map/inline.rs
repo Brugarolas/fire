@@ -1,22 +1,21 @@
-use crate::helpers::compact_map::INLINE_CAPACITY;
 use crate::helpers::compact_map::AesBuildHasher;
+use crate::helpers::compact_map::INLINE_CAPACITY;
 use crate::helpers::compact_map::raw::iter::RawIterMut;
 
 use core::{
     hash::{BuildHasher, Hash},
     iter::FusedIterator,
-    mem::{self, transmute, MaybeUninit},
+    mem::{self, MaybeUninit, transmute},
     ptr::NonNull,
 };
 
 use crate::helpers::compact_map::{
-    raw::{
-        h2,
-        iter::{RawIntoIter, RawIter},
-        util::{equivalent_key, likely, make_hash, Bucket, InsertSlot, SizedTypeProperties},
-        BitMaskWord, Group, RawIterInner, DELETED, EMPTY,
-    },
     Equivalent,
+    raw::{
+        BitMaskWord, DELETED, EMPTY, Group, RawIterInner, h2,
+        iter::{RawIntoIter, RawIter},
+        util::{Bucket, InsertSlot, SizedTypeProperties, equivalent_key, likely, make_hash},
+    },
 };
 
 #[derive(Clone)]
@@ -75,7 +74,9 @@ impl<T> Default for RawInline<T> {
                 _align: [],
             },
             len: 0,
-            data: unsafe { MaybeUninit::<[MaybeUninit<T>; INLINE_CAPACITY]>::uninit().assume_init() },
+            data: unsafe {
+                MaybeUninit::<[MaybeUninit<T>; INLINE_CAPACITY]>::uninit().assume_init()
+            },
         }
     }
 }
@@ -449,7 +450,9 @@ impl<K, V> Inline<K, V> {
                 },
                 len: 0,
 
-                data: unsafe { MaybeUninit::<[MaybeUninit<(K, V)>; INLINE_CAPACITY]>::uninit().assume_init() },
+                data: unsafe {
+                    MaybeUninit::<[MaybeUninit<(K, V)>; INLINE_CAPACITY]>::uninit().assume_init()
+                },
             },
             hash_builder: AesBuildHasher::default(),
         }
@@ -602,7 +605,9 @@ impl<'a, K, V> Iterator for IterMut<'a, K, V> {
 
 impl<'a, K, V> ExactSizeIterator for IterMut<'a, K, V> {
     #[inline]
-    fn len(&self) -> usize { self.inner.len() }
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
 }
 impl<'a, K, V> FusedIterator for IterMut<'a, K, V> {}
 

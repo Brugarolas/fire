@@ -7,12 +7,12 @@ use crate::gc::NAPALM_GC;
 use crate::jit::wir_make_method_closure;
 use crate::value as v;
 use crate::value::{
-    array_from_vec, allocate_new_string, make_smi, BoxedArray, BoxedClosure, BoxedF64, BoxedMap,
-    BoxedObj, BoxedSet, BoxedStr, Value, ValueRepr, NULL, ObjHeader, TAG_ARRAY, TAG_BOXED_F64,
-    TAG_CLOSURE, TAG_MAP, TAG_OBJECT, TAG_SET, TAG_STRING, bool_to_value, is_imm, map_new,
-    obj_assign, obj_clone_shallow, obj_get_field_deep, obj_get_proto, obj_get_slot,
-    obj_get_str_deep, obj_set_proto, obj_shape, obj_set_slot_known, set_new, shape_slot,
-    value_to_bool,
+    BoxedArray, BoxedClosure, BoxedF64, BoxedMap, BoxedObj, BoxedProxy, BoxedSet, BoxedStr, NULL,
+    ObjHeader, TAG_ARRAY, TAG_BOXED_F64, TAG_CLOSURE, TAG_MAP, TAG_OBJECT, TAG_PROXY, TAG_SET,
+    TAG_STRING, Value, ValueRepr, allocate_new_string, array_from_vec, bool_to_value, is_imm,
+    make_smi, map_new, obj_assign, obj_clone_shallow, obj_get_field_deep, obj_get_proto,
+    obj_get_slot, obj_get_str_deep, obj_set_proto, obj_set_slot_known, obj_shape, proxy_new,
+    set_new, shape_slot, value_to_bool,
 };
 
 use crate::helpers::collections::{ConcurrentHashMap, HashMap, HashSet};
@@ -20,6 +20,7 @@ use core::cmp::min;
 use parking_lot::{Mutex, RwLock};
 use std::slice;
 use std::sync::OnceLock;
+use tinyvec::TinyVec;
 
 #[inline(always)]
 fn smi_to_i64(v: i64) -> i64 {
@@ -72,7 +73,9 @@ struct FieldCacheList {
 
 impl FieldCacheList {
     fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     fn lookup(&self, shape: u32) -> Option<usize> {
@@ -83,11 +86,7 @@ impl FieldCacheList {
     }
 
     fn record(&mut self, shape: u32, slot: usize) {
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.shape == shape)
-        {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.shape == shape) {
             entry.slot = slot;
             return;
         }
@@ -136,6 +135,334 @@ fn cache_invalidate(fid: u32, shape: u32) {
     }
 }
 
+fn field_name_registry() -> &'static RwLock<HashMap<u32, String>> {
+    static REGISTRY: OnceLock<RwLock<HashMap<u32, String>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| RwLock::new(HashMap::default()))
+}
+
+fn field_name_for_id(fid: u32) -> Option<String> {
+    field_name_registry().read().get(&fid).cloned()
+}
+
+fn register_field_name(fid: u32, name: String) {
+    let mut guard = field_name_registry().write();
+    guard.entry(fid).or_insert(name);
+}
+
+#[inline(always)]
+fn is_proxy(v: i64) -> bool {
+    matches!(heap_tag(v), Some(TAG_PROXY))
+}
+
+#[inline(always)]
+unsafe fn proxy_ref(v: i64) -> &'static BoxedProxy {
+    &*(v as *const BoxedProxy)
+}
+
+#[inline(always)]
+fn proxy_target(proxy: i64) -> i64 {
+    unsafe { proxy_ref(proxy).target }
+}
+
+#[inline(always)]
+fn proxy_handler(proxy: i64) -> i64 {
+    unsafe { proxy_ref(proxy).handler }
+}
+
+fn obj_has_str_deep(mut obj: i64, key: &str) -> bool {
+    unsafe {
+        while obj != NULL {
+            if heap_tag(obj) != Some(TAG_OBJECT) {
+                break;
+            }
+            if value_to_bool(v::obj_has_str(obj, key)).unwrap_or(false) {
+                return true;
+            }
+            obj = obj_get_proto(obj);
+        }
+    }
+    false
+}
+
+fn obj_has_field_deep(mut obj: i64, fid: u32) -> bool {
+    unsafe {
+        while obj != NULL {
+            if heap_tag(obj) != Some(TAG_OBJECT) {
+                break;
+            }
+            if value_to_bool(v::obj_has_field(obj, fid)).unwrap_or(false) {
+                return true;
+            }
+            obj = obj_get_proto(obj);
+        }
+    }
+    false
+}
+
+fn ensure_key_value(key_ptr: i64, key: &str) -> i64 {
+    if key_ptr != 0 {
+        key_ptr
+    } else {
+        allocate_new_string(key)
+    }
+}
+
+fn proxy_invoke_trap(proxy: i64, method: &str, args: &[i64]) -> Option<i64> {
+    unsafe {
+        let handler = proxy_handler(proxy);
+        if handler == NULL || heap_tag(handler) != Some(TAG_OBJECT) {
+            return None;
+        }
+        let fun = v::obj_get_str_deep(handler, method);
+        if fun == 0 {
+            return None;
+        }
+        let mut argv = Vec::with_capacity(args.len() + 1);
+        argv.push(handler);
+        argv.extend_from_slice(args);
+        Some(crate::jit::wir_call_closure(
+            fun,
+            argv.as_ptr(),
+            argv.len() as i64,
+        ))
+    }
+}
+
+fn proxy_default_get(proxy: i64, key: &str) -> i64 {
+    let target = proxy_target(proxy);
+    if heap_tag(target) != Some(TAG_OBJECT) {
+        return NULL;
+    }
+    unsafe { obj_get_str_deep(target, key) }
+}
+
+fn proxy_default_set(proxy: i64, key: &str, val: i64) -> i64 {
+    let target = proxy_target(proxy);
+    if heap_tag(target) != Some(TAG_OBJECT) {
+        return 0;
+    }
+    unsafe {
+        v::obj_set_str(target, key, val);
+    }
+    0
+}
+
+fn proxy_default_has(proxy: i64, key: &str) -> i64 {
+    bool_to_value(obj_has_str_deep(proxy_target(proxy), key))
+}
+
+fn proxy_default_delete(proxy: i64, key: &str) -> i64 {
+    let target = proxy_target(proxy);
+    if heap_tag(target) != Some(TAG_OBJECT) {
+        return bool_to_value(false);
+    }
+    unsafe { v::obj_del_str(target, key) }
+}
+
+fn proxy_default_field_get(proxy: i64, fid: u32) -> i64 {
+    let target = proxy_target(proxy);
+    if heap_tag(target) != Some(TAG_OBJECT) {
+        return NULL;
+    }
+    unsafe { obj_get_field_deep(target, fid) }
+}
+
+fn proxy_default_field_set(proxy: i64, fid: u32, val: i64) -> i64 {
+    let target = proxy_target(proxy);
+    if heap_tag(target) != Some(TAG_OBJECT) {
+        return 0;
+    }
+    unsafe {
+        v::obj_set_field(target, fid, val);
+    }
+    0
+}
+
+fn proxy_default_field_has(proxy: i64, fid: u32) -> i64 {
+    bool_to_value(obj_has_field_deep(proxy_target(proxy), fid))
+}
+
+fn proxy_default_field_delete(proxy: i64, fid: u32) -> i64 {
+    let target = proxy_target(proxy);
+    if heap_tag(target) != Some(TAG_OBJECT) {
+        return bool_to_value(false);
+    }
+    unsafe { v::obj_del_field(target, fid) }
+}
+
+fn proxy_default_own_keys(proxy: i64) -> Vec<i64> {
+    let target = proxy_target(proxy);
+    if heap_tag(target) != Some(TAG_OBJECT) {
+        return Vec::new();
+    }
+    unsafe {
+        let obj = &*(target as *const BoxedObj);
+        collect_object_items(obj)
+            .into_iter()
+            .map(|(k, _)| allocate_new_string(k))
+            .collect()
+    }
+}
+
+fn proxy_own_keys(proxy: i64) -> Vec<i64> {
+    if let Some(res) = proxy_invoke_trap(proxy, "ownKeys", &[proxy_target(proxy)]) {
+        if matches!(heap_tag(res), Some(TAG_ARRAY)) {
+            unsafe {
+                let arr = &*(res as *const BoxedArray);
+                return arr.buf.clone();
+            }
+        }
+    }
+    proxy_default_own_keys(proxy)
+}
+
+fn proxy_get_with_name(proxy: i64, key_ptr: i64, key: &str, receiver: i64) -> i64 {
+    let key_val = ensure_key_value(key_ptr, key);
+    if let Some(res) = proxy_invoke_trap(proxy, "get", &[proxy_target(proxy), key_val, receiver]) {
+        return res;
+    }
+    proxy_default_get(proxy, key)
+}
+
+fn proxy_set_with_name(proxy: i64, key_ptr: i64, key: &str, val: i64, receiver: i64) -> i64 {
+    let key_val = ensure_key_value(key_ptr, key);
+    if let Some(res) =
+        proxy_invoke_trap(proxy, "set", &[proxy_target(proxy), key_val, val, receiver])
+    {
+        if value_to_bool(res).unwrap_or(false) {
+            return 0;
+        }
+    }
+    proxy_default_set(proxy, key, val)
+}
+
+fn proxy_has_with_name(proxy: i64, key_ptr: i64, key: &str) -> i64 {
+    let key_val = ensure_key_value(key_ptr, key);
+    if let Some(res) = proxy_invoke_trap(proxy, "has", &[proxy_target(proxy), key_val]) {
+        return bool_to_value(value_to_bool(res).unwrap_or(false));
+    }
+    proxy_default_has(proxy, key)
+}
+
+fn proxy_delete_with_name(proxy: i64, key_ptr: i64, key: &str) -> i64 {
+    let key_val = ensure_key_value(key_ptr, key);
+    if let Some(res) = proxy_invoke_trap(proxy, "deleteProperty", &[proxy_target(proxy), key_val]) {
+        return bool_to_value(value_to_bool(res).unwrap_or(false));
+    }
+    proxy_default_delete(proxy, key)
+}
+
+fn proxy_get_field(proxy: i64, fid: u32, receiver: i64) -> i64 {
+    if let Some(name) = field_name_for_id(fid) {
+        proxy_get_with_name(proxy, 0, &name, receiver)
+    } else {
+        proxy_default_field_get(proxy, fid)
+    }
+}
+
+fn proxy_set_field(proxy: i64, fid: u32, val: i64, receiver: i64) -> i64 {
+    if let Some(name) = field_name_for_id(fid) {
+        proxy_set_with_name(proxy, 0, &name, val, receiver)
+    } else {
+        proxy_default_field_set(proxy, fid, val)
+    }
+}
+
+fn proxy_has_field(proxy: i64, fid: u32) -> i64 {
+    if let Some(name) = field_name_for_id(fid) {
+        proxy_has_with_name(proxy, 0, &name)
+    } else {
+        proxy_default_field_has(proxy, fid)
+    }
+}
+
+fn proxy_delete_field(proxy: i64, fid: u32) -> i64 {
+    if let Some(name) = field_name_for_id(fid) {
+        proxy_delete_with_name(proxy, 0, &name)
+    } else {
+        proxy_default_field_delete(proxy, fid)
+    }
+}
+
+fn proxy_iter(proxy: i64, kind: BuiltinIterKind) -> i64 {
+    let keys: Vec<(i64, String)> = proxy_own_keys(proxy)
+        .into_iter()
+        .filter_map(|key| {
+            if matches!(heap_tag(key), Some(TAG_STRING)) {
+                unsafe { boxedstr_to_string(key) }.map(|name| (key, name))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    match kind {
+        BuiltinIterKind::Keys => {
+            let out: Vec<i64> = keys
+                .iter()
+                .map(|(_, name)| allocate_new_string(name))
+                .collect();
+            array_from_vec(out)
+        }
+        BuiltinIterKind::Values => {
+            let mut out = Vec::with_capacity(keys.len());
+            for (key_val, name) in &keys {
+                let key_handle = ensure_key_value(*key_val, name);
+                let value = unsafe { wir_obj_get_str(proxy, key_handle) };
+                out.push(value);
+            }
+            array_from_vec(out)
+        }
+        BuiltinIterKind::Entries => {
+            let mut out = Vec::with_capacity(keys.len());
+            for (key_val, name) in &keys {
+                let key_handle = ensure_key_value(*key_val, name);
+                let value = unsafe { wir_obj_get_str(proxy, key_handle) };
+                let key_copy = allocate_new_string(name);
+                let pair = array_from_vec(vec![key_copy, value]);
+                out.push(pair);
+            }
+            array_from_vec(out)
+        }
+    }
+}
+
+fn proxy_assign(dst: i64, src: i64) -> i64 {
+    fn entries_for(src: i64) -> Vec<(String, i64)> {
+        if is_proxy(src) {
+            let mut out = Vec::new();
+            for key_val in proxy_own_keys(src) {
+                if matches!(heap_tag(key_val), Some(TAG_STRING)) {
+                    if let Some(key) = unsafe { boxedstr_to_string(key_val) } {
+                        let value =
+                            unsafe { wir_obj_get_str(src, ensure_key_value(key_val, &key)) };
+                        out.push((key, value));
+                    }
+                }
+            }
+            out
+        } else if matches!(heap_tag(src), Some(TAG_OBJECT)) {
+            unsafe {
+                let obj = &*(src as *const BoxedObj);
+                collect_object_items(obj)
+                    .into_iter()
+                    .map(|(k, v)| (k.clone(), v))
+                    .collect()
+            }
+        } else {
+            Vec::new()
+        }
+    }
+
+    for (key, value) in entries_for(src) {
+        let key_val = allocate_new_string(&key);
+        unsafe {
+            wir_obj_set_str(dst, key_val, value);
+        }
+    }
+    0
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BuiltinIterKind {
     Keys,
@@ -164,6 +491,9 @@ fn object_iter(obj: i64, kind: BuiltinIterKind) -> i64 {
     unsafe {
         if obj == 0 || !is_heap_ptr(obj) {
             return empty_array();
+        }
+        if is_proxy(obj) {
+            return proxy_iter(obj, kind);
         }
         let o = &*(obj as *const BoxedObj);
         let items = collect_object_items(o);
@@ -277,6 +607,9 @@ pub extern "C" fn wir_obj_get_field(obj: i64, field_id_smi: i64) -> i64 {
         return 0;
     }
     let id = decode_field_smi(field_id_smi);
+    if is_proxy(obj) {
+        return proxy_get_field(obj, id, obj);
+    }
     unsafe {
         let shape = obj_shape(obj);
         if let Some(slot) = cache_lookup(id, shape) {
@@ -297,6 +630,9 @@ pub extern "C" fn wir_obj_set_field(obj: i64, field_id_smi: i64, val: i64) -> i6
         return 0;
     }
     let id = decode_field_smi(field_id_smi);
+    if is_proxy(obj) {
+        return proxy_set_field(obj, id, val, obj);
+    }
     unsafe {
         let shape_before = obj_shape(obj);
         if let Some(slot) = cache_lookup(id, shape_before) {
@@ -319,6 +655,9 @@ pub extern "C" fn wir_obj_has_field(obj: i64, field_id_smi: i64) -> i64 {
         return bool_to_value(false);
     }
     let id = decode_field_smi(field_id_smi);
+    if is_proxy(obj) {
+        return proxy_has_field(obj, id);
+    }
     unsafe {
         let shape = obj_shape(obj);
         if cache_lookup(id, shape).is_some() {
@@ -341,6 +680,9 @@ pub extern "C" fn wir_obj_del_field(obj: i64, field_id_smi: i64) -> i64 {
         return bool_to_value(false);
     }
     let id = decode_field_smi(field_id_smi);
+    if is_proxy(obj) {
+        return proxy_delete_field(obj, id);
+    }
     unsafe {
         let shape_before = obj_shape(obj);
         let res = v::obj_del_field(obj, id);
@@ -356,14 +698,38 @@ pub extern "C" fn wir_obj_set_proto(obj: i64, proto: i64) -> i64 {
     if obj == 0 {
         return 0;
     }
-    unsafe { obj_set_proto(obj, proto) }
+    if is_proxy(obj) {
+        if let Some(res) = proxy_invoke_trap(obj, "setPrototypeOf", &[proxy_target(obj), proto]) {
+            return res;
+        }
+        let target = proxy_target(obj);
+        if heap_tag(target) == Some(TAG_OBJECT) {
+            unsafe { obj_set_proto(target, proto) }
+        } else {
+            0
+        }
+    } else {
+        unsafe { obj_set_proto(obj, proto) }
+    }
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_obj_get_proto(obj: i64) -> i64 {
     if obj == 0 {
         return 0;
     }
-    unsafe { obj_get_proto(obj) }
+    if is_proxy(obj) {
+        if let Some(res) = proxy_invoke_trap(obj, "getPrototypeOf", &[proxy_target(obj)]) {
+            return res;
+        }
+        let target = proxy_target(obj);
+        if heap_tag(target) == Some(TAG_OBJECT) {
+            unsafe { obj_get_proto(target) }
+        } else {
+            0
+        }
+    } else {
+        unsafe { obj_get_proto(obj) }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -371,7 +737,11 @@ pub extern "C" fn wir_obj_get_field_deep(obj: i64, field_id_smi: i64) -> i64 {
     if obj == 0 {
         return 0;
     }
-    unsafe { obj_get_field_deep(obj, decode_field_smi(field_id_smi)) }
+    let fid = decode_field_smi(field_id_smi);
+    if is_proxy(obj) {
+        return proxy_get_field(obj, fid, obj);
+    }
+    unsafe { obj_get_field_deep(obj, fid) }
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_obj_get_str_deep(obj: i64, key_ptr: i64) -> i64 {
@@ -381,7 +751,11 @@ pub extern "C" fn wir_obj_get_str_deep(obj: i64, key_ptr: i64) -> i64 {
     let Some(k) = (unsafe { boxedstr_to_string(key_ptr) }) else {
         return 0;
     };
-    unsafe { obj_get_str_deep(obj, &k) }
+    if is_proxy(obj) {
+        proxy_get_with_name(obj, key_ptr, &k, obj)
+    } else {
+        unsafe { obj_get_str_deep(obj, &k) }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -426,7 +800,11 @@ pub extern "C" fn wir_obj_get_str(obj: i64, key_ptr: i64) -> i64 {
     let Some(k) = (unsafe { boxedstr_to_string(key_ptr) }) else {
         return 0;
     };
-    unsafe { v::obj_get_str(obj, &k) }
+    if is_proxy(obj) {
+        proxy_get_with_name(obj, key_ptr, &k, obj)
+    } else {
+        unsafe { v::obj_get_str(obj, &k) }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -437,10 +815,14 @@ pub extern "C" fn wir_obj_set_str(obj: i64, key_ptr: i64, val: i64) -> i64 {
     let Some(k) = (unsafe { boxedstr_to_string(key_ptr) }) else {
         return 0;
     };
-    unsafe {
-        v::obj_set_str(obj, &k, val);
+    if is_proxy(obj) {
+        proxy_set_with_name(obj, key_ptr, &k, val, obj)
+    } else {
+        unsafe {
+            v::obj_set_str(obj, &k, val);
+        }
+        0
     }
-    0
 }
 
 #[unsafe(no_mangle)]
@@ -451,7 +833,11 @@ pub extern "C" fn wir_obj_has_str(obj: i64, key_ptr: i64) -> i64 {
     let Some(k) = (unsafe { boxedstr_to_string(key_ptr) }) else {
         return bool_to_value(false);
     };
-    unsafe { v::obj_has_str(obj, &k) }
+    if is_proxy(obj) {
+        proxy_has_with_name(obj, key_ptr, &k)
+    } else {
+        unsafe { v::obj_has_str(obj, &k) }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -462,7 +848,11 @@ pub extern "C" fn wir_obj_del_str(obj: i64, key_ptr: i64) -> i64 {
     let Some(k) = (unsafe { boxedstr_to_string(key_ptr) }) else {
         return bool_to_value(false);
     };
-    unsafe { v::obj_del_str(obj, &k) }
+    if is_proxy(obj) {
+        proxy_delete_with_name(obj, key_ptr, &k)
+    } else {
+        unsafe { v::obj_del_str(obj, &k) }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -499,7 +889,23 @@ pub unsafe extern "C" fn wir_string_equals(s1_val: i64, s2_val: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_obj_assign(dst: i64, src: i64) -> i64 {
-    unsafe { obj_assign(dst, src) }
+    if is_proxy(dst) || is_proxy(src) {
+        proxy_assign(dst, src)
+    } else {
+        unsafe { obj_assign(dst, src) }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_field_register_name(field_id_smi: i64, key_ptr: i64) -> i64 {
+    if key_ptr == 0 {
+        return 0;
+    }
+    let fid = decode_field_smi(field_id_smi);
+    if let Some(name) = unsafe { boxedstr_to_string(key_ptr) } {
+        register_field_name(fid, name);
+    }
+    0
 }
 
 #[unsafe(no_mangle)]
@@ -509,7 +915,16 @@ pub extern "C" fn wir_is_nullish(v: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_obj_clone(obj: i64) -> i64 {
-    unsafe { obj_clone_shallow(obj) }
+    if is_proxy(obj) {
+        let target = proxy_target(obj);
+        if heap_tag(target) == Some(TAG_OBJECT) {
+            unsafe { obj_clone_shallow(target) }
+        } else {
+            NULL
+        }
+    } else {
+        unsafe { obj_clone_shallow(obj) }
+    }
 }
 
 // --- Definiciones de claves para funciones de 2, 3 y 4 argumentos ---
@@ -622,7 +1037,14 @@ pub extern "C" fn wir_memo_put3(fid: i64, k0: i64, k1: i64, k2: i64, val: i64) -
 
 // -- Funciones para 4 argumentos --
 #[unsafe(no_mangle)]
-pub extern "C" fn wir_memo_get4(fid: i64, k0: i64, k1: i64, k2: i64, k3: i64, out_ptr: *mut i64) -> i64 {
+pub extern "C" fn wir_memo_get4(
+    fid: i64,
+    k0: i64,
+    k1: i64,
+    k2: i64,
+    k3: i64,
+    out_ptr: *mut i64,
+) -> i64 {
     let fid_u = fid as u32;
     let guard = &mut memo4().guard();
 
@@ -660,7 +1082,11 @@ pub fn fmt_value(v: i64) -> String {
 
 fn pp(v: i64, depth: usize, max_depth: usize, max_elems: usize, seen: &mut HashSet<u64>) -> String {
     if let Some(b) = value_to_bool(v) {
-        return if b { "true".to_string() } else { "false".to_string() };
+        return if b {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        };
     }
 
     // Small ints (SMI)
@@ -836,15 +1262,35 @@ fn pp(v: i64, depth: usize, max_depth: usize, max_elems: usize, seen: &mut HashS
 // -----------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
+pub extern "C" fn wir_proxy_new(target: i64, handler: i64) -> i64 {
+    if target == 0 || handler == 0 {
+        return 0;
+    }
+    if heap_tag(target) != Some(TAG_OBJECT) || heap_tag(handler) != Some(TAG_OBJECT) {
+        return 0;
+    }
+    proxy_new(target, handler)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_is_proxy(v: i64) -> i64 {
+    bool_to_value(is_proxy(v))
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_is_map(v: i64) -> i64 {
-    if !is_heap_ptr(v) { return bool_to_value(false); }
+    if !is_heap_ptr(v) {
+        return bool_to_value(false);
+    }
     let hdr = &*(v as *const ObjHeader);
     bool_to_value(hdr.tag == TAG_MAP)
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_is_set(v: i64) -> i64 {
-    if !is_heap_ptr(v) { return bool_to_value(false); }
+    if !is_heap_ptr(v) {
+        return bool_to_value(false);
+    }
     let hdr = &*(v as *const ObjHeader);
     bool_to_value(hdr.tag == TAG_SET)
 }
@@ -859,7 +1305,9 @@ fn live_collections() -> &'static Mutex<HashSet<usize>> {
 pub fn collections_with_root_slots<F: FnMut(*mut i64)>(mut f: F) {
     let guard = live_collections().lock();
     for &addr in guard.iter() {
-        if addr == 0 { continue; }
+        if addr == 0 {
+            continue;
+        }
         let ptr = addr as *const u8;
         unsafe {
             let hdr = &*(ptr as *const ObjHeader);
@@ -891,22 +1339,28 @@ pub extern "C" fn wir_map_new() -> i64 {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_map_get(map_val: i64, key: i64) -> i64 {
-    if !is_heap_ptr(map_val) { return NULL; }
-    let map = &* (map_val as *const BoxedMap);
+    if !is_heap_ptr(map_val) {
+        return NULL;
+    }
+    let map = &*(map_val as *const BoxedMap);
     map.map.get(&Value(key)).map_or(NULL, |v| v.0)
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_map_set(map_val: i64, key: i64, val: i64) -> i64 {
-    if !is_heap_ptr(map_val) { return map_val; }
-    let map = &mut * (map_val as *mut BoxedMap);
+    if !is_heap_ptr(map_val) {
+        return map_val;
+    }
+    let map = &mut *(map_val as *mut BoxedMap);
     map.map.insert(Value(key), Value(val));
     map_val
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_map_has(map_val: i64, key: i64) -> i64 {
-    if !is_heap_ptr(map_val) { return bool_to_value(false); }
+    if !is_heap_ptr(map_val) {
+        return bool_to_value(false);
+    }
     match heap_tag(map_val) {
         Some(TAG_MAP) => {
             let map = &*(map_val as *const BoxedMap);
@@ -919,7 +1373,9 @@ pub unsafe extern "C" fn wir_map_has(map_val: i64, key: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_map_delete(map_val: i64, key: i64) -> i64 {
-    if !is_heap_ptr(map_val) { return bool_to_value(false); }
+    if !is_heap_ptr(map_val) {
+        return bool_to_value(false);
+    }
     match heap_tag(map_val) {
         Some(TAG_MAP) => {
             let map = &mut *(map_val as *mut BoxedMap);
@@ -932,7 +1388,9 @@ pub unsafe extern "C" fn wir_map_delete(map_val: i64, key: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_map_clear(map_val: i64) {
-    if !is_heap_ptr(map_val) { return; }
+    if !is_heap_ptr(map_val) {
+        return;
+    }
     match heap_tag(map_val) {
         Some(TAG_MAP) => {
             let map = &mut *(map_val as *mut BoxedMap);
@@ -945,7 +1403,9 @@ pub unsafe extern "C" fn wir_map_clear(map_val: i64) {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_map_size(map_val: i64) -> i64 {
-    if !is_heap_ptr(map_val) { return v::make_smi(0); }
+    if !is_heap_ptr(map_val) {
+        return v::make_smi(0);
+    }
     match heap_tag(map_val) {
         Some(TAG_MAP) => {
             let map = &*(map_val as *const BoxedMap);
@@ -995,6 +1455,10 @@ pub extern "C" fn wir_builtin_size(recv: i64) -> i64 {
             let set = unsafe { &*(recv as *const BoxedSet) };
             v::make_smi(set.set.len() as i64)
         }
+        Some(TAG_PROXY) => {
+            let len = proxy_own_keys(recv).len();
+            v::make_smi(len as i64)
+        }
         Some(TAG_OBJECT) => {
             let obj = unsafe { &*(recv as *const BoxedObj) };
             let count = obj
@@ -1022,37 +1486,47 @@ pub extern "C" fn wir_set_new() -> i64 {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_set_add(set_val: i64, val: i64) -> i64 {
-    if !is_heap_ptr(set_val) { return set_val; }
-    let set = &mut * (set_val as *mut BoxedSet);
+    if !is_heap_ptr(set_val) {
+        return set_val;
+    }
+    let set = &mut *(set_val as *mut BoxedSet);
     set.set.insert(Value(val));
     set_val
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_set_has(set_val: i64, val: i64) -> i64 {
-    if !is_heap_ptr(set_val) { return bool_to_value(false); }
-    let set = &* (set_val as *const BoxedSet);
+    if !is_heap_ptr(set_val) {
+        return bool_to_value(false);
+    }
+    let set = &*(set_val as *const BoxedSet);
     bool_to_value(set.set.contains(&Value(val)))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_set_delete(set_val: i64, val: i64) -> i64 {
-    if !is_heap_ptr(set_val) { return bool_to_value(false); }
-    let set = &mut * (set_val as *mut BoxedSet);
+    if !is_heap_ptr(set_val) {
+        return bool_to_value(false);
+    }
+    let set = &mut *(set_val as *mut BoxedSet);
     bool_to_value(set.set.remove(&Value(val)))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_set_clear(set_val: i64) {
-    if !is_heap_ptr(set_val) { return; }
-    let set = &mut * (set_val as *mut BoxedSet);
+    if !is_heap_ptr(set_val) {
+        return;
+    }
+    let set = &mut *(set_val as *mut BoxedSet);
     set.set.clear();
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_set_size(set_val: i64) -> i64 {
-    if !is_heap_ptr(set_val) { return v::make_smi(0); }
-    let set = &* (set_val as *const BoxedSet);
+    if !is_heap_ptr(set_val) {
+        return v::make_smi(0);
+    }
+    let set = &*(set_val as *const BoxedSet);
     v::make_smi(set.set.len() as i64)
 }
 

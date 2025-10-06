@@ -12,11 +12,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::helpers::collections::{HashMap, HashSet};
 use crate::front::{ExportDecl, ImportItem, ModuleAST, Parser, Program};
+use crate::helpers::collections::{HashMap, HashSet};
 use crate::lowerer::{LinkInfo, Lowerer};
 use crate::opt::optimization::optimization_passes;
-use crate::wir::{Builder as WirBuilder, CallConv, FuncId, IdRemap, Inst, Type, BindingId};
+use crate::wir::{BindingId, Builder as WirBuilder, CallConv, FuncId, IdRemap, Inst, Type};
 
 /// -----------------------------------------
 /// Minimal infra
@@ -249,11 +249,12 @@ impl ProgramBuilder {
         let mut links = LinkInfo::default();
 
         // 2. Get the ModuleAST for the current module, which contains the results of the parse-time binding.
-        let module_ast = self
-            .ctx
-            .registry
-            .get(path)
-            .ok_or_else(|| format!("[Linker] FATAL: Missing ModuleAST for own module {:?}", path))?;
+        let module_ast = self.ctx.registry.get(path).ok_or_else(|| {
+            format!(
+                "[Linker] FATAL: Missing ModuleAST for own module {:?}",
+                path
+            )
+        })?;
 
         // 3. Populate this module's OWN exports. The BindingIds were already created correctly by the parser
         //    and stored in this module's ModuleAST. We just copy them over.
@@ -269,7 +270,12 @@ impl ProgramBuilder {
             let resolved_provider_path = self
                 .loader
                 .resolve(path.as_ref(), &imp.specifier)
-                .map_err(|e| format!("Linker cannot resolve '{}' from {:?}: {}", imp.specifier, path, e))?;
+                .map_err(|e| {
+                    format!(
+                        "Linker cannot resolve '{}' from {:?}: {}",
+                        imp.specifier, path, e
+                    )
+                })?;
             let resolved_provider_arc = Arc::new(resolved_provider_path);
 
             // Get the ModuleAST of the module we are importing FROM.
@@ -277,15 +283,22 @@ impl ProgramBuilder {
                 .ctx
                 .registry
                 .get(&resolved_provider_arc)
-                .ok_or_else(|| format!("[Linker] FATAL: Missing provider ModuleAST for {:?}", resolved_provider_arc))?;
+                .ok_or_else(|| {
+                    format!(
+                        "[Linker] FATAL: Missing provider ModuleAST for {:?}",
+                        resolved_provider_arc
+                    )
+                })?;
 
             // 5. To know if an import is a class, we need to inspect the provider's full AST.
             //    We do this once per provider and cache the results.
             if !export_kind_cache.contains_key(&resolved_provider_arc) {
-                let provider_prog = self
-                    .programs
-                    .get(&resolved_provider_arc)
-                    .ok_or_else(|| format!("[Linker] FATAL: Missing provider Program AST for {:?}", resolved_provider_arc))?;
+                let provider_prog = self.programs.get(&resolved_provider_arc).ok_or_else(|| {
+                    format!(
+                        "[Linker] FATAL: Missing provider Program AST for {:?}",
+                        resolved_provider_arc
+                    )
+                })?;
 
                 let mut kind_map = HashMap::default();
                 for ed in &provider_prog.exports {
@@ -304,7 +317,9 @@ impl ProgramBuilder {
                                 let public_name = alias.clone().unwrap_or_else(|| local.clone());
                                 // We can't know the original type of a re-export without deep analysis,
                                 // so we conservatively mark it as 'Other'.
-                                kind_map.entry(public_name).or_insert(ExportSymbolKind::Other);
+                                kind_map
+                                    .entry(public_name)
+                                    .or_insert(ExportSymbolKind::Other);
                             }
                         }
                         ExportDecl::AllFrom { .. } => {
@@ -324,11 +339,14 @@ impl ProgramBuilder {
                         let local_name = alias.as_ref().unwrap_or(name);
 
                         // Find the export in the provider module to get the globally unique BindingId.
-                        if let Some(provider_export_item) = provider_ast.exports.get(name.as_str()) {
+                        if let Some(provider_export_item) = provider_ast.exports.get(name.as_str())
+                        {
                             let global_binding_id = provider_export_item.binding;
 
                             // Map our local name to that global ID.
-                            links.import_bindings.insert(local_name.clone(), global_binding_id);
+                            links
+                                .import_bindings
+                                .insert(local_name.clone(), global_binding_id);
 
                             // Check if this binding is for a class and record it.
                             if matches!(export_kinds.get(name), Some(&ExportSymbolKind::Class)) {
@@ -353,7 +371,9 @@ impl ProgramBuilder {
                             .collect();
 
                         // Map our local namespace alias to this full list.
-                        links.namespace_imports.insert(alias.clone(), all_provider_exports);
+                        links
+                            .namespace_imports
+                            .insert(alias.clone(), all_provider_exports);
                     }
                 }
             }
@@ -453,7 +473,8 @@ impl ProgramBuilder {
                         let mut m = crate::wir::Module::new();
 
                         let mut lowerer = Lowerer::new(&mut m);
-                        lowerer.set_links(job.links)
+                        lowerer
+                            .set_links(job.links)
                             .lower_program(&job.prog)
                             .map_err(|e| format!("lower error in {:?}: {:?}", &job.path, e))?;
 

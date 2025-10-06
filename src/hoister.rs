@@ -7,6 +7,7 @@ use logos::Logos;
 use smallbox::SmallBox;
 use std::collections::hash_map::Entry;
 use std::{collections::BTreeSet, ops::Deref};
+use tinyvec::TinyVec;
 
 // Bring in the WIR types from your other file/module.
 use crate::wir::{

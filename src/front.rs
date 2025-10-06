@@ -7,7 +7,6 @@ use ariadne::{Color, FileCache, FnCache, Label, Report, ReportKind, Source};
 use hybrid_rc::Arc;
 use logos::Logos;
 use smallbox::SmallBox;
-use smallvec::{smallvec, SmallVec};
 use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 use std::{collections::BTreeSet, ops::Deref};
@@ -120,6 +119,8 @@ pub enum Tok {
     MapBuiltin,
     #[token("Set")]
     SetBuiltin,
+    #[token("Proxy")]
+    ProxyBuiltin,
 
     // Identifiers & literals
     #[regex(r"[A-Za-z_][A-Za-z0-9_]*", |lex| lex.slice().to_string())]
@@ -356,6 +357,7 @@ pub enum ObjItem {
 pub enum BuiltinType {
     Map,
     Set,
+    Proxy,
     // We can add Array, String, Date, etc. here later
 }
 
@@ -2371,94 +2373,122 @@ impl<'src> Parser<'src> {
                     };
                 }
             } else if self.matches(&Tok::Dot) {
-            let name_str = self.parse_any_identifier()?;
-            
-            // Check if this is a method call or a property access
-            if self.matches(&Tok::LParen) {
-                let map_method = match name_str.as_str() {
-                    "get" => Some(BuiltinMapMethod::Get),
-                    "set" => Some(BuiltinMapMethod::Set),
-                    "has" => Some(BuiltinMapMethod::Has),
-                    "delete" => Some(BuiltinMapMethod::Delete),
-                    "clear" => Some(BuiltinMapMethod::Clear),
-                    "keys" => Some(BuiltinMapMethod::Keys),
-                    "values" => Some(BuiltinMapMethod::Values),
-                    "entries" => Some(BuiltinMapMethod::Entries),
-                    _ => None,
-                };
-                if let Some(method) = map_method {
-                    let args = self.parse_arg_list()?;
-                    if matches!(method, BuiltinMapMethod::Keys | BuiltinMapMethod::Values | BuiltinMapMethod::Entries)
-                        && !args.is_empty()
-                    {
-                        return Err(self.err_here("builtin method does not take arguments"));
-                    }
-                    e = Expr::CallBuiltinMapMethod { recv: SmallBox::new(e), method, args };
-                    continue;
-                }
+                let name_str = self.parse_any_identifier()?;
 
-                let set_method = match name_str.as_str() {
-                    "add" => Some(BuiltinSetMethod::Add),
-                    "has" => Some(BuiltinSetMethod::Has),
-                    "delete" => Some(BuiltinSetMethod::Delete),
-                    "clear" => Some(BuiltinSetMethod::Clear),
-                    "values" => Some(BuiltinSetMethod::Values),
-                    _ => None,
-                };
-                if let Some(method) = set_method {
-                    let args = self.parse_arg_list()?;
-                    if method == BuiltinSetMethod::Values && !args.is_empty() {
-                        return Err(self.err_here("builtin method does not take arguments"));
-                    }
-                    e = Expr::CallBuiltinSetMethod { recv: SmallBox::new(e), method, args };
-                    continue;
-                }
-
-                let common_method = match name_str.as_str() {
-                    "keys" => Some(BuiltinCommonMethod::Keys),
-                    "values" => Some(BuiltinCommonMethod::Values),
-                    "entries" => Some(BuiltinCommonMethod::Entries),
-                    _ => None,
-                };
-                if let Some(method) = common_method {
-                    let args = self.parse_arg_list()?;
-                    if !args.is_empty() {
-                        return Err(self.err_here("builtin method does not take arguments"));
-                    }
-                    e = Expr::CallBuiltinCommonMethod {
-                        recv: SmallBox::new(e),
-                        method,
+                // Check if this is a method call or a property access
+                if self.matches(&Tok::LParen) {
+                    let map_method = match name_str.as_str() {
+                        "get" => Some(BuiltinMapMethod::Get),
+                        "set" => Some(BuiltinMapMethod::Set),
+                        "has" => Some(BuiltinMapMethod::Has),
+                        "delete" => Some(BuiltinMapMethod::Delete),
+                        "clear" => Some(BuiltinMapMethod::Clear),
+                        "keys" => Some(BuiltinMapMethod::Keys),
+                        "values" => Some(BuiltinMapMethod::Values),
+                        "entries" => Some(BuiltinMapMethod::Entries),
+                        _ => None,
                     };
-                    continue;
-                }
+                    if let Some(method) = map_method {
+                        let args = self.parse_arg_list()?;
+                        if matches!(
+                            method,
+                            BuiltinMapMethod::Keys
+                                | BuiltinMapMethod::Values
+                                | BuiltinMapMethod::Entries
+                        ) && !args.is_empty()
+                        {
+                            return Err(self.err_here("builtin method does not take arguments"));
+                        }
+                        e = Expr::CallBuiltinMapMethod {
+                            recv: SmallBox::new(e),
+                            method,
+                            args,
+                        };
+                        continue;
+                    }
 
-                // Fallback for your original, working code (Array, String, etc.)
-                // Your existing code is already structured to call an arg parser and then continue.
-                // To keep this surgical, we'll put the arguments back for the original code to parse.
-                // A better refactor would merge them, but this adheres to the "no changes" rule.
-                self.i -= 1; // Un-consume the `(`.
-                
-                let callee = Expr::GetProp { recv: SmallBox::new(e), name: name_str };
-                let t_e = self.next()?; // This will now be `LParen`
-                let mut args = vec![];
-                // Manually re-implementing your original arg loop here to be safe
-                loop {
-                    if self.check(&Tok::RParen) { self.next()?; break; }
-                    if self.is_eof() { return Err(self.err_here("unexpected end of file in argument list")); }
-                    args.push(self.expr()?);
-                    if self.check(&Tok::RParen) { self.next()?; break; }
-                    self.expect(Tok::Comma, "expected ',' in argument list")?;
-                }
-                e = Expr::Call { callee: SmallBox::new(callee), args, };
+                    let set_method = match name_str.as_str() {
+                        "add" => Some(BuiltinSetMethod::Add),
+                        "has" => Some(BuiltinSetMethod::Has),
+                        "delete" => Some(BuiltinSetMethod::Delete),
+                        "clear" => Some(BuiltinSetMethod::Clear),
+                        "values" => Some(BuiltinSetMethod::Values),
+                        _ => None,
+                    };
+                    if let Some(method) = set_method {
+                        let args = self.parse_arg_list()?;
+                        if method == BuiltinSetMethod::Values && !args.is_empty() {
+                            return Err(self.err_here("builtin method does not take arguments"));
+                        }
+                        e = Expr::CallBuiltinSetMethod {
+                            recv: SmallBox::new(e),
+                            method,
+                            args,
+                        };
+                        continue;
+                    }
 
-            } else {
-                if name_str == "size" {
-                    e = Expr::GetBuiltinSize(SmallBox::new(e));
-                    continue;
+                    let common_method = match name_str.as_str() {
+                        "keys" => Some(BuiltinCommonMethod::Keys),
+                        "values" => Some(BuiltinCommonMethod::Values),
+                        "entries" => Some(BuiltinCommonMethod::Entries),
+                        _ => None,
+                    };
+                    if let Some(method) = common_method {
+                        let args = self.parse_arg_list()?;
+                        if !args.is_empty() {
+                            return Err(self.err_here("builtin method does not take arguments"));
+                        }
+                        e = Expr::CallBuiltinCommonMethod {
+                            recv: SmallBox::new(e),
+                            method,
+                        };
+                        continue;
+                    }
+
+                    // Fallback for your original, working code (Array, String, etc.)
+                    // Your existing code is already structured to call an arg parser and then continue.
+                    // To keep this surgical, we'll put the arguments back for the original code to parse.
+                    // A better refactor would merge them, but this adheres to the "no changes" rule.
+                    self.i -= 1; // Un-consume the `(`.
+
+                    let callee = Expr::GetProp {
+                        recv: SmallBox::new(e),
+                        name: name_str,
+                    };
+                    let t_e = self.next()?; // This will now be `LParen`
+                    let mut args = vec![];
+                    // Manually re-implementing your original arg loop here to be safe
+                    loop {
+                        if self.check(&Tok::RParen) {
+                            self.next()?;
+                            break;
+                        }
+                        if self.is_eof() {
+                            return Err(self.err_here("unexpected end of file in argument list"));
+                        }
+                        args.push(self.expr()?);
+                        if self.check(&Tok::RParen) {
+                            self.next()?;
+                            break;
+                        }
+                        self.expect(Tok::Comma, "expected ',' in argument list")?;
+                    }
+                    e = Expr::Call {
+                        callee: SmallBox::new(callee),
+                        args,
+                    };
+                } else {
+                    if name_str == "size" {
+                        e = Expr::GetBuiltinSize(SmallBox::new(e));
+                        continue;
+                    }
+                    e = Expr::GetProp {
+                        recv: SmallBox::new(e),
+                        name: name_str,
+                    };
                 }
-                e = Expr::GetProp { recv: SmallBox::new(e), name: name_str, };
-            }
-        } else if self.matches(&Tok::LBracket) {
+            } else if self.matches(&Tok::LBracket) {
                 let idx = self.expr()?;
                 self.expect(Tok::RBracket, "expected ']' after index")?;
                 e = Expr::Index {
@@ -2536,6 +2566,7 @@ impl<'src> Parser<'src> {
                     match peeked.tok {
                         Tok::MapBuiltin => Some(BuiltinType::Map),
                         Tok::SetBuiltin => Some(BuiltinType::Set),
+                        Tok::ProxyBuiltin => Some(BuiltinType::Proxy),
                         _ => None,
                     }
                 } else {
@@ -2543,23 +2574,65 @@ impl<'src> Parser<'src> {
                 };
 
                 if let Some(kind) = kind {
-                    self.next()?; // Consume the MapBuiltin/SetBuiltin token
+                    self.next()?; // Consume the builtin token
                     self.expect(Tok::LParen, "expected '(' after built-in type name")?;
-                    // Built-ins currently take no constructor args
-                    self.expect(Tok::RParen, "expected ')' after built-in constructor arguments")?;
+                    let mut args = Vec::new();
+                    if !self.check(&Tok::RParen) {
+                        loop {
+                            args.push(self.expr()?);
+                            if self.check(&Tok::RParen) {
+                                self.next()?; // consume ')'
+                                break;
+                            }
+                            self.expect(
+                                Tok::Comma,
+                                "expected ',' in built-in constructor arguments",
+                            )?;
+                        }
+                    } else {
+                        self.next()?; // consume ')'
+                    }
 
-                    return Ok(Expr::CreateBuiltin { kind, args: Vec::new() });
+                    match kind {
+                        BuiltinType::Map | BuiltinType::Set => {
+                            if !args.is_empty() {
+                                return Err(
+                                    self.err_here("Map/Set constructors do not take arguments")
+                                );
+                            }
+                        }
+                        BuiltinType::Proxy => {
+                            if args.len() != 2 {
+                                return Err(
+                                    self.err_here("Proxy constructor expects exactly 2 arguments")
+                                );
+                            }
+                        }
+                    }
+
+                    return Ok(Expr::CreateBuiltin { kind, args });
                 }
 
                 // --- Fallback to your original, working code for user classes ---
                 let class = self.parse_any_identifier()?;
-                self.expect(Tok::LParen, "expected '(' after class name in new expression")?;
+                self.expect(
+                    Tok::LParen,
+                    "expected '(' after class name in new expression",
+                )?;
                 let mut args = Vec::new(); // User class args
                 loop {
-                    if self.check(&Tok::RParen) { self.next()?; break; }
-                    if self.is_eof() { return Err(self.err_here("unexpected end of file in new arguments")); }
+                    if self.check(&Tok::RParen) {
+                        self.next()?;
+                        break;
+                    }
+                    if self.is_eof() {
+                        return Err(self.err_here("unexpected end of file in new arguments"));
+                    }
                     args.push(self.expr()?);
-                    if self.check(&Tok::RParen) { self.next()?; break; }
+                    if self.check(&Tok::RParen) {
+                        self.next()?;
+                        break;
+                    }
                     self.expect(Tok::Comma, "expected ',' in new arguments")?;
                 }
                 Ok(Expr::New { class, args })
@@ -2578,6 +2651,7 @@ impl<'src> Parser<'src> {
             Tok::DeferredBuiltin => Ok(Expr::Ident("Deferred".into())),
             Tok::MapBuiltin => Ok(Expr::Ident("Map".into())),
             Tok::SetBuiltin => Ok(Expr::Ident("Set".into())),
+            Tok::ProxyBuiltin => Ok(Expr::Ident("Proxy".into())),
 
             Tok::LParen => {
                 let e = self.expr()?;

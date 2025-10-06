@@ -114,6 +114,64 @@ set2.add("beta");
 print(set2.values());              // expect ["alpha", "beta"]
 print(set2.size);                  // expect 2
 
+print("===== Proxy basic traps =====");
+var proxyTarget = { foo: 10 };
+var proxyLog = Array(0);
+proxyLog.setLength(0);
+var proxyHandler = {
+    "get": fn (t, key, recv) {
+        proxyLog.push("get:" + key);
+        return t[key];
+    },
+    "set": fn (t, key, value, recv) {
+        proxyLog.push("set:" + key);
+        t[key] = value;
+        return true;
+    },
+    "has": fn (t, key) {
+        proxyLog.push("has:" + key);
+        return key in t;
+    },
+    "deleteProperty": fn (t, key) {
+        proxyLog.push("del:" + key);
+        delete t[key];
+        return true;
+    },
+    "ownKeys": fn (t) {
+        proxyLog.push("ownKeys");
+        return t.keys();
+    }
+};
+var proxied = new Proxy(proxyTarget, proxyHandler);
+print(proxied.foo);                // expect 10, triggers get
+proxied.bar = 42;                  // expect set trap, writes through
+print(proxyTarget.bar);            // expect 42
+print("foo" in proxied);           // expect true, has trap
+delete proxied.foo;                // expect delete trap
+print("foo" in proxied);           // expect false
+print(proxied.keys());             // expect ["bar"], uses ownKeys trap
+print(proxyLog);
+
+print("===== Proxy iteration & spread =====");
+var proxiedIter = new Proxy({ a: 1, c: 3 }, {
+    "ownKeys": fn (t) {
+        return ["c", "a"]; // custom key order
+    },
+    "get": fn (t, key, recv) {
+        return t[key];
+    },
+    "set": fn (t, key, value, recv) {
+        t[key] = value;
+        return true;
+    }
+});
+print(proxiedIter.keys());         // expect ["c", "a"]
+print(proxiedIter.values());       // expect [3, 1]
+print(proxiedIter.entries());      // expect [["c",3],["a",1]]
+var spreadProxy = { ...proxiedIter, b: 2 };
+print(spreadProxy.keys());         // expect sorted ["a","b","c"] (object keys sorted alpha)
+print(spreadProxy.values());       // expect [1,2,3]
+
 // ===========================
 // Arrays
 // ===========================

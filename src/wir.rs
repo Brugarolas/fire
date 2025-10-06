@@ -23,8 +23,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::helpers::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::fmt;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 #[derive(Default, Clone, Copy)]
 pub struct IdRemap {

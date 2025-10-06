@@ -76,8 +76,7 @@ mod tls_prng {
         }
         s = s.wrapping_add(0xA076_1D64_78BD_642F);
         let z = s;
-        let t = (z as u128)
-            .wrapping_mul((z ^ 0xE703_7ED1_A0B4_28DBu64) as u128);
+        let t = (z as u128).wrapping_mul((z ^ 0xE703_7ED1_A0B4_28DBu64) as u128);
         let out = ((t >> 64) as u64) ^ (t as u64);
         seed_cell.set(s);
         out
@@ -136,8 +135,7 @@ mod hasher_impl {
             unsafe {
                 // XOR message length and its bitwise NOT into lanes
                 let len = self.len as u64;
-                let len_vec =
-                    _mm_set_epi64x(!(len) as i64, len as i64);
+                let len_vec = _mm_set_epi64x(!(len) as i64, len as i64);
                 self.hash = _mm_xor_si128(self.hash, len_vec);
             }
         }
@@ -166,13 +164,17 @@ mod hasher_impl {
                 self.buffer[buf_pos..buf_pos + to_fill].copy_from_slice(&bytes[..to_fill]);
                 bytes = &bytes[to_fill..];
                 if buf_pos + to_fill == 16 {
-                    unsafe { self.round(self.buffer.as_ptr()); }
+                    unsafe {
+                        self.round(self.buffer.as_ptr());
+                    }
                 }
             }
 
             let mut chunks = bytes.chunks_exact(16);
             for chunk in &mut chunks {
-                unsafe { self.round(chunk.as_ptr()); }
+                unsafe {
+                    self.round(chunk.as_ptr());
+                }
             }
             let rem = chunks.remainder();
             if !rem.is_empty() {
@@ -181,11 +183,17 @@ mod hasher_impl {
         }
 
         #[inline(always)]
-        fn write_u64(&mut self, i: u64) { self.write(&i.to_ne_bytes()); }
+        fn write_u64(&mut self, i: u64) {
+            self.write(&i.to_ne_bytes());
+        }
         #[inline(always)]
-        fn write_u32(&mut self, i: u32) { self.write(&i.to_ne_bytes()); }
+        fn write_u32(&mut self, i: u32) {
+            self.write(&i.to_ne_bytes());
+        }
         #[inline(always)]
-        fn write_u8(&mut self, i: u8) { self.write(&[i]); }
+        fn write_u8(&mut self, i: u8) {
+            self.write(&[i]);
+        }
 
         #[inline(always)]
         fn finish(&self) -> u64 {
@@ -205,7 +213,8 @@ mod hasher_impl {
                 cur = _mm_xor_si128(cur, len_vec);
 
                 // final round
-                let final_key = _mm_set_epi64x(0x8E51EF21FABB4522u64 as i64, 0xE43D7A0656954B6Cu64 as i64);
+                let final_key =
+                    _mm_set_epi64x(0x8E51EF21FABB4522u64 as i64, 0xE43D7A0656954B6Cu64 as i64);
                 cur = _mm_aesenclast_si128(cur, final_key);
 
                 Self::fold128(cur)
@@ -285,11 +294,17 @@ mod hasher_impl {
         }
 
         #[inline(always)]
-        fn write_u64(&mut self, i: u64) { self.write(&i.to_ne_bytes()); }
+        fn write_u64(&mut self, i: u64) {
+            self.write(&i.to_ne_bytes());
+        }
         #[inline(always)]
-        fn write_u32(&mut self, i: u32) { self.write(&i.to_ne_bytes()); }
+        fn write_u32(&mut self, i: u32) {
+            self.write(&i.to_ne_bytes());
+        }
         #[inline(always)]
-        fn write_u8(&mut self, i: u8) { self.write(&[i]); }
+        fn write_u8(&mut self, i: u8) {
+            self.write(&[i]);
+        }
 
         #[inline(always)]
         fn finish(&self) -> u64 {
@@ -312,8 +327,8 @@ mod hasher_impl {
 
                 // final round
                 let final_key: [u8; 16] = [
-                    0x8E, 0x51, 0xEF, 0x21, 0xFA, 0xBB, 0x45, 0x22,
-                    0xE4, 0x3D, 0x7A, 0x06, 0x56, 0x95, 0x4B, 0x6C,
+                    0x8E, 0x51, 0xEF, 0x21, 0xFA, 0xBB, 0x45, 0x22, 0xE4, 0x3D, 0x7A, 0x06, 0x56,
+                    0x95, 0x4B, 0x6C,
                 ];
                 let fk = vld1q_u8(final_key.as_ptr());
                 cur = aes_last_round_arm(cur, fk);
@@ -348,15 +363,25 @@ mod hasher_impl {
 
     impl Hasher for AesHasher {
         #[inline(always)]
-        fn write(&mut self, bytes: &[u8]) { self.0.write(bytes) }
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.write(bytes)
+        }
         #[inline(always)]
-        fn write_u64(&mut self, i: u64) { self.0.write_u64(i) }
+        fn write_u64(&mut self, i: u64) {
+            self.0.write_u64(i)
+        }
         #[inline(always)]
-        fn write_u32(&mut self, i: u32) { self.0.write_u32(i) }
+        fn write_u32(&mut self, i: u32) {
+            self.0.write_u32(i)
+        }
         #[inline(always)]
-        fn write_u8(&mut self, i: u8) { self.0.write_u8(i) }
+        fn write_u8(&mut self, i: u8) {
+            self.0.write_u8(i)
+        }
         #[inline(always)]
-        fn finish(&self) -> u64 { self.0.finish() }
+        fn finish(&self) -> u64 {
+            self.0.finish()
+        }
     }
 }
 
@@ -383,12 +408,16 @@ impl AesBuildHasher {
 }
 impl Default for AesBuildHasher {
     #[inline]
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 impl BuildHasher for AesBuildHasher {
     type Hasher = AesHasher;
     #[inline]
-    fn build_hasher(&self) -> Self::Hasher { AesHasher::with_keys(self.k0, self.k1) }
+    fn build_hasher(&self) -> Self::Hasher {
+        AesHasher::with_keys(self.k0, self.k1)
+    }
 }
 
 /// ------------------------
@@ -399,26 +428,45 @@ impl BuildHasher for AesBuildHasher {
 #[derive(Debug)]
 pub struct ConcurrentHashMap<K: Eq + Hash, V>(pub papaya::HashMap<K, V, AesBuildHasher>);
 impl<K: Eq + Hash, V> ConcurrentHashMap<K, V> {
-    #[inline] pub fn new() -> Self { Self(papaya::HashMap::with_hasher(AesBuildHasher::new())) }
+    #[inline]
+    pub fn new() -> Self {
+        Self(papaya::HashMap::with_hasher(AesBuildHasher::new()))
+    }
 }
 impl<K: Eq + Hash, V> Default for ConcurrentHashMap<K, V> {
-    #[inline] fn default() -> Self { Self::new() }
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
 }
 impl<K: Eq + Hash, V> Deref for ConcurrentHashMap<K, V> {
     type Target = papaya::HashMap<K, V, AesBuildHasher>;
-    #[inline] fn deref(&self) -> &Self::Target { &self.0 }
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 impl<K: Eq + Hash, V> DerefMut for ConcurrentHashMap<K, V> {
-    #[inline] fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 
 // hashbrown::HashMap
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HashMap<K: Eq + Hash, V>(pub hashbrown::HashMap<K, V, AesBuildHasher>);
 impl<K: Eq + Hash, V> HashMap<K, V> {
-    #[inline] pub fn new() -> Self { Self(hashbrown::HashMap::with_hasher(AesBuildHasher::new())) }
-    #[inline] pub fn with_capacity(cap: usize) -> Self {
-        Self(hashbrown::HashMap::with_capacity_and_hasher(cap, AesBuildHasher::new()))
+    #[inline]
+    pub fn new() -> Self {
+        Self(hashbrown::HashMap::with_hasher(AesBuildHasher::new()))
+    }
+    #[inline]
+    pub fn with_capacity(cap: usize) -> Self {
+        Self(hashbrown::HashMap::with_capacity_and_hasher(
+            cap,
+            AesBuildHasher::new(),
+        ))
     }
 
     #[inline]
@@ -426,13 +474,24 @@ impl<K: Eq + Hash, V> HashMap<K, V> {
         &self.0
     }
 }
-impl<K: Eq + Hash, V> Default for HashMap<K, V> { #[inline] fn default() -> Self { Self::new() } }
+impl<K: Eq + Hash, V> Default for HashMap<K, V> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl<K: Eq + Hash, V> Deref for HashMap<K, V> {
     type Target = hashbrown::HashMap<K, V, AesBuildHasher>;
-    #[inline] fn deref(&self) -> &Self::Target { &self.0 }
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 impl<K: Eq + Hash, V> DerefMut for HashMap<K, V> {
-    #[inline] fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 impl<K: Eq + Hash, V> FromIterator<(K, V)> for HashMap<K, V> {
     #[inline]
@@ -456,9 +515,16 @@ impl<K: Eq + Hash, V> IntoIterator for HashMap<K, V> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HashSet<T: Eq + Hash>(pub hashbrown::HashSet<T, AesBuildHasher>);
 impl<T: Eq + Hash> HashSet<T> {
-    #[inline] pub fn new() -> Self { Self(hashbrown::HashSet::with_hasher(AesBuildHasher::new())) }
-    #[inline] pub fn with_capacity(cap: usize) -> Self {
-        Self(hashbrown::HashSet::with_capacity_and_hasher(cap, AesBuildHasher::new()))
+    #[inline]
+    pub fn new() -> Self {
+        Self(hashbrown::HashSet::with_hasher(AesBuildHasher::new()))
+    }
+    #[inline]
+    pub fn with_capacity(cap: usize) -> Self {
+        Self(hashbrown::HashSet::with_capacity_and_hasher(
+            cap,
+            AesBuildHasher::new(),
+        ))
     }
 
     #[inline]
@@ -466,13 +532,24 @@ impl<T: Eq + Hash> HashSet<T> {
         &self.0
     }
 }
-impl<T: Eq + Hash> Default for HashSet<T> { #[inline] fn default() -> Self { Self::new() } }
+impl<T: Eq + Hash> Default for HashSet<T> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl<T: Eq + Hash> Deref for HashSet<T> {
     type Target = hashbrown::HashSet<T, AesBuildHasher>;
-    #[inline] fn deref(&self) -> &Self::Target { &self.0 }
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 impl<T: Eq + Hash> DerefMut for HashSet<T> {
-    #[inline] fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 impl<T: Eq + Hash> FromIterator<T> for HashSet<T> {
     #[inline]

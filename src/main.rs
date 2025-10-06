@@ -18,10 +18,10 @@ mod runtime;
 mod value;
 mod wir;
 
+use crate::helpers::collections::HashMap;
 use crate::native_timers::invoke_and_pump;
 use crate::opt::Optimize;
 use crate::opt::optimization::optimization_passes;
-use crate::helpers::collections::HashMap;
 use front::Parser;
 use mimalloc::MiMalloc;
 use std::path::Path;

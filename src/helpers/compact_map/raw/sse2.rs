@@ -4,7 +4,7 @@ use core::arch::x86;
 use core::arch::x86_64 as x86;
 use core::{mem, num::NonZeroU16};
 
-use super::{bitmask::BitMask, EMPTY};
+use super::{EMPTY, bitmask::BitMask};
 
 pub(crate) type BitMaskWord = u16;
 pub(crate) type NonZeroBitMaskWord = NonZeroU16;

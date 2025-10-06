@@ -14,8 +14,8 @@ use std::{
     fmt::{self, Debug},
 };
 
-use hashbrown::HashMap;
 use crate::helpers::collections::AesBuildHasher;
+use hashbrown::HashMap;
 use inline::Inline;
 
 pub use hashbrown::Equivalent;
@@ -169,7 +169,9 @@ where
                             CompactMap::Inline(_) => unsafe { unreachable_unchecked() },
                         };
                         for (k, v) in inline.into_iter() {
-                            unsafe { heap.insert_unique_unchecked(k, v); };
+                            unsafe {
+                                heap.insert_unique_unchecked(k, v);
+                            };
                         }
                         heap
                     }
@@ -203,7 +205,7 @@ where
     }
 }
 
-impl<K, V> CompactMap<K, V>{
+impl<K, V> CompactMap<K, V> {
     /// Clears the map.
     ///
     /// This method clears the map as resets it to the Inline state.
@@ -388,7 +390,6 @@ impl<'a, K, V> ExactSizeIterator for IterMut<'a, K, V> {
     }
 }
 impl<'a, K, V> FusedIterator for IterMut<'a, K, V> {}
-
 
 impl<K, V> CompactMap<K, V> {
     #[inline]

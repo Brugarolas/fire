@@ -35,7 +35,10 @@ where
 }
 
 #[inline]
-pub(crate) fn make_hash<Q>(hash_builder: &crate::helpers::collections::AesBuildHasher, val: &Q) -> u64
+pub(crate) fn make_hash<Q>(
+    hash_builder: &crate::helpers::collections::AesBuildHasher,
+    val: &Q,
+) -> u64
 where
     Q: Hash + ?Sized,
 {

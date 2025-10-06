@@ -6,14 +6,14 @@
 
 use crate::gc::NAPALM_GC;
 use crate::helpers::collections::{HashMap, HashSet};
-use parking_lot::RwLock;
 use crate::helpers::compact_map::CompactMap;
 use core::mem;
-use std::ptr;
-use std::str;
-use std::slice;
-use std::hash::{Hash, Hasher};
+use parking_lot::RwLock;
 use std::borrow::Borrow;
+use std::hash::{Hash, Hasher};
+use std::ptr;
+use std::slice;
+use std::str;
 use std::sync::OnceLock;
 
 //use crate::gc::api::{alloc_raw, alloc_slow_path, post_alloc_object};
@@ -91,12 +91,14 @@ pub struct Value(pub ValueRepr);
 impl Hash for Value {
     fn hash<H: Hasher>(&self, state: &mut H) {
         let v = self.0;
-        if is_imm(v) { // It's an SMI
+        if is_imm(v) {
+            // It's an SMI
             v.hash(state); // Hash the raw integer value.
             return;
         }
 
-        if !is_ptr(v) || v == NULL { // Non-pointer immediates (bool) or Null
+        if !is_ptr(v) || v == NULL {
+            // Non-pointer immediates (bool) or Null
             v.hash(state);
             return;
         }
@@ -151,7 +153,9 @@ impl PartialEq for Value {
                 let s1 = &*(v1 as *const BoxedStr);
                 let s2 = &*(v2 as *const BoxedStr);
 
-                if s1.len != s2.len { return false; }
+                if s1.len != s2.len {
+                    return false;
+                }
 
                 let bytes1 = std::slice::from_raw_parts(s1.data, s1.len);
                 let bytes2 = std::slice::from_raw_parts(s2.data, s2.len);
@@ -193,6 +197,7 @@ pub const TAG_CLOSURE: u32 = 4;
 pub const TAG_OBJECT: u32 = 5;
 pub const TAG_MAP: u32 = 6;
 pub const TAG_SET: u32 = 7;
+pub const TAG_PROXY: u32 = 8;
 
 // ============================================================================
 // Boxed f64
@@ -811,9 +816,13 @@ pub struct BoxedStr {
 
 #[inline(always)]
 unsafe fn value_as_str_slice<'a>(v: ValueRepr) -> Option<&'a str> {
-    if !is_ptr(v) { return None; }
+    if !is_ptr(v) {
+        return None;
+    }
     let hdr = &*(v as *const ObjHeader);
-    if hdr.tag != TAG_STRING { return None; }
+    if hdr.tag != TAG_STRING {
+        return None;
+    }
     let s = &*(v as *const BoxedStr);
     if s.data.is_null() {
         return Some("");
@@ -929,11 +938,17 @@ pub fn allocate_new_string(s: &str) -> ValueRepr {
 
         // Step 4: Write the header struct into the beginning of the block.
         // The crucial part is that `data` now points inside its own allocation block.
-        ptr::write(obj_ptr, BoxedStr {
-            hdr: ObjHeader { tag: TAG_STRING, aux: 0 },
-            len,
-            data: data_ptr, // The `data` pointer points to the area right after this struct.
-        });
+        ptr::write(
+            obj_ptr,
+            BoxedStr {
+                hdr: ObjHeader {
+                    tag: TAG_STRING,
+                    aux: 0,
+                },
+                len,
+                data: data_ptr, // The `data` pointer points to the area right after this struct.
+            },
+        );
 
         // Step 5: Copy the actual string bytes into the data area.
         ptr::copy_nonoverlapping(bytes.as_ptr(), data_ptr, len);
@@ -951,10 +966,14 @@ pub fn allocate_new_string(s: &str) -> ValueRepr {
 /// Returns a new 1-character string or NULL if out of bounds.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_string_get_char(s_val: i64, index_smi: i64) -> i64 {
-    if !is_ptr(s_val) { return NULL; }
+    if !is_ptr(s_val) {
+        return NULL;
+    }
 
     let hdr = &*(s_val as *const ObjHeader);
-    if hdr.tag != TAG_STRING { return NULL; }
+    if hdr.tag != TAG_STRING {
+        return NULL;
+    }
 
     let s = &*(s_val as *const BoxedStr);
     let index = smi_to_i64(index_smi) as usize;
@@ -976,10 +995,14 @@ pub unsafe extern "C" fn wir_string_get_char(s_val: i64, index_smi: i64) -> i64 
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_string_len(s_val: i64) -> i64 {
-    if !is_ptr(s_val) { return make_smi(0); }
+    if !is_ptr(s_val) {
+        return make_smi(0);
+    }
 
     let hdr = &*(s_val as *const ObjHeader);
-    if hdr.tag != TAG_STRING { return make_smi(0); }
+    if hdr.tag != TAG_STRING {
+        return make_smi(0);
+    }
 
     let s = &*(s_val as *const BoxedStr);
     make_smi(s.len as i64)
@@ -995,15 +1018,20 @@ pub unsafe extern "C" fn wir_string_concat(s1_val: i64, s2_val: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_string_slice(s_val: i64, start_smi: i64, end_smi: i64) -> i64 {
-    let Some(s) = value_as_str_slice(s_val) else { return NULL; };
+    let Some(s) = value_as_str_slice(s_val) else {
+        return NULL;
+    };
     // FIX: Use byte length consistently.
     let len = s.len();
 
     let mut start = smi_to_i64(start_smi);
-    if start < 0 { start = (len as i64 + start).max(0); }
+    if start < 0 {
+        start = (len as i64 + start).max(0);
+    }
 
     let mut end = smi_to_i64(end_smi);
-    if end == -1 { // Sentinel for "to the end"
+    if end == -1 {
+        // Sentinel for "to the end"
         end = len as i64;
     } else if end < 0 {
         end = (len as i64 + end).max(0);
@@ -1023,7 +1051,9 @@ pub unsafe extern "C" fn wir_string_slice(s_val: i64, start_smi: i64, end_smi: i
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_string_substring(s_val: i64, start_smi: i64, end_smi: i64) -> i64 {
-    let Some(s) = value_as_str_slice(s_val) else { return NULL; };
+    let Some(s) = value_as_str_slice(s_val) else {
+        return NULL;
+    };
     // FIX: Use byte length consistently.
     let len = s.len();
 
@@ -1031,7 +1061,11 @@ pub unsafe extern "C" fn wir_string_substring(s_val: i64, start_smi: i64, end_sm
     let end_raw = smi_to_i64(end_smi);
 
     let start = (start_raw.max(0) as usize).min(len);
-    let end = if end_raw == -1 { len } else { (end_raw.max(0) as usize).min(len) };
+    let end = if end_raw == -1 {
+        len
+    } else {
+        (end_raw.max(0) as usize).min(len)
+    };
 
     // JS `substring` swaps if start > end.
     let final_start = start.min(end);
@@ -1042,8 +1076,12 @@ pub unsafe extern "C" fn wir_string_substring(s_val: i64, start_smi: i64, end_sm
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_string_index_of(s_val: i64, search_val: i64, pos_smi: i64) -> i64 {
-    let Some(s) = value_as_str_slice(s_val) else { return make_smi(-1); };
-    let Some(search) = value_as_str_slice(search_val) else { return make_smi(-1); };
+    let Some(s) = value_as_str_slice(s_val) else {
+        return make_smi(-1);
+    };
+    let Some(search) = value_as_str_slice(search_val) else {
+        return make_smi(-1);
+    };
 
     // Use byte index for starting position, clamped to string length.
     let start_byte = (smi_to_i64(pos_smi).max(0) as usize).min(s.len());
@@ -1058,9 +1096,17 @@ pub unsafe extern "C" fn wir_string_index_of(s_val: i64, search_val: i64, pos_sm
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn wir_string_last_index_of(s_val: i64, search_val: i64, pos_smi: i64) -> i64 {
-    let Some(s) = value_as_str_slice(s_val) else { return make_smi(-1); };
-    let Some(search) = value_as_str_slice(search_val) else { return make_smi(-1); };
+pub unsafe extern "C" fn wir_string_last_index_of(
+    s_val: i64,
+    search_val: i64,
+    pos_smi: i64,
+) -> i64 {
+    let Some(s) = value_as_str_slice(s_val) else {
+        return make_smi(-1);
+    };
+    let Some(search) = value_as_str_slice(search_val) else {
+        return make_smi(-1);
+    };
 
     let pos = smi_to_i64(pos_smi);
     let len = s.len();
@@ -1085,7 +1131,9 @@ pub unsafe extern "C" fn wir_string_last_index_of(s_val: i64, search_val: i64, p
 // (No need to copy them here, just replace the buggy ones above)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_string_split(s_val: i64, sep_val: i64) -> i64 {
-    let Some(s) = value_as_str_slice(s_val) else { return array_new(0); };
+    let Some(s) = value_as_str_slice(s_val) else {
+        return array_new(0);
+    };
     let Some(sep) = value_as_str_slice(sep_val) else {
         let arr = array_new(1);
         array_set(arr, 0, s_val);
@@ -1093,16 +1141,24 @@ pub unsafe extern "C" fn wir_string_split(s_val: i64, sep_val: i64) -> i64 {
     };
     let components: Vec<i64> = s.split(sep).map(|sub| allocate_new_string(sub)).collect();
     let arr = array_new(components.len());
-    for (i, &comp) in components.iter().enumerate() { array_set(arr, i, comp); }
+    for (i, &comp) in components.iter().enumerate() {
+        array_set(arr, i, comp);
+    }
     arr
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_string_pad_end(s_val: i64, max_len_smi: i64, fill_val: i64) -> i64 {
-    let Some(s) = value_as_str_slice(s_val) else { return NULL; };
-    let Some(fill) = value_as_str_slice(fill_val) else { return s_val; };
+    let Some(s) = value_as_str_slice(s_val) else {
+        return NULL;
+    };
+    let Some(fill) = value_as_str_slice(fill_val) else {
+        return s_val;
+    };
     let target_len = smi_to_i64(max_len_smi) as usize;
-    if s.len() >= target_len { return s_val; }
+    if s.len() >= target_len {
+        return s_val;
+    }
     let needed = target_len - s.len();
     let mut result = s.to_string();
     result.extend(fill.chars().cycle().take(needed));
@@ -1111,10 +1167,16 @@ pub unsafe extern "C" fn wir_string_pad_end(s_val: i64, max_len_smi: i64, fill_v
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_string_pad_start(s_val: i64, max_len_smi: i64, fill_val: i64) -> i64 {
-    let Some(s) = value_as_str_slice(s_val) else { return NULL; };
-    let Some(fill) = value_as_str_slice(fill_val) else { return s_val; };
+    let Some(s) = value_as_str_slice(s_val) else {
+        return NULL;
+    };
+    let Some(fill) = value_as_str_slice(fill_val) else {
+        return s_val;
+    };
     let target_len = smi_to_i64(max_len_smi) as usize;
-    if s.len() >= target_len { return s_val; }
+    if s.len() >= target_len {
+        return s_val;
+    }
     let needed = target_len - s.len();
     let mut padding = String::with_capacity(needed);
     padding.extend(fill.chars().cycle().take(needed));
@@ -1124,75 +1186,111 @@ pub unsafe extern "C" fn wir_string_pad_start(s_val: i64, max_len_smi: i64, fill
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_string_repeat(s_val: i64, count_smi: i64) -> i64 {
-    let Some(s) = value_as_str_slice(s_val) else { return NULL; };
+    let Some(s) = value_as_str_slice(s_val) else {
+        return NULL;
+    };
     let count = smi_to_i64(count_smi).max(0) as usize;
     allocate_new_string(&s.repeat(count))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_string_replace(s_val: i64, search_val: i64, rep_val: i64) -> i64 {
-    let Some(s) = value_as_str_slice(s_val) else { return NULL; };
-    let Some(search) = value_as_str_slice(search_val) else { return s_val; };
-    let Some(rep) = value_as_str_slice(rep_val) else { return s_val; };
+    let Some(s) = value_as_str_slice(s_val) else {
+        return NULL;
+    };
+    let Some(search) = value_as_str_slice(search_val) else {
+        return s_val;
+    };
+    let Some(rep) = value_as_str_slice(rep_val) else {
+        return s_val;
+    };
     allocate_new_string(&s.replacen(search, rep, 1))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_string_replace_all(s_val: i64, search_val: i64, rep_val: i64) -> i64 {
-    let Some(s) = value_as_str_slice(s_val) else { return NULL; };
-    let Some(search) = value_as_str_slice(search_val) else { return s_val; };
-    let Some(rep) = value_as_str_slice(rep_val) else { return s_val; };
+    let Some(s) = value_as_str_slice(s_val) else {
+        return NULL;
+    };
+    let Some(search) = value_as_str_slice(search_val) else {
+        return s_val;
+    };
+    let Some(rep) = value_as_str_slice(rep_val) else {
+        return s_val;
+    };
     allocate_new_string(&s.replace(search, rep))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_string_starts_with(s_val: i64, search_val: i64) -> i64 {
-    let Some(s) = value_as_str_slice(s_val) else { return bool_to_value(false); };
-    let Some(search) = value_as_str_slice(search_val) else { return bool_to_value(false); };
+    let Some(s) = value_as_str_slice(s_val) else {
+        return bool_to_value(false);
+    };
+    let Some(search) = value_as_str_slice(search_val) else {
+        return bool_to_value(false);
+    };
     bool_to_value(s.starts_with(search))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_string_ends_with(s_val: i64, search_val: i64) -> i64 {
-    let Some(s) = value_as_str_slice(s_val) else { return bool_to_value(false); };
-    let Some(search) = value_as_str_slice(search_val) else { return bool_to_value(false); };
+    let Some(s) = value_as_str_slice(s_val) else {
+        return bool_to_value(false);
+    };
+    let Some(search) = value_as_str_slice(search_val) else {
+        return bool_to_value(false);
+    };
     bool_to_value(s.ends_with(search))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_string_includes(s_val: i64, search_val: i64) -> i64 {
-    let Some(s) = value_as_str_slice(s_val) else { return bool_to_value(false); };
-    let Some(search) = value_as_str_slice(search_val) else { return bool_to_value(false); };
+    let Some(s) = value_as_str_slice(s_val) else {
+        return bool_to_value(false);
+    };
+    let Some(search) = value_as_str_slice(search_val) else {
+        return bool_to_value(false);
+    };
     bool_to_value(s.contains(search))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_string_to_upper_case(s_val: i64) -> i64 {
-    let Some(s) = value_as_str_slice(s_val) else { return NULL; };
+    let Some(s) = value_as_str_slice(s_val) else {
+        return NULL;
+    };
     allocate_new_string(&s.to_uppercase())
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_string_to_lower_case(s_val: i64) -> i64 {
-    let Some(s) = value_as_str_slice(s_val) else { return NULL; };
+    let Some(s) = value_as_str_slice(s_val) else {
+        return NULL;
+    };
     allocate_new_string(&s.to_lowercase())
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_string_trim(s_val: i64) -> i64 {
-    let Some(s) = value_as_str_slice(s_val) else { return NULL; };
+    let Some(s) = value_as_str_slice(s_val) else {
+        return NULL;
+    };
     allocate_new_string(s.trim())
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_string_trim_end(s_val: i64) -> i64 {
-    let Some(s) = value_as_str_slice(s_val) else { return NULL; };
+    let Some(s) = value_as_str_slice(s_val) else {
+        return NULL;
+    };
     allocate_new_string(s.trim_end())
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wir_string_trim_start(s_val: i64) -> i64 {
-    let Some(s) = value_as_str_slice(s_val) else { return NULL; };
+    let Some(s) = value_as_str_slice(s_val) else {
+        return NULL;
+    };
     allocate_new_string(s.trim_start())
 }
 
@@ -1786,6 +1884,13 @@ pub struct BoxedSet {
     pub set: HashSet<Value>,
 }
 
+#[repr(C)]
+pub struct BoxedProxy {
+    pub hdr: ObjHeader,
+    pub target: ValueRepr,
+    pub handler: ValueRepr,
+}
+
 #[inline(always)]
 pub fn map_new() -> ValueRepr {
     unsafe {
@@ -1795,7 +1900,9 @@ pub fn map_new() -> ValueRepr {
         #[cfg(feature = "gc")]
         let p = {
             let mut p = NAPALM_GC.alloc_raw(size, align);
-            if p.is_null() { p = NAPALM_GC.alloc_slow_path(size, align); }
+            if p.is_null() {
+                p = NAPALM_GC.alloc_slow_path(size, align);
+            }
             p
         };
         #[cfg(not(feature = "gc"))]
@@ -1803,15 +1910,23 @@ pub fn map_new() -> ValueRepr {
             use std::alloc::{Layout, alloc, handle_alloc_error};
             let layout = Layout::from_size_align_unchecked(size, align);
             let p = alloc(layout);
-            if p.is_null() { handle_alloc_error(layout); }
+            if p.is_null() {
+                handle_alloc_error(layout);
+            }
             p
         };
 
         let obj = p as *mut BoxedMap;
-        ptr::write(obj, BoxedMap {
-            hdr: ObjHeader { tag: TAG_MAP, aux: 0 },
-            map: HashMap::new(),
-        });
+        ptr::write(
+            obj,
+            BoxedMap {
+                hdr: ObjHeader {
+                    tag: TAG_MAP,
+                    aux: 0,
+                },
+                map: HashMap::new(),
+            },
+        );
 
         #[cfg(feature = "gc")]
         NAPALM_GC.post_alloc_object(p, size);
@@ -1829,7 +1944,9 @@ pub fn set_new() -> ValueRepr {
         #[cfg(feature = "gc")]
         let p = {
             let mut p = NAPALM_GC.alloc_raw(size, align);
-            if p.is_null() { p = NAPALM_GC.alloc_slow_path(size, align); }
+            if p.is_null() {
+                p = NAPALM_GC.alloc_slow_path(size, align);
+            }
             p
         };
         #[cfg(not(feature = "gc"))]
@@ -1837,18 +1954,80 @@ pub fn set_new() -> ValueRepr {
             use std::alloc::{Layout, alloc, handle_alloc_error};
             let layout = Layout::from_size_align_unchecked(size, align);
             let p = alloc(layout);
-            if p.is_null() { handle_alloc_error(layout); }
+            if p.is_null() {
+                handle_alloc_error(layout);
+            }
             p
         };
 
         let obj = p as *mut BoxedSet;
-        ptr::write(obj, BoxedSet {
-            hdr: ObjHeader { tag: TAG_SET, aux: 0 },
-            set: HashSet::new(),
-        });
+        ptr::write(
+            obj,
+            BoxedSet {
+                hdr: ObjHeader {
+                    tag: TAG_SET,
+                    aux: 0,
+                },
+                set: HashSet::new(),
+            },
+        );
 
         #[cfg(feature = "gc")]
         NAPALM_GC.post_alloc_object(p, size);
+
+        p as ValueRepr
+    }
+}
+
+#[inline(always)]
+pub fn proxy_new(target: ValueRepr, handler: ValueRepr) -> ValueRepr {
+    unsafe {
+        let size = mem::size_of::<BoxedProxy>();
+        let align = mem::align_of::<BoxedProxy>();
+
+        #[cfg(feature = "gc")]
+        let p = {
+            let mut p = NAPALM_GC.alloc_raw(size, align);
+            if p.is_null() {
+                p = NAPALM_GC.alloc_slow_path(size, align);
+            }
+            p
+        };
+        #[cfg(not(feature = "gc"))]
+        let p = {
+            use std::alloc::{Layout, alloc, handle_alloc_error};
+            let layout = Layout::from_size_align_unchecked(size, align);
+            let p = alloc(layout);
+            if p.is_null() {
+                handle_alloc_error(layout);
+            }
+            p
+        };
+
+        let proxy = p as *mut BoxedProxy;
+        ptr::write(
+            proxy,
+            BoxedProxy {
+                hdr: ObjHeader {
+                    tag: TAG_PROXY,
+                    aux: 0,
+                },
+                target,
+                handler,
+            },
+        );
+
+        #[cfg(feature = "gc")]
+        {
+            NAPALM_GC.post_alloc_object(p, size);
+            let proxy_obj = &mut *proxy;
+            if is_ptr(target) && target != NULL {
+                NAPALM_GC.post_write_barrier(p, &mut proxy_obj.target, target);
+            }
+            if is_ptr(handler) && handler != NULL {
+                NAPALM_GC.post_write_barrier(p, &mut proxy_obj.handler, handler);
+            }
+        }
 
         p as ValueRepr
     }
@@ -1862,7 +2041,11 @@ pub fn set_new() -> ValueRepr {
 /// Keep this conservative; it’s only for `print` and debugging.
 pub fn fmt_value(v: i64) -> String {
     if let Some(b) = value_to_bool(v) {
-        return if b { "true".to_string() } else { "false".to_string() };
+        return if b {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        };
     }
 
     // Small ints are odd (SMI)

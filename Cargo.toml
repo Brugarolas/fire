@@ -32,7 +32,7 @@ smallvec = "1.15.1" # Small vectors for small collections, faster
 smallnum = "0.4.1" # Small optimization for numbers
 small-map = "0.1.3" # Small map optimization
 smallbox = "0.8.8" # Small Box<T> optimization
-tiny-vec = "0.10.0" # Tiny vector optimization
+tinyvec = "1.10.0" # Tiny vector optimization
 #tiny-str = "0.10.0" # Tiny string optimization
 
 #lasso = "0.7.3" # String interning

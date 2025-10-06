@@ -55,8 +55,9 @@ static STW_LOCK: ParkMutex<()> = ParkMutex::new(());
 static STW_CV: ParkCondvar = ParkCondvar::new();
 
 use crate::value::{
-    ARRAY_DATA_OFFSET, ARRAY_LEN_OFFSET, BoxedClosure, BoxedF64, BoxedObj, BoxedStr, NULL,
-    ObjHeader, TAG_ARRAY, TAG_BOXED_F64, TAG_CLOSURE, TAG_OBJECT, TAG_STRING, ValueRepr, is_ptr,
+    ARRAY_DATA_OFFSET, ARRAY_LEN_OFFSET, BoxedClosure, BoxedF64, BoxedObj, BoxedProxy, BoxedStr,
+    NULL, ObjHeader, TAG_ARRAY, TAG_BOXED_F64, TAG_CLOSURE, TAG_OBJECT, TAG_PROXY, TAG_STRING,
+    ValueRepr, is_ptr,
 };
 
 static MUTATOR_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -111,6 +112,8 @@ fn size_of_object_from_tag(base: *const u8) -> usize {
             // the GC only owns the outer header+two HashMap structs; the buffers those maps
             // allocate live on the Rust heap and are *not* part of this object’s GC size.
             TAG_OBJECT => mem::size_of::<BoxedObj>(),
+
+            TAG_PROXY => mem::size_of::<BoxedProxy>(),
 
             _ => {
                 debug_assert!(false, "Unknown object tag: {}", hdr.tag);
@@ -334,6 +337,7 @@ impl ObjectModel<NapalmVM> for VMObjModel {
                 TAG_ARRAY => core::mem::size_of::<BoxedArray>(),
                 TAG_CLOSURE => core::mem::size_of::<BoxedClosure>(),
                 TAG_OBJECT => core::mem::size_of::<BoxedObj>(),
+                TAG_PROXY => core::mem::size_of::<BoxedProxy>(),
                 _ => core::mem::size_of::<ObjHeader>(), // conservative fallback
             }
         }
@@ -356,6 +360,7 @@ impl ObjectModel<NapalmVM> for VMObjModel {
                 TAG_ARRAY => core::mem::align_of::<BoxedArray>(),
                 TAG_CLOSURE => core::mem::align_of::<BoxedClosure>(),
                 TAG_OBJECT => core::mem::align_of::<BoxedObj>(),
+                TAG_PROXY => core::mem::align_of::<BoxedProxy>(),
                 _ => core::mem::align_of::<ObjHeader>(),
             }
         }
@@ -532,8 +537,8 @@ impl Scanning<NapalmVM> for VMScanning {
         slot_visitor: &mut SV,
     ) {
         use crate::value::{
-            BoxedArray, BoxedF64, BoxedObj, BoxedStr, NULL, ObjHeader, TAG_ARRAY, TAG_BOXED_F64,
-            TAG_OBJECT, TAG_STRING, is_ptr,
+            BoxedArray, BoxedF64, BoxedObj, BoxedProxy, BoxedStr, NULL, ObjHeader, TAG_ARRAY,
+            TAG_BOXED_F64, TAG_CLOSURE, TAG_OBJECT, TAG_PROXY, TAG_STRING, is_ptr,
         };
         use mmtk::util::Address;
 
@@ -588,6 +593,18 @@ impl Scanning<NapalmVM> for VMScanning {
                             let edge = SlotItem(Address::from_ptr(slot_ptr.cast::<u8>()));
                             slot_visitor.visit_slot(edge);
                         }
+                    }
+                }
+
+                TAG_PROXY => {
+                    let proxy = &mut *(base as *mut BoxedProxy);
+                    if is_ptr(proxy.target) && proxy.target != NULL {
+                        let slot = &mut proxy.target as *mut ValueRepr;
+                        slot_visitor.visit_slot(SlotItem(Address::from_ptr(slot.cast::<u8>())));
+                    }
+                    if is_ptr(proxy.handler) && proxy.handler != NULL {
+                        let slot = &mut proxy.handler as *mut ValueRepr;
+                        slot_visitor.visit_slot(SlotItem(Address::from_ptr(slot.cast::<u8>())));
                     }
                 }
 
@@ -1166,6 +1183,15 @@ impl NapalmGc {
                     let ptr = clo.env.as_mut_ptr();
                     for i in 0..len {
                         f(ptr.add(i));
+                    }
+                }
+                TAG_PROXY => {
+                    let proxy = &mut *(base as *mut BoxedProxy);
+                    if is_ptr(proxy.target) && proxy.target != NULL {
+                        f(&mut proxy.target as *mut ValueRepr);
+                    }
+                    if is_ptr(proxy.handler) && proxy.handler != NULL {
+                        f(&mut proxy.handler as *mut ValueRepr);
                     }
                 }
                 _ => {}

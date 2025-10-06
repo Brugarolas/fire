@@ -298,7 +298,7 @@ fn bump_uses_for_inst(uses: &mut [usize], k: &Inst) {
         Inst::LoadMethod { obj, .. } => bump(uses, *obj),
         Inst::LoadSuperMethod { recv, .. } => bump(uses, *recv),
         Inst::InstanceOf { obj, .. } => bump(uses, *obj),
-        
+
         // ---- Arrays ----
         Inst::AllocArray { len, .. } => bump(uses, *len),
         Inst::ArrayLen(v) => bump(uses, *v),
@@ -388,8 +388,9 @@ fn bump_uses_for_inst(uses: &mut [usize], k: &Inst) {
         | Inst::UnboxToF64(v) => bump(uses, *v),
 
         // ---- Calls / closures ----
-        Inst::CallDirect { args, .. } 
-        | Inst::CallDirectMemoized { args, .. } => args.iter().for_each(|&v| bump(uses, v)),
+        Inst::CallDirect { args, .. } | Inst::CallDirectMemoized { args, .. } => {
+            args.iter().for_each(|&v| bump(uses, v))
+        }
         Inst::CallIC { recv, args, .. } => bump_recv_args(uses, *recv, args),
         Inst::CallMethodIC { recv, args, .. } => bump_recv_args(uses, *recv, args),
         Inst::CallSuper { recv, args, .. } => bump_recv_args(uses, *recv, args),

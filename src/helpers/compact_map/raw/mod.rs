@@ -1,6 +1,6 @@
 use core::{marker::PhantomData, mem, ptr::NonNull};
 
-use crate::helpers::compact_map::raw::util::{unlikely, SizedTypeProperties};
+use crate::helpers::compact_map::raw::util::{SizedTypeProperties, unlikely};
 
 cfg_if! {
     // Use the SSE2 implementation if possible: it allows us to scan 16 buckets

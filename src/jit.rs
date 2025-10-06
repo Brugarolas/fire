@@ -11,7 +11,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::JITModule;
 use cranelift_module::{Linkage, Module as _};
 
-use ahash::AHashMap as HashMap;
+use crate::helpers::collections::HashMap;
 use parking_lot::Mutex;
 use std::cell::Cell;
 use std::sync::OnceLock;
@@ -37,28 +37,28 @@ use crate::native_timers::{
 };
 #[allow(unused_imports)]
 use crate::runtime::{
-    napalm_yieldpoint, wir_is_nullish, wir_is_str, wir_memo_get, wir_memo_put, wir_obj_assign,
-    wir_obj_clone, wir_obj_del_field, wir_obj_del_str, wir_obj_get_field, wir_obj_get_field_deep,
-    wir_obj_get_method, wir_obj_get_proto, wir_obj_get_str, wir_obj_get_str_deep,
-    wir_obj_has_field, wir_obj_has_str, wir_obj_new, wir_obj_set_field, wir_obj_set_proto,
-    wir_obj_set_str, wir_super_get_method, wir_string_equals, wir_is_map, wir_is_set,
-    wir_map_new, wir_map_get, wir_map_set, wir_map_has, wir_map_delete, wir_map_clear, wir_map_size,
-    wir_set_new, wir_set_add, wir_set_has, wir_set_delete, wir_set_clear, wir_set_size,
-    wir_builtin_keys, wir_builtin_values, wir_builtin_entries, wir_builtin_size,
+    napalm_yieldpoint, wir_builtin_entries, wir_builtin_keys, wir_builtin_size, wir_builtin_values,
+    wir_field_register_name, wir_is_map, wir_is_nullish, wir_is_proxy, wir_is_set, wir_is_str,
+    wir_map_clear, wir_map_delete, wir_map_get, wir_map_has, wir_map_new, wir_map_set,
+    wir_map_size, wir_memo_get, wir_memo_put, wir_obj_assign, wir_obj_clone, wir_obj_del_field,
+    wir_obj_del_str, wir_obj_get_field, wir_obj_get_field_deep, wir_obj_get_method,
+    wir_obj_get_proto, wir_obj_get_str, wir_obj_get_str_deep, wir_obj_has_field, wir_obj_has_str,
+    wir_obj_new, wir_obj_set_field, wir_obj_set_proto, wir_obj_set_str, wir_proxy_new, wir_set_add,
+    wir_set_clear, wir_set_delete, wir_set_has, wir_set_new, wir_set_size, wir_string_equals,
+    wir_super_get_method,
 };
 #[allow(unused_imports)]
 use crate::value::{
-    BoxedArray, BoxedClosure, ObjHeader, TAG_ARRAY, BOOL_FALSE, BOOL_TRUE, closure_new,
-    closure_set_env_slot,
-    wir_array_copy, wir_array_fill, wir_array_filter, wir_array_find, wir_array_find_index,
-    wir_array_for_each, wir_array_get, wir_array_len, wir_array_map, wir_array_new, wir_array_pop,
-    wir_array_push, wir_array_reduce, wir_array_set, wir_array_set_len, wir_array_shift,
-    wir_array_slice, wir_array_unshift, wir_string_get_char, wir_string_len, wir_string_concat,
-    wir_string_index_of, wir_string_last_index_of, wir_string_to_upper_case,
-    wir_string_to_lower_case, wir_string_starts_with, wir_string_ends_with, wir_string_substring,
-    wir_string_trim, wir_string_trim_start, wir_string_trim_end, wir_string_replace,
-    wir_string_replace_all, wir_string_includes, wir_string_pad_start, wir_string_pad_end,
-    wir_string_split, wir_string_repeat, wir_string_slice
+    BOOL_FALSE, BOOL_TRUE, BoxedArray, BoxedClosure, ObjHeader, TAG_ARRAY, closure_new,
+    closure_set_env_slot, wir_array_copy, wir_array_fill, wir_array_filter, wir_array_find,
+    wir_array_find_index, wir_array_for_each, wir_array_get, wir_array_len, wir_array_map,
+    wir_array_new, wir_array_pop, wir_array_push, wir_array_reduce, wir_array_set,
+    wir_array_set_len, wir_array_shift, wir_array_slice, wir_array_unshift, wir_string_concat,
+    wir_string_ends_with, wir_string_get_char, wir_string_includes, wir_string_index_of,
+    wir_string_last_index_of, wir_string_len, wir_string_pad_end, wir_string_pad_start,
+    wir_string_repeat, wir_string_replace, wir_string_replace_all, wir_string_slice,
+    wir_string_split, wir_string_starts_with, wir_string_substring, wir_string_to_lower_case,
+    wir_string_to_upper_case, wir_string_trim, wir_string_trim_end, wir_string_trim_start,
 };
 
 impl JIT {
@@ -237,7 +237,8 @@ pub struct JIT {
 
 impl Default for JIT {
     fn default() -> Self {
-        let mut jb = cranelift_jit::JITBuilder::new(cranelift_module::default_libcall_names()).expect("JITBuilder::new");
+        let mut jb = cranelift_jit::JITBuilder::new(cranelift_module::default_libcall_names())
+            .expect("JITBuilder::new");
 
         unsafe extern "C" {
             fn wir_resolve_funptr(fid: i64) -> *const u8;
@@ -335,6 +336,9 @@ impl Default for JIT {
             fn wir_obj_clone(obj: i64) -> i64;
             fn wir_string_get_char(s_val: i64, index_smi: i64) -> i64;
             fn wir_string_len(s_val: i64) -> i64;
+            fn wir_proxy_new(target: i64, handler: i64) -> i64;
+            fn wir_is_proxy(v: i64) -> i64;
+            fn wir_field_register_name(field_id: i64, key: i64) -> i64;
         }
 
         unsafe extern "C" {
@@ -668,6 +672,18 @@ impl Default for JIT {
                 wir_obj_clone as *const extern "C" fn(i64) -> i64 as *const u8,
             );
             jb.symbol(
+                "wir_proxy_new",
+                wir_proxy_new as *const extern "C" fn(i64, i64) -> i64 as *const u8,
+            );
+            jb.symbol(
+                "wir_is_proxy",
+                wir_is_proxy as *const extern "C" fn(i64) -> i64 as *const u8,
+            );
+            jb.symbol(
+                "wir_field_register_name",
+                wir_field_register_name as *const extern "C" fn(i64, i64) -> i64 as *const u8,
+            );
+            jb.symbol(
                 "wir_string_get_char",
                 wir_string_get_char as *const extern "C" fn(i64, i64) -> i64 as *const u8,
             );
@@ -877,19 +893,34 @@ impl Default for JIT {
             jb.symbol("wir_string_concat", wir_string_concat as *const u8);
             jb.symbol("wir_string_split", wir_string_split as *const u8);
             jb.symbol("wir_string_index_of", wir_string_index_of as *const u8);
-            jb.symbol("wir_string_last_index_of", wir_string_last_index_of as *const u8);
+            jb.symbol(
+                "wir_string_last_index_of",
+                wir_string_last_index_of as *const u8,
+            );
             jb.symbol("wir_string_pad_end", wir_string_pad_end as *const u8);
             jb.symbol("wir_string_pad_start", wir_string_pad_start as *const u8);
             jb.symbol("wir_string_repeat", wir_string_repeat as *const u8);
             jb.symbol("wir_string_replace", wir_string_replace as *const u8);
-            jb.symbol("wir_string_replace_all", wir_string_replace_all as *const u8);
+            jb.symbol(
+                "wir_string_replace_all",
+                wir_string_replace_all as *const u8,
+            );
             jb.symbol("wir_string_slice", wir_string_slice as *const u8);
             jb.symbol("wir_string_substring", wir_string_substring as *const u8);
-            jb.symbol("wir_string_starts_with", wir_string_starts_with as *const u8);
+            jb.symbol(
+                "wir_string_starts_with",
+                wir_string_starts_with as *const u8,
+            );
             jb.symbol("wir_string_ends_with", wir_string_ends_with as *const u8);
             jb.symbol("wir_string_includes", wir_string_includes as *const u8);
-            jb.symbol("wir_string_to_upper_case", wir_string_to_upper_case as *const u8);
-            jb.symbol("wir_string_to_lower_case", wir_string_to_lower_case as *const u8);
+            jb.symbol(
+                "wir_string_to_upper_case",
+                wir_string_to_upper_case as *const u8,
+            );
+            jb.symbol(
+                "wir_string_to_lower_case",
+                wir_string_to_lower_case as *const u8,
+            );
             jb.symbol("wir_string_trim", wir_string_trim as *const u8);
             jb.symbol("wir_string_trim_end", wir_string_trim_end as *const u8);
             jb.symbol("wir_string_trim_start", wir_string_trim_start as *const u8);
@@ -2445,7 +2476,9 @@ impl JIT {
             Constant::Int32(x) => fb.ins().iconst(types::I64, ((*x as i64) << 1) | 1),
 
             // bools as tagged immediates
-            Constant::Bool(b) => fb.ins().iconst(types::I64, if *b { BOOL_TRUE } else { BOOL_FALSE }),
+            Constant::Bool(b) => fb
+                .ins()
+                .iconst(types::I64, if *b { BOOL_TRUE } else { BOOL_FALSE }),
 
             // null as 0
             Constant::Null => fb.ins().iconst(types::I64, 0),
@@ -2608,7 +2641,10 @@ fn synth_const(values: &Vec<WirValue>, id: ValueId, fb: &mut FunctionBuilder) ->
                 // (Simplest: return None for F64 here.)
                 None
             }
-            Constant::Bool(b) => Some(fb.ins().iconst(types::I64, if *b { BOOL_TRUE } else { BOOL_FALSE })),
+            Constant::Bool(b) => Some(
+                fb.ins()
+                    .iconst(types::I64, if *b { BOOL_TRUE } else { BOOL_FALSE }),
+            ),
             Constant::Null => Some(fb.ins().iconst(types::I64, 0)),
             Constant::Str(_) => None,
             Constant::Undefined => Some(fb.ins().iconst(types::I64, 0)),
