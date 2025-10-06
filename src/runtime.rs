@@ -7,11 +7,12 @@ use crate::gc::NAPALM_GC;
 use crate::jit::wir_make_method_closure;
 use crate::value as v;
 use crate::value::{
-    BoxedArray, BoxedClosure, BoxedF64, BoxedMap, BoxedObj, BoxedSet, BoxedStr, Value,
-    NULL, ObjHeader, TAG_ARRAY, TAG_BOXED_F64, TAG_CLOSURE, TAG_MAP, TAG_OBJECT, TAG_SET,
-    TAG_STRING, bool_to_value, is_imm, map_new, obj_assign, obj_clone_shallow,
-    obj_get_field_deep, obj_get_proto, obj_get_slot, obj_get_str_deep, obj_set_proto, obj_shape,
-    obj_set_slot_known, set_new, shape_slot, value_to_bool,
+    array_from_vec, allocate_new_string, make_smi, BoxedArray, BoxedClosure, BoxedF64, BoxedMap,
+    BoxedObj, BoxedSet, BoxedStr, Value, ValueRepr, NULL, ObjHeader, TAG_ARRAY, TAG_BOXED_F64,
+    TAG_CLOSURE, TAG_MAP, TAG_OBJECT, TAG_SET, TAG_STRING, bool_to_value, is_imm, map_new,
+    obj_assign, obj_clone_shallow, obj_get_field_deep, obj_get_proto, obj_get_slot,
+    obj_get_str_deep, obj_set_proto, obj_shape, obj_set_slot_known, set_new, shape_slot,
+    value_to_bool,
 };
 
 use crate::helpers::collections::{ConcurrentHashMap, HashMap, HashSet};
@@ -132,6 +133,110 @@ fn cache_invalidate(fid: u32, shape: u32) {
         if list.is_empty() {
             guard.remove(&fid);
         }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BuiltinIterKind {
+    Keys,
+    Values,
+    Entries,
+}
+
+#[inline(always)]
+fn empty_array() -> i64 {
+    array_from_vec(Vec::new())
+}
+
+fn collect_object_items<'a>(obj: &'a BoxedObj) -> Vec<(&'a String, ValueRepr)> {
+    let mut items = Vec::with_capacity(obj.dict.len());
+    for (k, v) in obj.dict.iter() {
+        if k.starts_with("__get__") || k.starts_with("__set__") {
+            continue;
+        }
+        items.push((k, *v));
+    }
+    items
+}
+
+fn object_iter(obj: i64, kind: BuiltinIterKind) -> i64 {
+    unsafe {
+        if obj == 0 || !is_heap_ptr(obj) {
+            return empty_array();
+        }
+        let o = &*(obj as *const BoxedObj);
+        let items = collect_object_items(o);
+        match kind {
+            BuiltinIterKind::Keys => {
+                let mut out: Vec<ValueRepr> = Vec::with_capacity(items.len());
+                for (k, _) in items {
+                    out.push(allocate_new_string(k));
+                }
+                array_from_vec(out)
+            }
+            BuiltinIterKind::Values => {
+                let mut out: Vec<ValueRepr> = Vec::with_capacity(items.len());
+                for (_, v) in items {
+                    out.push(v);
+                }
+                array_from_vec(out)
+            }
+            BuiltinIterKind::Entries => {
+                let mut out: Vec<ValueRepr> = Vec::with_capacity(items.len());
+                for (k, v) in items {
+                    let pair = array_from_vec(vec![allocate_new_string(k), v]);
+                    out.push(pair);
+                }
+                array_from_vec(out)
+            }
+        }
+    }
+}
+
+fn map_iter(map_val: i64, kind: BuiltinIterKind) -> i64 {
+    unsafe {
+        if map_val == 0 || !is_heap_ptr(map_val) {
+            return empty_array();
+        }
+        let map = &*(map_val as *const BoxedMap);
+        match kind {
+            BuiltinIterKind::Keys => {
+                let mut out: Vec<ValueRepr> = Vec::with_capacity(map.map.len());
+                for (k, _) in map.map.iter() {
+                    out.push(k.0);
+                }
+                array_from_vec(out)
+            }
+            BuiltinIterKind::Values => {
+                let mut out: Vec<ValueRepr> = Vec::with_capacity(map.map.len());
+                for (_, v) in map.map.iter() {
+                    out.push(v.0);
+                }
+                array_from_vec(out)
+            }
+            BuiltinIterKind::Entries => {
+                let mut out: Vec<ValueRepr> = Vec::with_capacity(map.map.len());
+                for (k, v) in map.map.iter() {
+                    let pair = array_from_vec(vec![k.0, v.0]);
+                    out.push(pair);
+                }
+                array_from_vec(out)
+            }
+        }
+    }
+}
+
+fn set_values_iter(set_val: i64) -> i64 {
+    unsafe {
+        if set_val == 0 || !is_heap_ptr(set_val) {
+            return empty_array();
+        }
+        let set = &*(set_val as *const BoxedSet);
+        let mut out: Vec<ValueRepr> = Vec::with_capacity(set.set.len());
+        for v in set.set.iter() {
+            out.push(v.0);
+        }
+        array_from_vec(out)
     }
 }
 
@@ -846,6 +951,62 @@ pub unsafe extern "C" fn wir_map_size(map_val: i64) -> i64 {
             v::make_smi(map.map.len() as i64)
         }
         Some(TAG_SET) => wir_set_size(map_val),
+        _ => v::make_smi(0),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_builtin_keys(recv: i64) -> i64 {
+    match heap_tag(recv) {
+        Some(TAG_MAP) => map_iter(recv, BuiltinIterKind::Keys),
+        Some(TAG_OBJECT) => object_iter(recv, BuiltinIterKind::Keys),
+        _ => empty_array(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_builtin_values(recv: i64) -> i64 {
+    match heap_tag(recv) {
+        Some(TAG_MAP) => map_iter(recv, BuiltinIterKind::Values),
+        Some(TAG_SET) => set_values_iter(recv),
+        Some(TAG_OBJECT) => object_iter(recv, BuiltinIterKind::Values),
+        _ => empty_array(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_builtin_entries(recv: i64) -> i64 {
+    match heap_tag(recv) {
+        Some(TAG_MAP) => map_iter(recv, BuiltinIterKind::Entries),
+        Some(TAG_OBJECT) => object_iter(recv, BuiltinIterKind::Entries),
+        _ => empty_array(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_builtin_size(recv: i64) -> i64 {
+    match heap_tag(recv) {
+        Some(TAG_MAP) => {
+            let map = unsafe { &*(recv as *const BoxedMap) };
+            v::make_smi(map.map.len() as i64)
+        }
+        Some(TAG_SET) => {
+            let set = unsafe { &*(recv as *const BoxedSet) };
+            v::make_smi(set.set.len() as i64)
+        }
+        Some(TAG_OBJECT) => {
+            let obj = unsafe { &*(recv as *const BoxedObj) };
+            let count = obj
+                .dict
+                .keys()
+                .filter(|k| !k.starts_with("__get__") && !k.starts_with("__set__"))
+                .count();
+            v::make_smi(count as i64)
+        }
+        Some(TAG_ARRAY) => unsafe {
+            let arr = &*(recv as *const BoxedArray);
+            v::make_smi(arr.buf.len() as i64)
+        },
         _ => v::make_smi(0),
     }
 }

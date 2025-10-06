@@ -366,6 +366,9 @@ pub enum BuiltinMapMethod {
     Has,
     Delete,
     Clear,
+    Keys,
+    Values,
+    Entries,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -374,6 +377,14 @@ pub enum BuiltinSetMethod {
     Has,
     Delete,
     Clear,
+    Values,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinCommonMethod {
+    Keys,
+    Values,
+    Entries,
 }
 
 #[derive(Debug, Clone)]
@@ -508,6 +519,13 @@ pub enum Expr {
         method: BuiltinSetMethod,
         args: Vec<Expr>,
     },
+
+    CallBuiltinCommonMethod {
+        recv: SmallBox<Expr, u8>,
+        method: BuiltinCommonMethod,
+    },
+
+    GetBuiltinSize(SmallBox<Expr, u8>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2358,29 +2376,62 @@ impl<'src> Parser<'src> {
             // Check if this is a method call or a property access
             if self.matches(&Tok::LParen) {
                 let map_method = match name_str.as_str() {
-                    "get" => Some(BuiltinMapMethod::Get), "set" => Some(BuiltinMapMethod::Set),
-                    "has" => Some(BuiltinMapMethod::Has), "delete" => Some(BuiltinMapMethod::Delete),
-                    "clear" => Some(BuiltinMapMethod::Clear), _ => None,
+                    "get" => Some(BuiltinMapMethod::Get),
+                    "set" => Some(BuiltinMapMethod::Set),
+                    "has" => Some(BuiltinMapMethod::Has),
+                    "delete" => Some(BuiltinMapMethod::Delete),
+                    "clear" => Some(BuiltinMapMethod::Clear),
+                    "keys" => Some(BuiltinMapMethod::Keys),
+                    "values" => Some(BuiltinMapMethod::Values),
+                    "entries" => Some(BuiltinMapMethod::Entries),
+                    _ => None,
                 };
                 if let Some(method) = map_method {
-                    let args = self.parse_arg_list()?; // This now consumes ')'
-                    // REMOVED `self.expect(Tok::RParen, ...)`
+                    let args = self.parse_arg_list()?;
+                    if matches!(method, BuiltinMapMethod::Keys | BuiltinMapMethod::Values | BuiltinMapMethod::Entries)
+                        && !args.is_empty()
+                    {
+                        return Err(self.err_here("builtin method does not take arguments"));
+                    }
                     e = Expr::CallBuiltinMapMethod { recv: SmallBox::new(e), method, args };
                     continue;
                 }
 
                 let set_method = match name_str.as_str() {
-                    "add" => Some(BuiltinSetMethod::Add), "has" => Some(BuiltinSetMethod::Has),
-                    "delete" => Some(BuiltinSetMethod::Delete), "clear" => Some(BuiltinSetMethod::Clear),
-                     _ => None
+                    "add" => Some(BuiltinSetMethod::Add),
+                    "has" => Some(BuiltinSetMethod::Has),
+                    "delete" => Some(BuiltinSetMethod::Delete),
+                    "clear" => Some(BuiltinSetMethod::Clear),
+                    "values" => Some(BuiltinSetMethod::Values),
+                    _ => None,
                 };
                 if let Some(method) = set_method {
-                     let args = self.parse_arg_list()?; // This now consumes ')'
-                     // REMOVED `self.expect(Tok::RParen, ...)`
-                     e = Expr::CallBuiltinSetMethod { recv: SmallBox::new(e), method, args };
-                     continue;
+                    let args = self.parse_arg_list()?;
+                    if method == BuiltinSetMethod::Values && !args.is_empty() {
+                        return Err(self.err_here("builtin method does not take arguments"));
+                    }
+                    e = Expr::CallBuiltinSetMethod { recv: SmallBox::new(e), method, args };
+                    continue;
                 }
-                
+
+                let common_method = match name_str.as_str() {
+                    "keys" => Some(BuiltinCommonMethod::Keys),
+                    "values" => Some(BuiltinCommonMethod::Values),
+                    "entries" => Some(BuiltinCommonMethod::Entries),
+                    _ => None,
+                };
+                if let Some(method) = common_method {
+                    let args = self.parse_arg_list()?;
+                    if !args.is_empty() {
+                        return Err(self.err_here("builtin method does not take arguments"));
+                    }
+                    e = Expr::CallBuiltinCommonMethod {
+                        recv: SmallBox::new(e),
+                        method,
+                    };
+                    continue;
+                }
+
                 // Fallback for your original, working code (Array, String, etc.)
                 // Your existing code is already structured to call an arg parser and then continue.
                 // To keep this surgical, we'll put the arguments back for the original code to parse.
@@ -2401,6 +2452,10 @@ impl<'src> Parser<'src> {
                 e = Expr::Call { callee: SmallBox::new(callee), args, };
 
             } else {
+                if name_str == "size" {
+                    e = Expr::GetBuiltinSize(SmallBox::new(e));
+                    continue;
+                }
                 e = Expr::GetProp { recv: SmallBox::new(e), name: name_str, };
             }
         } else if self.matches(&Tok::LBracket) {

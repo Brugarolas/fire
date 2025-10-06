@@ -1077,6 +1077,22 @@ fn collect_mut_locals_in_expr(e: &Expr, out: &mut BTreeSet<String>) {
                 }
             }
         }
+        Expr::CallBuiltinMapMethod { recv, args, .. } => {
+            collect_mut_locals_in_expr(recv, out);
+            for a in args {
+                collect_mut_locals_in_expr(a, out);
+            }
+        }
+        Expr::CallBuiltinSetMethod { recv, args, .. } => {
+            collect_mut_locals_in_expr(recv, out);
+            for a in args {
+                collect_mut_locals_in_expr(a, out);
+            }
+        }
+        Expr::CallBuiltinCommonMethod { recv, .. } => {
+            collect_mut_locals_in_expr(recv, out);
+        }
+        Expr::GetBuiltinSize(recv) => collect_mut_locals_in_expr(recv, out),
         _ => {}
     }
 }
@@ -4993,6 +5009,9 @@ fn lower_expr_free<'m>(
                 crate::front::BuiltinMapMethod::Has => ("wir_map_has", false),
                 crate::front::BuiltinMapMethod::Delete => ("wir_map_delete", false),
                 crate::front::BuiltinMapMethod::Clear => ("wir_map_clear", false),
+                crate::front::BuiltinMapMethod::Keys => ("wir_builtin_keys", false),
+                crate::front::BuiltinMapMethod::Values => ("wir_builtin_values", false),
+                crate::front::BuiltinMapMethod::Entries => ("wir_builtin_entries", false),
             };
 
             let mut call_args: smallvec::SmallVec<[ValueId; 4]> = smallvec::smallvec![recv_v];
@@ -5021,6 +5040,7 @@ fn lower_expr_free<'m>(
                 crate::front::BuiltinSetMethod::Has => ("wir_set_has", false),
                 crate::front::BuiltinSetMethod::Delete => ("wir_set_delete", false),
                 crate::front::BuiltinSetMethod::Clear => ("wir_set_clear", false),
+                crate::front::BuiltinSetMethod::Values => ("wir_builtin_values", false),
             };
 
             let mut call_args: smallvec::SmallVec<[ValueId; 4]> = smallvec::smallvec![recv_v];
@@ -5039,6 +5059,43 @@ fn lower_expr_free<'m>(
             } else {
                 Ok(res[0])
             }
+        }
+
+        Expr::CallBuiltinCommonMethod { recv, method } => {
+            let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
+            let native_name = match method {
+                crate::front::BuiltinCommonMethod::Keys => "wir_builtin_keys",
+                crate::front::BuiltinCommonMethod::Values => "wir_builtin_values",
+                crate::front::BuiltinCommonMethod::Entries => "wir_builtin_entries",
+            };
+            let (_nid, res) = b.push_node(
+                Inst::CallNative {
+                    name: native_name.into(),
+                    args: vec![recv_v],
+                    pure: false,
+                    can_throw: false,
+                },
+                None,
+                1,
+                true,
+            );
+            Ok(res[0])
+        }
+
+        Expr::GetBuiltinSize(recv) => {
+            let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
+            let (_nid, res) = b.push_node(
+                Inst::CallNative {
+                    name: "wir_builtin_size".into(),
+                    args: vec![recv_v],
+                    pure: true,
+                    can_throw: false,
+                },
+                Some(Type::Int32),
+                1,
+                false,
+            );
+            Ok(res[0])
         }
 
         _ => Err(LowerError::NotLowerable("expression type not supported")),

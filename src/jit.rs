@@ -44,6 +44,7 @@ use crate::runtime::{
     wir_obj_set_str, wir_super_get_method, wir_string_equals, wir_is_map, wir_is_set,
     wir_map_new, wir_map_get, wir_map_set, wir_map_has, wir_map_delete, wir_map_clear, wir_map_size,
     wir_set_new, wir_set_add, wir_set_has, wir_set_delete, wir_set_clear, wir_set_size,
+    wir_builtin_keys, wir_builtin_values, wir_builtin_entries, wir_builtin_size,
 };
 #[allow(unused_imports)]
 use crate::value::{
@@ -441,6 +442,11 @@ impl Default for JIT {
             fn wir_set_delete(set: i64, val: i64) -> i64;
             fn wir_set_clear(set: i64);
             fn wir_set_size(set: i64) -> i64;
+
+            fn wir_builtin_keys(recv: i64) -> i64;
+            fn wir_builtin_values(recv: i64) -> i64;
+            fn wir_builtin_entries(recv: i64) -> i64;
+            fn wir_builtin_size(recv: i64) -> i64;
         }
 
         unsafe {
@@ -903,6 +909,10 @@ impl Default for JIT {
             jb.symbol("wir_set_delete", wir_set_delete as *const u8);
             jb.symbol("wir_set_clear", wir_set_clear as *const u8);
             jb.symbol("wir_set_size", wir_set_size as *const u8);
+            jb.symbol("wir_builtin_keys", wir_builtin_keys as *const u8);
+            jb.symbol("wir_builtin_values", wir_builtin_values as *const u8);
+            jb.symbol("wir_builtin_entries", wir_builtin_entries as *const u8);
+            jb.symbol("wir_builtin_size", wir_builtin_size as *const u8);
         }
 
         let module = cranelift_jit::JITModule::new(jb);

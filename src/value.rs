@@ -353,6 +353,11 @@ fn alloc_array_from_vec(mut buf: Vec<i64>) -> ValueRepr {
     }
 }
 
+#[inline(always)]
+pub fn array_from_vec(buf: Vec<ValueRepr>) -> ValueRepr {
+    alloc_array_from_vec(buf)
+}
+
 #[inline]
 pub fn box_array_with_len(len: usize) -> ValueRepr {
     // IMPORTANT: zero-init to avoid GC scanning garbage that mimics pointers.

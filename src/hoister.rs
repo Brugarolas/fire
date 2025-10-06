@@ -869,6 +869,27 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                     .collect(),
             },
 
+            Expr::CallBuiltinCommonMethod { recv, method } => Expr::CallBuiltinCommonMethod {
+                recv: SmallBox::new(rw_expr(
+                    recv,
+                    used,
+                    counter,
+                    enclosing_locals,
+                    out_funcs,
+                    lam_caps_out,
+                )),
+                method: *method,
+            },
+
+            Expr::GetBuiltinSize(recv) => Expr::GetBuiltinSize(SmallBox::new(rw_expr(
+                recv,
+                used,
+                counter,
+                enclosing_locals,
+                out_funcs,
+                lam_caps_out,
+            ))),
+
             Expr::Await(inner) => Expr::Await(SmallBox::new(rw_expr(
                 inner,
                 used,
