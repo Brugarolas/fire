@@ -156,6 +156,7 @@ fn collect_object_items<'a>(obj: &'a BoxedObj) -> Vec<(&'a String, ValueRepr)> {
         }
         items.push((k, *v));
     }
+    items.sort_by(|(ka, _), (kb, _)| ka.cmp(kb));
     items
 }
 

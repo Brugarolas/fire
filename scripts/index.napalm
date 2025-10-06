@@ -79,6 +79,41 @@ var merged = { greeting: "hi", ...base, ...extra, d: 10 };
 print(merged.a + merged.b + merged.c + merged.d); // expect 1 + 5 + 9 + 10 = 25
 print(merged);
 
+print("===== Object iteration helpers =====");
+print(merged.keys());              // expect keys of merged in insertion order
+print(merged.values());            // expect values [1, 5, 9, 10, "hi"]
+print(merged.entries());           // expect entry pairs [["a",1], ...]
+print(merged.size);                // expect 5
+
+print("===== Class instance iteration helpers =====");
+class Box {
+  constructor(v) {
+    this.value = v;
+    this.tag = "box";
+  }
+}
+var box = new Box(42);
+print(box.keys());                 // expect ["value", "tag"]
+print(box.values());               // expect [42, "box"]
+print(box.entries());              // expect [["value",42],["tag","box"]]
+print(box.size);                   // expect 2
+
+print("===== Map iteration helpers =====");
+var map2 = new Map();
+map2.set("x", 1);
+map2.set("y", 2);
+print(map2.keys());                // expect ["x", "y"]
+print(map2.values());              // expect [1, 2]
+print(map2.entries());             // expect [["x",1],["y",2]]
+print(map2.size);                  // expect 2
+
+print("===== Set iteration helpers =====");
+var set2 = new Set();
+set2.add("alpha");
+set2.add("beta");
+print(set2.values());              // expect ["alpha", "beta"]
+print(set2.size);                  // expect 2
+
 // ===========================
 // Arrays
 // ===========================

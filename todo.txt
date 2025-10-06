@@ -1,7 +1,6 @@
 Hi! I am making a new scripting programming language named Napalm. I have like 20% of the language features already implemented and the most important: a very complex engine already set up, but there are still a lot of features still to implement as well as a few bugs and incorrect stuff.
 
 Features I still have not implemented:
-- Add .values(), .keys(), .entries() for objects, class instances, Maps, and Sets (except .keys() and .entries() on Sets), and add .size property to objects/class instances
 - Try/Catch/Finally (a là JavaScript)
 - Defer/Errdefer (a là Zig)
 - Add Dates (a là JavaScript: get/set of properties .date, .day, .fullYear, .hours, .milliseconds, .seconds, .time; constructors new Date(), Date(), Date.now(), Date.parse())
