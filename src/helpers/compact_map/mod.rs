@@ -38,7 +38,7 @@ where
     }
 }
 
-impl<K, V: Default> Default for CompactMap<K, V> {
+impl<K, V> Default for CompactMap<K, V> {
     /// Creates an empty `CompactMap<K, V>`.
     ///
     /// You can specify all types of CompactMap, including N and hasher.
@@ -52,7 +52,7 @@ impl<K, V: Default> Default for CompactMap<K, V> {
     }
 }
 
-impl<K, V: Default> CompactMap<K, V> {
+impl<K, V> CompactMap<K, V> {
     /// Creates an empty `CompactMap`.
     #[inline]
     pub fn new() -> Self {
