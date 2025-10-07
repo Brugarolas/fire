@@ -2991,11 +2991,28 @@ fn lower_expr_free<'m>(
         }
 
         Expr::Binary { op, a, b: bb } => {
+            let left_is_str_lit = matches!(&**a, Expr::Str(_));
+            let right_is_str_lit = matches!(&**bb, Expr::Str(_));
             let va = lower_expr_free(b, locals, fields, next_field, a, lowering_ctx)?;
             match op {
                 Add => {
                     let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
-                    Ok(b.int_bin(IntBinOp::Add, va, vb))
+                    if left_is_str_lit || right_is_str_lit {
+                        let (_nid, res) = b.push_node(
+                            Inst::CallNative {
+                                name: "wir_string_concat".into(),
+                                args: vec![va, vb],
+                                pure: false,
+                                can_throw: false,
+                            },
+                            Some(Type::Str),
+                            1,
+                            true,
+                        );
+                        Ok(res[0])
+                    } else {
+                        Ok(b.int_bin(IntBinOp::Add, va, vb))
+                    }
                 }
                 Sub => {
                     let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
@@ -3014,12 +3031,9 @@ fn lower_expr_free<'m>(
                     Ok(b.int_bin(IntBinOp::RemS, va, vb))
                 }
                 Eq | Ne | Lt | Le | Gt | Ge => {
-                    let va = lower_expr_free(b, locals, fields, next_field, a, lowering_ctx)?;
                     let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
 
-                    // Handle equality operators (==, !=) with a special path for strings.
                     if *op == BinOp::Eq || *op == BinOp::Ne {
-                        // At runtime, check if either operand is a string.
                         let (_nid1, is_a_str) = b.push_node(
                             Inst::CallNative {
                                 name: "wir_is_str".into(),
@@ -3051,7 +3065,6 @@ fn lower_expr_free<'m>(
 
                         b.branch(is_either_str, string_path, int_path);
 
-                        // PATH 1: At least one operand is a string. Use content comparison.
                         b.position_at(string_path);
                         let (_nid_streq, str_eq_res) = b.push_node(
                             Inst::CallNative {
@@ -3065,34 +3078,30 @@ fn lower_expr_free<'m>(
                             true,
                         );
                         let str_res = if *op == BinOp::Ne {
-                            let one = b.const_i32(1); // Your bools are 0/1
-                            b.int_bin(IntBinOp::Xor, str_eq_res[0], one) // a != b is !(a == b)
+                            let one = b.const_i32(1);
+                            b.int_bin(IntBinOp::Xor, str_eq_res[0], one)
                         } else {
                             str_eq_res[0]
                         };
                         b.jump(cont, &[str_res]);
 
-                        // PATH 2: Neither operand is a string. Use the fast integer/SMI comparison.
                         b.position_at(int_path);
                         let kind = if *op == BinOp::Eq {
-                            crate::wir::CmpKind::Eq // This is the correct WIR enum
+                            crate::wir::CmpKind::Eq
                         } else {
-                            crate::wir::CmpKind::Ne // This is the correct WIR enum
+                            crate::wir::CmpKind::Ne
                         };
                         let (_nid_int, int_res) = b.push_node(
-                            Inst::CmpInt { kind, a: va, b: vb }, // Generate the correct WIR instruction
+                            Inst::CmpInt { kind, a: va, b: vb },
                             Some(Type::Bool),
                             1,
                             false,
                         );
                         b.jump(cont, &[int_res[0]]);
 
-                        // Join the paths and return the result.
                         b.position_at(cont);
                         return Ok(result_phi);
                     } else {
-                        // For Lt, Gt, etc., we keep the original, simple integer comparison logic for now.
-                        // This preserves the existing functionality.
                         let kind = match *op {
                             BinOp::Lt => crate::wir::CmpKind::Lt,
                             BinOp::Le => crate::wir::CmpKind::Le,

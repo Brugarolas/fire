@@ -2068,7 +2068,13 @@ pub fn fmt_value(v: i64) -> String {
                     return format!("{}", f.val);
                 }
                 TAG_STRING => {
-                    return format!("<string@{:#x}>", v as u64);
+                    let s = &*(v as *const BoxedStr);
+                    let bytes = slice::from_raw_parts(s.data, s.len);
+                    if let Ok(text) = str::from_utf8(bytes) {
+                        return format!("{text:?}");
+                    } else {
+                        return format!("<string@{:#x}>", v as u64);
+                    }
                 }
                 TAG_ARRAY => {
                     return format!("<array@{:#x}>", v as u64);

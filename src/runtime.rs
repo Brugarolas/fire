@@ -140,13 +140,24 @@ fn field_name_registry() -> &'static RwLock<HashMap<u32, String>> {
     REGISTRY.get_or_init(|| RwLock::new(HashMap::default()))
 }
 
+fn field_name_lookup() -> &'static RwLock<HashMap<String, u32>> {
+    static LOOKUP: OnceLock<RwLock<HashMap<String, u32>>> = OnceLock::new();
+    LOOKUP.get_or_init(|| RwLock::new(HashMap::default()))
+}
+
 fn field_name_for_id(fid: u32) -> Option<String> {
     field_name_registry().read().get(&fid).cloned()
 }
 
+fn field_id_for_name(name: &str) -> Option<u32> {
+    field_name_lookup().read().get(name).copied()
+}
+
 fn register_field_name(fid: u32, name: String) {
     let mut guard = field_name_registry().write();
-    guard.entry(fid).or_insert(name);
+    guard.entry(fid).or_insert_with(|| name.clone());
+    let mut rev = field_name_lookup().write();
+    rev.entry(name).or_insert(fid);
 }
 
 #[inline(always)]
@@ -213,7 +224,15 @@ fn proxy_invoke_trap(proxy: i64, method: &str, args: &[i64]) -> Option<i64> {
         if handler == NULL || heap_tag(handler) != Some(TAG_OBJECT) {
             return None;
         }
-        let fun = v::obj_get_str_deep(handler, method);
+        let mut fun = v::obj_get_str_deep(handler, method);
+        if fun == 0 {
+            if let Some(fid) = field_id_for_name(method) {
+                fun = obj_get_field_deep(handler, fid);
+                if fun != 0 && (fun & 1) == 1 {
+                    fun = wir_make_method_closure(fun);
+                }
+            }
+        }
         if fun == 0 {
             return None;
         }
@@ -346,7 +365,11 @@ fn proxy_has_with_name(proxy: i64, key_ptr: i64, key: &str) -> i64 {
 fn proxy_delete_with_name(proxy: i64, key_ptr: i64, key: &str) -> i64 {
     let key_val = ensure_key_value(key_ptr, key);
     if let Some(res) = proxy_invoke_trap(proxy, "deleteProperty", &[proxy_target(proxy), key_val]) {
-        return bool_to_value(value_to_bool(res).unwrap_or(false));
+        let ok = value_to_bool(res).unwrap_or(false);
+        if ok {
+            proxy_default_delete(proxy, key);
+        }
+        return bool_to_value(ok);
     }
     proxy_default_delete(proxy, key)
 }
@@ -377,14 +400,14 @@ fn proxy_has_field(proxy: i64, fid: u32) -> i64 {
 
 fn proxy_delete_field(proxy: i64, fid: u32) -> i64 {
     if let Some(name) = field_name_for_id(fid) {
-        proxy_delete_with_name(proxy, 0, &name)
-    } else {
-        proxy_default_field_delete(proxy, fid)
+        return proxy_delete_with_name(proxy, 0, &name);
     }
+    proxy_default_field_delete(proxy, fid)
 }
 
 fn proxy_iter(proxy: i64, kind: BuiltinIterKind) -> i64 {
-    let keys: Vec<(i64, String)> = proxy_own_keys(proxy)
+    let raw_keys = proxy_own_keys(proxy);
+    let keys: Vec<(i64, String)> = raw_keys
         .into_iter()
         .filter_map(|key| {
             if matches!(heap_tag(key), Some(TAG_STRING)) {
@@ -1411,6 +1434,7 @@ pub extern "C" fn wir_builtin_keys(recv: i64) -> i64 {
     match heap_tag(recv) {
         Some(TAG_MAP) => map_iter(recv, BuiltinIterKind::Keys),
         Some(TAG_OBJECT) => object_iter(recv, BuiltinIterKind::Keys),
+        Some(TAG_PROXY) => proxy_iter(recv, BuiltinIterKind::Keys),
         _ => empty_array(),
     }
 }
@@ -1421,6 +1445,7 @@ pub extern "C" fn wir_builtin_values(recv: i64) -> i64 {
         Some(TAG_MAP) => map_iter(recv, BuiltinIterKind::Values),
         Some(TAG_SET) => set_values_iter(recv),
         Some(TAG_OBJECT) => object_iter(recv, BuiltinIterKind::Values),
+        Some(TAG_PROXY) => proxy_iter(recv, BuiltinIterKind::Values),
         _ => empty_array(),
     }
 }
@@ -1430,6 +1455,7 @@ pub extern "C" fn wir_builtin_entries(recv: i64) -> i64 {
     match heap_tag(recv) {
         Some(TAG_MAP) => map_iter(recv, BuiltinIterKind::Entries),
         Some(TAG_OBJECT) => object_iter(recv, BuiltinIterKind::Entries),
+        Some(TAG_PROXY) => proxy_iter(recv, BuiltinIterKind::Entries),
         _ => empty_array(),
     }
 }
