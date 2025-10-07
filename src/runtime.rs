@@ -217,8 +217,7 @@ fn proxy_invoke_trap(proxy: i64, method: &str, args: &[i64]) -> Option<i64> {
         if fun == 0 {
             return None;
         }
-        let mut argv = Vec::with_capacity(args.len() + 1);
-        argv.push(handler);
+        let mut argv = Vec::with_capacity(args.len());
         argv.extend_from_slice(args);
         Some(crate::jit::wir_call_closure(
             fun,
