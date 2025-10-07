@@ -15,7 +15,7 @@ use crate::value::{
     set_new, shape_slot, value_to_bool,
 };
 
-use crate::helpers::collections::{ConcurrentHashMap, HashMap, HashSet};
+use crate::helpers::collections::{HashMap, HashSet};
 use core::cmp::min;
 use parking_lot::{Mutex, RwLock};
 use std::slice;
@@ -927,144 +927,135 @@ pub extern "C" fn wir_obj_clone(obj: i64) -> i64 {
     }
 }
 
-// --- Definiciones de claves para funciones de 2, 3 y 4 argumentos ---
+// --- Memoized hash tables ---
+use core::hash::{BuildHasher, Hasher};
+type FastBuildHasher = crate::helpers::collections::AesBuildHasher; // <-- change path if needed
+use papaya::HashMap as ConcurrentHashMap;
+
+// -------- Keys (flattened to avoid nested lookups) --------
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct Key2(i64, i64);
+#[repr(C)]
+struct Key1 { fid: u32, a: i64 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct Key3(i64, i64, i64);
+#[repr(C)]
+struct Key2 { fid: u32, a: i64, b: i64 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct Key4(i64, i64, i64, i64);
+#[repr(C)]
+struct Key3 { fid: u32, a: i64, b: i64, c: i64 }
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(C)]
+struct Key4 { fid: u32, a: i64, b: i64, c: i64, d: i64 }
 
-// --- Tablas de memoización globales, lock-free y con el hasher AES ---
-static MEMO1: OnceLock<ConcurrentHashMap<(u32, i64), i64>> = OnceLock::new();
-static MEMO2: OnceLock<ConcurrentHashMap<(u32, Key2), i64>> = OnceLock::new();
-static MEMO3: OnceLock<ConcurrentHashMap<(u32, Key3), i64>> = OnceLock::new();
-static MEMO4: OnceLock<ConcurrentHashMap<(u32, Key4), i64>> = OnceLock::new();
+// -------- Global tables (one per arity, lock-free) --------
+type Map1 = ConcurrentHashMap<Key1, i64, FastBuildHasher>;
+type Map2 = ConcurrentHashMap<Key2, i64, FastBuildHasher>;
+type Map3 = ConcurrentHashMap<Key3, i64, FastBuildHasher>;
+type Map4 = ConcurrentHashMap<Key4, i64, FastBuildHasher>;
 
-// --- Inicializadores para las tablas de memoización ---
-fn memo1() -> &'static ConcurrentHashMap<(u32, i64), i64> {
-    MEMO1.get_or_init(|| ConcurrentHashMap::new())
+static MAP1: OnceLock<Map1> = OnceLock::new();
+static MAP2: OnceLock<Map2> = OnceLock::new();
+static MAP3: OnceLock<Map3> = OnceLock::new();
+static MAP4: OnceLock<Map4> = OnceLock::new();
+
+#[inline(always)]
+fn map1() -> &'static Map1 {
+    MAP1.get_or_init(|| ConcurrentHashMap::with_hasher(FastBuildHasher::default()))
 }
-fn memo2() -> &'static ConcurrentHashMap<(u32, Key2), i64> {
-    MEMO2.get_or_init(|| ConcurrentHashMap::new())
+#[inline(always)]
+fn map2() -> &'static Map2 {
+    MAP2.get_or_init(|| ConcurrentHashMap::with_hasher(FastBuildHasher::default()))
 }
-fn memo3() -> &'static ConcurrentHashMap<(u32, Key3), i64> {
-    MEMO3.get_or_init(|| ConcurrentHashMap::new())
+#[inline(always)]
+fn map3() -> &'static Map3 {
+    MAP3.get_or_init(|| ConcurrentHashMap::with_hasher(FastBuildHasher::default()))
 }
-fn memo4() -> &'static ConcurrentHashMap<(u32, Key4), i64> {
-    MEMO4.get_or_init(|| ConcurrentHashMap::new())
+#[inline(always)]
+fn map4() -> &'static Map4 {
+    MAP4.get_or_init(|| ConcurrentHashMap::with_hasher(FastBuildHasher::default()))
 }
 
-// --- API C para el Runtime de Napalm ---
+#[inline(always)]
+unsafe fn write_out(out_ptr: *mut i64, val: i64) {
+    if !out_ptr.is_null() { *out_ptr = val; }
+}
 
-// -- Funciones para 1 argumento --
+// -------- FFI: arity 1 --------
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_memo_get(fid: i64, key: i64, out_ptr: *mut i64) -> i64 {
     let fid_u = fid as u32;
-    let guard = &mut memo1().guard();
-
-    if let Some(val) = memo1().get(&(fid_u, key), guard) {
-        unsafe {
-            if !out_ptr.is_null() {
-                *out_ptr = *val;
-            }
-        }
-        return bool_to_value(true);
+    let p = map1().pin();                    // holds a local GC guard
+    if let Some(&v) = p.get(&Key1 { fid: fid_u, a: key }) {
+        unsafe { write_out(out_ptr, v) }
+        1
+    } else {
+        0
     }
-    bool_to_value(false)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_memo_put(fid: i64, key: i64, val: i64) -> i64 {
     let fid_u = fid as u32;
-    let guard = &mut memo1().guard();
-
-    memo1().insert((fid_u, key), val, guard);
+    let p = map1().pin();
+    let _ = p.insert(Key1 { fid: fid_u, a: key }, val); // ignore old value
     0
 }
 
-// -- Funciones para 2 argumentos --
+// -------- FFI: arity 2 --------
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_memo_get2(fid: i64, k0: i64, k1: i64, out_ptr: *mut i64) -> i64 {
     let fid_u = fid as u32;
-    let guard = &mut memo2().guard();
-
-    if let Some(val) = memo2().get(&(fid_u, Key2(k0, k1)), guard) {
-        unsafe {
-            if !out_ptr.is_null() {
-                *out_ptr = *val;
-            }
-        }
-        return bool_to_value(true);
-    }
-    bool_to_value(false)
+    let p = map2().pin();
+    if let Some(&v) = p.get(&Key2 { fid: fid_u, a: k0, b: k1 }) {
+        unsafe { write_out(out_ptr, v) }
+        1
+    } else { 0 }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_memo_put2(fid: i64, k0: i64, k1: i64, val: i64) -> i64 {
     let fid_u = fid as u32;
-    let guard = &mut memo2().guard();
-
-    memo2().insert((fid_u, Key2(k0, k1)), val, guard);
+    let p = map2().pin();
+    let _ = p.insert(Key2 { fid: fid_u, a: k0, b: k1 }, val);
     0
 }
 
-// -- Funciones para 3 argumentos --
+// -------- FFI: arity 3 --------
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_memo_get3(fid: i64, k0: i64, k1: i64, k2: i64, out_ptr: *mut i64) -> i64 {
     let fid_u = fid as u32;
-    let guard = &mut memo3().guard();
-
-    if let Some(val) = memo3().get(&(fid_u, Key3(k0, k1, k2)), guard) {
-        unsafe {
-            if !out_ptr.is_null() {
-                *out_ptr = *val;
-            }
-        }
-        return bool_to_value(true);
-    }
-    bool_to_value(false)
+    let p = map3().pin();
+    if let Some(&v) = p.get(&Key3 { fid: fid_u, a: k0, b: k1, c: k2 }) {
+        unsafe { write_out(out_ptr, v) }
+        1
+    } else { 0 }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_memo_put3(fid: i64, k0: i64, k1: i64, k2: i64, val: i64) -> i64 {
     let fid_u = fid as u32;
-    let guard = &mut memo3().guard();
-
-    memo3().insert((fid_u, Key3(k0, k1, k2)), val, guard);
+    let p = map3().pin();
+    let _ = p.insert(Key3 { fid: fid_u, a: k0, b: k1, c: k2 }, val);
     0
 }
 
-// -- Funciones para 4 argumentos --
+// -------- FFI: arity 4 --------
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_memo_get4(
-    fid: i64,
-    k0: i64,
-    k1: i64,
-    k2: i64,
-    k3: i64,
-    out_ptr: *mut i64,
+    fid: i64, k0: i64, k1: i64, k2: i64, k3: i64, out_ptr: *mut i64,
 ) -> i64 {
     let fid_u = fid as u32;
-    let guard = &mut memo4().guard();
-
-    if let Some(val) = memo4().get(&(fid_u, Key4(k0, k1, k2, k3)), guard) {
-        unsafe {
-            if !out_ptr.is_null() {
-                *out_ptr = *val;
-            }
-        }
-        return bool_to_value(true);
-    }
-    bool_to_value(false)
+    let p = map4().pin();
+    if let Some(&v) = p.get(&Key4 { fid: fid_u, a: k0, b: k1, c: k2, d: k3 }) {
+        unsafe { write_out(out_ptr, v) }
+        1
+    } else { 0 }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_memo_put4(fid: i64, k0: i64, k1: i64, k2: i64, k3: i64, val: i64) -> i64 {
     let fid_u = fid as u32;
-    let guard = &mut memo4().guard();
-
-    memo4().insert((fid_u, Key4(k0, k1, k2, k3)), val, guard);
+    let p = map4().pin();
+    let _ = p.insert(Key4 { fid: fid_u, a: k0, b: k1, c: k2, d: k3 }, val);
     0
 }
 
