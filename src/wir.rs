@@ -66,6 +66,8 @@ id_newtype!(DeoptId);
 id_newtype!(EffectId); // special: also a ValueId in practice
 id_newtype!(ClassId);
 id_newtype!(BindingId); // ESM live binding cell
+id_newtype!(TryRegionId);
+id_newtype!(DeferSiteId);
 
 /// -------- Type lattice --------
 
@@ -284,6 +286,59 @@ pub struct ClassMeta {
     pub static_shape: ShapeId,   // hidden-class for the class object (statics)
 }
 
+/// Describes when a deferred action should fire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WirDeferKind {
+    /// Run the defer regardless of how the scope exits.
+    Always,
+    /// Only run the defer when the scope unwinds with an error/throw.
+    OnError,
+}
+
+/// Distinguishes how a try-region completed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TryExitKind {
+    /// The try block finished normally (fallthrough/return).
+    Normal,
+    /// Control left the try via an exception.
+    Exception,
+    /// The handler explicitly re-threw.
+    Rethrow,
+}
+
+/// Metadata for a single catch handler inside a try-region.
+#[derive(Clone, Debug)]
+pub struct TryHandler {
+    /// Destination block for the handler.
+    pub handler: BlockId,
+    /// Whether the handler expects the thrown value as its first block param.
+    pub binds_exception: bool,
+}
+
+/// A try/catch/finally region within a function.
+#[derive(Clone, Debug)]
+pub struct TryRegion {
+    pub id: TryRegionId,
+    /// Entry block for the protected "try" section.
+    pub try_entry: BlockId,
+    /// Continuation block to resume execution after the region finishes.
+    pub continuation: BlockId,
+    /// Catch handlers, evaluated in order.
+    pub catches: Vec<TryHandler>,
+    /// Optional finally block that always executes before continuing.
+    pub finally_entry: Option<BlockId>,
+}
+
+/// A deferred action scheduled within a scope.
+#[derive(Clone, Debug)]
+pub struct DeferSite {
+    pub id: DeferSiteId,
+    /// Kind of defer (always vs. only on error).
+    pub kind: WirDeferKind,
+    /// Block containing the deferred action body.
+    pub action: BlockId,
+}
+
 /// Main instruction enum. SSA values are referenced by ValueId.
 /// Effects: instructions that read/write heap have `effect_in` and may produce `effect_out`.
 #[derive(Clone, Debug)]
@@ -303,6 +358,13 @@ pub enum Inst {
     },
     Return(Vec<ValueId>),
     Throw(ValueId),
+    TryEnter {
+        region: TryRegionId,
+    },
+    TryLeave {
+        region: TryRegionId,
+        exit: TryExitKind,
+    },
 
     // ---- Effect / bookkeeping ----
     EffectEntry, // E0 entry token
@@ -671,6 +733,10 @@ pub enum Inst {
     ImportDynamic {
         spec: ValueId,
     },
+    ScheduleDefer {
+        site: DeferSiteId,
+        captures: Vec<ValueId>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -741,6 +807,9 @@ impl Inst {
                 | StoreBinding { .. }    // writes a live cell
                 | MakeNamespace { .. }   // allocates a namespace object
                 | ImportDynamic { .. } // schedules async load/eval (calls runtime)
+                | TryEnter { .. }
+                | TryLeave { .. }
+                | ScheduleDefer { .. }
         )
     }
 
@@ -790,6 +859,8 @@ pub struct Function {
     pub deopts: Vec<DeoptPoint>,
     pub block_params: HashMap<BlockId, Vec<Type>>,
     pub profiles: ProfileData,
+    pub try_regions: Vec<TryRegion>,
+    pub defer_sites: Vec<DeferSite>,
 }
 
 /// SSA Value descriptor.
@@ -938,6 +1009,8 @@ impl<'m> Builder<'m> {
             deopts: Vec::new(),
             block_params: HashMap::new(),
             profiles: ProfileData::default(),
+            try_regions: Vec::new(),
+            defer_sites: Vec::new(),
         };
         // Create block params for function params
         let mut block_params = Vec::new();
@@ -965,6 +1038,12 @@ impl<'m> Builder<'m> {
         }
         for (i, v) in self.func.values.iter_mut().enumerate() {
             v.id = ValueId(i as u32);
+        }
+        for (i, region) in self.func.try_regions.iter_mut().enumerate() {
+            region.id = TryRegionId(i as u32);
+        }
+        for (i, site) in self.func.defer_sites.iter_mut().enumerate() {
+            site.id = DeferSiteId(i as u32);
         }
         self.func
     }
@@ -1059,7 +1138,11 @@ impl<'m> Builder<'m> {
             use crate::wir::Inst;
             matches!(
                 self.func.nodes[last.0 as usize].kind,
-                Inst::Return(_) | Inst::Branch { .. } | Inst::Jump(_, _) | Inst::Throw(_)
+                Inst::Return(_)
+                    | Inst::Branch { .. }
+                    | Inst::Jump(_, _)
+                    | Inst::Throw(_)
+                    | Inst::TryEnter { .. }
             )
         } else {
             false
@@ -1084,6 +1167,20 @@ impl<'m> Builder<'m> {
             insts: Vec::new(),
             sealed: false,
         });
+        id
+    }
+
+    pub fn add_try_region(&mut self, mut region: TryRegion) -> TryRegionId {
+        let id = TryRegionId(self.func.try_regions.len() as u32);
+        region.id = id;
+        self.func.try_regions.push(region);
+        id
+    }
+
+    pub fn add_defer_site(&mut self, mut site: DeferSite) -> DeferSiteId {
+        let id = DeferSiteId(self.func.defer_sites.len() as u32);
+        site.id = id;
+        self.func.defer_sites.push(site);
         id
     }
 
@@ -1354,7 +1451,8 @@ impl EffectKind {
             crate::wir::Inst::EffectEntry
             | crate::wir::Inst::LoadMethod { .. }
             | crate::wir::Inst::LoadSuperMethod { .. }
-            | crate::wir::Inst::InstanceOf { .. } => EffectKind::Entry,
+            | crate::wir::Inst::InstanceOf { .. }
+            | crate::wir::Inst::TryLeave { .. } => EffectKind::Entry,
 
             crate::wir::Inst::Safepoint => EffectKind::Safepoint,
 
@@ -1412,6 +1510,9 @@ impl EffectKind {
             // Barriers
             crate::wir::Inst::PostWriteBarrier { .. }
             | crate::wir::Inst::ReadBarrier { .. } => EffectKind::Barrier,
+
+            crate::wir::Inst::TryEnter { .. }
+            | crate::wir::Inst::ScheduleDefer { .. } => EffectKind::Call,
 
             _ => EffectKind::from_inst_default(i),
         }

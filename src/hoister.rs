@@ -16,9 +16,9 @@ use crate::wir::{
 };
 
 use crate::front::{
-    BinOp, Block, ClassDecl, ClassMember, ExportDecl, Expr, FuncDecl, ImportDecl, ImportItem,
-    LValue, ListenDecl, ObjItem, ObjPattern, OptionalAccess, Program, PropKey, RouteDecl, Stmt,
-    UnOp,
+    BinOp, Block, CatchClause, ClassDecl, ClassMember, DeferKind, ExportDecl, Expr, FuncDecl,
+    ImportDecl, ImportItem, LValue, ListenDecl, ObjItem, ObjPattern, OptionalAccess, Program,
+    PropKey, RouteDecl, Stmt, UnOp,
 };
 
 /// Hoist all function literals to top-level functions, replacing them with
@@ -107,6 +107,24 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                     collect_uses_expr(e, uses);
                 }
             }
+            Stmt::Try {
+                try_block,
+                catch,
+                finally_block,
+            } => {
+                collect_defs_uses_block(try_block, defs, uses);
+                if let Some(c) = catch {
+                    if let Some(binding) = &c.binding {
+                        defs.insert(binding.clone());
+                    }
+                    collect_defs_uses_block(&c.body, defs, uses);
+                }
+                if let Some(fin) = finally_block {
+                    collect_defs_uses_block(fin, defs, uses);
+                }
+            }
+            Stmt::Throw(expr) => collect_uses_expr(expr, uses),
+            Stmt::Defer { expr, .. } => collect_uses_expr(expr, uses),
             Stmt::Expr(e) => collect_uses_expr(e, uses),
             Stmt::Listen(ld) => {
                 for r in &ld.routes {
@@ -413,6 +431,74 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                     .map(|e| rw_expr(e, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
                 body: rw_block(
                     body,
+                    used,
+                    counter,
+                    enclosing_locals,
+                    out_funcs,
+                    lam_caps_out,
+                ),
+            },
+            Stmt::Try {
+                try_block,
+                catch,
+                finally_block,
+            } => {
+                let try_rw = rw_block(
+                    try_block,
+                    used,
+                    counter,
+                    enclosing_locals,
+                    out_funcs,
+                    lam_caps_out,
+                );
+
+                let catch_rw = catch.as_ref().map(|clause| {
+                    let mut catch_scope = enclosing_locals.clone();
+                    if let Some(binding) = &clause.binding {
+                        catch_scope.insert(binding.clone());
+                    }
+                    CatchClause {
+                        binding: clause.binding.clone(),
+                        body: rw_block(
+                            &clause.body,
+                            used,
+                            counter,
+                            &catch_scope,
+                            out_funcs,
+                            lam_caps_out,
+                        ),
+                    }
+                });
+
+                let finally_rw = finally_block.as_ref().map(|b| {
+                    rw_block(
+                        b,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    )
+                });
+
+                Stmt::Try {
+                    try_block: try_rw,
+                    catch: catch_rw,
+                    finally_block: finally_rw,
+                }
+            }
+            Stmt::Throw(expr) => Stmt::Throw(rw_expr(
+                expr,
+                used,
+                counter,
+                enclosing_locals,
+                out_funcs,
+                lam_caps_out,
+            )),
+            Stmt::Defer { kind, expr } => Stmt::Defer {
+                kind: *kind,
+                expr: rw_expr(
+                    expr,
                     used,
                     counter,
                     enclosing_locals,

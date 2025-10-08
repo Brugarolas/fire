@@ -15,9 +15,9 @@ use crate::wir::{
 };
 
 use crate::front::{
-    BinOp, Block, ClassDecl, ClassMember, ExportDecl, Expr, FuncDecl, ImportDecl, ImportItem,
-    LValue, ListenDecl, ObjItem, ObjPattern, OptionalAccess, Program, PropKey, RouteDecl, Stmt,
-    UnOp,
+    BinOp, Block, CatchClause, ClassDecl, ClassMember, DeferKind, ExportDecl, Expr, FuncDecl,
+    ImportDecl, ImportItem, LValue, ListenDecl, ObjItem, ObjPattern, OptionalAccess, Program,
+    PropKey, RouteDecl, Stmt, UnOp,
 };
 
 use crate::hoister::hoist_fn_lits_program;
@@ -805,6 +805,21 @@ fn lower_stmt_free<'m>(
                 locals.insert(nm, p);
             }
         }
+        Stmt::Try { .. } => {
+            return Err(LowerError::NotLowerable(
+                "try/catch/finally lowering not implemented yet",
+            ));
+        }
+        Stmt::Throw(_) => {
+            return Err(LowerError::NotLowerable(
+                "throw statements not implemented yet",
+            ));
+        }
+        Stmt::Defer { .. } => {
+            return Err(LowerError::NotLowerable(
+                "defer/errdefer lowering not implemented yet",
+            ));
+        }
         Stmt::Return(e) => {
             if let Some(e) = e {
                 let v = lower_expr_free(b, locals, fields, next_field, e, lowering_ctx)?;
@@ -1190,6 +1205,27 @@ fn collect_mut_locals_in_stmt(s: &Stmt, out: &mut BTreeSet<String>) {
                 collect_mut_locals_in_expr(e, out);
             }
         }
+        Stmt::Try {
+            try_block,
+            catch,
+            finally_block,
+        } => {
+            for st in &try_block.stmts {
+                collect_mut_locals_in_stmt(st, out);
+            }
+            if let Some(c) = catch {
+                for st in &c.body.stmts {
+                    collect_mut_locals_in_stmt(st, out);
+                }
+            }
+            if let Some(fin) = finally_block {
+                for st in &fin.stmts {
+                    collect_mut_locals_in_stmt(st, out);
+                }
+            }
+        }
+        Stmt::Throw(expr) => collect_mut_locals_in_expr(expr, out),
+        Stmt::Defer { expr, .. } => collect_mut_locals_in_expr(expr, out),
 
         Stmt::Listen(ld) => {
             for r in &ld.routes {
@@ -1335,6 +1371,15 @@ fn lower_stmt_free_async<'m>(
         _ => {
             // Forward to the old lowering, but via the *_async versions
             match s {
+                Stmt::Try { .. } => Err(LowerError::NotLowerable(
+                    "try/catch/finally lowering not implemented yet",
+                )),
+                Stmt::Throw(_) => Err(LowerError::NotLowerable(
+                    "throw statements not implemented yet",
+                )),
+                Stmt::Defer { .. } => Err(LowerError::NotLowerable(
+                    "defer/errdefer lowering not implemented yet",
+                )),
                 Stmt::Var { name, init } => {
                     let val = if let Some(e) = init {
                         lower_expr_free_async(
@@ -6029,6 +6074,23 @@ impl<'m> Lowerer<'m> {
                     cond: cond.as_ref().map(|e| rw_expr(e, f)),
                     step: step.as_ref().map(|e| rw_expr(e, f)),
                     body: rw_block(body, f),
+                },
+                Stmt::Try {
+                    try_block,
+                    catch,
+                    finally_block,
+                } => Stmt::Try {
+                    try_block: rw_block(try_block, f),
+                    catch: catch.as_ref().map(|clause| CatchClause {
+                        binding: clause.binding.clone(),
+                        body: rw_block(&clause.body, f),
+                    }),
+                    finally_block: finally_block.as_ref().map(|blk| rw_block(blk, f)),
+                },
+                Stmt::Throw(expr) => Stmt::Throw(rw_expr(expr, f)),
+                Stmt::Defer { kind, expr } => Stmt::Defer {
+                    kind: *kind,
+                    expr: rw_expr(expr, f),
                 },
                 Stmt::Return(e) => Stmt::Return(e.as_ref().map(|x| rw_expr(x, f))),
                 Stmt::Expr(e) => Stmt::Expr(rw_expr(e, f)),

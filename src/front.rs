@@ -55,6 +55,14 @@ pub enum Tok {
     For,
     #[token("return")]
     Return,
+    #[token("throw")]
+    Throw,
+    #[token("try")]
+    Try,
+    #[token("catch")]
+    Catch,
+    #[token("finally")]
+    Finally,
     #[token("true")]
     True,
     #[token("false")]
@@ -348,6 +356,18 @@ pub struct ObjPattern {
 }
 
 #[derive(Debug, Clone)]
+pub struct CatchClause {
+    pub binding: Option<String>,
+    pub body: Block,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferKind {
+    Defer,
+    ErrDefer,
+}
+
+#[derive(Debug, Clone)]
 pub enum ObjItem {
     Prop(PropKey, Expr),
     Spread(Expr),
@@ -413,6 +433,16 @@ pub enum Stmt {
         cond: Option<Expr>,
         step: Option<Expr>,
         body: Block,
+    },
+    Try {
+        try_block: Block,
+        catch: Option<CatchClause>,
+        finally_block: Option<Block>,
+    },
+    Throw(Expr),
+    Defer {
+        kind: DeferKind,
+        expr: Expr,
     },
     Return(Option<Expr>),
     Expr(Expr),
@@ -1968,6 +1998,64 @@ impl<'src> Parser<'src> {
                 cond,
                 step,
                 body,
+            })
+        } else if self.matches(&Tok::Try) {
+            let try_block = self.block()?;
+
+            let mut catch_clause = None;
+            if self.matches(&Tok::Catch) {
+                let binding = if self.matches(&Tok::LParen) {
+                    if self.matches(&Tok::RParen) {
+                        None
+                    } else {
+                        let name = self.parse_any_identifier()?;
+                        self.expect(Tok::RParen, "expected ')' after catch binding")?;
+                        Some(name)
+                    }
+                } else {
+                    None
+                };
+                let catch_block = self.block()?;
+                catch_clause = Some(CatchClause {
+                    binding,
+                    body: catch_block,
+                });
+            }
+
+            let finally_block = if self.matches(&Tok::Finally) {
+                Some(self.block()?)
+            } else {
+                None
+            };
+
+            if catch_clause.is_none() && finally_block.is_none() {
+                return Err(self.err_here(
+                    "try statement must include at least a catch or finally clause",
+                ));
+            }
+
+            Ok(Stmt::Try {
+                try_block,
+                catch: catch_clause,
+                finally_block,
+            })
+        } else if self.matches(&Tok::Throw) {
+            let value = self.expr()?;
+            self.expect(Tok::Semi, "expected ';' after throw expression")?;
+            Ok(Stmt::Throw(value))
+        } else if self.matches(&Tok::Defer) {
+            let expr = self.expr()?;
+            self.expect(Tok::Semi, "expected ';' after defer expression")?;
+            Ok(Stmt::Defer {
+                kind: DeferKind::Defer,
+                expr,
+            })
+        } else if self.matches(&Tok::ErrDefer) {
+            let expr = self.expr()?;
+            self.expect(Tok::Semi, "expected ';' after errdefer expression")?;
+            Ok(Stmt::Defer {
+                kind: DeferKind::ErrDefer,
+                expr,
             })
         } else if self.matches(&Tok::Return) {
             if self.matches(&Tok::Semi) {
