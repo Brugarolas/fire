@@ -1,18 +1,10 @@
 use super::*;
 
-use alloc::vec::{self, Vec};
 use core::convert::TryFrom;
 use tinyvec_macros::impl_mirrored;
 
-#[cfg(feature = "rustc_1_57")]
 use alloc::collections::TryReserveError;
-
-#[cfg(feature = "serde")]
-use core::marker::PhantomData;
-#[cfg(feature = "serde")]
-use serde::de::{Deserialize, Deserializer, SeqAccess, Visitor};
-#[cfg(feature = "serde")]
-use serde::ser::{Serialize, SerializeSeq, Serializer};
+use alloc::vec::Vec;
 
 /// Helper to make a `TinyVec`.
 ///
@@ -92,7 +84,6 @@ pub enum TinyVecConstructor<A: Array> {
 /// let empty_tv = tiny_vec!([u8; 16]);
 /// let some_ints = tiny_vec!([i32; 4] => 1, 2, 3);
 /// ```
-#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
 pub enum TinyVec<A: Array> {
   #[allow(missing_docs)]
   Inline(ArrayVec<A>),
@@ -170,8 +161,6 @@ impl<A: Array, I: SliceIndex<[A::Item]>> IndexMut<I> for TinyVec<A> {
   }
 }
 
-#[cfg(feature = "std")]
-#[cfg_attr(docs_rs, doc(cfg(feature = "std")))]
 impl<A: Array<Item = u8>> std::io::Write for TinyVec<A> {
   #[inline(always)]
   fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -182,94 +171,6 @@ impl<A: Array<Item = u8>> std::io::Write for TinyVec<A> {
   #[inline(always)]
   fn flush(&mut self) -> std::io::Result<()> {
     Ok(())
-  }
-}
-
-#[cfg(feature = "serde")]
-#[cfg_attr(docs_rs, doc(cfg(feature = "serde")))]
-impl<A: Array> Serialize for TinyVec<A>
-where
-  A::Item: Serialize,
-{
-  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-  where
-    S: Serializer,
-  {
-    let mut seq = serializer.serialize_seq(Some(self.len()))?;
-    for element in self.iter() {
-      seq.serialize_element(element)?;
-    }
-    seq.end()
-  }
-}
-
-#[cfg(feature = "serde")]
-#[cfg_attr(docs_rs, doc(cfg(feature = "serde")))]
-impl<'de, A: Array> Deserialize<'de> for TinyVec<A>
-where
-  A::Item: Deserialize<'de>,
-{
-  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-  where
-    D: Deserializer<'de>,
-  {
-    deserializer.deserialize_seq(TinyVecVisitor(PhantomData))
-  }
-}
-
-#[cfg(feature = "borsh")]
-#[cfg_attr(docs_rs, doc(cfg(feature = "borsh")))]
-impl<A: Array> borsh::BorshSerialize for TinyVec<A>
-where
-  <A as Array>::Item: borsh::BorshSerialize,
-{
-  fn serialize<W: borsh::io::Write>(
-    &self, writer: &mut W,
-  ) -> borsh::io::Result<()> {
-    <usize as borsh::BorshSerialize>::serialize(&self.len(), writer)?;
-    for elem in self.iter() {
-      <<A as Array>::Item as borsh::BorshSerialize>::serialize(elem, writer)?;
-    }
-    Ok(())
-  }
-}
-
-#[cfg(feature = "borsh")]
-#[cfg_attr(docs_rs, doc(cfg(feature = "borsh")))]
-impl<A: Array> borsh::BorshDeserialize for TinyVec<A>
-where
-  <A as Array>::Item: borsh::BorshDeserialize,
-{
-  fn deserialize_reader<R: borsh::io::Read>(
-    reader: &mut R,
-  ) -> borsh::io::Result<Self> {
-    let len = <usize as borsh::BorshDeserialize>::deserialize_reader(reader)?;
-    let mut new_tinyvec = Self::with_capacity(len);
-
-    for _ in 0..len {
-      new_tinyvec.push(
-        <<A as Array>::Item as borsh::BorshDeserialize>::deserialize_reader(
-          reader,
-        )?,
-      )
-    }
-
-    Ok(new_tinyvec)
-  }
-}
-
-#[cfg(feature = "arbitrary")]
-#[cfg_attr(docs_rs, doc(cfg(feature = "arbitrary")))]
-impl<'a, A> arbitrary::Arbitrary<'a> for TinyVec<A>
-where
-  A: Array,
-  A::Item: arbitrary::Arbitrary<'a>,
-{
-  fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-    let v = Vec::arbitrary(u)?;
-    let mut tv = TinyVec::Heap(v);
-    tv.shrink_to_fit();
-    Ok(tv)
   }
 }
 

@@ -81,10 +81,6 @@ use core::{
   slice::SliceIndex,
 };
 
-#[cfg(feature = "alloc")]
-#[doc(hidden)] // re-export for macros
-pub extern crate alloc;
-
 mod array;
 pub use array::*;
 
@@ -97,7 +93,5 @@ pub use arrayvec_drain::*;
 mod slicevec;
 pub use slicevec::*;
 
-#[cfg(feature = "alloc")]
 mod tinyvec;
-#[cfg(feature = "alloc")]
-pub use crate::tinyvec::*;
+pub use tinyvec::*;
