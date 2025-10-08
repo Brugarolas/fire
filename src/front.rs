@@ -2093,6 +2093,8 @@ impl<'src> Parser<'src> {
             // a general-purpose identifier, we convert them to strings.
             Tok::Get => Ok("get".to_string()),
             Tok::Set => Ok("set".to_string()),
+            Tok::Catch => Ok("catch".to_string()),
+            Tok::Finally => Ok("finally".to_string()),
 
             Tok::MapBuiltin => Ok("Map".to_string()),
             Tok::SetBuiltin => Ok("Set".to_string()),

@@ -3398,9 +3398,6 @@ fn lower_expr_free<'m>(
 
                 // x = rv          (local write, with capture boxing support)
                 LValue::Ident(name) => {
-                    // Primero resuelve RHS
-                    let rv = lower_expr_free(b, locals, fields, next_field, rhs, lowering_ctx)?;
-
                     #[cfg(debug_assertions)]
                     {
                         eprintln!("lower_expr_free() LValue::Ident({})", name);
@@ -3501,15 +3498,13 @@ fn lower_expr_free<'m>(
 
         // obj.<propKey>  where propKey is an identifier or string
         Expr::GetProp { recv, name } => {
+            // Static class method read: Class.static → closure with null env
             if let Expr::Ident(cn) = &**recv {
                 if let Some(&mfid) = lowering_ctx.funcs.get(&format!("__static_{}_{}", cn, name)) {
                     let (_nid, env_null) =
                         b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
                     let (_nid, clos) = b.push_node(
-                        Inst::MakeClosure {
-                            callee: mfid,
-                            env: env_null[0],
-                        },
+                        Inst::MakeClosure { callee: mfid, env: env_null[0] },
                         Some(Type::Closure(None)),
                         1,
                         false,
@@ -3518,9 +3513,12 @@ fn lower_expr_free<'m>(
                 }
             }
 
-            if name == "length" {
-                let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
+            // Lower receiver once
+            let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
 
+            // --- Special case: "length" ---
+            if name == "length" {
+                // Proxies must delegate to generic getprop to honor traps
                 let (_nid_is_proxy, is_proxy_res) = b.push_node(
                     Inst::CallNative {
                         name: "wir_is_proxy".into(),
@@ -3533,20 +3531,21 @@ fn lower_expr_free<'m>(
                     false,
                 );
 
-                let proxy_block = b.block();
-                let normal_block = b.block();
+                let proxy_b = b.block();
+                let normal_b = b.block();
                 let cont = b.block();
-                let result_phi = b.add_block_param(cont, Type::Int32);
+                let out = b.add_block_param(cont, Type::Int32);
 
-                b.branch(is_proxy_res[0], proxy_block, normal_block);
+                b.branch(is_proxy_res[0], proxy_b, normal_b);
 
-                b.position_at(proxy_block);
-                let proxy_value = lower_general_getprop(b, recv_v, name, fields, next_field);
-                b.jump(cont, &[proxy_value]);
+                // Proxy path → generic (may be trapped/overridden)
+                b.position_at(proxy_b);
+                let pv = lower_general_getprop(b, recv_v, name, fields, next_field);
+                b.jump(cont, &[pv]);
 
-                // At runtime, check if the receiver `recv_v` is a string.
-                b.position_at(normal_block);
-                let (_nid_is_s, is_string_res) = b.push_node(
+                // Non-proxy: first branch on STRING (never call obj_* on strings!)
+                b.position_at(normal_b);
+                let (_nid_is_s, is_s) = b.push_node(
                     Inst::CallNative {
                         name: "wir_is_str".into(),
                         args: vec![recv_v],
@@ -3557,14 +3556,13 @@ fn lower_expr_free<'m>(
                     1,
                     true,
                 );
-                let is_string = is_string_res[0];
 
-                let string_path = b.block();
-                let array_path = b.block();
+                let string_b = b.block();
+                let not_string_b = b.block();
+                b.branch(is_s[0], string_b, not_string_b);
 
-                b.branch(is_string, string_path, array_path);
-
-                b.position_at(string_path);
+                // String path → builtin length
+                b.position_at(string_b);
                 let (_nid_len, len_res) = b.push_node(
                     Inst::CallNative {
                         name: "wir_string_len".into(),
@@ -3578,7 +3576,47 @@ fn lower_expr_free<'m>(
                 );
                 b.jump(cont, &[len_res[0]]);
 
-                b.position_at(array_path);
+                // Not a string: prefer real user property if present, else fallback to array length.
+                b.position_at(not_string_b);
+                let (_nid_k, k) = b.push_node(
+                    Inst::Const(Constant::Str(name.clone())),
+                    Some(Type::Str),
+                    1,
+                    false,
+                );
+                let (_nid_has, has_prop) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_obj_has_str".into(),
+                        args: vec![recv_v, k[0]],
+                        pure: false,
+                        can_throw: false,
+                    },
+                    Some(Type::Bool),
+                    1,
+                    true,
+                );
+
+                let hit_b = b.block();
+                let miss_b = b.block();
+                b.branch(has_prop[0], hit_b, miss_b);
+
+                // Hit: actual property shadows builtin
+                b.position_at(hit_b);
+                let (_nid_get, got) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_obj_get_str".into(),
+                        args: vec![recv_v, k[0]],
+                        pure: false,
+                        can_throw: false,
+                    },
+                    None,
+                    1,
+                    true,
+                );
+                b.jump(cont, &[got[0]]);
+
+                // Miss: treat as array length (arrays OK; plain objects typically yield 0)
+                b.position_at(miss_b);
                 let (_nid_a, arr_res) = b.push_node(
                     Inst::CallNative {
                         name: "wir_array_len".into(),
@@ -3593,12 +3631,12 @@ fn lower_expr_free<'m>(
                 b.jump(cont, &[arr_res[0]]);
 
                 b.position_at(cont);
-                return Ok(result_phi);
+                return Ok(out);
             }
 
+            // --- Special case: "size" (Map/Set) ---
             if name == "size" {
-                let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
-
+                // Proxies → generic
                 let (_nid_is_proxy, is_proxy_res) = b.push_node(
                     Inst::CallNative {
                         name: "wir_is_proxy".into(),
@@ -3611,20 +3649,18 @@ fn lower_expr_free<'m>(
                     false,
                 );
 
-                let proxy_block = b.block();
-                let normal_block = b.block();
-                let join_path = b.block();
-                let result_phi = b.add_block_param(join_path, Type::Int32);
+                let proxy_b = b.block();
+                let normal_b = b.block();
+                let join = b.block();
+                let out = b.add_block_param(join, Type::Int32);
+                b.branch(is_proxy_res[0], proxy_b, normal_b);
 
-                b.branch(is_proxy_res[0], proxy_block, normal_block);
+                b.position_at(proxy_b);
+                let v = lower_general_getprop(b, recv_v, name, fields, next_field);
+                b.jump(join, &[v]);
 
-                b.position_at(proxy_block);
-                let value = lower_general_getprop(b, recv_v, name, fields, next_field);
-                b.jump(join_path, &[value]);
-
-                b.position_at(normal_block);
-
-                let (_nid, is_map) = b.push_node(
+                b.position_at(normal_b);
+                let (_nid_map, is_map) = b.push_node(
                     Inst::CallNative {
                         name: "wir_is_map".into(),
                         args: vec![recv_v],
@@ -3635,30 +3671,12 @@ fn lower_expr_free<'m>(
                     1,
                     false,
                 );
+                let map_b = b.block();
+                let check_set_b = b.block();
+                b.branch(is_map[0], map_b, check_set_b);
 
-                let map_path = b.block();
-                let set_path = b.block();
-                let otherwise_path = b.block();
-                let check_set_path = b.block();
-
-                b.branch(is_map[0], map_path, check_set_path);
-
-                b.position_at(check_set_path);
-                let (_nid, is_set) = b.push_node(
-                    Inst::CallNative {
-                        name: "wir_is_set".into(),
-                        args: vec![recv_v],
-                        pure: true,
-                        can_throw: false,
-                    },
-                    Some(Type::Bool),
-                    1,
-                    false,
-                );
-                b.branch(is_set[0], set_path, otherwise_path);
-
-                b.position_at(map_path);
-                let (_nid, map_size_res) = b.push_node(
+                b.position_at(map_b);
+                let (_nid_ms, ms) = b.push_node(
                     Inst::CallNative {
                         name: "wir_map_size".into(),
                         args: vec![recv_v],
@@ -3669,12 +3687,26 @@ fn lower_expr_free<'m>(
                     1,
                     false,
                 );
-                if !b.current_block_terminated() {
-                    b.jump(join_path, &[map_size_res[0]]);
-                }
+                b.jump(join, &[ms[0]]);
 
-                b.position_at(set_path);
-                let (_nid, set_size_res) = b.push_node(
+                b.position_at(check_set_b);
+                let (_nid_set, is_set) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_is_set".into(),
+                        args: vec![recv_v],
+                        pure: true,
+                        can_throw: false,
+                    },
+                    Some(Type::Bool),
+                    1,
+                    false,
+                );
+                let set_b = b.block();
+                let other_b = b.block();
+                b.branch(is_set[0], set_b, other_b);
+
+                b.position_at(set_b);
+                let (_nid_ss, ss) = b.push_node(
                     Inst::CallNative {
                         name: "wir_set_size".into(),
                         args: vec![recv_v],
@@ -3685,23 +3717,18 @@ fn lower_expr_free<'m>(
                     1,
                     false,
                 );
-                if !b.current_block_terminated() {
-                    b.jump(join_path, &[set_size_res[0]]);
-                }
+                b.jump(join, &[ss[0]]);
 
-                b.position_at(otherwise_path);
-                let zero_smi = b.const_i32(0);
-                if !b.current_block_terminated() {
-                    b.jump(join_path, &[zero_smi]);
-                }
+                b.position_at(other_b);
+                let zero = b.const_i32(0);
+                b.jump(join, &[zero]);
 
-                b.position_at(join_path);
-                return Ok(result_phi);
+                b.position_at(join);
+                return Ok(out);
             }
 
             // Fallback to the generic property getter for all other property names.
-            let obj = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
-            let value = lower_general_getprop(b, obj, name, fields, next_field);
+            let value = lower_general_getprop(b, recv_v, name, fields, next_field);
             Ok(value)
         }
 

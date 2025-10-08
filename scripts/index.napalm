@@ -19,6 +19,70 @@ fn fibonacci(n) {
 }
 print(fibonacci(5)); // expect 5
 
+print("===== Levenshtein distance =====");
+
+fn levenshtein(a, b) {
+    if (a == b) { return 0; }
+
+    var m = a.length;
+    var n = b.length;
+
+    if (m == 0) { return n; }
+    if (n == 0) { return m; }
+
+    // Two-row dynamic programming: O(min(m, n)) space
+    // Ensure we iterate over the shorter string horizontally for cache-friendliness
+    if (n > m) {
+        // swap a <-> b and m <-> n so that n <= m
+        var tmpS = a; a = b; b = tmpS;
+        var tmpL = m; m = n; n = tmpL;
+    }
+
+    var prev = Array(n + 1);
+    var curr = Array(n + 1);
+
+    // Initialize prev row: [0..n]
+    var j = 0;
+    while (j <= n) {
+        prev[j] = j;
+        j += 1;
+    }
+
+    var i = 1;
+    while (i <= m) {
+        curr[0] = i;
+
+        var ai = a[i - 1];   // assume string indexing returns 1-char string
+
+        j = 1;
+        while (j <= n) {
+            var cost = (ai == b[j - 1]) ? 0 : 1;
+
+            var del = prev[j] + 1;       // deletion
+            var ins = curr[j - 1] + 1;   // insertion
+            var sub = prev[j - 1] + cost; // substitution
+
+            // min of three
+            var t = (del < ins) ? del : ins;
+            curr[j] = (sub < t) ? sub : t;
+
+            j += 1;
+        }
+
+        // swap rows (no copy)
+        var trow = prev; prev = curr; curr = trow;
+
+        i += 1;
+    }
+
+    return prev[n];
+}
+
+var A = "kitten";
+var B = "sitting";
+var d = levenshtein(A, B);
+print(d); // expect 3
+
 print("===== While loop =====");
 var x = 0;
 while (x < 10) {
@@ -136,6 +200,64 @@ set2.add("alpha");
 set2.add("beta");
 print(set2.values());              // expect ["alpha", "beta"]
 print(set2.size);                  // expect 2
+
+print("===== Proxy basic traps =====");
+var proxyTarget = { foo: 10 };
+var proxyLog = Array(0);
+proxyLog.setLength(0);
+var proxyHandler = {
+    "get": fn (t, key, recv) {
+        proxyLog.push("get:" + key);
+        return t[key];
+    },
+    "set": fn (t, key, value, recv) {
+        proxyLog.push("set:" + key);
+        t[key] = value;
+        return true;
+    },
+    "has": fn (t, key) {
+        proxyLog.push("has:" + key);
+        return key in t;
+    },
+    "deleteProperty": fn (t, key) {
+        proxyLog.push("del:" + key);
+        delete t[key];
+        return true;
+    },
+    "ownKeys": fn (t) {
+        proxyLog.push("ownKeys");
+        return t.keys();
+    }
+};
+var proxied = new Proxy(proxyTarget, proxyHandler);
+print(proxied.foo);                // expect 10, triggers get
+proxied.bar = 42;                  // expect set trap, writes through
+print(proxyTarget.bar);            // expect 42
+print("foo" in proxied);           // expect true, has trap
+delete proxied.foo;                // expect delete trap
+print("foo" in proxied);           // expect false
+print(proxied.keys());             // expect ["bar"], uses ownKeys trap
+print(proxyLog);
+
+print("===== Proxy iteration & spread =====");
+var proxiedIter = new Proxy({ a: 1, c: 3 }, {
+    "ownKeys": fn (t) {
+        return ["c", "a"]; // custom key order
+    },
+    "get": fn (t, key, recv) {
+        return t[key];
+    },
+    "set": fn (t, key, value, recv) {
+        t[key] = value;
+        return true;
+    }
+});
+print(proxiedIter.keys());         // expect ["c", "a"]
+print(proxiedIter.values());       // expect [3, 1]
+print(proxiedIter.entries());      // expect [["c",3],["a",1]]
+var spreadProxy = { ...proxiedIter, b: 2 };
+print(spreadProxy.keys());         // expect sorted ["a","b","c"] (object keys sorted alpha)
+print(spreadProxy.values());       // expect [1,2,3]
 
 // ===========================
 // Arrays
