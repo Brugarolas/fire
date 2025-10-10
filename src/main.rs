@@ -108,7 +108,6 @@ fn main() {
 
     // 4.2) JIT compile ALL functions
     let mut jit = jit::JIT::default();
-    let mut fptrs = HashMap::new();
 
     let jit_elapsed = jit_start.elapsed();
     #[cfg(debug_assertions)]
@@ -137,21 +136,30 @@ fn main() {
     }
 
     let mut compile_order: Vec<&wir::Function> = module.funcs.iter().collect();
-    compile_order.sort_by_key(|f| compile_priority(&f.sig.name));
 
     for f in compile_order {
-        match jit.compile(f) {
-            Ok(fp) => {
-                fptrs.insert(f.sig.name.clone(), fp);
-            }
-            Err(e) => {
-                eprintln!("JIT compile error in {}: {}", f.sig.name, e);
-                return;
-            }
+        if let Err(e) = jit.compile(f) {
+            eprintln!("JIT compile error in {}: {}", f.sig.name, e);
+            return;
         }
     }
 
-    // 5) Pick entrypoint: __toplevel__ > main > first function
+    // After all functions are defined, finalize the module and get all pointers.
+    let all_fptrs_by_id = match jit.finalize_and_get_pointers() {
+        Ok(ptrs) => ptrs,
+        Err(e) => {
+            eprintln!("JIT finalization error: {}", e);
+            return;
+        }
+    };
+
+    let mut fptrs = HashMap::new();
+    for f in &module.funcs {
+        if let Some(fptr) = all_fptrs_by_id.get(&f.id.0) {
+            fptrs.insert(f.sig.name.clone(), *fptr);
+        }
+    }
+
     let entry_name = pick_entrypoint(&module).unwrap_or_else(|| {
         eprintln!("No functions to run.");
         std::process::exit(1);
@@ -162,6 +170,7 @@ fn main() {
         .iter()
         .find(|f| f.sig.name == entry_name)
         .unwrap();
+
     #[cfg(debug_assertions)]
     eprintln!(
         "(Debug build) Selected function: {} (id={:?}) with {} params",

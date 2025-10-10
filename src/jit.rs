@@ -1071,7 +1071,28 @@ impl JIT {
 }
 
 impl JIT {
-    pub fn compile(&mut self, fun: &WirFunction) -> Result<JitFnPtr, String> {
+    pub fn finalize_and_get_pointers(&mut self) -> Result<HashMap<u32, JitFnPtr>, String> {
+        self.module.finalize_definitions().map_err(|e| e.to_string())?;
+
+        let mut fptrs = HashMap::new();
+        // Iterate over the stubs we declared during the compile calls.
+        // We clone the keys to avoid borrowing `self` mutably while iterating.
+        let ids_to_finalize: Vec<u32> = self.stub_decls.keys().cloned().collect();
+
+        for id_raw in ids_to_finalize {
+            let func_id = *self.stub_decls.get(&id_raw).unwrap();
+            let code = self.module.get_finalized_function(func_id);
+
+            // Register and transmute the pointer now that it's valid.
+            register_funptr(id_raw, code as *const u8);
+            let fptr: JitFnPtr = unsafe { std::mem::transmute(code) };
+            fptrs.insert(id_raw, fptr);
+        }
+
+        Ok(fptrs)
+    }
+
+    pub fn compile(&mut self, fun: &WirFunction) -> Result<(), String> { // Result<JitFnPtr, String>
         use cranelift::prelude::types;
         use cranelift::prelude::*;
         use cranelift::prelude::{AbiParam, FunctionBuilder};
@@ -1127,7 +1148,7 @@ impl JIT {
 
         // Do the whole build in a closure so we can early-return with `?`
         // and still restore `self.fctx` afterwards.
-        let result = (|| -> Result<JitFnPtr, String> {
+        let result = (|| -> Result<(), String> { // Result<JitFnPtr, String>
             // IR builder uses the LOCAL context (not self.fctx)
             let mut fb = FunctionBuilder::new(&mut fast_ctx.func, &mut fctx_local);
             let entry = fb.create_block();
@@ -2447,14 +2468,15 @@ impl JIT {
                 .map_err(|e| e.to_string())?;
             self.module.clear_context(&mut stub_ctx);
 
-            self.module
+            /*self.module
                 .finalize_definitions()
                 .map_err(|e| e.to_string())?;
 
             let code = self.module.get_finalized_function(stub_func_id);
             register_funptr(fun.id.0 as u32, code as *const u8);
             let fptr: JitFnPtr = unsafe { std::mem::transmute(code) };
-            Ok(fptr)
+            Ok(fptr)*/
+            Ok(())
         })();
 
         // Always restore the shared builder context
