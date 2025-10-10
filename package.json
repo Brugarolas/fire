@@ -17,6 +17,12 @@
         "cargo::run::bool": "RUSTFLAGS=\"-Awarnings\" cargo run > log.txt 2>&1 -- scripts/bool.napalm",
         "cargo::run::proxy": "RUSTFLAGS=\"-Awarnings\" cargo run > log.txt 2>&1 -- scripts/proxy.napalm",
         "cargo::run::error": "RUSTFLAGS=\"-Awarnings\" cargo run > log.txt 2>&1 -- scripts/error.napalm",
+        "cargo::perf::fib": "RUSTFLAGS=\"-Awarnings\" cargo run > log.txt 2>&1 -- perf/fib.napalm",
+        "cargo::perf::trees": "RUSTFLAGS=\"-Awarnings\" cargo run > log.txt 2>&1 -- perf/trees.napalm",
+        "cargo::perf::lev": "RUSTFLAGS=\"-Awarnings\" cargo run > log.txt 2>&1 -- perf/lev.napalm",
+        "node::perf::fib": "node perf/fib.js",
+        "node::perf::trees": "node perf/trees.js",
+        "node::perf::lev": "node perf/lev.js",
         "cargo::build": "RUSTFLAGS=\"-Awarnings\" cargo build --release"
     },
     "author": "Andrés Brugarolas Martínez",

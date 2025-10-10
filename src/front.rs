@@ -145,6 +145,12 @@ pub enum Tok {
     EqEq,
     #[token("!=")]
     BangEq,
+    #[token("<<")]
+    Shl,
+    #[token(">>")]
+    Shr,
+    #[token("~")]
+    BitwiseNot,
     #[token("<=")]
     LtEq,
     #[token(">=")]
@@ -602,6 +608,8 @@ pub enum BinOp {
     Ge,
     And,
     Or,
+    Shl,
+    Shr,
     Nullish,
 }
 
@@ -2259,7 +2267,7 @@ impl<'src> Parser<'src> {
         Ok(e)
     }
     fn parse_cmp(&mut self) -> PResult<Expr> {
-        let mut e = self.parse_term()?;
+        let mut e = self.parse_shift()?;
         loop {
             if self.matches(&Tok::Lt) {
                 let rhs = self.parse_term()?;
@@ -2296,6 +2304,21 @@ impl<'src> Parser<'src> {
                     key: SmallBox::new(e),
                     obj: SmallBox::new(rhs),
                 };
+            } else {
+                break;
+            }
+        }
+        Ok(e)
+    }
+    fn parse_shift(&mut self) -> PResult<Expr> {
+        let mut e = self.parse_term()?;
+        loop {
+            if self.matches(&Tok::Shl) {
+                let rhs = self.parse_term()?;
+                e = Expr::Binary { op: BinOp::Shl, a: SmallBox::new(e), b: SmallBox::new(rhs) };
+            } else if self.matches(&Tok::Shr) {
+                let rhs = self.parse_term()?;
+                e = Expr::Binary { op: BinOp::Shr, a: SmallBox::new(e), b: SmallBox::new(rhs) };
             } else {
                 break;
             }

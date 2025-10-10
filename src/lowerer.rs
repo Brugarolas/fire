@@ -3075,6 +3075,16 @@ fn lower_expr_free<'m>(
                     let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
                     Ok(b.int_bin(IntBinOp::RemS, va, vb))
                 }
+                Shl => {
+                    // a << b
+                    let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
+                    Ok(b.int_bin(IntBinOp::Shl, va, vb))
+                }
+                Shr => {
+                    // a >> b  (arithmetic right shift, sign-propagating)
+                    let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
+                    Ok(b.int_bin(IntBinOp::Sar, va, vb))
+                }
                 Eq | Ne | Lt | Le | Gt | Ge => {
                     let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
 
