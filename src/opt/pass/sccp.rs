@@ -836,6 +836,7 @@ fn fold_int_bin(op: IntBinOp, la: Lat, lb: Lat) -> Lat {
                 IntBinOp::Shl => Some(x.wrapping_shl((y as u32) & 31)),
                 IntBinOp::ShrU => Some(((x as u32) >> ((y as u32) & 31)) as i32),
                 IntBinOp::Sar => Some(x >> ((y as u32) & 31)),
+                IntBinOp::Not => None, // unary
             };
             c.map(|v| Const(Constant::Int32(v))).unwrap_or(Overdef)
         }

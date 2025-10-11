@@ -230,6 +230,7 @@ pub enum IntBinOp {
     And,
     Or,
     Xor,
+    Not,
     Shl,
     ShrU,
     Sar,
@@ -1439,6 +1440,15 @@ impl<'m> Builder<'m> {
             Some(Type::Str),
             1,
             false,
+        );
+        res[0]
+    }
+    pub fn str_concat(&mut self, a: ValueId, b: ValueId) -> ValueId {
+        let (_nid, res) = self.push_node(
+            Inst::StrConcat { a, b },
+            Some(Type::Str),
+            1,
+            false, // String concat is pure in our model
         );
         res[0]
     }

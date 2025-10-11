@@ -331,6 +331,7 @@ impl Default for JIT {
             fn wir_obj_set_str(obj: i64, key: i64, val: i64) -> i64;
             fn wir_obj_has_str(obj: i64, key: i64) -> i64;
             fn wir_obj_del_str(obj: i64, key: i64) -> i64;
+            fn wir_string_concat_coerce(a: i64, b: i64) -> i64;
             fn wir_string_equals(s1_val: i64, s2_val: i64) -> i64;
             fn wir_obj_assign(dst: i64, src: i64) -> i64;
             fn wir_obj_clone(obj: i64) -> i64;
@@ -647,6 +648,10 @@ impl Default for JIT {
                 wir_obj_del_field as *const extern "C" fn(i64, i64) -> i64 as *const u8,
             );
 
+            jb.symbol(
+                "wir_string_concat_coerce",
+                wir_string_concat_coerce as *const u8,
+            );
             jb.symbol(
                 "wir_obj_get_str",
                 wir_obj_get_str as *const extern "C" fn(i64, i64) -> i64 as *const u8,
@@ -1272,6 +1277,7 @@ impl JIT {
                                 IntBinOp::Shl => fb.ins().ishl(ra, rb),
                                 IntBinOp::ShrU => fb.ins().ushr(ra, rb),
                                 IntBinOp::Sar => fb.ins().sshr(ra, rb),
+                                IntBinOp::Not => fb.ins().bnot(ra),
                             };
 
                             // re-encode to SMI: (raw << 1) | 1

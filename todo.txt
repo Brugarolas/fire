@@ -11,7 +11,6 @@ Features I still have not implemented:
 - Ranges (a là Wren & custom: 1..100 -> 1, 2, 3, ...; 1..100::5 -> 5, 10, 15, ...; 1..100::-1 -> 100, 99, 98, ...;)
 - Decorators (a là TypeScript)
 - Extend existing Classes with computed properties and operator overloading (a là TypeScript)
-- Add BitwiseNot and >>>
 - Add functional programming (a là fp-core)
 - Add reactive programming (pure reactive programming - and patterns like Stream, Sinks (a là Carboxyl), Event/Emitter/Pipe/Listener)
 

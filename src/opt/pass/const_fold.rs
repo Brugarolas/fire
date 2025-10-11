@@ -233,6 +233,7 @@ impl OptimizationWIR for ConstFold {
                                 }
                             }
                         }
+                        IntBinOp::Not => {}
                     }
                 }
 
@@ -263,6 +264,7 @@ impl OptimizationWIR for ConstFold {
                             IntBinOp::Shl => Some(x.wrapping_shl((y as u32) & 31)),
                             IntBinOp::ShrU => Some(((x as u32) >> ((y as u32) & 31)) as i32),
                             IntBinOp::Sar => Some(x >> ((y as u32) & 31)),
+                            IntBinOp::Not => None, // unary
                         };
                         if let Some(v) = folded {
                             act = Action::ReplaceKind(Const(Constant::Int32(v)), Some(Type::Int32));

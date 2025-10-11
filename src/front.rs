@@ -130,6 +130,10 @@ pub enum Tok {
     #[token("Proxy")]
     ProxyBuiltin,
 
+    // Moved for precedence reasons
+    #[token("__")]
+    StrConcat,
+
     // Identifiers & literals
     #[regex(r"[A-Za-z_][A-Za-z0-9_]*", |lex| lex.slice().to_string())]
     Ident(String),
@@ -149,6 +153,8 @@ pub enum Tok {
     Shl,
     #[token(">>")]
     Shr,
+    #[token(">>>")] // zero-fill right shift token
+    ShrU,
     #[token("~")]
     BitwiseNot,
     #[token("<=")]
@@ -610,6 +616,8 @@ pub enum BinOp {
     Or,
     Shl,
     Shr,
+    ShrU,
+    StrConcat,
     Nullish,
 }
 
@@ -618,6 +626,7 @@ pub enum UnOp {
     Neg,
     Pos,
     Not,
+    BitwiseNot,
 }
 
 #[derive(Debug, Clone)]
@@ -2319,6 +2328,9 @@ impl<'src> Parser<'src> {
             } else if self.matches(&Tok::Shr) {
                 let rhs = self.parse_term()?;
                 e = Expr::Binary { op: BinOp::Shr, a: SmallBox::new(e), b: SmallBox::new(rhs) };
+            } else if self.matches(&Tok::ShrU) { // + Add logic for `>>>`
+                let rhs = self.parse_term()?;    // +
+                e = Expr::Binary { op: BinOp::ShrU, a: SmallBox::new(e), b: SmallBox::new(rhs) }; // +
             } else {
                 break;
             }
@@ -2339,6 +2351,13 @@ impl<'src> Parser<'src> {
                 let rhs = self.parse_factor()?;
                 e = Expr::Binary {
                     op: BinOp::Sub,
+                    a: SmallBox::new(e),
+                    b: SmallBox::new(rhs),
+                };
+            } else if self.matches(&Tok::StrConcat) {
+                let rhs = self.parse_factor()?;
+                e = Expr::Binary {
+                    op: BinOp::StrConcat,
                     a: SmallBox::new(e),
                     b: SmallBox::new(rhs),
                 };
@@ -2394,6 +2413,12 @@ impl<'src> Parser<'src> {
             let e = self.parse_unary()?;
             Ok(Expr::Unary {
                 op: UnOp::Neg,
+                e: SmallBox::new(e),
+            })
+        }  else if self.matches(&Tok::BitwiseNot) {
+            let e = self.parse_unary()?;
+            Ok(Expr::Unary {
+                op: UnOp::BitwiseNot,
                 e: SmallBox::new(e),
             })
         } else if self.matches(&Tok::Plus) {

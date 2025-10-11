@@ -12,15 +12,19 @@ use crate::value::{
     TAG_STRING, Value, ValueRepr, allocate_new_string, array_from_vec, bool_to_value, is_imm,
     make_smi, map_new, obj_assign, obj_clone_shallow, obj_get_field_deep, obj_get_proto,
     obj_get_slot, obj_get_str_deep, obj_set_proto, obj_set_slot_known, obj_shape, proxy_new,
-    set_new, shape_slot, value_to_bool,
+    set_new, shape_slot, value_to_bool, BOOL_TRUE, BOOL_FALSE,
 };
 
-use crate::helpers::collections::{HashMap, HashSet};
+use crate::helpers::collections::{HashMap, HashSet, ConcurrentHashMap};
+use core::hash::{BuildHasher, Hasher};
+type FastBuildHasher = crate::helpers::collections::AesBuildHasher;
+use papaya::HashMap as LockfreeHashMap;
 use core::cmp::min;
 use parking_lot::{Mutex, RwLock};
 use std::slice;
 use std::sync::OnceLock;
 use tinyvec::TinyVec;
+use smallvec::SmallVec;
 
 #[inline(always)]
 fn smi_to_i64(v: i64) -> i64 {
@@ -66,15 +70,17 @@ struct FieldCacheEntry {
     slot: usize,
 }
 
-#[derive(Default)]
+const MAX_CACHE_ENTRIES: usize = 8; // V8 uses 8
+
+#[derive(Clone, Default)]
 struct FieldCacheList {
-    entries: Vec<FieldCacheEntry>,
+    entries: smallvec::SmallVec<[FieldCacheEntry; MAX_CACHE_ENTRIES]>,
 }
 
 impl FieldCacheList {
     fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: smallvec::SmallVec::new(),
         }
     }
 
@@ -91,7 +97,6 @@ impl FieldCacheList {
             return;
         }
 
-        const MAX_CACHE_ENTRIES: usize = 4;
         if self.entries.len() >= MAX_CACHE_ENTRIES {
             self.entries.remove(0);
         }
@@ -107,57 +112,115 @@ impl FieldCacheList {
     }
 }
 
-fn field_cache() -> &'static RwLock<HashMap<u32, FieldCacheList>> {
-    static CACHE: OnceLock<RwLock<HashMap<u32, FieldCacheList>>> = OnceLock::new();
-    CACHE.get_or_init(|| RwLock::new(HashMap::default()))
+type FieldCache = ConcurrentHashMap<u32, FieldCacheList>;
+
+static FIELD_CACHE: OnceLock<FieldCache> = OnceLock::new();
+
+#[inline(always)]
+fn field_cache() -> &'static FieldCache {
+    FIELD_CACHE.get_or_init(|| {
+        ConcurrentHashMap::new()
+    })
 }
 
-fn cache_lookup(fid: u32, shape: u32) -> Option<usize> {
-    let guard = field_cache().read();
+#[inline(always)]
+pub fn cache_lookup(fid: u32, shape: u32) -> Option<usize> {
+    let guard = field_cache().pin();
     guard.get(&fid).and_then(|list| list.lookup(shape))
 }
 
-fn cache_record(fid: u32, shape: u32, slot: usize) {
-    let mut guard = field_cache().write();
-    guard
-        .entry(fid)
-        .or_insert_with(FieldCacheList::new)
-        .record(shape, slot);
-}
+#[inline]
+pub fn cache_record(fid: u32, shape: u32, slot: usize) {
+    let guard = field_cache().pin();
 
-fn cache_invalidate(fid: u32, shape: u32) {
-    let mut guard = field_cache().write();
-    if let Some(list) = guard.get_mut(&fid) {
-        list.invalidate(shape);
-        if list.is_empty() {
-            guard.remove(&fid);
+    match guard.get(&fid) {
+        Some(list) => {
+            let mut new_list = list.clone();
+            new_list.record(shape, slot);
+            guard.insert(fid, new_list);
+        }
+        None => {
+            let mut list = FieldCacheList::new();
+            list.record(shape, slot);
+            guard.insert(fid, list);
         }
     }
 }
 
-fn field_name_registry() -> &'static RwLock<HashMap<u32, String>> {
-    static REGISTRY: OnceLock<RwLock<HashMap<u32, String>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| RwLock::new(HashMap::default()))
+#[inline]
+pub fn cache_invalidate(fid: u32, shape: u32) {
+    let guard = field_cache().pin();
+
+    if let Some(list) = guard.get(&fid) {
+        let mut new_list = list.clone();
+        new_list.invalidate(shape);
+
+        if new_list.is_empty() {
+            guard.remove(&fid);
+        } else {
+            guard.insert(fid, new_list);
+        }
+    }
 }
 
-fn field_name_lookup() -> &'static RwLock<HashMap<String, u32>> {
-    static LOOKUP: OnceLock<RwLock<HashMap<String, u32>>> = OnceLock::new();
-    LOOKUP.get_or_init(|| RwLock::new(HashMap::default()))
+#[inline]
+pub fn cache_clear() {
+    let guard = field_cache().pin();
+    guard.clear();
 }
 
-fn field_name_for_id(fid: u32) -> Option<String> {
-    field_name_registry().read().get(&fid).cloned()
+// ============================================================================
+// Field Name Registry
+// ============================================================================
+
+type NameRegistry = LockfreeHashMap<u32, String, FastBuildHasher>;
+type NameLookup = LockfreeHashMap<String, u32, FastBuildHasher>;
+
+static FIELD_NAME_REGISTRY: OnceLock<NameRegistry> = OnceLock::new();
+static FIELD_NAME_LOOKUP: OnceLock<NameLookup> = OnceLock::new();
+
+#[inline(always)]
+fn field_name_registry() -> &'static NameRegistry {
+    FIELD_NAME_REGISTRY.get_or_init(|| {
+        NameRegistry::with_hasher(FastBuildHasher::new())
+    })
 }
 
-fn field_id_for_name(name: &str) -> Option<u32> {
-    field_name_lookup().read().get(name).copied()
+#[inline(always)]
+fn field_name_lookup() -> &'static NameLookup {
+    FIELD_NAME_LOOKUP.get_or_init(|| {
+        NameLookup::with_hasher(FastBuildHasher::new())
+    })
 }
 
-fn register_field_name(fid: u32, name: String) {
-    let mut guard = field_name_registry().write();
-    guard.entry(fid).or_insert_with(|| name.clone());
-    let mut rev = field_name_lookup().write();
-    rev.entry(name).or_insert(fid);
+/// Fast lookup: fid → name (clones the String)
+#[inline(always)]
+pub fn field_name_for_id(fid: u32) -> Option<String> {
+    let guard = field_name_registry().pin();
+    guard.get(&fid).cloned()
+}
+
+/// Fast lookup: name → fid (copies u32, no allocation)
+#[inline(always)]
+pub fn field_id_for_name(name: &str) -> Option<u32> {
+    let guard = field_name_lookup().pin();
+    guard.get(name).copied()
+}
+
+/// Register bidirectional mapping (fid ↔ name)
+/// Uses compute_if_absent to avoid double insertion
+#[inline]
+pub fn register_field_name(fid: u32, name: String) {
+    let reg_guard = field_name_registry().pin();
+    let lookup_guard = field_name_lookup().pin();
+
+    // Insert only if absent (check-then-act is fine - idempotent operation)
+    if reg_guard.get(&fid).is_none() {
+        reg_guard.insert(fid, name.clone());
+    }
+    if lookup_guard.get(&name).is_none() {
+        lookup_guard.insert(name, fid);
+    }
 }
 
 #[inline(always)]
@@ -178,6 +241,56 @@ fn proxy_target(proxy: i64) -> i64 {
 #[inline(always)]
 fn proxy_handler(proxy: i64) -> i64 {
     unsafe { proxy_ref(proxy).handler }
+}
+
+fn val_to_string_for_concat(v: i64) -> String {
+    if is_imm(v) {
+        return smi_to_i64(v).to_string();
+    }
+    if v == NULL {
+        return "null".to_string();
+    }
+    if v == BOOL_TRUE {
+        return "true".to_string();
+    }
+    if v == BOOL_FALSE {
+        return "false".to_string();
+    }
+
+    // It's a heap object, inspect its tag.
+    unsafe {
+        let hdr = &*(v as *const ObjHeader);
+        match hdr.tag {
+            // For a string, return its raw content, not its debug representation.
+            TAG_STRING => {
+                let s = &*(v as *const BoxedStr);
+                let bytes = slice::from_raw_parts(s.data, s.len);
+                String::from_utf8_lossy(bytes).to_string()
+            }
+            // For all other types, we can fall back to the pretty-printer's logic.
+            TAG_BOXED_F64 => {
+                let b = &*(v as *const BoxedF64);
+                b.val.to_string()
+            }
+            _ => {
+                // For arrays, objects, etc., using the debug format is reasonable.
+                fmt_value(v)
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_string_concat_coerce(a: i64, b: i64) -> i64 {
+    // Use the existing pretty-printer to convert any value to a string.
+    let s1 = val_to_string_for_concat(a);
+    let s2 = val_to_string_for_concat(b);
+
+    // Concatenate the Rust strings.
+    let result = s1 + &s2;
+
+    // Allocate a new heap string in our runtime and return its pointer.
+    allocate_new_string(&result)
 }
 
 fn obj_has_str_deep(mut obj: i64, key: &str) -> bool {
@@ -949,11 +1062,6 @@ pub extern "C" fn wir_obj_clone(obj: i64) -> i64 {
     }
 }
 
-// --- Memoized hash tables ---
-use core::hash::{BuildHasher, Hasher};
-type FastBuildHasher = crate::helpers::collections::AesBuildHasher; // <-- change path if needed
-use papaya::HashMap as ConcurrentHashMap;
-
 // -------- Keys (flattened to avoid nested lookups) --------
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(C)]
@@ -969,10 +1077,10 @@ struct Key3 { fid: u32, a: i64, b: i64, c: i64 }
 struct Key4 { fid: u32, a: i64, b: i64, c: i64, d: i64 }
 
 // -------- Global tables (one per arity, lock-free) --------
-type Map1 = ConcurrentHashMap<Key1, i64, FastBuildHasher>;
-type Map2 = ConcurrentHashMap<Key2, i64, FastBuildHasher>;
-type Map3 = ConcurrentHashMap<Key3, i64, FastBuildHasher>;
-type Map4 = ConcurrentHashMap<Key4, i64, FastBuildHasher>;
+type Map1 = LockfreeHashMap<Key1, i64, FastBuildHasher>;
+type Map2 = LockfreeHashMap<Key2, i64, FastBuildHasher>;
+type Map3 = LockfreeHashMap<Key3, i64, FastBuildHasher>;
+type Map4 = LockfreeHashMap<Key4, i64, FastBuildHasher>;
 
 static MAP1: OnceLock<Map1> = OnceLock::new();
 static MAP2: OnceLock<Map2> = OnceLock::new();
@@ -981,19 +1089,19 @@ static MAP4: OnceLock<Map4> = OnceLock::new();
 
 #[inline(always)]
 fn map1() -> &'static Map1 {
-    MAP1.get_or_init(|| ConcurrentHashMap::with_hasher(FastBuildHasher::default()))
+    MAP1.get_or_init(|| LockfreeHashMap::with_hasher(FastBuildHasher::default()))
 }
 #[inline(always)]
 fn map2() -> &'static Map2 {
-    MAP2.get_or_init(|| ConcurrentHashMap::with_hasher(FastBuildHasher::default()))
+    MAP2.get_or_init(|| LockfreeHashMap::with_hasher(FastBuildHasher::default()))
 }
 #[inline(always)]
 fn map3() -> &'static Map3 {
-    MAP3.get_or_init(|| ConcurrentHashMap::with_hasher(FastBuildHasher::default()))
+    MAP3.get_or_init(|| LockfreeHashMap::with_hasher(FastBuildHasher::default()))
 }
 #[inline(always)]
 fn map4() -> &'static Map4 {
-    MAP4.get_or_init(|| ConcurrentHashMap::with_hasher(FastBuildHasher::default()))
+    MAP4.get_or_init(|| LockfreeHashMap::with_hasher(FastBuildHasher::default()))
 }
 
 #[inline(always)]

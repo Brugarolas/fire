@@ -7,11 +7,7 @@ fn main() {
 
     var stretchDepth = maxDepth + 1;
     var stretchTree = createTree(stretchDepth);
-    print("stretch tree of depths & checksums:");
-    print(0);
-    print(stretchDepth);
-    print(checksum(stretchTree));
-    print("--");
+    print("stretch tree of depth " __ stretchDepth __ " check: " __ checksum(stretchTree));
 
     var longLivedTree = createTree(maxDepth);
 
@@ -26,17 +22,11 @@ fn main() {
             i += 1;
         }
 
-        print(iterations);
-        print(depth);
-        print(sum);
-        print("--");
+        print(iterations __ " trees of depth " __ depth __ " check: " __ sum);
         depth += 2;
     }
 
-    print(N);
-    print(maxDepth);
-    print(checksum(longLivedTree));
-    print("--");
+    print("long lived tree of depth " __ maxDepth __ " check: " __ checksum(longLivedTree));
 }
 
 fn checksum(node) {

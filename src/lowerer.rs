@@ -3013,6 +3013,10 @@ fn lower_expr_free<'m>(
                     Ok(b.int_bin(IntBinOp::Sub, zero, v))
                 }
                 UnOp::Pos => Ok(v),
+                UnOp::BitwiseNot => { // handle `~`
+                    let neg_one = b.const_i32(-1);
+                    Ok(b.int_bin(IntBinOp::Xor, v, neg_one))
+                }
                 UnOp::Not => {
                     let (_nid, falsev) = b.push_node(
                         Inst::Const(Constant::Bool(false)),
@@ -3084,6 +3088,30 @@ fn lower_expr_free<'m>(
                     // a >> b  (arithmetic right shift, sign-propagating)
                     let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
                     Ok(b.int_bin(IntBinOp::Sar, va, vb))
+                }
+                ShrU => { // handle `>>>`
+                    let va = lower_expr_free(b, locals, fields, next_field, a, lowering_ctx)?;
+                    let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
+                    Ok(b.int_bin(IntBinOp::ShrU, va, vb)) // ShrU = Unsigned (Logical) Shift Right
+                }
+                StrConcat => { // handle `__`
+                    let va = lower_expr_free(b, locals, fields, next_field, a, lowering_ctx)?;
+                    let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
+
+                    // We need to ensure both operands are strings before concatenating.
+                    // For simplicity, we'll use a native helper that does the conversion.
+                    let (_nid, res) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_string_concat_coerce".into(),
+                            args: vec![va, vb],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::Str),
+                        1,
+                        true,
+                    );
+                    Ok(res[0])
                 }
                 Eq | Ne | Lt | Le | Gt | Ge => {
                     let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;

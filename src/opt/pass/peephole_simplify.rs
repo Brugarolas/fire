@@ -251,6 +251,7 @@ impl OptimizationWIR for PeepholeSimplify {
                             return true;
                         }
                     }
+                    _ => { /*Not all ops handled*/ }
                 }
 
                 // Fully constant fold (wrap semantics preserved)
@@ -279,6 +280,7 @@ impl OptimizationWIR for PeepholeSimplify {
                         Shl => Some(x.wrapping_shl((y as u32) & 31)),
                         ShrU => Some(((x as u32) >> ((y as u32) & 31)) as i32),
                         Sar => Some(x >> ((y as u32) & 31)), // **arithmetic** shift
+                        Not => None, // unary
                     };
                     if let Some(v) = folded {
                         cur.with_cur(|n| {

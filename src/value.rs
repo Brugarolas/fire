@@ -1476,8 +1476,8 @@ impl ShapeTable {
         let slot = new_shape.fields.len();
         new_shape.fields.push(fid);
         new_shape.field_map.insert(fid, slot);
-        new_shape.add_transitions.clear();
-        new_shape.del_transitions.clear();
+        // new_shape.add_transitions.clear(); // V8 does not clear transitions
+        // new_shape.del_transitions.clear(); // V8 does not clear transitions
 
         let new_shape_id = self.shapes.len() as u32;
         self.shapes.push(new_shape);

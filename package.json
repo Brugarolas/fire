@@ -23,6 +23,7 @@
         "node::perf::fib": "node perf/fib.js",
         "node::perf::trees": "node perf/trees.js",
         "node::perf::lev": "node perf/lev.js",
+        "py::perf::trees": "python perf/trees.py",
         "cargo::build": "RUSTFLAGS=\"-Awarnings\" cargo build --release"
     },
     "author": "Andrés Brugarolas Martínez",

@@ -1,5 +1,5 @@
 function main() {
-    const maxDepth = 20;
+    const maxDepth = 10;
     const stretchDepth = maxDepth + 1;
     const stretchTree = createTree(stretchDepth)
     console.log(`stretch tree of depth ${stretchDepth}\t check: ${checksum(stretchTree)}`)
