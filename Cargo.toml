@@ -92,6 +92,7 @@ cranelift-frontend = "0.124.2"
 
 memmap2 = "0.9.8"
 target-lexicon = "0.13.3"
+memoffset = "0.9.1"
 
 #polodb_core = "5.1.4" # Polodb embedded database
 #chromadb = "2.3.0" # ChromaDB database

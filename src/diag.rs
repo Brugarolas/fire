@@ -6,10 +6,32 @@ use compact_str::CompactString;
 use std::result::Result;
 use std::io::Error;
 
-pub type Span = Range<usize>;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FileId(pub u32);
+
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct Span {
+    pub range: Range<usize>,
+}
+
+impl Span {
+    pub fn new(start: usize, end: usize) -> Self {
+        Span {
+            range: start..end,
+        }
+    }
+
+    #[inline]
+    fn join_spans(&mut self, b: &Span) {
+        // Safe even if overlapping; assumes both in same file.
+        self.range = self.range.start.min(b.range.start) .. self.range.end.max(b.range.end)
+    }
+
+    #[inline]
+    fn join3(&mut self, b: &Span, c: &Span) {
+        self.range = self.range.start.min(b.range.start).min(c.range.start) .. self.range.end.max(b.range.end).max(c.range.end)
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Meta {
@@ -152,14 +174,14 @@ impl FrontError {
     pub fn emit(&self, source: (&str, &str)) -> Result<(), Error> {
         let mut builder = Report::build(
             ReportKind::Error,
-            (self.file_name.as_str(), self.span.clone()),
+            (self.file_name.as_str(), self.span.range.clone()),
         )
         .with_code(self.code.as_str())
         .with_message(self.message.render());
 
         for lab in &self.labels {
             builder = builder.with_label(
-                Label::new((lab.file_name.as_str(), lab.span.clone()))
+                Label::new((lab.file_name.as_str(), lab.span.range.clone()))
                     .with_message(lab.message.render())
                     .with_color(lab.message.color.to_color()),
             );
@@ -188,7 +210,7 @@ impl Meta {
     pub fn unknown() -> Self {
         Meta {
             file: None,
-            span: 0..0,
+            span: Span::new(0, 0),
             ..Default::default()
         }
     }
