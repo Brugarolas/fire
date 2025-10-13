@@ -4,6 +4,7 @@ use std::ops::Range;
 use compact_str::CompactString;
 use std::result::Result;
 use std::io::Error;
+use smallvec::SmallVec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FileId(pub u32);
@@ -21,14 +22,21 @@ impl Span {
     }
 
     #[inline]
-    fn join_span(&mut self, b: &Span) {
+    pub fn join_span(&mut self, b: &Span) {
         // Safe even if overlapping; assumes both in same file.
         self.range = self.range.start.min(b.range.start) .. self.range.end.max(b.range.end)
     }
 
     #[inline]
-    fn join_spans(&mut self, b: &Span, c: &Span) {
+    pub fn join_spans(&mut self, b: &Span, c: &Span) {
         self.range = self.range.start.min(b.range.start).min(c.range.start) .. self.range.end.max(b.range.end).max(c.range.end)
+    }
+
+    #[inline]
+    pub fn covering(a: &Span, b: &Span) -> Span {
+        let mut out = a.clone();
+        out.join_span(b);
+        out
     }
 }
 
@@ -210,6 +218,14 @@ impl RegisteredColors {
 }
 
 impl FrontErrorMessage {
+    pub fn plain<S: Into<CompactString>>(text: S) -> Self {
+        FrontErrorMessage {
+            text: text.into(),
+            highlighted_strings: Vec::new(),
+            color: RegisteredColors::BrightRed,
+        }
+    }
+
     /// Render `text` replacing each `{}` (first N occurrences) with a colored value from `highlighted_strings`.
     pub fn render(&self) -> String {
         let mut out = self.text.to_string();
@@ -293,6 +309,17 @@ impl Meta {
         Meta {
             file: None,
             span: Span::new(0, 0),
+            ..Default::default()
+        }
+    }
+
+    #[inline]
+    pub fn covering(a: &Meta, b: &Meta) -> Meta {
+        let mut span = a.span.clone();
+        span.join_span(&b.span);
+        Meta {
+            file: a.file.or(b.file),
+            span,
             ..Default::default()
         }
     }

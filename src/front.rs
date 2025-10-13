@@ -3,13 +3,17 @@
 #![allow(unused_variables)]
 
 use crate::helpers::collections::{HashMap, HashSet};
-use ariadne::{Color, FileCache, FnCache, Label, Report, ReportKind, Source};
+use ariadne::Source;
 use hybrid_rc::Arc;
 use logos::Logos;
 use smallbox::SmallBox;
 use std::collections::hash_map::Entry;
 use std::path::PathBuf;
-use std::{collections::BTreeSet, ops::Deref};
+use std::{collections::BTreeSet, ops::Deref, sync::atomic::{AtomicU32, Ordering}};
+
+use compact_str::CompactString;
+
+use smallvec::SmallVec;
 
 // Bring in the WIR types from your other file/module.
 use crate::modules::{FSLoader, ModuleId, ModuleLoader, ModulesCTX, ProgramBuilder};
@@ -17,7 +21,9 @@ use crate::wir::{
     AccessorInfo, BindingId, Builder, Constant, FieldId, FuncId, Inst, IntBinOp, MethodInfo,
     Module, Type, ValueId, next_id,
 };
-use crate::diag::{Meta, Node};
+use crate::diag::{
+    ErrorCode, FileId, FrontError, FrontErrorLabel, FrontErrorMessage, Meta, Node, Span,
+};
 
 /// -------------------------
 /// LEXER (Logos)
@@ -751,15 +757,26 @@ pub struct RouteDecl {
 /// PARSER (Pratt + RD)
 /// -------------------------
 
+static NEXT_FILE_ID: AtomicU32 = AtomicU32::new(0);
+
+fn allocate_file_id() -> FileId {
+    FileId(NEXT_FILE_ID.fetch_add(1, Ordering::Relaxed))
+}
+
 #[derive(Debug, Clone)]
 pub struct ParseError {
     pub msg: String,
-    pub span: std::ops::Range<usize>,
+    pub meta: Meta,
 }
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{} at {}", self.msg, self.span.start)
+        write!(
+            f,
+            "{} at {}",
+            self.msg,
+            self.meta.span.range.start
+        )
     }
 }
 
@@ -772,27 +789,32 @@ struct SpannedTok {
 }
 
 impl ParseError {
-    pub fn print(&self, src: &str, filename: Option<&str>) {
-        let filename_str = filename.unwrap_or("<unknown>");
-        let id = filename_str.to_string();
-        let span_id = (id.clone(), self.span.clone());
-        let report = Report::build(ReportKind::Error, span_id.clone())
-            .with_message(&self.msg)
-            .with_label(
-                Label::new(span_id)
-                    .with_message("error occurred here")
-                    .with_color(Color::Red),
-            )
-            .finish();
+    pub fn new<S: Into<String>>(msg: S, meta: Meta) -> Self {
+        ParseError {
+            msg: msg.into(),
+            meta,
+        }
+    }
 
-        let mut cache = FnCache::new(move |file_id: &String| -> Result<String, &'static str> {
-            if file_id == &id {
-                Ok(src.to_string())
-            } else {
-                Err("Unknown file")
-            }
+    pub fn emit(&self, file_name: &str, source: &str) {
+        let file_name_cs: CompactString = file_name.into();
+        let mut labels: Vec<FrontErrorLabel> = Vec::new();
+        labels.push(FrontErrorLabel {
+            file_name: file_name_cs.clone(),
+            span: self.meta.span.clone(),
+            message: Some(FrontErrorMessage::plain("error occurred here")),
         });
-        let _ = report.eprint(&mut cache);
+
+        let err = FrontError {
+            file_name: file_name_cs,
+            span: self.meta.span.clone(),
+            message: FrontErrorMessage::plain(&self.msg),
+            code: ErrorCode::SyntaxError,
+            labels,
+            note: None,
+        };
+
+        let _ = err.emit((file_name, source));
     }
 }
 
@@ -807,10 +829,19 @@ pub struct Parser<'src> {
     ctx: Option<*const ModulesCTX>,
     resolver: Option<*const ProgramBuilder>,
     referrer: Option<Arc<PathBuf>>,
+    file_id: FileId,
+    file_name: CompactString,
 }
 
 impl<'src> Parser<'src> {
     pub fn new(src: &'src str) -> Self {
+        Self::with_name(src, "<unknown>")
+    }
+
+    pub fn with_name(src: &'src str, name: impl Into<CompactString>) -> Self {
+        let file_id = allocate_file_id();
+        let file_name = name.into();
+
         let mut lex = Tok::lexer(src);
         let mut toks = Vec::new();
         let mut lexer_errors = Vec::new();
@@ -824,7 +855,8 @@ impl<'src> Parser<'src> {
                 Err(_) => {
                     let span = lex.span();
                     let msg = format!("unrecognized sequence: {}", lex.slice());
-                    lexer_errors.push(ParseError { msg, span });
+                    let meta = Meta::new(file_id, Span::new(span.start, span.end));
+                    lexer_errors.push(ParseError::new(msg, meta));
                 }
             }
         }
@@ -838,7 +870,39 @@ impl<'src> Parser<'src> {
             ctx: None,
             resolver: None,
             referrer: None,
+            file_id,
+            file_name,
         }
+    }
+
+    #[inline]
+    pub fn file_name(&self) -> &str {
+        self.file_name.as_str()
+    }
+
+    #[inline]
+    pub fn source(&self) -> &str {
+        self._src
+    }
+
+    #[inline]
+    fn meta_from_range(&self, range: std::ops::Range<usize>) -> Meta {
+        Meta::new(self.file_id, Span::new(range.start, range.end))
+    }
+
+    #[inline]
+    fn make_error<S: Into<String>>(&self, msg: S, span: std::ops::Range<usize>) -> ParseError {
+        ParseError::new(msg, self.meta_from_range(span))
+    }
+
+    #[inline]
+    fn expr_from_token(&self, tok: &SpannedTok, kind: ExprKind) -> Expr {
+        expr_unknown(kind).with_meta(self.meta_from_range(tok.span.clone()))
+    }
+
+    #[inline]
+    fn stmt_from_span(&self, span: std::ops::Range<usize>, kind: StmtKind) -> Stmt {
+        stmt_unknown(kind).with_meta(self.meta_from_range(span))
     }
 
     pub fn with_module<'a>(
@@ -848,7 +912,8 @@ impl<'src> Parser<'src> {
         module_ptr: *mut ModuleAST<'a>,
         referrer: Arc<PathBuf>,
     ) -> Self {
-        let mut p = Self::new(src);
+        let display_name = referrer.to_string_lossy();
+        let mut p = Self::with_name(src, display_name.as_ref());
         p.module_ptr = Some(module_ptr as *mut ModuleAST<'static>);
         p.ctx = Some(ctx as *const _);
         p.resolver = Some(resolver as *const _);
@@ -872,10 +937,7 @@ impl<'src> Parser<'src> {
             } else {
                 0..0
             };
-            Err(ParseError {
-                msg: "unexpected end of file".to_string(),
-                span,
-            })
+            Err(self.make_error("unexpected end of file", span))
         } else {
             let t = self.toks[self.i].clone();
             self.i += 1;
@@ -913,20 +975,17 @@ impl<'src> Parser<'src> {
             } else {
                 0..0
             };
-            Err(ParseError {
-                msg: format!("unexpected end of file, {}", msg),
-                span,
-            })
+            Err(self.make_error(format!("unexpected end of file, {}", msg), span))
         } else {
             let found = if let Some(p) = self.peek() {
                 format!("found {:?}", p.tok)
             } else {
                 "reached end of file".to_string()
             };
-            Err(ParseError {
-                msg: format!("{}; {}", msg, found),
-                span: self.peek().map(|p| p.span.clone()).unwrap_or(0..0),
-            })
+            Err(self.make_error(
+                format!("{}; {}", msg, found),
+                self.peek().map(|p| p.span.clone()).unwrap_or(0..0),
+            ))
         }
     }
 
@@ -940,10 +999,7 @@ impl<'src> Parser<'src> {
                 0..0
             }
         };
-        ParseError {
-            msg: msg.to_string(),
-            span,
-        }
+        self.make_error(msg.to_string(), span)
     }
 
     #[inline(always)]
@@ -1176,10 +1232,10 @@ impl<'src> Parser<'src> {
         let name = match t.tok {
             Tok::Ident(s) => s,
             ref tok => {
-                return Err(ParseError {
-                    msg: format!("expected class name (identifier), found {:?}", tok),
-                    span: t.span,
-                });
+                return Err(self.make_error(
+                    format!("expected class name (identifier), found {:?}", tok),
+                    t.span,
+                ));
             }
         };
 
@@ -1188,10 +1244,10 @@ impl<'src> Parser<'src> {
             match t.tok {
                 Tok::Ident(s) => Some(s),
                 ref tok => {
-                    return Err(ParseError {
-                        msg: format!("expected base class name after 'extends', found {:?}", tok),
-                        span: t.span,
-                    });
+                    return Err(self.make_error(
+                        format!("expected base class name after 'extends', found {:?}", tok),
+                        t.span,
+                    ));
                 }
             }
         } else {
@@ -1258,10 +1314,10 @@ impl<'src> Parser<'src> {
             let name = match t.tok {
                 Tok::Ident(s) => s,
                 ref tok => {
-                    return Err(ParseError {
-                        msg: format!("expected field name after 'var', found {:?}", tok),
-                        span: t.span,
-                    });
+                    return Err(self.make_error(
+                        format!("expected field name after 'var', found {:?}", tok),
+                        t.span,
+                    ));
                 }
             };
 
@@ -1291,10 +1347,10 @@ impl<'src> Parser<'src> {
             let name = match t.tok {
                 Tok::Ident(s) => s,
                 ref tok => {
-                    return Err(ParseError {
-                        msg: format!("expected property name after 'get', found {:?}", tok),
-                        span: t.span,
-                    });
+                    return Err(self.make_error(
+                        format!("expected property name after 'get', found {:?}", tok),
+                        t.span,
+                    ));
                 }
             };
             self.expect(Tok::LParen, "expected '(' after getter name")?;
@@ -1316,10 +1372,10 @@ impl<'src> Parser<'src> {
             let name = match t.tok {
                 Tok::Ident(s) => s,
                 ref tok => {
-                    return Err(ParseError {
-                        msg: format!("expected property name after 'set', found {:?}", tok),
-                        span: t.span,
-                    });
+                    return Err(self.make_error(
+                        format!("expected property name after 'set', found {:?}", tok),
+                        t.span,
+                    ));
                 }
             };
             self.expect(Tok::LParen, "expected '(' after setter name")?;
@@ -1327,10 +1383,10 @@ impl<'src> Parser<'src> {
             let param = match t.tok {
                 Tok::Ident(s) => s,
                 ref tok => {
-                    return Err(ParseError {
-                        msg: format!("expected setter parameter name, found {:?}", tok),
-                        span: t.span,
-                    });
+                    return Err(self.make_error(
+                        format!("expected setter parameter name, found {:?}", tok),
+                        t.span,
+                    ));
                 }
             };
             self.expect(Tok::RParen, "expected ')' after setter parameter")?;
@@ -1354,10 +1410,10 @@ impl<'src> Parser<'src> {
         let name = match t.tok {
             Tok::Ident(s) => s,
             ref tok => {
-                return Err(ParseError {
-                    msg: format!("expected method name (identifier), found {:?}", tok),
-                    span: t.span,
-                });
+                return Err(self.make_error(
+                    format!("expected method name (identifier), found {:?}", tok),
+                    t.span,
+                ));
             }
         };
 
@@ -1418,13 +1474,13 @@ impl<'src> Parser<'src> {
             let spec = match t.tok {
                 Tok::Str(s) => s,
                 ref tok => {
-                    return Err(ParseError {
-                        msg: format!(
+                    return Err(self.make_error(
+                        format!(
                             "expected string literal for import specifier, found {:?}",
                             tok
                         ),
-                        span: t.span,
-                    });
+                        t.span,
+                    ));
                 }
             };
             self.expect(Tok::Semi, "expected ';' after import specifier")?;
@@ -1443,10 +1499,10 @@ impl<'src> Parser<'src> {
             let alias = match t.tok {
                 Tok::Ident(s) => s,
                 ref tok => {
-                    return Err(ParseError {
-                        msg: format!("expected identifier after 'as', found {:?}", tok),
-                        span: t.span,
-                    });
+                    return Err(self.make_error(
+                        format!("expected identifier after 'as', found {:?}", tok),
+                        t.span,
+                    ));
                 }
             };
             self.expect(Tok::From, "expected 'from'")?;
@@ -1454,10 +1510,10 @@ impl<'src> Parser<'src> {
             let spec = match t.tok {
                 Tok::Str(s) => s,
                 ref tok => {
-                    return Err(ParseError {
-                        msg: format!("expected string literal after 'from', found {:?}", tok),
-                        span: t.span,
-                    });
+                    return Err(self.make_error(
+                        format!("expected string literal after 'from', found {:?}", tok),
+                        t.span,
+                    ));
                 }
             };
             self.expect(Tok::Semi, "expected ';' after import")?;
@@ -1487,10 +1543,10 @@ impl<'src> Parser<'src> {
             let name = match t.tok {
                 Tok::Ident(s) => s,
                 ref tok => {
-                    return Err(ParseError {
-                        msg: format!("expected imported name (identifier), found {:?}", tok),
-                        span: t.span,
-                    });
+                    return Err(self.make_error(
+                        format!("expected imported name (identifier), found {:?}", tok),
+                        t.span,
+                    ));
                 }
             };
             let alias = if self.matches(&Tok::As) {
@@ -1501,13 +1557,13 @@ impl<'src> Parser<'src> {
                         Some(s)
                     }
                     ref tok => {
-                        return Err(ParseError {
-                            msg: format!(
+                        return Err(self.make_error(
+                            format!(
                                 "expected alias name (identifier) after 'as', found {:?}",
                                 tok
                             ),
-                            span: t.span,
-                        });
+                            t.span,
+                        ));
                     }
                 }
             } else {
@@ -1526,10 +1582,10 @@ impl<'src> Parser<'src> {
         let spec = match t.tok {
             Tok::Str(s) => s,
             ref tok => {
-                return Err(ParseError {
-                    msg: format!("expected string literal after 'from', found {:?}", tok),
-                    span: t.span,
-                });
+                return Err(self.make_error(
+                    format!("expected string literal after 'from', found {:?}", tok),
+                    t.span,
+                ));
             }
         };
         self.expect(Tok::Semi, "expected ';' after import")?;
@@ -1603,13 +1659,13 @@ impl<'src> Parser<'src> {
             let name = match t.tok {
                 Tok::Ident(s) => s,
                 ref tok => {
-                    return Err(ParseError {
-                        msg: format!(
+                    return Err(self.make_error(
+                        format!(
                             "expected identifier after 'export var/let/const', found {:?}",
                             tok
                         ),
-                        span: t.span,
-                    });
+                        t.span,
+                    ));
                 }
             };
             let init = if self.matches(&Tok::Eq) {
@@ -1634,10 +1690,10 @@ impl<'src> Parser<'src> {
             let spec = match t.tok {
                 Tok::Str(s) => s,
                 ref tok => {
-                    return Err(ParseError {
-                        msg: format!("expected string literal after 'from', found {:?}", tok),
-                        span: t.span,
-                    });
+                    return Err(self.make_error(
+                        format!("expected string literal after 'from', found {:?}", tok),
+                        t.span,
+                    ));
                 }
             };
             self.expect(Tok::Semi, "expected ';' after export")?;
@@ -1660,10 +1716,10 @@ impl<'src> Parser<'src> {
                 let name = match t.tok {
                     Tok::Ident(s) => s,
                     ref tok => {
-                        return Err(ParseError {
-                            msg: format!("expected exported name (identifier), found {:?}", tok),
-                            span: t.span,
-                        });
+                        return Err(self.make_error(
+                            format!("expected exported name (identifier), found {:?}", tok),
+                            t.span,
+                        ));
                     }
                 };
                 let alias = if self.matches(&Tok::As) {
@@ -1671,13 +1727,13 @@ impl<'src> Parser<'src> {
                     match t.tok {
                         Tok::Ident(s) => Some(s),
                         ref tok => {
-                            return Err(ParseError {
-                                msg: format!(
+                            return Err(self.make_error(
+                                format!(
                                     "expected alias name (identifier) after 'as', found {:?}",
                                     tok
                                 ),
-                                span: t.span,
-                            });
+                                t.span,
+                            ));
                         }
                     }
                 } else {
@@ -1696,10 +1752,10 @@ impl<'src> Parser<'src> {
                 let spec = match t.tok {
                     Tok::Str(s) => s,
                     ref tok => {
-                        return Err(ParseError {
-                            msg: format!("expected string literal after 'from', found {:?}", tok),
-                            span: t.span,
-                        });
+                        return Err(self.make_error(
+                            format!("expected string literal after 'from', found {:?}", tok),
+                            t.span,
+                        ));
                     }
                 };
                 self.expect(Tok::Semi, "expected ';' after export")?;
@@ -1733,10 +1789,10 @@ impl<'src> Parser<'src> {
         let name = match t.tok {
             Tok::Ident(s) => s,
             ref tok => {
-                return Err(ParseError {
-                    msg: format!("expected method name, found {:?}", tok),
-                    span: t.span,
-                });
+                return Err(self.make_error(
+                    format!("expected method name, found {:?}", tok),
+                    t.span,
+                ));
             }
         };
         self.expect(Tok::LParen, "expected '(' after method name")?;
@@ -1750,10 +1806,10 @@ impl<'src> Parser<'src> {
         let name = match t.tok {
             Tok::Ident(s) => s,
             ref tok => {
-                return Err(ParseError {
-                    msg: format!("expected function name (identifier), found {:?}", tok),
-                    span: t.span,
-                });
+                return Err(self.make_error(
+                    format!("expected function name (identifier), found {:?}", tok),
+                    t.span,
+                ));
             }
         };
         self.expect(Tok::LParen, "expected '(' after function name")?;
@@ -1770,10 +1826,10 @@ impl<'src> Parser<'src> {
             let ident = match t.tok {
                 Tok::Ident(s) => s,
                 ref tok => {
-                    return Err(ParseError {
-                        msg: format!("expected parameter name (identifier), found {:?}", tok),
-                        span: t.span,
-                    });
+                    return Err(self.make_error(
+                        format!("expected parameter name (identifier), found {:?}", tok),
+                        t.span,
+                    ));
                 }
             };
             params.push(ident);
@@ -1825,10 +1881,10 @@ impl<'src> Parser<'src> {
             let name = match t.tok {
                 Tok::Ident(s) => s,
                 ref tok => {
-                    return Err(ParseError {
-                        msg: format!("expected parameter name (identifier), found {:?}", tok),
-                        span: t.span,
-                    });
+                    return Err(self.make_error(
+                        format!("expected parameter name (identifier), found {:?}", tok),
+                        t.span,
+                    ));
                 }
             };
             params.push(name);
@@ -1872,13 +1928,13 @@ impl<'src> Parser<'src> {
             let name = match t.tok {
                 Tok::Ident(s) => s,
                 ref tok => {
-                    return Err(ParseError {
-                        msg: format!(
+                    return Err(self.make_error(
+                        format!(
                             "expected identifier after 'var'/'let'/'const', found {:?}",
                             tok
                         ),
-                        span: t.span,
-                    });
+                        t.span,
+                    ));
                 }
             };
             let init = if self.matches(&Tok::Eq) {
@@ -2035,13 +2091,13 @@ impl<'src> Parser<'src> {
                     let name = match t.tok {
                         Tok::Ident(s) => s,
                         ref tok => {
-                            return Err(ParseError {
-                                msg: format!(
+                            return Err(self.make_error(
+                                format!(
                                     "expected identifier after 'var' in for init, found {:?}",
                                     tok
                                 ),
-                                span: t.span,
-                            });
+                                t.span,
+                            ));
                         }
                     };
                     let init_e = if self.matches(&Tok::Eq) {
@@ -2181,10 +2237,10 @@ impl<'src> Parser<'src> {
             Tok::Delete => Ok("delete".to_string()),
 
             // Add any other contextual keywords here if needed in the future.
-            _ => Err(ParseError {
-                msg: format!("expected an identifier, but found {:?}", t.tok),
-                span: t.span,
-            }),
+            _ => Err(self.make_error(
+                format!("expected an identifier, but found {:?}", t.tok),
+                t.span,
+            )),
         }
     }
 
@@ -2575,10 +2631,10 @@ impl<'src> Parser<'src> {
                     let name = match t.tok {
                         Tok::Ident(s) => s,
                         ref tok => {
-                            return Err(ParseError {
-                                msg: format!("expected identifier after '?.', found {:?}", tok),
-                                span: t.span,
-                            });
+                            return Err(self.make_error(
+                                format!("expected identifier after '?.', found {:?}", tok),
+                                t.span,
+                            ));
                         }
                     };
                     e = expr!(OptionalChain {
@@ -2760,10 +2816,10 @@ impl<'src> Parser<'src> {
                     let name = match t.tok {
                         Tok::Ident(s) => s,
                         ref tok => {
-                            return Err(ParseError {
-                                msg: format!("expected identifier after 'super.', found {:?}", tok),
-                                span: t.span,
-                            });
+                            return Err(self.make_error(
+                                format!("expected identifier after 'super.', found {:?}", tok),
+                                t.span,
+                            ));
                         }
                     };
                     Ok(expr!(SuperProp(name)))
@@ -2923,13 +2979,13 @@ impl<'src> Parser<'src> {
                     let name = match t.tok {
                         Tok::Ident(s) => s,
                         ref tok => {
-                            return Err(ParseError {
-                                msg: format!(
+                            return Err(self.make_error(
+                                format!(
                                     "expected parameter name (identifier) in lambda, found {:?}",
                                     tok
                                 ),
-                                span: t.span,
-                            });
+                                t.span,
+                            ));
                         }
                     };
                     params.push(name);
@@ -2954,13 +3010,13 @@ impl<'src> Parser<'src> {
             }
             Tok::LBrace => self.parse_object_literal(),
             Tok::Delete => self.parse_delete(),
-            ref tok => Err(ParseError {
-                msg: format!(
+            ref tok => Err(self.make_error(
+                format!(
                     "unexpected token {:?}, expected literal, identifier, 'this', 'super', 'new', '(', '[', '{{', 'fn', 'function', '|', or 'delete'",
                     tok
                 ),
-                span: t.span,
-            }),
+                t.span,
+            )),
         }
     }
 
@@ -2972,13 +3028,13 @@ impl<'src> Parser<'src> {
         let addr = match t.tok {
             Tok::Str(s) => s,
             ref tok => {
-                return Err(ParseError {
-                    msg: format!(
+                return Err(self.make_error(
+                    format!(
                         "expected string literal for address after 'listen', found {:?}",
                         tok
                     ),
-                    span: t.span,
-                });
+                    t.span,
+                ));
             }
         };
         // body
@@ -3009,13 +3065,13 @@ impl<'src> Parser<'src> {
             Tok::Str(s) => s,
             Tok::Ident(s) => s, // allow: route GET [...]
             ref tok => {
-                return Err(ParseError {
-                    msg: format!(
+                return Err(self.make_error(
+                    format!(
                         "expected HTTP method (string literal or identifier), found {:?}",
                         tok
                     ),
-                    span: t.span,
-                });
+                    t.span,
+                ));
             }
         };
 
@@ -3174,13 +3230,10 @@ impl<'src> Parser<'src> {
                 let name = match t.tok {
                     Tok::Ident(s) => s,
                     ref tok => {
-                        return Err(ParseError {
-                            msg: format!(
+                        return Err(self.make_error(format!(
                                 "expected identifier after '...' in object pattern, found {:?}",
                                 tok
-                            ),
-                            span: t.span,
-                        });
+                            ), t.span,));
                     }
                 };
                 rest = Some(name);
@@ -3207,13 +3260,10 @@ impl<'src> Parser<'src> {
                             let alias = match alias_tok.tok {
                                 Tok::Ident(a) => a,
                                 ref tok => {
-                                    return Err(ParseError {
-                                        msg: format!(
+                                    return Err(self.make_error(format!(
                                             "expected identifier after ':' in object pattern, found {:?}",
                                             tok
-                                        ),
-                                        span: alias_tok.span,
-                                    });
+                                        ), alias_tok.span,));
                                 }
                             };
                             (PropKey::Ident(s), alias)
@@ -3236,13 +3286,10 @@ impl<'src> Parser<'src> {
                         let alias = match alias_tok.tok {
                             Tok::Ident(a) => a,
                             ref tok => {
-                                return Err(ParseError {
-                                    msg: format!(
+                                return Err(self.make_error(format!(
                                         "expected identifier after ':' in object pattern, found {:?}",
                                         tok
-                                    ),
-                                    span: alias_tok.span,
-                                });
+                                    ), alias_tok.span,));
                             }
                         };
                         (PropKey::Str(s), alias)
@@ -3281,10 +3328,7 @@ impl<'src> Parser<'src> {
             let name = match t.tok {
                 Tok::Ident(s) => s,
                 ref tok => {
-                    return Err(ParseError {
-                        msg: format!("expected identifier after '.' in delete, found {:?}", tok),
-                        span: t.span,
-                    });
+                    return Err(self.make_error(format!("expected identifier after '.' in delete, found {:?}", tok), t.span,));
                 }
             };
             return Ok(expr!(DeleteProp {

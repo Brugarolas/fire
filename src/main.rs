@@ -42,10 +42,14 @@ fn default_script() -> &'static str {
 }
 
 fn build_module_from_source(name: &str, src: &str) -> Result<wir::Module, String> {
-    let mut parser = Parser::new(src);
-    let prog = parser
-        .program()
-        .map_err(|e| format!("Parse error in {name}: {} at {:?}", e.msg, e.span))?;
+    let mut parser = Parser::with_name(src, name);
+    let prog = match parser.program() {
+        Ok(p) => p,
+        Err(e) => {
+            e.emit(parser.file_name(), parser.source());
+            return Err(format!("Parse error in {name}: {}", e.msg));
+        }
+    };
 
     let mut module = wir::Module::new();
     let mut lowerer = lowerer::Lowerer::new(&mut module);

@@ -637,9 +637,13 @@ impl ProgramBuilder {
                 abs.clone(), // referrer
             );
 
-            let prog = p
-                .program()
-                .map_err(|e| format!("Parse error in {:?}: {} at {:?}", abs, e.msg, e.span))?;
+            let prog = match p.program() {
+                Ok(pr) => pr,
+                Err(e) => {
+                    e.emit(p.file_name(), p.source());
+                    return Err(format!("Parse error in {:?}: {}", abs, e.msg));
+                }
+            };
 
             // Debug while `p` (and its borrows) are still in-scope
             #[cfg(debug_assertions)]
@@ -754,11 +758,16 @@ pub fn build_simple_program_from_entry(entry: &str) -> Result<crate::wir::Module
     let src =
         std::fs::read_to_string(&abs).map_err(|e| format!("read_to_string({}): {e}", entry))?;
 
-    let mut parser: Parser = Parser::new(&src);
+    let path_str = abs.to_string_lossy();
+    let mut parser: Parser = Parser::with_name(&src, path_str.as_ref());
 
-    let prog = parser
-        .program()
-        .map_err(|e| format!("Parse error in {:?}: {} at {:?}", abs, e.msg, e.span))?;
+    let prog = match parser.program() {
+        Ok(p) => p,
+        Err(e) => {
+            e.emit(parser.file_name(), parser.source());
+            return Err(format!("Parse error in {:?}: {}", abs, e.msg));
+        }
+    };
 
     let mut m = crate::wir::Module::new();
 
