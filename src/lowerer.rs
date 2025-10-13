@@ -15,13 +15,43 @@ use crate::wir::{
 };
 
 use crate::front::{
-    BinOp, Block, CatchClause, ClassDecl, ClassMember, DeferKind, ExportDecl, Expr, FuncDecl,
-    ImportDecl, ImportItem, LValue, ListenDecl, ObjItem, ObjPattern, OptionalAccess, Program,
-    PropKey, RouteDecl, Stmt, UnOp,
+    BinOp, Block, CatchClause, ClassDecl, ClassMember, DeferKind, ExportDecl, Expr, ExprKind,
+    FuncDecl, ImportDecl, ImportItem, LValue, LValueKind, ListenDecl, ObjItem, ObjPattern,
+    OptionalAccess, Program, PropKey, RouteDecl, Stmt, StmtKind, UnOp,
 };
+use crate::diag::Node;
 
 use crate::hoister::hoist_fn_lits_program;
 
+#[inline]
+fn stmt_unknown(kind: StmtKind) -> Stmt {
+    Node::unknown(kind)
+}
+
+#[inline]
+fn expr_unknown(kind: ExprKind) -> Expr {
+    Node::unknown(kind)
+}
+
+#[inline]
+fn lvalue_unknown(kind: LValueKind) -> LValue {
+    Node::unknown(kind)
+}
+
+#[inline]
+fn stmt_with_meta(template: &Stmt, kind: StmtKind) -> Stmt {
+    Node::new(template.meta.clone(), kind)
+}
+
+#[inline]
+fn expr_with_meta(template: &Expr, kind: ExprKind) -> Expr {
+    Node::new(template.meta.clone(), kind)
+}
+
+#[inline]
+fn lvalue_with_meta(template: &LValue, kind: LValueKind) -> LValue {
+    Node::new(template.meta.clone(), kind)
+}
 // -------------------------
 /// LOWERING (AST → WIR)
 /// -------------------------
@@ -491,8 +521,8 @@ fn lower_stmt_free<'m>(
     s: &Stmt,
     lowering_ctx: &LoweringContext,
 ) -> LResult<()> {
-    match s {
-        Stmt::Var { name, init } => {
+    match s.kind() {
+        StmtKind::Var { name, init } => {
             let val = if let Some(e) = init {
                 lower_expr_free(b, locals, fields, next_field, e, lowering_ctx)? // <-- pass
             } else {
@@ -502,7 +532,7 @@ fn lower_stmt_free<'m>(
 
             #[cfg(debug_assertions)]
             {
-                eprintln!("lower_stmt_free() Stmt::Var {{ {} }}", name);
+                eprintln!("lower_stmt_free() StmtKind::Var {{ {} }}", name);
                 eprintln!(
                     "[links] exports        : {:?}",
                     lowering_ctx
@@ -536,7 +566,7 @@ fn lower_stmt_free<'m>(
                 b.store_binding(bid, val);
             }
         }
-        Stmt::VarDestruct { pattern, init } => {
+        StmtKind::VarDestruct { pattern, init } => {
             let obj_val = lower_expr_free(b, locals, fields, next_field, init, lowering_ctx)?;
 
             for field in &pattern.fields {
@@ -628,7 +658,7 @@ fn lower_stmt_free<'m>(
                 }
             }
         }
-        Stmt::If {
+        StmtKind::If {
             cond,
             then_b,
             else_b,
@@ -702,7 +732,7 @@ fn lower_stmt_free<'m>(
                 locals.insert(name.clone(), phi_params[i]);
             }
         }
-        Stmt::While { cond, body } => {
+        StmtKind::While { cond, body } => {
             let head = b.block();
             let body_b = b.block();
             let exit = b.block();
@@ -739,7 +769,7 @@ fn lower_stmt_free<'m>(
                 locals.insert(nm, p);
             }
         }
-        Stmt::For {
+        StmtKind::For {
             init,
             cond,
             step,
@@ -805,22 +835,22 @@ fn lower_stmt_free<'m>(
                 locals.insert(nm, p);
             }
         }
-        Stmt::Try { .. } => {
+        StmtKind::Try { .. } => {
             return Err(LowerError::NotLowerable(
                 "try/catch/finally lowering not implemented yet",
             ));
         }
-        Stmt::Throw(_) => {
+        StmtKind::Throw(_) => {
             return Err(LowerError::NotLowerable(
                 "throw statements not implemented yet",
             ));
         }
-        Stmt::Defer { .. } => {
+        StmtKind::Defer { .. } => {
             return Err(LowerError::NotLowerable(
                 "defer/errdefer lowering not implemented yet",
             ));
         }
-        Stmt::Return(e) => {
+        StmtKind::Return(e) => {
             if let Some(e) = e {
                 let v = lower_expr_free(b, locals, fields, next_field, e, lowering_ctx)?;
                 b.ret(&[v]);
@@ -829,7 +859,7 @@ fn lower_stmt_free<'m>(
                 b.ret(&[z]);
             }
         }
-        Stmt::Listen(ld) => {
+        StmtKind::Listen(ld) => {
             // server id = wir_server_create(addr)
             let (_nid_addr, addr_r) = b.push_node(
                 Inst::Const(Constant::Str(ld.addr.clone())),
@@ -892,7 +922,7 @@ fn lower_stmt_free<'m>(
             );
         }
 
-        Stmt::Expr(e) => {
+        StmtKind::Expr(e) => {
             let _ = lower_expr_free(b, locals, fields, next_field, e, lowering_ctx)?;
         } // <-- pass
     }
@@ -1082,14 +1112,14 @@ fn lower_general_getprop<'m>(
 }
 
 fn collect_mut_locals_in_expr(e: &Expr, out: &mut BTreeSet<String>) {
-    match e {
-        Expr::Assign(lv, rhs) => {
-            if let LValue::Ident(name) = &**lv {
+    match e.kind() {
+        ExprKind::Assign(lv, rhs) => {
+            if let LValueKind::Ident(name) = lv.kind() {
                 out.insert(name.clone());
             }
             collect_mut_locals_in_expr(rhs, out);
         }
-        Expr::Conditional {
+        ExprKind::Conditional {
             cond,
             then_branch,
             else_branch,
@@ -1098,24 +1128,24 @@ fn collect_mut_locals_in_expr(e: &Expr, out: &mut BTreeSet<String>) {
             collect_mut_locals_in_expr(then_branch, out);
             collect_mut_locals_in_expr(else_branch, out);
         }
-        Expr::Binary { a, b, .. } => {
+        ExprKind::Binary { a, b, .. } => {
             collect_mut_locals_in_expr(a, out);
             collect_mut_locals_in_expr(b, out);
         }
-        Expr::Unary { e, .. } => collect_mut_locals_in_expr(e, out),
-        Expr::Call { callee, args } => {
+        ExprKind::Unary { e: inner, .. } => collect_mut_locals_in_expr(inner, out),
+        ExprKind::Call { callee, args } => {
             collect_mut_locals_in_expr(callee, out);
             for a in args {
                 collect_mut_locals_in_expr(a, out);
             }
         }
-        Expr::GetProp { recv, .. } => collect_mut_locals_in_expr(recv, out),
-        Expr::Index { recv, index } => {
+        ExprKind::GetProp { recv, .. } => collect_mut_locals_in_expr(recv, out),
+        ExprKind::Index { recv, index } => {
             collect_mut_locals_in_expr(recv, out);
             collect_mut_locals_in_expr(index, out);
         }
-        Expr::Group(e) => collect_mut_locals_in_expr(e, out),
-        Expr::ObjLit(items) => {
+        ExprKind::Group(inner) => collect_mut_locals_in_expr(inner, out),
+        ExprKind::ObjLit(items) => {
             for item in items {
                 match item {
                     ObjItem::Prop(_, value) => collect_mut_locals_in_expr(value, out),
@@ -1123,7 +1153,7 @@ fn collect_mut_locals_in_expr(e: &Expr, out: &mut BTreeSet<String>) {
                 }
             }
         }
-        Expr::OptionalChain { base, access } => {
+        ExprKind::OptionalChain { base, access } => {
             collect_mut_locals_in_expr(base, out);
             match access {
                 OptionalAccess::Prop(_) => {}
@@ -1135,32 +1165,32 @@ fn collect_mut_locals_in_expr(e: &Expr, out: &mut BTreeSet<String>) {
                 }
             }
         }
-        Expr::CallBuiltinMapMethod { recv, args, .. } => {
+        ExprKind::CallBuiltinMapMethod { recv, args, .. } => {
             collect_mut_locals_in_expr(recv, out);
             for a in args {
                 collect_mut_locals_in_expr(a, out);
             }
         }
-        Expr::CallBuiltinSetMethod { recv, args, .. } => {
+        ExprKind::CallBuiltinSetMethod { recv, args, .. } => {
             collect_mut_locals_in_expr(recv, out);
             for a in args {
                 collect_mut_locals_in_expr(a, out);
             }
         }
-        Expr::CallBuiltinCommonMethod { recv, .. } => {
+        ExprKind::CallBuiltinCommonMethod { recv, .. } => {
             collect_mut_locals_in_expr(recv, out);
         }
-        Expr::GetBuiltinSize(recv) => collect_mut_locals_in_expr(recv, out),
+        ExprKind::GetBuiltinSize(recv) => collect_mut_locals_in_expr(recv, out),
         _ => {}
     }
 }
 
 fn collect_mut_locals_in_stmt(s: &Stmt, out: &mut BTreeSet<String>) {
-    match s {
-        Stmt::Expr(e) => collect_mut_locals_in_expr(e, out),
-        Stmt::Var { .. } => {} // vars declared inside the loop are not loop-carried
-        Stmt::VarDestruct { .. } => {}
-        Stmt::If {
+    match s.kind() {
+        StmtKind::Expr(e) => collect_mut_locals_in_expr(e, out),
+        StmtKind::Var { .. } => {} // vars declared inside the loop are not loop-carried
+        StmtKind::VarDestruct { .. } => {}
+        StmtKind::If {
             cond,
             then_b,
             else_b,
@@ -1175,13 +1205,13 @@ fn collect_mut_locals_in_stmt(s: &Stmt, out: &mut BTreeSet<String>) {
                 }
             }
         }
-        Stmt::While { cond, body } => {
+        StmtKind::While { cond, body } => {
             collect_mut_locals_in_expr(cond, out);
             for st in &body.stmts {
                 collect_mut_locals_in_stmt(st, out);
             }
         }
-        Stmt::For {
+        StmtKind::For {
             init,
             cond,
             step,
@@ -1200,12 +1230,12 @@ fn collect_mut_locals_in_stmt(s: &Stmt, out: &mut BTreeSet<String>) {
                 collect_mut_locals_in_stmt(st, out);
             }
         }
-        Stmt::Return(e) => {
+        StmtKind::Return(e) => {
             if let Some(e) = e {
                 collect_mut_locals_in_expr(e, out);
             }
         }
-        Stmt::Try {
+        StmtKind::Try {
             try_block,
             catch,
             finally_block,
@@ -1224,10 +1254,9 @@ fn collect_mut_locals_in_stmt(s: &Stmt, out: &mut BTreeSet<String>) {
                 }
             }
         }
-        Stmt::Throw(expr) => collect_mut_locals_in_expr(expr, out),
-        Stmt::Defer { expr, .. } => collect_mut_locals_in_expr(expr, out),
-
-        Stmt::Listen(ld) => {
+        StmtKind::Throw(expr) => collect_mut_locals_in_expr(expr, out),
+        StmtKind::Defer { expr, .. } => collect_mut_locals_in_expr(expr, out),
+        StmtKind::Listen(ld) => {
             for r in &ld.routes {
                 collect_mut_locals_in_expr(&r.pattern, out);
                 collect_mut_locals_in_expr(&r.handler, out);
@@ -1268,8 +1297,8 @@ fn lower_stmt_free_async<'m>(
     lowering_ctx: &LoweringContext,
     in_async: bool,
 ) -> LResult<()> {
-    match s {
-        Stmt::Return(eopt) if in_async => {
+    match s.kind() {
+        StmtKind::Return(eopt) if in_async => {
             let d = *locals.get("__deferred").expect("__deferred present");
             let v = if let Some(e) = eopt {
                 lower_expr_free_async(b, locals, fields, next_field, e, lowering_ctx, in_async)?
@@ -1290,7 +1319,7 @@ fn lower_stmt_free_async<'m>(
             b.ret(&[d]);
             Ok(())
         }
-        Stmt::Listen(ld) => {
+        StmtKind::Listen(ld) => {
             // server id = wir_server_create(addr)
             let (_nid_addr, addr_r) = b.push_node(
                 Inst::Const(Constant::Str(ld.addr.clone())),
@@ -1370,17 +1399,17 @@ fn lower_stmt_free_async<'m>(
         }
         _ => {
             // Forward to the old lowering, but via the *_async versions
-            match s {
-                Stmt::Try { .. } => Err(LowerError::NotLowerable(
+            match s.kind() {
+                StmtKind::Try { .. } => Err(LowerError::NotLowerable(
                     "try/catch/finally lowering not implemented yet",
                 )),
-                Stmt::Throw(_) => Err(LowerError::NotLowerable(
+                StmtKind::Throw(_) => Err(LowerError::NotLowerable(
                     "throw statements not implemented yet",
                 )),
-                Stmt::Defer { .. } => Err(LowerError::NotLowerable(
+                StmtKind::Defer { .. } => Err(LowerError::NotLowerable(
                     "defer/errdefer lowering not implemented yet",
                 )),
-                Stmt::Var { name, init } => {
+                StmtKind::Var { name, init } => {
                     let val = if let Some(e) = init {
                         lower_expr_free_async(
                             b,
@@ -1400,7 +1429,7 @@ fn lower_stmt_free_async<'m>(
                     }
                     Ok(())
                 }
-                Stmt::VarDestruct { pattern, init } => {
+                StmtKind::VarDestruct { pattern, init } => {
                     let obj_val = lower_expr_free_async(
                         b,
                         locals,
@@ -1502,7 +1531,7 @@ fn lower_stmt_free_async<'m>(
                     }
                     Ok(())
                 }
-                Stmt::If {
+                StmtKind::If {
                     cond,
                     then_b,
                     else_b,
@@ -1599,7 +1628,7 @@ fn lower_stmt_free_async<'m>(
                     Ok(())
                 }
                 // While / For / Expr … call lower_*_async respectively
-                Stmt::While { cond, body } => {
+                StmtKind::While { cond, body } => {
                     // same as your While, but using lower_expr_free_async / lower_block_free_async
                     let head = b.block();
                     let body_b = b.block();
@@ -1654,7 +1683,7 @@ fn lower_stmt_free_async<'m>(
                     }
                     Ok(())
                 }
-                Stmt::For {
+                StmtKind::For {
                     init,
                     cond,
                     step,
@@ -1753,7 +1782,7 @@ fn lower_stmt_free_async<'m>(
                     }
                     Ok(())
                 }
-                Stmt::Expr(e) => {
+                StmtKind::Expr(e) => {
                     let _ = lower_expr_free_async(
                         b,
                         locals,
@@ -1766,8 +1795,8 @@ fn lower_stmt_free_async<'m>(
                     Ok(())
                 }
 
-                Stmt::Listen(_) => unreachable!(), // handled in the outer match arm
-                Stmt::Return(_) => unreachable!(), // handled above when in_async
+                StmtKind::Listen(_) => unreachable!(), // handled in the outer match arm
+                StmtKind::Return(_) => unreachable!(), // handled above when in_async
             }
         }
     }
@@ -2714,19 +2743,19 @@ fn lower_expr_free<'m>(
 ) -> LResult<ValueId> {
     use BinOp::*;
 
-    match e {
-        Expr::LitInt(i) => Ok(b.const_i32(*i)),
-        Expr::LitF64(f) => Ok(b.const_f64(*f)),
-        Expr::LitBool(v) => {
+    match e.kind() {
+        ExprKind::LitInt(i) => Ok(b.const_i32(*i)),
+        ExprKind::LitF64(f) => Ok(b.const_f64(*f)),
+        ExprKind::LitBool(v) => {
             let (_nid, res) =
                 b.push_node(Inst::Const(Constant::Bool(*v)), Some(Type::Bool), 1, false);
             Ok(res[0])
         }
-        Expr::LitNull => {
+        ExprKind::LitNull => {
             let (_nid, res) = b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
             Ok(res[0])
         }
-        Expr::Str(s) => {
+        ExprKind::Str(s) => {
             let (_nid, res) = b.push_node(
                 Inst::Const(Constant::Str(s.clone())),
                 Some(Type::Str),
@@ -2736,7 +2765,7 @@ fn lower_expr_free<'m>(
             Ok(res[0])
         }
 
-        Expr::Conditional {
+        ExprKind::Conditional {
             cond,
             then_branch,
             else_branch,
@@ -2761,7 +2790,7 @@ fn lower_expr_free<'m>(
         }
 
         // Allow await when inside an async lowering scope.
-        Expr::Await(inner) => {
+        ExprKind::Await(inner) => {
             if !await_allowed() {
                 return Err(LowerError::NotLowerable("await outside async function"));
             }
@@ -2780,14 +2809,14 @@ fn lower_expr_free<'m>(
             return Ok(res[0]);
         }
         // Unhoisted function literal shouldn't reach the lowerer
-        Expr::FnLit { .. } => {
+        ExprKind::FnLit { .. } => {
             return Err(LowerError::NotLowerable(
                 "unhoisted function literal reached lowerer",
             ));
         }
 
         // locals first, else known function -> a closure with null env
-        Expr::Ident(name) => {
+        ExprKind::Ident(name) => {
             // 1) Captured/boxed local (read box[0])
             //    If you use a specific key format for boxed locals, keep it here.
             if locals.get(&boxed_key(name)).is_some() {
@@ -2871,7 +2900,7 @@ fn lower_expr_free<'m>(
             Err(LowerError::UnknownVar(name.clone()))
         }
 
-        Expr::OptionalChain { base, access } => {
+        ExprKind::OptionalChain { base, access } => {
             let base_v = lower_expr_free(b, locals, fields, next_field, base, lowering_ctx)?;
             let cont = b.block();
             let res_param = b.add_block_param(cont, Type::Top);
@@ -2954,14 +2983,16 @@ fn lower_expr_free<'m>(
                 OptionalAccess::Call(args) => {
                     let mut argv = Vec::with_capacity(args.len() + 1);
                     let mut this_source: Option<Expr> = None;
-                    match &**base {
-                        Expr::GetProp { recv, .. } => {
+                    match base.kind() {
+                        ExprKind::GetProp { recv, .. } => {
                             this_source = Some((**recv).clone());
                         }
-                        Expr::Index { recv, index } if matches!(&**index, Expr::Str(_)) => {
+                        ExprKind::Index { recv, index }
+                            if matches!(index.kind(), ExprKind::Str(_)) =>
+                        {
                             this_source = Some((**recv).clone());
                         }
-                        Expr::OptionalChain {
+                        ExprKind::OptionalChain {
                             base: inner,
                             access: OptionalAccess::Prop(_),
                         } => {
@@ -3003,9 +3034,11 @@ fn lower_expr_free<'m>(
             Ok(res_param)
         }
 
-        Expr::Group(inner) => lower_expr_free(b, locals, fields, next_field, inner, lowering_ctx),
+        ExprKind::Group(inner) => {
+            lower_expr_free(b, locals, fields, next_field, inner, lowering_ctx)
+        }
 
-        Expr::Unary { op, e } => {
+        ExprKind::Unary { op, e } => {
             let v = lower_expr_free(b, locals, fields, next_field, e, lowering_ctx)?;
             match op {
                 UnOp::Neg => {
@@ -3039,9 +3072,9 @@ fn lower_expr_free<'m>(
             }
         }
 
-        Expr::Binary { op, a, b: bb } => {
-            let left_is_str_lit = matches!(&**a, Expr::Str(_));
-            let right_is_str_lit = matches!(&**bb, Expr::Str(_));
+        ExprKind::Binary { op, a, b: bb } => {
+            let left_is_str_lit = matches!(a.kind(), ExprKind::Str(_));
+            let right_is_str_lit = matches!(bb.kind(), ExprKind::Str(_));
             let va = lower_expr_free(b, locals, fields, next_field, a, lowering_ctx)?;
             match op {
                 Add => {
@@ -3275,11 +3308,11 @@ fn lower_expr_free<'m>(
             }
         }
 
-        Expr::Assign(lv, rhs) => {
+        ExprKind::Assign(lv, rhs) => {
             let rv = lower_expr_free(b, locals, fields, next_field, rhs, lowering_ctx)?;
-            match &**lv {
+            match lv.kind() {
                 // o.a = rv      (dot write)
-                LValue::GetProp { recv, name } => {
+                LValueKind::GetProp { recv, name } => {
                     let obj = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
 
                     // Special-case: arr.length = n
@@ -3335,9 +3368,9 @@ fn lower_expr_free<'m>(
                 }
 
                 // o["a"] = rv     (bracket write with string)
-                LValue::Index { recv, index } if matches!(index, Expr::Str(_)) => {
+                LValueKind::Index { recv, index } if matches!(index.kind(), ExprKind::Str(_)) => {
                     let obj = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
-                    let s = if let Expr::Str(s) = index {
+                    let s = if let ExprKind::Str(s) = index.kind() {
                         s
                     } else {
                         unreachable!()
@@ -3379,8 +3412,8 @@ fn lower_expr_free<'m>(
                     Ok(rv)
                 }
 
-                // --- inside Expr::Assign(lv, rhs) match ---
-                LValue::Index { recv, index } if !matches!(index, Expr::Str(_)) => {
+                // --- inside ExprKind::Assign(lv, rhs) match ---
+                LValueKind::Index { recv, index } if !matches!(index.kind(), ExprKind::Str(_)) => {
                     let obj = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
                     let idxv = lower_expr_free(b, locals, fields, next_field, index, lowering_ctx)?;
 
@@ -3435,7 +3468,7 @@ fn lower_expr_free<'m>(
                 }
 
                 // x = rv          (local write, with capture boxing support)
-                LValue::Ident(name) => {
+                LValueKind::Ident(name) => {
                     #[cfg(debug_assertions)]
                     {
                         eprintln!("lower_expr_free() LValue::Ident({})", name);
@@ -3535,10 +3568,12 @@ fn lower_expr_free<'m>(
         }
 
         // obj.<propKey>  where propKey is an identifier or string
-        Expr::GetProp { recv, name } => {
+        ExprKind::GetProp { recv, name } => {
             // Static class method read: Class.static → closure with null env
-            if let Expr::Ident(cn) = &**recv {
-                if let Some(&mfid) = lowering_ctx.funcs.get(&format!("__static_{}_{}", cn, name)) {
+            if let ExprKind::Ident(cn) = recv.kind() {
+                if let Some(&mfid) =
+                    lowering_ctx.funcs.get(&format!("__static_{}_{}", cn, name))
+                {
                     let (_nid, env_null) =
                         b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
                     let (_nid, clos) = b.push_node(
@@ -3771,7 +3806,7 @@ fn lower_expr_free<'m>(
         }
 
         // obj.<propKey> = value   (identifier or string propKey)
-        Expr::SetPropObj { obj, key, value } => {
+        ExprKind::SetPropObj { obj, key, value } => {
             let o = lower_expr_free(b, locals, fields, next_field, obj, lowering_ctx)?;
             let v = lower_expr_free(b, locals, fields, next_field, value, lowering_ctx)?;
             let field_name = match key {
@@ -3919,10 +3954,10 @@ fn lower_expr_free<'m>(
         }
 
         // Calls / builtins
-        Expr::Call { callee, args } => {
+        ExprKind::Call { callee, args } => {
             // --- Bracket-literal method call: o["m"](... ) -> inject receiver as first arg ---
-            if let Expr::Index { recv, index } = &**callee {
-                if matches!(&**index, Expr::Str(_)) {
+            if let ExprKind::Index { recv, index } = callee.kind() {
+                if matches!(index.kind(), ExprKind::Str(_)) {
                     let this_v =
                         lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
                     let fun_v =
@@ -3954,18 +3989,7 @@ fn lower_expr_free<'m>(
             }
 
             // --- Property-call fast paths ---
-            if let Expr::GetProp { recv, name } = &**callee {
-                if let Expr::Ident(name) = &**callee {
-                    if name == "import" {
-                        if args.len() != 1 {
-                            return Err(LowerError::NotLowerable("import(spec) expects 1 arg"));
-                        }
-                        let spec =
-                            lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
-                        let v = b.import_dynamic(spec);
-                        return Ok(v);
-                    }
-                }
+            if let ExprKind::GetProp { recv, name } = callee.kind() {
 
                 // 0a) Promise-style instance methods
                 if name == "then" {
@@ -4063,7 +4087,7 @@ fn lower_expr_free<'m>(
                 }
 
                 // 0b) http.* helpers — IMPORTANT: this branch does NOT lower `recv`
-                if let Expr::Ident(obj) = &**recv {
+                if let ExprKind::Ident(obj) = recv.kind() {
                     if obj == "http" {
                         match name.as_str() {
                             "startStream" => {
@@ -4193,7 +4217,7 @@ fn lower_expr_free<'m>(
                 }
 
                 // 0c) STATIC CLASS METHODS — check BEFORE anything that would lower `recv`
-                if let Expr::Ident(cn) = &**recv {
+                if let ExprKind::Ident(cn) = recv.kind() {
                     if let Some(&fid) = lowering_ctx.funcs.get(&format!("__static_{}_{}", cn, name))
                     {
                         #[cfg(debug_assertions)]
@@ -4255,7 +4279,7 @@ fn lower_expr_free<'m>(
                 }
 
                 // 0e) Generic property call: Distinguish between static and instance calls.
-                let is_static_call = if let Expr::Ident(id_name) = &**recv {
+                let is_static_call = if let ExprKind::Ident(id_name) = recv.kind() {
                     // This is now valid! We use the passed-in context.
                     lowering_ctx.is_class_ident(id_name)
                 } else {
@@ -4307,9 +4331,9 @@ fn lower_expr_free<'m>(
             // - If recv is a class ident and key is a string matching a static, direct-call it.
             // - Else, if key is a string at runtime, inject `this`.
             // - Otherwise treat as array[index] function call (no `this`).
-            if let Expr::Index { recv, index } = &**callee {
+            if let ExprKind::Index { recv, index } = callee.kind() {
                 // Static: Class["M"](...)
-                if let (Expr::Ident(cn), Expr::Str(m)) = (&**recv, &**index) {
+                if let (ExprKind::Ident(cn), ExprKind::Str(m)) = (recv.kind(), index.kind()) {
                     if let Some(&fid) = lowering_ctx.funcs.get(&format!("__static_{}_{}", cn, m)) {
                         let mut argv = Vec::with_capacity(args.len());
                         for a in args {
@@ -4429,7 +4453,7 @@ fn lower_expr_free<'m>(
             }
 
             // --- Bare identifier callee & other cases ---
-            if let Expr::Ident(name) = &**callee {
+            if let ExprKind::Ident(name) = callee.kind() {
                 // Timers
                 if name == "setTimeout" {
                     if args.len() != 2 {
@@ -4727,7 +4751,7 @@ fn lower_expr_free<'m>(
 
                     // Fast string-literal path
                     // Fast path for string literals: avoid allocation/inspection.
-                    if matches!(args[0], Expr::Str(_)) {
+                    if matches!(args[0].kind(), ExprKind::Str(_)) {
                         let v =
                             lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
                         let (_nid, res) = b.push_node(
@@ -4813,7 +4837,7 @@ fn lower_expr_free<'m>(
             Ok(res[0])
         }
 
-        Expr::This => {
+        ExprKind::This => {
             if let Some(&v) = locals.get("this") {
                 Ok(v)
             } else {
@@ -4821,18 +4845,18 @@ fn lower_expr_free<'m>(
             }
         }
 
-        Expr::SuperProp(_) => {
+        ExprKind::SuperProp(_) => {
             return Err(LowerError::NotLowerable(
                 "`super.prop` is only valid when called: use `super.prop(...)`",
             ));
         }
-        Expr::SuperCall(_) => {
+        ExprKind::SuperCall(_) => {
             return Err(LowerError::NotLowerable(
                 "`super(...)` is only valid in a derived constructor",
             ));
         }
 
-        Expr::New { class, args } => {
+        ExprKind::New { class, args } => {
             #[cfg(debug_assertions)]
             {
                 eprintln!(
@@ -4899,7 +4923,7 @@ fn lower_expr_free<'m>(
 
             #[cfg(debug_assertions)]
             {
-                eprintln!("lower_expr_free() Expr::Call(...) Expr::New({})", class);
+                eprintln!("lower_expr_free() ExprKind::Call(...) ExprKind::New({})", class);
                 eprintln!(
                     "[links] exports        : {:?}",
                     lowering_ctx
@@ -4992,10 +5016,10 @@ fn lower_expr_free<'m>(
             return Err(LowerError::UnknownFunc(fname));
         }
 
-        Expr::Index { recv, index } => {
+        ExprKind::Index { recv, index } => {
             // Path A: The index is a compile-time string literal, e.g., obj["key"].
             // This is the most common case for object property access and can be optimized.
-            if let Expr::Str(s) = &**index {
+            if let ExprKind::Str(s) = index.kind() {
                 // Your existing, correct logic for this case is perfect.
                 let obj = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
                 let value = lower_general_getprop(b, obj, s, fields, next_field);
@@ -5105,7 +5129,7 @@ fn lower_expr_free<'m>(
             Ok(result_phi)
         }
 
-        Expr::ArrayLit(elems) => {
+        ExprKind::ArrayLit(elems) => {
             // Allocate array
             let len_v = b.const_i32(elems.len() as i32);
             let (_nid_new, new_res) = b.push_node(
@@ -5144,7 +5168,7 @@ fn lower_expr_free<'m>(
         }
 
         // Closure creation from hoisted lambda
-        Expr::FnRef { name } => {
+        ExprKind::FnRef { name } => {
             let fid = *lowering_ctx
                 .funcs
                 .get(name)
@@ -5231,7 +5255,7 @@ fn lower_expr_free<'m>(
             Ok(clos[0])
         }
 
-        Expr::ObjLit(items) => {
+        ExprKind::ObjLit(items) => {
             // obj = wir_obj_new()
             let (_nid, obj_res) = b.push_node(
                 Inst::CallNative {
@@ -5314,7 +5338,7 @@ fn lower_expr_free<'m>(
             Ok(obj)
         }
 
-        Expr::DeleteProp { obj, key } => {
+        ExprKind::DeleteProp { obj, key } => {
             let o = lower_expr_free(b, locals, fields, next_field, obj, lowering_ctx)?;
 
             match key {
@@ -5411,12 +5435,12 @@ fn lower_expr_free<'m>(
             }
         }
 
-        Expr::In { key, obj } => {
+        ExprKind::In { key, obj } => {
             let o = lower_expr_free(b, locals, fields, next_field, obj, lowering_ctx)?;
 
-            match &**key {
+            match key.kind() {
                 // identifier key:  a in o
-                Expr::Ident(name) => {
+                ExprKind::Ident(name) => {
                     let field = intern_field_local(fields, next_field, name);
                     let fid_smi = b.const_i32(field.0 as i32);
 
@@ -5468,7 +5492,7 @@ fn lower_expr_free<'m>(
                 }
 
                 // string-literal key:  "a" in o
-                Expr::Str(s) => {
+                ExprKind::Str(s) => {
                     let field = intern_field_local(fields, next_field, s);
                     let fid_smi = b.const_i32(field.0 as i32);
 
@@ -5509,7 +5533,7 @@ fn lower_expr_free<'m>(
             }
         }
 
-        Expr::CreateBuiltin { kind, args } => match kind {
+        ExprKind::CreateBuiltin { kind, args } => match kind {
             crate::front::BuiltinType::Map => {
                 if !args.is_empty() {
                     return Err(LowerError::NotLowerable(
@@ -5573,7 +5597,7 @@ fn lower_expr_free<'m>(
             }
         },
 
-        Expr::CallBuiltinMapMethod { recv, method, args } => {
+        ExprKind::CallBuiltinMapMethod { recv, method, args } => {
             let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
 
             // The AST gives us the exact method. No string matching, no runtime checks.
@@ -5620,7 +5644,7 @@ fn lower_expr_free<'m>(
             }
         }
 
-        Expr::CallBuiltinSetMethod { recv, method, args } => {
+        ExprKind::CallBuiltinSetMethod { recv, method, args } => {
             let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
 
             let (native_name, is_chainable) = match method {
@@ -5659,7 +5683,7 @@ fn lower_expr_free<'m>(
             if is_chainable { Ok(recv_v) } else { Ok(res[0]) }
         }
 
-        Expr::CallBuiltinCommonMethod { recv, method } => {
+        ExprKind::CallBuiltinCommonMethod { recv, method } => {
             let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
             let native_name = match method {
                 crate::front::BuiltinCommonMethod::Keys => "wir_builtin_keys",
@@ -5680,7 +5704,7 @@ fn lower_expr_free<'m>(
             Ok(res[0])
         }
 
-        Expr::GetBuiltinSize(recv) => {
+        ExprKind::GetBuiltinSize(recv) => {
             let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
             let (_nid, res) = b.push_node(
                 Inst::CallNative {
@@ -5759,7 +5783,7 @@ impl<'m> Lowerer<'m> {
             }
             #[cfg(debug_assertions)]
             eprintln!(
-                "[modinit] export {:?}: no es func/clase local (vars se materializan via Stmt::Var en __toplevel__)",
+                "[modinit] export {:?}: no es func/clase local (vars se materializan via StmtKind::Var en __toplevel__)",
                 name
             );
         }
@@ -6107,59 +6131,86 @@ impl<'m> Lowerer<'m> {
             }
         }
         fn rw_stmt<F: Fn(&Expr) -> Expr + Copy>(s: &Stmt, f: F) -> Stmt {
-            match s {
-                Stmt::Var { name, init } => Stmt::Var {
-                    name: name.clone(),
-                    init: init.as_ref().map(|e| rw_expr(e, f)),
-                },
-                Stmt::VarDestruct { pattern, init } => Stmt::VarDestruct {
-                    pattern: pattern.clone(),
-                    init: rw_expr(init, f),
-                },
-                Stmt::If {
+            match s.kind() {
+                StmtKind::Var { name, init } => stmt_with_meta(
+                    s,
+                    StmtKind::Var {
+                        name: name.clone(),
+                        init: init.as_ref().map(|e| rw_expr(e, f)),
+                    },
+                ),
+                StmtKind::VarDestruct { pattern, init } => stmt_with_meta(
+                    s,
+                    StmtKind::VarDestruct {
+                        pattern: pattern.clone(),
+                        init: rw_expr(init, f),
+                    },
+                ),
+                StmtKind::If {
                     cond,
                     then_b,
                     else_b,
-                } => Stmt::If {
-                    cond: rw_expr(cond, f),
-                    then_b: rw_block(then_b, f),
-                    else_b: else_b.as_ref().map(|b| rw_block(b, f)),
-                },
-                Stmt::While { cond, body } => Stmt::While {
-                    cond: rw_expr(cond, f),
-                    body: rw_block(body, f),
-                },
-                Stmt::For {
+                } => stmt_with_meta(
+                    s,
+                    StmtKind::If {
+                        cond: rw_expr(cond, f),
+                        then_b: rw_block(then_b, f),
+                        else_b: else_b.as_ref().map(|b| rw_block(b, f)),
+                    },
+                ),
+                StmtKind::While { cond, body } => stmt_with_meta(
+                    s,
+                    StmtKind::While {
+                        cond: rw_expr(cond, f),
+                        body: rw_block(body, f),
+                    },
+                ),
+                StmtKind::For {
                     init,
                     cond,
                     step,
                     body,
-                } => Stmt::For {
-                    init: init.as_deref().map(|i| SmallBox::new(rw_stmt(i, f))),
-                    cond: cond.as_ref().map(|e| rw_expr(e, f)),
-                    step: step.as_ref().map(|e| rw_expr(e, f)),
-                    body: rw_block(body, f),
-                },
-                Stmt::Try {
+                } => stmt_with_meta(
+                    s,
+                    StmtKind::For {
+                        init: init.as_deref().map(|i| SmallBox::new(rw_stmt(i, f))),
+                        cond: cond.as_ref().map(|e| rw_expr(e, f)),
+                        step: step.as_ref().map(|e| rw_expr(e, f)),
+                        body: rw_block(body, f),
+                    },
+                ),
+                StmtKind::Try {
                     try_block,
                     catch,
                     finally_block,
-                } => Stmt::Try {
-                    try_block: rw_block(try_block, f),
-                    catch: catch.as_ref().map(|clause| CatchClause {
-                        binding: clause.binding.clone(),
-                        body: rw_block(&clause.body, f),
-                    }),
-                    finally_block: finally_block.as_ref().map(|blk| rw_block(blk, f)),
-                },
-                Stmt::Throw(expr) => Stmt::Throw(rw_expr(expr, f)),
-                Stmt::Defer { kind, expr } => Stmt::Defer {
-                    kind: *kind,
-                    expr: rw_expr(expr, f),
-                },
-                Stmt::Return(e) => Stmt::Return(e.as_ref().map(|x| rw_expr(x, f))),
-                Stmt::Expr(e) => Stmt::Expr(rw_expr(e, f)),
-                Stmt::Listen(ld) => {
+                } => stmt_with_meta(
+                    s,
+                    StmtKind::Try {
+                        try_block: rw_block(try_block, f),
+                        catch: catch.as_ref().map(|clause| CatchClause {
+                            binding: clause.binding.clone(),
+                            body: rw_block(&clause.body, f),
+                        }),
+                        finally_block: finally_block.as_ref().map(|blk| rw_block(blk, f)),
+                    },
+                ),
+                StmtKind::Throw(expr) => stmt_with_meta(
+                    s,
+                    StmtKind::Throw(rw_expr(expr, f)),
+                ),
+                StmtKind::Defer { kind, expr } => stmt_with_meta(
+                    s,
+                    StmtKind::Defer {
+                        kind: *kind,
+                        expr: rw_expr(expr, f),
+                    },
+                ),
+                StmtKind::Return(e) => stmt_with_meta(
+                    s,
+                    StmtKind::Return(e.as_ref().map(|x| rw_expr(x, f))),
+                ),
+                StmtKind::Expr(e) => stmt_with_meta(s, StmtKind::Expr(rw_expr(e, f))),
+                StmtKind::Listen(ld) => {
                     let routes = ld
                         .routes
                         .iter()
@@ -6169,84 +6220,139 @@ impl<'m> Lowerer<'m> {
                             handler: rw_expr(&r.handler, f),
                         })
                         .collect();
-                    Stmt::Listen(ListenDecl {
-                        addr: ld.addr.clone(),
-                        routes,
-                    })
+                    stmt_with_meta(
+                        s,
+                        StmtKind::Listen(ListenDecl {
+                            addr: ld.addr.clone(),
+                            routes,
+                        }),
+                    )
                 }
             }
         }
         fn rw_expr<F: Fn(&Expr) -> Expr + Copy>(e: &Expr, f: F) -> Expr {
-            use Expr::*;
             let m = f(e);
-            if !std::mem::discriminant(&m).eq(&std::mem::discriminant(e)) {
-                // f() replaced the node entirely (e.g. super-rewrite) – don’t recurse
+            if std::mem::discriminant(m.kind()) != std::mem::discriminant(e.kind()) {
                 return m;
             }
-            match m {
-                Assign(ref lv, ref rhs) => Expr::Assign(lv.clone(), SmallBox::new(rw_expr(rhs, f))),
-                Binary { op, ref a, ref b } => Expr::Binary {
-                    op,
-                    a: SmallBox::new(rw_expr(a, f)),
-                    b: SmallBox::new(rw_expr(b, f)),
-                },
-                Unary { op, ref e } => Expr::Unary {
-                    op,
-                    e: SmallBox::new(rw_expr(e, f)),
-                },
-                Call {
-                    ref callee,
-                    ref args,
-                } => Expr::Call {
-                    callee: SmallBox::new(rw_expr(callee, f)),
-                    args: args.iter().map(|x| rw_expr(x, f)).collect(),
-                },
-                GetProp { ref recv, ref name } => Expr::GetProp {
-                    recv: SmallBox::new(rw_expr(recv, f)),
-                    name: name.clone(),
-                },
-                Index {
-                    ref recv,
-                    ref index,
-                } => Expr::Index {
-                    recv: SmallBox::new(rw_expr(recv, f)),
-                    index: SmallBox::new(rw_expr(index, f)),
-                },
-                Group(ref g) => Expr::Group(SmallBox::new(rw_expr(g, f))),
-                ArrayLit(ref es) => Expr::ArrayLit(es.iter().map(|x| rw_expr(x, f)).collect()),
-                ObjLit(ref items) => Expr::ObjLit(
-                    items
-                        .iter()
-                        .map(|item| match item {
-                            ObjItem::Prop(k, v) => ObjItem::Prop(k.clone(), rw_expr(v, f)),
-                            ObjItem::Spread(expr) => ObjItem::Spread(rw_expr(expr, f)),
-                        })
-                        .collect(),
+
+            match m.kind() {
+                ExprKind::Assign(lv, rhs) => expr_with_meta(
+                    &m,
+                    ExprKind::Assign(
+                        SmallBox::new(rw_lvalue(lv, f)),
+                        SmallBox::new(rw_expr(rhs, f)),
+                    ),
                 ),
-                GetPropObj { ref obj, ref key } => Expr::GetPropObj {
-                    obj: SmallBox::new(rw_expr(obj, f)),
-                    key: key.clone(),
-                },
-                SetPropObj {
-                    ref obj,
-                    ref key,
-                    ref value,
-                } => Expr::SetPropObj {
-                    obj: SmallBox::new(rw_expr(obj, f)),
-                    key: key.clone(),
-                    value: SmallBox::new(rw_expr(value, f)),
-                },
-                In { ref key, ref obj } => Expr::In {
-                    key: SmallBox::new(rw_expr(key, f)),
-                    obj: SmallBox::new(rw_expr(obj, f)),
-                },
-                DeleteProp { ref obj, ref key } => Expr::DeleteProp {
-                    obj: SmallBox::new(rw_expr(obj, f)),
-                    key: key.clone(),
-                },
-                Await(ref inner) => Expr::Await(SmallBox::new(rw_expr(inner, f))),
-                // terminals and simple refs
+                ExprKind::Binary { op, a, b } => expr_with_meta(
+                    &m,
+                    ExprKind::Binary {
+                        op: *op,
+                        a: SmallBox::new(rw_expr(a, f)),
+                        b: SmallBox::new(rw_expr(b, f)),
+                    },
+                ),
+                ExprKind::Unary { op, e: inner } => expr_with_meta(
+                    &m,
+                    ExprKind::Unary {
+                        op: *op,
+                        e: SmallBox::new(rw_expr(inner, f)),
+                    },
+                ),
+                ExprKind::Call { callee, args } => expr_with_meta(
+                    &m,
+                    ExprKind::Call {
+                        callee: SmallBox::new(rw_expr(callee, f)),
+                        args: args.iter().map(|x| rw_expr(x, f)).collect(),
+                    },
+                ),
+                ExprKind::GetProp { recv, name } => expr_with_meta(
+                    &m,
+                    ExprKind::GetProp {
+                        recv: SmallBox::new(rw_expr(recv, f)),
+                        name: name.clone(),
+                    },
+                ),
+                ExprKind::Index { recv, index } => expr_with_meta(
+                    &m,
+                    ExprKind::Index {
+                        recv: SmallBox::new(rw_expr(recv, f)),
+                        index: SmallBox::new(rw_expr(index, f)),
+                    },
+                ),
+                ExprKind::Group(inner) => expr_with_meta(
+                    &m,
+                    ExprKind::Group(SmallBox::new(rw_expr(inner, f))),
+                ),
+                ExprKind::ArrayLit(items) => expr_with_meta(
+                    &m,
+                    ExprKind::ArrayLit(items.iter().map(|x| rw_expr(x, f)).collect()),
+                ),
+                ExprKind::ObjLit(list) => expr_with_meta(
+                    &m,
+                    ExprKind::ObjLit(
+                        list.iter()
+                            .map(|item| match item {
+                                ObjItem::Prop(k, v) => ObjItem::Prop(k.clone(), rw_expr(v, f)),
+                                ObjItem::Spread(expr) => ObjItem::Spread(rw_expr(expr, f)),
+                            })
+                            .collect(),
+                    ),
+                ),
+                ExprKind::GetPropObj { obj, key } => expr_with_meta(
+                    &m,
+                    ExprKind::GetPropObj {
+                        obj: SmallBox::new(rw_expr(obj, f)),
+                        key: key.clone(),
+                    },
+                ),
+                ExprKind::SetPropObj { obj, key, value } => expr_with_meta(
+                    &m,
+                    ExprKind::SetPropObj {
+                        obj: SmallBox::new(rw_expr(obj, f)),
+                        key: key.clone(),
+                        value: SmallBox::new(rw_expr(value, f)),
+                    },
+                ),
+                ExprKind::In { key, obj } => expr_with_meta(
+                    &m,
+                    ExprKind::In {
+                        key: SmallBox::new(rw_expr(key, f)),
+                        obj: SmallBox::new(rw_expr(obj, f)),
+                    },
+                ),
+                ExprKind::DeleteProp { obj, key } => expr_with_meta(
+                    &m,
+                    ExprKind::DeleteProp {
+                        obj: SmallBox::new(rw_expr(obj, f)),
+                        key: key.clone(),
+                    },
+                ),
+                ExprKind::Await(inner) => expr_with_meta(
+                    &m,
+                    ExprKind::Await(SmallBox::new(rw_expr(inner, f))),
+                ),
                 _ => m,
+            }
+        }
+
+        fn rw_lvalue<F: Fn(&Expr) -> Expr + Copy>(lv: &LValue, f: F) -> LValue {
+            match lv.kind() {
+                LValueKind::GetProp { recv, name } => lvalue_with_meta(
+                    lv,
+                    LValueKind::GetProp {
+                        recv: rw_expr(recv, f),
+                        name: name.clone(),
+                    },
+                ),
+                LValueKind::Index { recv, index } => lvalue_with_meta(
+                    lv,
+                    LValueKind::Index {
+                        recv: rw_expr(recv, f),
+                        index: rw_expr(index, f),
+                    },
+                ),
+                _ => lv.clone(),
             }
         }
 
@@ -6254,36 +6360,39 @@ impl<'m> Lowerer<'m> {
         let class_name = class_name.to_string();
 
         let f = |e: &Expr| -> Expr {
-            match e {
+            match e.kind() {
                 // super(args...)  →  __ctor_Base(this, args...)  (only if there *is* a base)
-                Expr::SuperCall(args) => {
+                ExprKind::SuperCall(args) => {
                     if let Some(ref base) = base_opt {
                         let mut new_args = Vec::with_capacity(args.len() + 1);
-                        new_args.push(Expr::This);
+                        new_args.push(expr_unknown(ExprKind::This));
                         new_args.extend(args.iter().cloned());
-                        Expr::Call {
-                            callee: SmallBox::new(Expr::Ident(format!("__ctor_{}", base))),
+                        expr_unknown(ExprKind::Call {
+                            callee: SmallBox::new(expr_unknown(ExprKind::Ident(format!(
+                                "__ctor_{}",
+                                base
+                            )))),
                             args: new_args,
-                        }
+                        })
                     } else {
                         e.clone() // leave for lowerer to complain
                     }
                 }
 
                 // (super.m)(args...)  →  __method_Base_m(this, args...)  (only if base exists)
-                Expr::Call { callee, args } => {
-                    if let Expr::SuperProp(m) = &**callee {
+                ExprKind::Call { callee, args } => {
+                    if let ExprKind::SuperProp(m) = callee.kind() {
                         if let Some(ref base) = base_opt {
                             let mut new_args = Vec::with_capacity(args.len() + 1);
-                            new_args.push(Expr::This);
+                            new_args.push(expr_unknown(ExprKind::This));
                             new_args.extend(args.iter().cloned());
-                            Expr::Call {
-                                callee: SmallBox::new(Expr::Ident(format!(
+                            expr_unknown(ExprKind::Call {
+                                callee: SmallBox::new(expr_unknown(ExprKind::Ident(format!(
                                     "__method_{}_{}",
                                     base, m
-                                ))),
+                                )))),
                                 args: new_args,
-                            }
+                            })
                         } else {
                             e.clone()
                         }
@@ -6293,7 +6402,7 @@ impl<'m> Lowerer<'m> {
                 }
 
                 // Value-position super.m stays as-is so the lowerer raises your existing error.
-                Expr::SuperProp(_) => e.clone(),
+                ExprKind::SuperProp(_) => e.clone(),
 
                 _ => e.clone(),
             }

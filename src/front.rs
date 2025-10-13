@@ -17,6 +17,7 @@ use crate::wir::{
     AccessorInfo, BindingId, Builder, Constant, FieldId, FuncId, Inst, IntBinOp, MethodInfo,
     Module, Type, ValueId, next_id,
 };
+use crate::diag::{Meta, Node};
 
 /// -------------------------
 /// LEXER (Logos)
@@ -422,7 +423,7 @@ pub enum BuiltinCommonMethod {
 }
 
 #[derive(Debug, Clone)]
-pub enum Stmt {
+pub enum StmtKind {
     Var {
         name: String,
         init: Option<Expr>,
@@ -461,8 +462,10 @@ pub enum Stmt {
     Listen(ListenDecl),
 }
 
+pub type Stmt = Node<StmtKind>;
+
 #[derive(Debug, Clone)]
-pub enum Expr {
+pub enum ExprKind {
     LitInt(i32),
     LitF64(f64),
     LitBool(bool),
@@ -572,6 +575,59 @@ pub enum Expr {
     GetBuiltinSize(SmallBox<Expr, u8>),
 }
 
+pub type Expr = Node<ExprKind>;
+
+#[inline]
+fn stmt_unknown(kind: StmtKind) -> Stmt {
+    Node::unknown(kind)
+}
+
+#[inline]
+fn expr_unknown(kind: ExprKind) -> Expr {
+    Node::unknown(kind)
+}
+
+#[inline]
+fn lvalue_unknown(kind: LValueKind) -> LValue {
+    Node::unknown(kind)
+}
+
+macro_rules! stmt {
+    ($variant:ident { $($inner:tt)* }) => {
+        stmt_unknown(StmtKind::$variant { $($inner)* })
+    };
+    ($variant:ident ( $($inner:expr),* $(,)? )) => {
+        stmt_unknown(StmtKind::$variant($($inner),*))
+    };
+    ($variant:ident) => {
+        stmt_unknown(StmtKind::$variant)
+    };
+}
+
+macro_rules! expr {
+    ($variant:ident { $($inner:tt)* }) => {
+        expr_unknown(ExprKind::$variant { $($inner)* })
+    };
+    ($variant:ident ( $($inner:expr),* $(,)? )) => {
+        expr_unknown(ExprKind::$variant($($inner),*))
+    };
+    ($variant:ident) => {
+        expr_unknown(ExprKind::$variant)
+    };
+}
+
+macro_rules! lvalue {
+    ($variant:ident { $($inner:tt)* }) => {
+        lvalue_unknown(LValueKind::$variant { $($inner)* })
+    };
+    ($variant:ident ( $($inner:expr),* $(,)? )) => {
+        lvalue_unknown(LValueKind::$variant($($inner),*))
+    };
+    ($variant:ident) => {
+        lvalue_unknown(LValueKind::$variant)
+    };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Visibility {
     Public,
@@ -593,11 +649,13 @@ pub enum NewTarget {
 }
 
 #[derive(Debug, Clone)]
-pub enum LValue {
+pub enum LValueKind {
     Ident(String),
     GetProp { recv: Expr, name: String },
     Index { recv: Expr, index: Expr },
 }
+
+pub type LValue = Node<LValueKind>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
@@ -1560,10 +1618,10 @@ impl<'src> Parser<'src> {
                 None
             };
             self.expect(Tok::Semi, "expected ';' after export var/let/const")?;
-            toplevel.push(Stmt::Var {
+            toplevel.push(stmt_unknown(StmtKind::Var {
                 name: name.clone(),
                 init,
-            });
+            }));
             self.record_export(&name);
             exports.push(ExportDecl::Var(name));
             return Ok(());
@@ -1787,7 +1845,9 @@ impl<'src> Parser<'src> {
         // Allow empty statements (`;`) anywhere a statement is expected
         // (including top level). Treat as a no-op expression stmt.
         if self.matches(&Tok::Semi) {
-            return Ok(Stmt::Expr(Expr::LitInt(0)));
+            return Ok(stmt_unknown(StmtKind::Expr(expr_unknown(
+                ExprKind::LitInt(0),
+            ))));
         }
 
         if self.check_ident("listen") {
@@ -1805,7 +1865,7 @@ impl<'src> Parser<'src> {
                 )?;
                 let init = self.expr()?;
                 self.expect(Tok::Semi, "expected ';' after destructuring declaration")?;
-                return Ok(Stmt::VarDestruct { pattern, init });
+                return Ok(stmt_unknown(StmtKind::VarDestruct { pattern, init }));
             }
 
             let t = self.next()?;
@@ -1827,7 +1887,7 @@ impl<'src> Parser<'src> {
                 None
             };
             self.expect(Tok::Semi, "expected ';' after variable declaration")?;
-            Ok(Stmt::Var { name, init })
+            Ok(stmt_unknown(StmtKind::Var { name, init }))
         } else if self.matches(&Tok::If) {
             self.expect(Tok::LParen, "expected '(' after 'if'")?;
             let cond = self.expr()?;
@@ -1853,10 +1913,11 @@ impl<'src> Parser<'src> {
                     let mut cond2 = self.expr()?;
                     self.expect(Tok::RParen, "expected ')' after condition")?;
                     if negated {
-                        cond2 = Expr::Unary {
+                        let prev = cond2;
+                        cond2 = expr_unknown(ExprKind::Unary {
                             op: UnOp::Not,
-                            e: SmallBox::new(cond2),
-                        };
+                            e: SmallBox::new(prev),
+                        });
                     }
                     let then2 = self.block()?;
 
@@ -1869,11 +1930,11 @@ impl<'src> Parser<'src> {
 
                     // Desugar into: else { if (cond2) then2 else tail_else }
                     Some(Block {
-                        stmts: vec![Stmt::If {
+                        stmts: vec![stmt_unknown(StmtKind::If {
                             cond: cond2,
                             then_b: then2,
                             else_b: tail_else,
-                        }],
+                        })],
                     })
                 } else {
                     // Plain "else { … }"
@@ -1883,20 +1944,20 @@ impl<'src> Parser<'src> {
                 None
             };
 
-            Ok(Stmt::If {
+            Ok(stmt_unknown(StmtKind::If {
                 cond,
                 then_b,
                 else_b,
-            })
+            }))
         } else if self.matches(&Tok::Unless) {
             // unless (cond) { then } [ else { ... } | else if (...) { ... } | else unless (...) { ... } ]
             self.expect(Tok::LParen, "expected '(' after 'unless'")?;
             let cond0 = self.expr()?;
             self.expect(Tok::RParen, "expected ')' after 'unless' condition")?;
-            let cond = Expr::Unary {
+            let cond = expr_unknown(ExprKind::Unary {
                 op: UnOp::Not,
                 e: SmallBox::new(cond0),
-            };
+            });
             let then_b = self.block()?;
 
             // else { … } | else if (…) { … } | else unless (…) { … }
@@ -1911,10 +1972,11 @@ impl<'src> Parser<'src> {
                     let mut cond2 = self.expr()?;
                     self.expect(Tok::RParen, "expected ')' after condition")?;
                     if was_unless {
-                        cond2 = Expr::Unary {
+                        let prev = cond2;
+                        cond2 = expr_unknown(ExprKind::Unary {
                             op: UnOp::Not,
-                            e: SmallBox::new(cond2),
-                        };
+                            e: SmallBox::new(prev),
+                        });
                     }
                     let then2 = self.block()?;
 
@@ -1927,11 +1989,11 @@ impl<'src> Parser<'src> {
 
                     // Desugar into: else { if (cond2) then2 else tail_else }
                     Some(Block {
-                        stmts: vec![Stmt::If {
+                        stmts: vec![stmt_unknown(StmtKind::If {
                             cond: cond2,
                             then_b: then2,
                             else_b: tail_else,
-                        }],
+                        })],
                     })
                 } else {
                     // Plain "else { … }"
@@ -1941,17 +2003,17 @@ impl<'src> Parser<'src> {
                 None
             };
 
-            Ok(Stmt::If {
+            Ok(stmt_unknown(StmtKind::If {
                 cond,
                 then_b,
                 else_b,
-            })
+            }))
         } else if self.matches(&Tok::While) {
             self.expect(Tok::LParen, "expected '(' after 'while'")?;
             let cond = self.expr()?;
             self.expect(Tok::RParen, "expected ')' after 'while' condition")?;
             let body = self.block()?;
-            Ok(Stmt::While { cond, body })
+            Ok(stmt_unknown(StmtKind::While { cond, body }))
         } else if self.matches(&Tok::For) {
             self.expect(Tok::LParen, "expected '(' after 'for'")?;
             let init = if self.matches(&Tok::Semi) {
@@ -1964,10 +2026,10 @@ impl<'src> Parser<'src> {
                     self.expect(Tok::Eq, "destructuring initializer required in for loop")?;
                     let init_expr = self.expr()?;
                     self.expect(Tok::Semi, "expected ';' after for init")?;
-                    Some(SmallBox::new(Stmt::VarDestruct {
+                    Some(SmallBox::new(stmt_unknown(StmtKind::VarDestruct {
                         pattern,
                         init: init_expr,
-                    }))
+                    })))
                 } else {
                     let t = self.next()?;
                     let name = match t.tok {
@@ -1988,12 +2050,12 @@ impl<'src> Parser<'src> {
                         None
                     };
                     self.expect(Tok::Semi, "expected ';' after for init")?;
-                    Some(SmallBox::new(Stmt::Var { name, init: init_e }))
+                    Some(SmallBox::new(stmt_unknown(StmtKind::Var { name, init: init_e })))
                 }
             } else {
                 let e = self.expr()?;
                 self.expect(Tok::Semi, "expected ';' after for init")?;
-                Some(SmallBox::new(Stmt::Expr(e)))
+                Some(SmallBox::new(stmt_unknown(StmtKind::Expr(e))))
             };
             let cond = if self.matches(&Tok::Semi) {
                 None
@@ -2010,12 +2072,12 @@ impl<'src> Parser<'src> {
                 Some(e)
             };
             let body = self.block()?;
-            Ok(Stmt::For {
+            Ok(stmt_unknown(StmtKind::For {
                 init,
                 cond,
                 step,
                 body,
-            })
+            }))
         } else if self.matches(&Tok::Try) {
             let try_block = self.block()?;
 
@@ -2051,41 +2113,41 @@ impl<'src> Parser<'src> {
                 ));
             }
 
-            Ok(Stmt::Try {
+            Ok(stmt_unknown(StmtKind::Try {
                 try_block,
                 catch: catch_clause,
                 finally_block,
-            })
+            }))
         } else if self.matches(&Tok::Throw) {
             let value = self.expr()?;
             self.expect(Tok::Semi, "expected ';' after throw expression")?;
-            Ok(Stmt::Throw(value))
+            Ok(stmt_unknown(StmtKind::Throw(value)))
         } else if self.matches(&Tok::Defer) {
             let expr = self.expr()?;
             self.expect(Tok::Semi, "expected ';' after defer expression")?;
-            Ok(Stmt::Defer {
+            Ok(stmt_unknown(StmtKind::Defer {
                 kind: DeferKind::Defer,
                 expr,
-            })
+            }))
         } else if self.matches(&Tok::ErrDefer) {
             let expr = self.expr()?;
             self.expect(Tok::Semi, "expected ';' after errdefer expression")?;
-            Ok(Stmt::Defer {
+            Ok(stmt_unknown(StmtKind::Defer {
                 kind: DeferKind::ErrDefer,
                 expr,
-            })
+            }))
         } else if self.matches(&Tok::Return) {
             if self.matches(&Tok::Semi) {
-                Ok(Stmt::Return(None))
+                Ok(stmt_unknown(StmtKind::Return(None)))
             } else {
                 let e = self.expr()?;
                 self.expect(Tok::Semi, "expected ';' after return expression")?;
-                Ok(Stmt::Return(Some(e)))
+                Ok(stmt_unknown(StmtKind::Return(Some(e))))
             }
         } else {
             let e = self.expr()?;
             self.expect(Tok::Semi, "expected ';' after statement")?;
-            Ok(Stmt::Expr(e))
+            Ok(stmt_unknown(StmtKind::Expr(e)))
         }
     }
 
@@ -2153,18 +2215,28 @@ impl<'src> Parser<'src> {
 
         if let Some((kind, bop)) = op {
             // Turn `left` into an LValue
-            let lv = match left {
-                Expr::Ident(s) => LValue::Ident(s),
-                Expr::GetProp { recv, name } => {
-                    let recv_expr = (*recv).clone();         // or: recv.as_ref().clone()
-                    LValue::GetProp { recv: recv_expr, name }
+            let lv = match left.kind() {
+                ExprKind::Ident(s) => lvalue!(Ident(s.clone())),
+                ExprKind::GetProp { recv, name } => {
+                    let recv_expr = recv.deref().clone();
+                    lvalue!(GetProp {
+                        recv: recv_expr,
+                        name: name.clone(),
+                    })
                 }
-                Expr::Index { recv, index } => {
-                    let recv_expr  = (*recv).clone();
-                    let index_expr = (*index).clone();
-                    LValue::Index { recv: recv_expr, index: index_expr }
+                ExprKind::Index { recv, index } => {
+                    let recv_expr = recv.deref().clone();
+                    let index_expr = index.deref().clone();
+                    lvalue!(Index {
+                        recv: recv_expr,
+                        index: index_expr,
+                    })
                 }
-                _ => return Err(self.err_here("invalid left-hand side in assignment; expected identifier, property access, or index")),
+                _ => {
+                    return Err(self.err_here(
+                        "invalid left-hand side in assignment; expected identifier, property access, or index",
+                    ))
+                }
             };
 
             // Parse the RHS (right-associative)
@@ -2174,14 +2246,17 @@ impl<'src> Parser<'src> {
             let final_rhs = if kind == "Eq" {
                 rhs
             } else {
-                Expr::Binary {
+                expr!(Binary {
                     op: bop,
                     a: SmallBox::new(lvalue_to_expr(&lv)),
                     b: SmallBox::new(rhs),
-                }
+                })
             };
 
-            Ok(Expr::Assign(SmallBox::new(lv), SmallBox::new(final_rhs)))
+            Ok(expr!(Assign(
+                SmallBox::new(lv),
+                SmallBox::new(final_rhs)
+            )))
         } else {
             Ok(left)
         }
@@ -2193,11 +2268,11 @@ impl<'src> Parser<'src> {
             let then_branch = self.parse_assign()?;
             self.expect(Tok::Colon, "expected ':' in conditional expression")?;
             let else_branch = self.parse_assign()?;
-            Ok(Expr::Conditional {
+            Ok(expr!(Conditional {
                 cond: SmallBox::new(cond),
                 then_branch: SmallBox::new(then_branch),
                 else_branch: SmallBox::new(else_branch),
-            })
+            }))
         } else {
             Ok(cond)
         }
@@ -2207,10 +2282,10 @@ impl<'src> Parser<'src> {
         let mut e = self.parse_nullish()?;
         while self.matches(&Tok::PipeForward) {
             let rhs = self.parse_nullish()?;
-            e = Expr::Call {
+            e = expr!(Call {
                 callee: SmallBox::new(rhs),
                 args: vec![e],
-            };
+            });
         }
         Ok(e)
     }
@@ -2219,11 +2294,11 @@ impl<'src> Parser<'src> {
         let mut e = self.parse_or()?;
         while self.matches(&Tok::QuestionQuestion) {
             let rhs = self.parse_or()?;
-            e = Expr::Binary {
+            e = expr!(Binary {
                 op: BinOp::Nullish,
                 a: SmallBox::new(e),
                 b: SmallBox::new(rhs),
-            };
+            });
         }
         Ok(e)
     }
@@ -2232,11 +2307,11 @@ impl<'src> Parser<'src> {
         let mut e = self.parse_and()?;
         while self.matches(&Tok::OrOr) {
             let rhs = self.parse_and()?;
-            e = Expr::Binary {
+            e = expr!(Binary {
                 op: BinOp::Or,
                 a: SmallBox::new(e),
                 b: SmallBox::new(rhs),
-            };
+            });
         }
         Ok(e)
     }
@@ -2244,11 +2319,11 @@ impl<'src> Parser<'src> {
         let mut e = self.parse_eq()?;
         while self.matches(&Tok::AndAnd) {
             let rhs = self.parse_eq()?;
-            e = Expr::Binary {
+            e = expr!(Binary {
                 op: BinOp::And,
                 a: SmallBox::new(e),
                 b: SmallBox::new(rhs),
-            };
+            });
         }
         Ok(e)
     }
@@ -2257,18 +2332,18 @@ impl<'src> Parser<'src> {
         loop {
             if self.matches(&Tok::EqEq) {
                 let rhs = self.parse_cmp()?;
-                e = Expr::Binary {
+                e = expr!(Binary {
                     op: BinOp::Eq,
                     a: SmallBox::new(e),
                     b: SmallBox::new(rhs),
-                };
+                });
             } else if self.matches(&Tok::BangEq) {
                 let rhs = self.parse_cmp()?;
-                e = Expr::Binary {
+                e = expr!(Binary {
                     op: BinOp::Ne,
                     a: SmallBox::new(e),
                     b: SmallBox::new(rhs),
-                };
+                });
             } else {
                 break;
             }
@@ -2280,39 +2355,39 @@ impl<'src> Parser<'src> {
         loop {
             if self.matches(&Tok::Lt) {
                 let rhs = self.parse_term()?;
-                e = Expr::Binary {
+                e = expr!(Binary {
                     op: BinOp::Lt,
                     a: SmallBox::new(e),
                     b: SmallBox::new(rhs),
-                };
+                });
             } else if self.matches(&Tok::LtEq) {
                 let rhs = self.parse_term()?;
-                e = Expr::Binary {
+                e = expr!(Binary {
                     op: BinOp::Le,
                     a: SmallBox::new(e),
                     b: SmallBox::new(rhs),
-                };
+                });
             } else if self.matches(&Tok::Gt) {
                 let rhs = self.parse_term()?;
-                e = Expr::Binary {
+                e = expr!(Binary {
                     op: BinOp::Gt,
                     a: SmallBox::new(e),
                     b: SmallBox::new(rhs),
-                };
+                });
             } else if self.matches(&Tok::GtEq) {
                 let rhs = self.parse_term()?;
-                e = Expr::Binary {
+                e = expr!(Binary {
                     op: BinOp::Ge,
                     a: SmallBox::new(e),
                     b: SmallBox::new(rhs),
-                };
+                });
             } else if self.matches(&Tok::In) {
                 let rhs = self.parse_term()?;
                 // left "in" right → Expr::In { key: left, obj: right }
-                e = Expr::In {
+                e = expr!(In {
                     key: SmallBox::new(e),
                     obj: SmallBox::new(rhs),
-                };
+                });
             } else {
                 break;
             }
@@ -2324,13 +2399,13 @@ impl<'src> Parser<'src> {
         loop {
             if self.matches(&Tok::Shl) {
                 let rhs = self.parse_term()?;
-                e = Expr::Binary { op: BinOp::Shl, a: SmallBox::new(e), b: SmallBox::new(rhs) };
+                e = expr!(Binary { op: BinOp::Shl, a: SmallBox::new(e), b: SmallBox::new(rhs) });
             } else if self.matches(&Tok::Shr) {
                 let rhs = self.parse_term()?;
-                e = Expr::Binary { op: BinOp::Shr, a: SmallBox::new(e), b: SmallBox::new(rhs) };
+                e = expr!(Binary { op: BinOp::Shr, a: SmallBox::new(e), b: SmallBox::new(rhs) });
             } else if self.matches(&Tok::ShrU) { // + Add logic for `>>>`
                 let rhs = self.parse_term()?;    // +
-                e = Expr::Binary { op: BinOp::ShrU, a: SmallBox::new(e), b: SmallBox::new(rhs) }; // +
+                e = expr!(Binary { op: BinOp::ShrU, a: SmallBox::new(e), b: SmallBox::new(rhs) }); // +
             } else {
                 break;
             }
@@ -2342,25 +2417,25 @@ impl<'src> Parser<'src> {
         loop {
             if self.matches(&Tok::Plus) {
                 let rhs = self.parse_factor()?;
-                e = Expr::Binary {
+                e = expr!(Binary {
                     op: BinOp::Add,
                     a: SmallBox::new(e),
                     b: SmallBox::new(rhs),
-                };
+                });
             } else if self.matches(&Tok::Minus) {
                 let rhs = self.parse_factor()?;
-                e = Expr::Binary {
+                e = expr!(Binary {
                     op: BinOp::Sub,
                     a: SmallBox::new(e),
                     b: SmallBox::new(rhs),
-                };
+                });
             } else if self.matches(&Tok::StrConcat) {
                 let rhs = self.parse_factor()?;
-                e = Expr::Binary {
+                e = expr!(Binary {
                     op: BinOp::StrConcat,
                     a: SmallBox::new(e),
                     b: SmallBox::new(rhs),
-                };
+                });
             } else {
                 break;
             }
@@ -2372,25 +2447,25 @@ impl<'src> Parser<'src> {
         loop {
             if self.matches(&Tok::Star) {
                 let rhs = self.parse_unary()?;
-                e = Expr::Binary {
+                e = expr!(Binary {
                     op: BinOp::Mul,
                     a: SmallBox::new(e),
                     b: SmallBox::new(rhs),
-                };
+                });
             } else if self.matches(&Tok::Slash) {
                 let rhs = self.parse_unary()?;
-                e = Expr::Binary {
+                e = expr!(Binary {
                     op: BinOp::Div,
                     a: SmallBox::new(e),
                     b: SmallBox::new(rhs),
-                };
+                });
             } else if self.matches(&Tok::Percent) {
                 let rhs = self.parse_unary()?;
-                e = Expr::Binary {
+                e = expr!(Binary {
                     op: BinOp::Rem,
                     a: SmallBox::new(e),
                     b: SmallBox::new(rhs),
-                };
+                });
             } else {
                 break;
             }
@@ -2401,32 +2476,32 @@ impl<'src> Parser<'src> {
         if self.matches(&Tok::Await) {
             // await <unary>
             let e = self.parse_unary()?;
-            return Ok(Expr::Await(SmallBox::new(e)));
+            return Ok(expr!(Await(SmallBox::new(e))));
         }
         if self.matches(&Tok::Bang) {
             let e = self.parse_unary()?;
-            Ok(Expr::Unary {
+            Ok(expr!(Unary {
                 op: UnOp::Not,
                 e: SmallBox::new(e),
-            })
+            }))
         } else if self.matches(&Tok::Minus) {
             let e = self.parse_unary()?;
-            Ok(Expr::Unary {
+            Ok(expr!(Unary {
                 op: UnOp::Neg,
                 e: SmallBox::new(e),
-            })
+            }))
         }  else if self.matches(&Tok::BitwiseNot) {
             let e = self.parse_unary()?;
-            Ok(Expr::Unary {
+            Ok(expr!(Unary {
                 op: UnOp::BitwiseNot,
                 e: SmallBox::new(e),
-            })
+            }))
         } else if self.matches(&Tok::Plus) {
             let e = self.parse_unary()?;
-            Ok(Expr::Unary {
+            Ok(expr!(Unary {
                 op: UnOp::Pos,
                 e: SmallBox::new(e),
-            })
+            }))
         } else {
             self.parse_call()
         }
@@ -2452,16 +2527,17 @@ impl<'src> Parser<'src> {
                     self.expect(Tok::Comma, "expected ',' in argument list")?;
                 }
                 let prev = e;
-                if let Expr::OptionalChain { .. } = prev {
-                    e = Expr::OptionalChain {
+                let was_optional_chain = matches!(prev.kind(), ExprKind::OptionalChain { .. });
+                if was_optional_chain {
+                    e = expr!(OptionalChain {
                         base: SmallBox::new(prev),
                         access: OptionalAccess::Call(args),
-                    };
+                    });
                 } else {
-                    e = Expr::Call {
+                    e = expr!(Call {
                         callee: SmallBox::new(prev),
                         args,
-                    };
+                    });
                 }
             } else if self.matches(&Tok::QuestionDot) {
                 if self.matches(&Tok::LParen) {
@@ -2483,17 +2559,17 @@ impl<'src> Parser<'src> {
                         }
                         self.expect(Tok::Comma, "expected ',' in optional call arguments")?;
                     }
-                    e = Expr::OptionalChain {
+                    e = expr!(OptionalChain {
                         base: SmallBox::new(e),
                         access: OptionalAccess::Call(args),
-                    };
+                    });
                 } else if self.matches(&Tok::LBracket) {
                     let idx = self.expr()?;
                     self.expect(Tok::RBracket, "expected ']' after optional index")?;
-                    e = Expr::OptionalChain {
+                    e = expr!(OptionalChain {
                         base: SmallBox::new(e),
                         access: OptionalAccess::Index(SmallBox::new(idx)),
-                    };
+                    });
                 } else {
                     let t = self.next()?;
                     let name = match t.tok {
@@ -2505,10 +2581,10 @@ impl<'src> Parser<'src> {
                             });
                         }
                     };
-                    e = Expr::OptionalChain {
+                    e = expr!(OptionalChain {
                         base: SmallBox::new(e),
                         access: OptionalAccess::Prop(name),
-                    };
+                    });
                 }
             } else if self.matches(&Tok::Dot) {
                 let name_str = self.parse_any_identifier()?;
@@ -2537,11 +2613,11 @@ impl<'src> Parser<'src> {
                         {
                             return Err(self.err_here("builtin method does not take arguments"));
                         }
-                        e = Expr::CallBuiltinMapMethod {
+                        e = expr!(CallBuiltinMapMethod {
                             recv: SmallBox::new(e),
                             method,
                             args,
-                        };
+                        });
                         continue;
                     }
 
@@ -2558,11 +2634,11 @@ impl<'src> Parser<'src> {
                         if method == BuiltinSetMethod::Values && !args.is_empty() {
                             return Err(self.err_here("builtin method does not take arguments"));
                         }
-                        e = Expr::CallBuiltinSetMethod {
+                        e = expr!(CallBuiltinSetMethod {
                             recv: SmallBox::new(e),
                             method,
                             args,
-                        };
+                        });
                         continue;
                     }
 
@@ -2577,10 +2653,10 @@ impl<'src> Parser<'src> {
                         if !args.is_empty() {
                             return Err(self.err_here("builtin method does not take arguments"));
                         }
-                        e = Expr::CallBuiltinCommonMethod {
+                        e = expr!(CallBuiltinCommonMethod {
                             recv: SmallBox::new(e),
                             method,
-                        };
+                        });
                         continue;
                     }
 
@@ -2590,10 +2666,10 @@ impl<'src> Parser<'src> {
                     // A better refactor would merge them, but this adheres to the "no changes" rule.
                     self.i -= 1; // Un-consume the `(`.
 
-                    let callee = Expr::GetProp {
+                    let callee = expr!(GetProp {
                         recv: SmallBox::new(e),
                         name: name_str,
-                    };
+                    });
                     let t_e = self.next()?; // This will now be `LParen`
                     let mut args = vec![];
                     // Manually re-implementing your original arg loop here to be safe
@@ -2612,27 +2688,27 @@ impl<'src> Parser<'src> {
                         }
                         self.expect(Tok::Comma, "expected ',' in argument list")?;
                     }
-                    e = Expr::Call {
+                    e = expr!(Call {
                         callee: SmallBox::new(callee),
                         args,
-                    };
+                    });
                 } else {
                     if name_str == "size" {
-                        e = Expr::GetBuiltinSize(SmallBox::new(e));
+                        e = expr!(GetBuiltinSize(SmallBox::new(e)));
                         continue;
                     }
-                    e = Expr::GetProp {
+                    e = expr!(GetProp {
                         recv: SmallBox::new(e),
                         name: name_str,
-                    };
+                    });
                 }
             } else if self.matches(&Tok::LBracket) {
                 let idx = self.expr()?;
                 self.expect(Tok::RBracket, "expected ']' after index")?;
-                e = Expr::Index {
+                e = expr!(Index {
                     recv: SmallBox::new(e),
                     index: SmallBox::new(idx),
-                };
+                });
             } else {
                 break;
             }
@@ -2650,12 +2726,12 @@ impl<'src> Parser<'src> {
             // Here we know for sure we are in an expression context, not a class body.
             // So, we can safely treat `get`/`set` as an identifier.
             let name = self.parse_any_identifier()?;
-            return Ok(Expr::Ident(name));
+            return Ok(expr!(Ident(name)));
         }
 
         let t = self.next()?;
         match t.tok {
-            Tok::This => Ok(Expr::This),
+            Tok::This => Ok(expr!(This)),
 
             Tok::Super => {
                 if self.check(&Tok::LParen) {
@@ -2677,7 +2753,7 @@ impl<'src> Parser<'src> {
                         }
                         self.expect(Tok::Comma, "expected ',' in super call arguments")?;
                     }
-                    Ok(Expr::SuperCall(args))
+                    Ok(expr!(SuperCall(args)))
                 } else if self.matches(&Tok::Dot) {
                     // super.name
                     let t = self.next()?;
@@ -2690,7 +2766,7 @@ impl<'src> Parser<'src> {
                             });
                         }
                     };
-                    Ok(Expr::SuperProp(name))
+                    Ok(expr!(SuperProp(name)))
                 } else {
                     Err(self.err_here(
                         "expected '(' for super call or '.' for super property after 'super'",
@@ -2748,7 +2824,7 @@ impl<'src> Parser<'src> {
                         }
                     }
 
-                    return Ok(Expr::CreateBuiltin { kind, args });
+                    return Ok(expr!(CreateBuiltin { kind, args }));
                 }
 
                 // --- Fallback to your original, working code for user classes ---
@@ -2773,28 +2849,28 @@ impl<'src> Parser<'src> {
                     }
                     self.expect(Tok::Comma, "expected ',' in new arguments")?;
                 }
-                Ok(Expr::New { class, args })
+                Ok(expr!(New { class, args }))
             }
 
-            Tok::Int(x) => Ok(Expr::LitInt(x)),
-            Tok::Float(x) => Ok(Expr::LitF64(x)),
-            Tok::True => Ok(Expr::LitBool(true)),
-            Tok::False => Ok(Expr::LitBool(false)),
-            Tok::Null => Ok(Expr::LitNull),
-            Tok::Str(s) => Ok(Expr::Str(s)),
-            Tok::Ident(s) => Ok(Expr::Ident(s)),
+            Tok::Int(x) => Ok(expr!(LitInt(x))),
+            Tok::Float(x) => Ok(expr!(LitF64(x))),
+            Tok::True => Ok(expr!(LitBool(true))),
+            Tok::False => Ok(expr!(LitBool(false))),
+            Tok::Null => Ok(expr!(LitNull)),
+            Tok::Str(s) => Ok(expr!(Str(s))),
+            Tok::Ident(s) => Ok(expr!(Ident(s))),
 
-            Tok::ListBuiltin => Ok(Expr::Ident("Array".into())),
-            Tok::PromiseBuiltin => Ok(Expr::Ident("Promise".into())),
-            Tok::DeferredBuiltin => Ok(Expr::Ident("Deferred".into())),
-            Tok::MapBuiltin => Ok(Expr::Ident("Map".into())),
-            Tok::SetBuiltin => Ok(Expr::Ident("Set".into())),
-            Tok::ProxyBuiltin => Ok(Expr::Ident("Proxy".into())),
+            Tok::ListBuiltin => Ok(expr!(Ident("Array".into()))),
+            Tok::PromiseBuiltin => Ok(expr!(Ident("Promise".into()))),
+            Tok::DeferredBuiltin => Ok(expr!(Ident("Deferred".into()))),
+            Tok::MapBuiltin => Ok(expr!(Ident("Map".into()))),
+            Tok::SetBuiltin => Ok(expr!(Ident("Set".into()))),
+            Tok::ProxyBuiltin => Ok(expr!(Ident("Proxy".into()))),
 
             Tok::LParen => {
                 let e = self.expr()?;
                 self.expect(Tok::RParen, "expected ')' to close grouped expression")?;
-                Ok(Expr::Group(SmallBox::new(e)))
+                Ok(expr!(Group(SmallBox::new(e))))
             }
             Tok::LBracket => {
                 let mut elems = Vec::new();
@@ -2819,7 +2895,7 @@ impl<'src> Parser<'src> {
                         break;
                     }
                 }
-                Ok(Expr::ArrayLit(elems))
+                Ok(expr!(ArrayLit(elems)))
             }
             Tok::Fn | Tok::Function => {
                 // Stage #1: only the anonymous form inside expressions.
@@ -2830,7 +2906,7 @@ impl<'src> Parser<'src> {
                 )?;
                 let params = self.parse_param_list()?;
                 let body = self.block()?;
-                Ok(Expr::FnLit { params, body })
+                Ok(expr!(FnLit { params, body }))
             }
             Tok::Pipe => {
                 // parse `|x, y|`
@@ -2866,14 +2942,14 @@ impl<'src> Parser<'src> {
                 // body: either { block } or a single expression (implicitly returned)
                 if self.check(&Tok::LBrace) {
                     let body = self.block()?;
-                    Ok(Expr::FnLit { params, body })
+                    Ok(expr!(FnLit { params, body }))
                 } else {
                     // expression-body -> synthesize a block with an implicit return
                     let expr = self.expr()?;
                     let body = Block {
-                        stmts: vec![Stmt::Return(Some(expr))],
+                        stmts: vec![stmt_unknown(StmtKind::Return(Some(expr)))],
                     };
-                    Ok(Expr::FnLit { params, body })
+                    Ok(expr!(FnLit { params, body }))
                 }
             }
             Tok::LBrace => self.parse_object_literal(),
@@ -2918,7 +2994,7 @@ impl<'src> Parser<'src> {
             }
             routes.push(self.parse_route_decl()?);
         }
-        Ok(Stmt::Listen(ListenDecl { addr, routes }))
+        Ok(stmt_unknown(StmtKind::Listen(ListenDecl { addr, routes })))
     }
 
     fn parse_route_decl(&mut self) -> PResult<RouteDecl> {
@@ -2962,7 +3038,7 @@ impl<'src> Parser<'src> {
             }
             self.expect(Tok::Comma, "expected ',' in route pattern")?;
         }
-        let pattern_expr = Expr::ArrayLit(elems);
+        let pattern_expr = expr!(ArrayLit(elems));
 
         // ( params )
         self.expect(Tok::LParen, "expected '(' before route handler params")?;
@@ -2979,17 +3055,17 @@ impl<'src> Parser<'src> {
             // expression-body → implicit return
             let e = self.expr()?;
             Block {
-                stmts: vec![Stmt::Return(Some(e))],
+                stmts: vec![stmt_unknown(StmtKind::Return(Some(e)))],
             }
         };
 
         // optional ';' after a block is allowed by your grammar, require it for consistency
         self.expect(Tok::Semi, "expected ';' after route declaration")?;
 
-        let handler = Expr::FnLit {
+        let handler = expr!(FnLit {
             params,
             body: handler_body,
-        };
+        });
         Ok(RouteDecl {
             method,
             pattern: pattern_expr,
@@ -3068,7 +3144,7 @@ impl<'src> Parser<'src> {
             self.expect(Tok::Comma, "expected ',' after property")?;
         }
 
-        Ok(Expr::ObjLit(items))
+        Ok(expr!(ObjLit(items)))
     }
 
     // Parse an object destructuring pattern: { a, b: alias, "c": cAlias, ...rest }
@@ -3211,10 +3287,10 @@ impl<'src> Parser<'src> {
                     });
                 }
             };
-            return Ok(Expr::DeleteProp {
+            return Ok(expr!(DeleteProp {
                 obj: SmallBox::new(recv),
                 key: PropKey::Ident(name),
-            });
+            }));
         }
 
         if self.matches(&Tok::LBracket) {
@@ -3227,18 +3303,18 @@ impl<'src> Parser<'src> {
             if let Some(key) = key_opt {
                 self.next()?; // consume key
                 self.expect(Tok::RBracket, "expected ']' after key in delete")?;
-                return Ok(Expr::DeleteProp {
+                return Ok(expr!(DeleteProp {
                     obj: SmallBox::new(recv),
                     key,
-                });
+                }));
             } else {
                 // general: delete obj[expr]
                 let index = self.expr()?;
                 self.expect(Tok::RBracket, "expected ']' after index in delete")?;
-                return Ok(Expr::DeleteIndex {
+                return Ok(expr!(DeleteIndex {
                     obj: SmallBox::new(recv),
                     index: SmallBox::new(index),
-                });
+                }));
             }
         }
 
@@ -3263,15 +3339,15 @@ impl<'src> Parser<'src> {
 }
 
 fn lvalue_to_expr(lv: &LValue) -> Expr {
-    match lv {
-        LValue::Ident(s) => Expr::Ident(s.clone()),
-        LValue::GetProp { recv, name } => Expr::GetProp {
+    match lv.kind() {
+        LValueKind::Ident(s) => expr!(Ident(s.clone())),
+        LValueKind::GetProp { recv, name } => expr!(GetProp {
             recv: SmallBox::new(recv.clone()),
             name: name.clone(),
-        },
-        LValue::Index { recv, index } => Expr::Index {
+        }),
+        LValueKind::Index { recv, index } => expr!(Index {
             recv: SmallBox::new(recv.clone()),
             index: SmallBox::new(index.clone()),
-        },
+        }),
     }
 }

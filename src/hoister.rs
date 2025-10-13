@@ -15,11 +15,42 @@ use crate::wir::{
     Module, Type, ValueId, next_id,
 };
 
+use crate::diag::Node;
 use crate::front::{
-    BinOp, Block, CatchClause, ClassDecl, ClassMember, DeferKind, ExportDecl, Expr, FuncDecl,
-    ImportDecl, ImportItem, LValue, ListenDecl, ObjItem, ObjPattern, OptionalAccess, Program,
-    PropKey, RouteDecl, Stmt, UnOp,
+    BinOp, Block, CatchClause, ClassDecl, ClassMember, DeferKind, ExportDecl, Expr, ExprKind,
+    FuncDecl, ImportDecl, ImportItem, LValue, LValueKind, ListenDecl, ObjItem, ObjPattern,
+    OptionalAccess, Program, PropKey, RouteDecl, Stmt, StmtKind, UnOp,
 };
+
+#[inline]
+fn stmt_unknown(kind: StmtKind) -> Stmt {
+    Node::unknown(kind)
+}
+
+#[inline]
+fn expr_unknown(kind: ExprKind) -> Expr {
+    Node::unknown(kind)
+}
+
+#[inline]
+fn lvalue_unknown(kind: LValueKind) -> LValue {
+    Node::unknown(kind)
+}
+
+#[inline]
+fn stmt_with_meta(template: &Stmt, kind: StmtKind) -> Stmt {
+    Node::new(template.meta.clone(), kind)
+}
+
+#[inline]
+fn expr_with_meta(template: &Expr, kind: ExprKind) -> Expr {
+    Node::new(template.meta.clone(), kind)
+}
+
+#[inline]
+fn lvalue_with_meta(template: &LValue, kind: LValueKind) -> LValue {
+    Node::new(template.meta.clone(), kind)
+}
 
 /// Hoist all function literals to top-level functions, replacing them with
 pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<String>>) {
@@ -58,19 +89,23 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
             collect_defs_uses_stmt(s, defs, uses);
         }
     }
-    fn collect_defs_uses_stmt(s: &Stmt, defs: &mut BTreeSet<String>, uses: &mut BTreeSet<String>) {
-        match s {
-            Stmt::Var { name, init } => {
+    fn collect_defs_uses_stmt(
+        s: &Stmt,
+        defs: &mut BTreeSet<String>,
+        uses: &mut BTreeSet<String>,
+    ) {
+        match &s.kind {
+            StmtKind::Var { name, init } => {
                 defs.insert(name.clone());
                 if let Some(e) = init {
                     collect_uses_expr(e, uses);
                 }
             }
-            Stmt::VarDestruct { pattern, init } => {
+            StmtKind::VarDestruct { pattern, init } => {
                 insert_pattern_bindings(defs, pattern);
                 collect_uses_expr(init, uses);
             }
-            Stmt::If {
+            StmtKind::If {
                 cond,
                 then_b,
                 else_b,
@@ -81,11 +116,11 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                     collect_defs_uses_block(b, defs, uses);
                 }
             }
-            Stmt::While { cond, body } => {
+            StmtKind::While { cond, body } => {
                 collect_uses_expr(cond, uses);
                 collect_defs_uses_block(body, defs, uses);
             }
-            Stmt::For {
+            StmtKind::For {
                 init,
                 cond,
                 step,
@@ -102,12 +137,12 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                 }
                 collect_defs_uses_block(body, defs, uses);
             }
-            Stmt::Return(e) => {
+            StmtKind::Return(e) => {
                 if let Some(e) = e {
                     collect_uses_expr(e, uses);
                 }
             }
-            Stmt::Try {
+            StmtKind::Try {
                 try_block,
                 catch,
                 finally_block,
@@ -123,10 +158,10 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                     collect_defs_uses_block(fin, defs, uses);
                 }
             }
-            Stmt::Throw(expr) => collect_uses_expr(expr, uses),
-            Stmt::Defer { expr, .. } => collect_uses_expr(expr, uses),
-            Stmt::Expr(e) => collect_uses_expr(e, uses),
-            Stmt::Listen(ld) => {
+            StmtKind::Throw(expr) => collect_uses_expr(expr, uses),
+            StmtKind::Defer { expr, .. } => collect_uses_expr(expr, uses),
+            StmtKind::Expr(e) => collect_uses_expr(e, uses),
+            StmtKind::Listen(ld) => {
                 for r in &ld.routes {
                     collect_uses_expr(&r.pattern, uses);
                     collect_uses_expr(&r.handler, uses);
@@ -136,53 +171,56 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
     }
 
     fn collect_uses_expr(e: &Expr, uses: &mut BTreeSet<String>) {
-        match e {
-            Expr::Ident(s) => {
+        match &e.kind {
+            ExprKind::Ident(s) => {
                 uses.insert(s.clone());
             }
-            Expr::Assign(lv, rhs) => {
-                match &**lv {
-                    LValue::Ident(s) => {
+            ExprKind::Assign(lv, rhs) => {
+                match &lv.kind {
+                    LValueKind::Ident(s) => {
                         uses.insert(s.clone());
                     }
-                    LValue::GetProp { recv, .. } => collect_uses_expr(recv, uses),
-                    LValue::Index { recv, index } => {
+                    LValueKind::GetProp { recv, .. } => collect_uses_expr(recv, uses),
+                    LValueKind::Index { recv, index } => {
                         collect_uses_expr(recv, uses);
                         collect_uses_expr(index, uses);
                     }
                 }
                 collect_uses_expr(rhs, uses);
             }
-            Expr::Binary { a, b, .. } => {
+            ExprKind::Binary { a, b, .. } => {
                 collect_uses_expr(a, uses);
                 collect_uses_expr(b, uses);
             }
-            Expr::Unary { e, .. } => {
+            ExprKind::Unary { e, .. } => {
                 collect_uses_expr(e, uses);
             }
-            Expr::Call { callee, args } => {
+            ExprKind::Call { callee, args } => {
                 collect_uses_expr(callee, uses);
                 for a in args {
                     collect_uses_expr(a, uses);
                 }
             }
-            Expr::GetProp { recv, .. } => collect_uses_expr(recv, uses),
-            Expr::Index { recv, index } => {
+            ExprKind::GetProp { recv, .. } => collect_uses_expr(recv, uses),
+            ExprKind::Index { recv, index } => {
                 collect_uses_expr(recv, uses);
                 collect_uses_expr(index, uses);
             }
-            Expr::Group(g) => collect_uses_expr(g, uses),
-            Expr::FnLit { .. } | Expr::FnRef { .. } => { /* handled at outer level */ }
-            Expr::LitInt(_) | Expr::LitF64(_) | Expr::LitBool(_) | Expr::LitNull | Expr::Str(_) => {
-            }
+            ExprKind::Group(g) => collect_uses_expr(g, uses),
+            ExprKind::FnLit { .. } | ExprKind::FnRef { .. } => { /* handled at outer level */ }
+            ExprKind::LitInt(_)
+            | ExprKind::LitF64(_)
+            | ExprKind::LitBool(_)
+            | ExprKind::LitNull
+            | ExprKind::Str(_) => {}
 
-            Expr::ArrayLit(elems) => {
+            ExprKind::ArrayLit(elems) => {
                 for el in elems {
                     collect_uses_expr(el, uses);
                 }
             }
 
-            Expr::ObjLit(items) => {
+            ExprKind::ObjLit(items) => {
                 for item in items {
                     match item {
                         ObjItem::Prop(_, value) => collect_uses_expr(value, uses),
@@ -191,43 +229,43 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                 }
             }
 
-            Expr::GetPropObj { obj, .. } => {
+            ExprKind::GetPropObj { obj, .. } => {
                 collect_uses_expr(obj, uses);
             }
 
-            Expr::SetPropObj { obj, value, .. } => {
+            ExprKind::SetPropObj { obj, value, .. } => {
                 collect_uses_expr(obj, uses);
                 collect_uses_expr(value, uses);
             }
 
-            Expr::In { key, obj } => {
+            ExprKind::In { key, obj } => {
                 collect_uses_expr(key, uses);
                 collect_uses_expr(obj, uses);
             }
 
-            Expr::DeleteProp { obj, .. } => {
+            ExprKind::DeleteProp { obj, .. } => {
                 collect_uses_expr(obj, uses);
             }
 
-            Expr::SuperProp(_) => { /* no local uses */ }
-            Expr::SuperCall(args) => {
+            ExprKind::SuperProp(_) => { /* no local uses */ }
+            ExprKind::SuperCall(args) => {
                 for a in args {
                     collect_uses_expr(a, uses);
                 }
             }
 
-            Expr::CreateBuiltin { args, .. } => {
+            ExprKind::CreateBuiltin { args, .. } => {
                 for a in args {
                     collect_uses_expr(a, uses);
                 }
             }
-            Expr::CallBuiltinMapMethod { recv, args, .. } => {
+            ExprKind::CallBuiltinMapMethod { recv, args, .. } => {
                 collect_uses_expr(recv, uses);
                 for a in args {
                     collect_uses_expr(a, uses);
                 }
             }
-            Expr::CallBuiltinSetMethod { recv, args, .. } => {
+            ExprKind::CallBuiltinSetMethod { recv, args, .. } => {
                 collect_uses_expr(recv, uses);
                 for a in args {
                     collect_uses_expr(a, uses);
@@ -252,30 +290,36 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
         let mut out_stmts = Vec::with_capacity(b.stmts.len());
 
         for s in &b.stmts {
-            match s {
+            match &s.kind {
                 // `var` introduces a name *after* its initializer; rewrite init with current scope,
                 // then add the binding to the scope for following statements.
-                Stmt::Var { name, init } => {
+                StmtKind::Var { name, init } => {
                     let init_rw = init
                         .as_ref()
                         .map(|e| rw_expr(e, used, counter, &scope, out_funcs, lam_caps_out));
-                    out_stmts.push(Stmt::Var {
-                        name: name.clone(),
-                        init: init_rw,
-                    });
+                    out_stmts.push(stmt_with_meta(
+                        s,
+                        StmtKind::Var {
+                            name: name.clone(),
+                            init: init_rw,
+                        },
+                    ));
                     scope.insert(name.clone());
                 }
-                Stmt::VarDestruct { pattern, init } => {
+                StmtKind::VarDestruct { pattern, init } => {
                     let init_rw = rw_expr(init, used, counter, &scope, out_funcs, lam_caps_out);
-                    out_stmts.push(Stmt::VarDestruct {
-                        pattern: pattern.clone(),
-                        init: init_rw,
-                    });
+                    out_stmts.push(stmt_with_meta(
+                        s,
+                        StmtKind::VarDestruct {
+                            pattern: pattern.clone(),
+                            init: init_rw,
+                        },
+                    ));
                     insert_pattern_bindings(&mut scope, pattern);
                 }
 
                 // `for` init can introduce a name that is visible to cond/step/body.
-                Stmt::For {
+                StmtKind::For {
                     init,
                     cond,
                     step,
@@ -296,11 +340,11 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                             lam_caps_out,
                         ));
                         // If the init is `var id = ...;`, extend for_scope for the rest.
-                        match i0 {
-                            Stmt::Var { name, .. } => {
+                        match &i0.kind {
+                            StmtKind::Var { name, .. } => {
                                 for_scope.insert(name.clone());
                             }
-                            Stmt::VarDestruct { pattern, .. } => {
+                            StmtKind::VarDestruct { pattern, .. } => {
                                 insert_pattern_bindings(&mut for_scope, pattern);
                             }
                             _ => {}
@@ -319,12 +363,15 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                     let body_rw =
                         rw_block(body, used, counter, &for_scope, out_funcs, lam_caps_out);
 
-                    out_stmts.push(Stmt::For {
-                        init: init_rw,
-                        cond: cond_rw,
-                        step: step_rw,
-                        body: body_rw,
-                    });
+                    out_stmts.push(stmt_with_meta(
+                        s,
+                        StmtKind::For {
+                            init: init_rw,
+                            cond: cond_rw,
+                            step: step_rw,
+                            body: body_rw,
+                        },
+                    ));
                 }
 
                 // Everything else: rewrite with the current scope.
@@ -346,99 +393,145 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
         out_funcs: &mut Vec<FuncDecl>,
         lam_caps_out: &mut HashMap<String, Vec<String>>,
     ) -> Stmt {
-        match s {
-            Stmt::Var { name, init } => Stmt::Var {
-                name: name.clone(),
-                init: init
-                    .as_ref()
-                    .map(|e| rw_expr(e, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
-            },
-            Stmt::VarDestruct { pattern, init } => Stmt::VarDestruct {
-                pattern: pattern.clone(),
-                init: rw_expr(
-                    init,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                ),
-            },
-            Stmt::If {
-                cond,
-                then_b,
-                else_b,
-            } => Stmt::If {
-                cond: rw_expr(
-                    cond,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                ),
-                then_b: rw_block(
-                    then_b,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                ),
-                else_b: else_b
-                    .as_ref()
-                    .map(|b| rw_block(b, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
-            },
-            Stmt::While { cond, body } => Stmt::While {
-                cond: rw_expr(
-                    cond,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                ),
-                body: rw_block(
-                    body,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                ),
-            },
-            Stmt::For {
-                init,
-                cond,
-                step,
-                body,
-            } => Stmt::For {
-                init: init.as_deref().map(|i| {
-                    SmallBox::new(rw_stmt(
-                        i,
+        match &s.kind {
+            StmtKind::Var { name, init } => {
+                let init_rw = init.as_ref().map(|expr| {
+                    rw_expr(
+                        expr,
                         used,
                         counter,
                         enclosing_locals,
                         out_funcs,
                         lam_caps_out,
-                    ))
-                }),
-                cond: cond
-                    .as_ref()
-                    .map(|e| rw_expr(e, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
-                step: step
-                    .as_ref()
-                    .map(|e| rw_expr(e, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
-                body: rw_block(
-                    body,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                ),
-            },
-            Stmt::Try {
+                    )
+                });
+                stmt_with_meta(
+                    s,
+                    StmtKind::Var {
+                        name: name.clone(),
+                        init: init_rw,
+                    },
+                )
+            }
+            StmtKind::VarDestruct { pattern, init } => stmt_with_meta(
+                s,
+                StmtKind::VarDestruct {
+                    pattern: pattern.clone(),
+                    init: rw_expr(
+                        init,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    ),
+                },
+            ),
+            StmtKind::If {
+                cond,
+                then_b,
+                else_b,
+            } => stmt_with_meta(
+                s,
+                StmtKind::If {
+                    cond: rw_expr(
+                        cond,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    ),
+                    then_b: rw_block(
+                        then_b,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    ),
+                    else_b: else_b.as_ref().map(|b| {
+                        rw_block(
+                            b,
+                            used,
+                            counter,
+                            enclosing_locals,
+                            out_funcs,
+                            lam_caps_out,
+                        )
+                    }),
+                },
+            ),
+            StmtKind::While { cond, body } => stmt_with_meta(
+                s,
+                StmtKind::While {
+                    cond: rw_expr(
+                        cond,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    ),
+                    body: rw_block(
+                        body,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    ),
+                },
+            ),
+            StmtKind::For {
+                init,
+                cond,
+                step,
+                body,
+            } => stmt_with_meta(
+                s,
+                StmtKind::For {
+                    init: init.as_ref().map(|boxed| {
+                        SmallBox::new(rw_stmt(
+                            &**boxed,
+                            used,
+                            counter,
+                            enclosing_locals,
+                            out_funcs,
+                            lam_caps_out,
+                        ))
+                    }),
+                    cond: cond.as_ref().map(|expr| {
+                        rw_expr(
+                            expr,
+                            used,
+                            counter,
+                            enclosing_locals,
+                            out_funcs,
+                            lam_caps_out,
+                        )
+                    }),
+                    step: step.as_ref().map(|expr| {
+                        rw_expr(
+                            expr,
+                            used,
+                            counter,
+                            enclosing_locals,
+                            out_funcs,
+                            lam_caps_out,
+                        )
+                    }),
+                    body: rw_block(
+                        body,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    ),
+                },
+            ),
+            StmtKind::Try {
                 try_block,
                 catch,
                 finally_block,
@@ -481,73 +574,94 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                     )
                 });
 
-                Stmt::Try {
-                    try_block: try_rw,
-                    catch: catch_rw,
-                    finally_block: finally_rw,
-                }
+                stmt_with_meta(
+                    s,
+                    StmtKind::Try {
+                        try_block: try_rw,
+                        catch: catch_rw,
+                        finally_block: finally_rw,
+                    },
+                )
             }
-            Stmt::Throw(expr) => Stmt::Throw(rw_expr(
-                expr,
-                used,
-                counter,
-                enclosing_locals,
-                out_funcs,
-                lam_caps_out,
-            )),
-            Stmt::Defer { kind, expr } => Stmt::Defer {
-                kind: *kind,
-                expr: rw_expr(
+            StmtKind::Throw(expr) => stmt_with_meta(
+                s,
+                StmtKind::Throw(rw_expr(
                     expr,
                     used,
                     counter,
                     enclosing_locals,
                     out_funcs,
                     lam_caps_out,
-                ),
-            },
-            Stmt::Return(e) => Stmt::Return(
-                e.as_ref()
-                    .map(|x| rw_expr(x, used, counter, enclosing_locals, out_funcs, lam_caps_out)),
+                )),
             ),
-            Stmt::Expr(e) => Stmt::Expr(rw_expr(
-                e,
-                used,
-                counter,
-                enclosing_locals,
-                out_funcs,
-                lam_caps_out,
-            )),
-
-            Stmt::Listen(ld) => {
+            StmtKind::Defer { kind, expr } => stmt_with_meta(
+                s,
+                StmtKind::Defer {
+                    kind: *kind,
+                    expr: rw_expr(
+                        expr,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    ),
+                },
+            ),
+            StmtKind::Return(expr_opt) => stmt_with_meta(
+                s,
+                StmtKind::Return(expr_opt.as_ref().map(|expr| {
+                    rw_expr(
+                        expr,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    )
+                })),
+            ),
+            StmtKind::Expr(expr) => stmt_with_meta(
+                s,
+                StmtKind::Expr(rw_expr(
+                    expr,
+                    used,
+                    counter,
+                    enclosing_locals,
+                    out_funcs,
+                    lam_caps_out,
+                )),
+            ),
+            StmtKind::Listen(ld) => {
                 let mut routes = Vec::with_capacity(ld.routes.len());
                 for r in &ld.routes {
-                    let pattern_rw = rw_expr(
-                        &r.pattern,
-                        used,
-                        counter,
-                        enclosing_locals,
-                        out_funcs,
-                        lam_caps_out,
-                    );
-                    let handler_rw = rw_expr(
-                        &r.handler,
-                        used,
-                        counter,
-                        enclosing_locals,
-                        out_funcs,
-                        lam_caps_out,
-                    );
                     routes.push(RouteDecl {
                         method: r.method.clone(),
-                        pattern: pattern_rw,
-                        handler: handler_rw,
+                        pattern: rw_expr(
+                            &r.pattern,
+                            used,
+                            counter,
+                            enclosing_locals,
+                            out_funcs,
+                            lam_caps_out,
+                        ),
+                        handler: rw_expr(
+                            &r.handler,
+                            used,
+                            counter,
+                            enclosing_locals,
+                            out_funcs,
+                            lam_caps_out,
+                        ),
                     });
                 }
-                Stmt::Listen(ListenDecl {
-                    addr: ld.addr.clone(),
-                    routes,
-                })
+                stmt_with_meta(
+                    s,
+                    StmtKind::Listen(ListenDecl {
+                        addr: ld.addr.clone(),
+                        routes,
+                    }),
+                )
             }
         }
     }
@@ -560,37 +674,43 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
         out_funcs: &mut Vec<FuncDecl>,
         lam_caps_out: &mut HashMap<String, Vec<String>>,
     ) -> LValue {
-        match lv {
-            LValue::Ident(s) => LValue::Ident(s.clone()),
-            LValue::GetProp { recv, name } => LValue::GetProp {
-                recv: rw_expr(
-                    recv,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                ),
-                name: name.clone(),
-            },
-            LValue::Index { recv, index } => LValue::Index {
-                recv: rw_expr(
-                    recv,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                ),
-                index: rw_expr(
-                    index,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                ),
-            },
+        match &lv.kind {
+            LValueKind::Ident(s) => lvalue_with_meta(lv, LValueKind::Ident(s.clone())),
+            LValueKind::GetProp { recv, name } => lvalue_with_meta(
+                lv,
+                LValueKind::GetProp {
+                    recv: rw_expr(
+                        recv,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    ),
+                    name: name.clone(),
+                },
+            ),
+            LValueKind::Index { recv, index } => lvalue_with_meta(
+                lv,
+                LValueKind::Index {
+                    recv: rw_expr(
+                        recv,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    ),
+                    index: rw_expr(
+                        index,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    ),
+                },
+            ),
         }
     }
 
@@ -602,145 +722,165 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
         out_funcs: &mut Vec<FuncDecl>,
         lam_caps_out: &mut HashMap<String, Vec<String>>,
     ) -> Expr {
-        match e {
-            Expr::Assign(lv, rhs) => Expr::Assign(
-                SmallBox::new(rw_lvalue(
-                    lv,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                )),
-                SmallBox::new(rw_expr(
-                    rhs,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                )),
+        match &e.kind {
+            ExprKind::Assign(lv, rhs) => expr_with_meta(
+                e,
+                ExprKind::Assign(
+                    SmallBox::new(rw_lvalue(
+                        &**lv,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    )),
+                    SmallBox::new(rw_expr(
+                        rhs,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    )),
+                ),
             ),
-            Expr::Conditional {
+            ExprKind::Conditional {
                 cond,
                 then_branch,
                 else_branch,
-            } => Expr::Conditional {
-                cond: SmallBox::new(rw_expr(
-                    cond,
+            } => expr_with_meta(
+                e,
+                ExprKind::Conditional {
+                    cond: SmallBox::new(rw_expr(
+                        cond,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    )),
+                    then_branch: SmallBox::new(rw_expr(
+                        then_branch,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    )),
+                    else_branch: SmallBox::new(rw_expr(
+                        else_branch,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    )),
+                },
+            ),
+            ExprKind::Binary { op, a, b } => expr_with_meta(
+                e,
+                ExprKind::Binary {
+                    op: *op,
+                    a: SmallBox::new(rw_expr(
+                        a,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    )),
+                    b: SmallBox::new(rw_expr(
+                        b,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    )),
+                },
+            ),
+            ExprKind::Unary { op, e: inner } => expr_with_meta(
+                e,
+                ExprKind::Unary {
+                    op: *op,
+                    e: SmallBox::new(rw_expr(
+                        inner,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    )),
+                },
+            ),
+            ExprKind::Call { callee, args } => expr_with_meta(
+                e,
+                ExprKind::Call {
+                    callee: SmallBox::new(rw_expr(
+                        callee,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    )),
+                    args: args
+                        .iter()
+                        .map(|a| rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out))
+                        .collect(),
+                },
+            ),
+            ExprKind::GetProp { recv, name } => expr_with_meta(
+                e,
+                ExprKind::GetProp {
+                    recv: SmallBox::new(rw_expr(
+                        recv,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    )),
+                    name: name.clone(),
+                },
+            ),
+            ExprKind::Index { recv, index } => expr_with_meta(
+                e,
+                ExprKind::Index {
+                    recv: SmallBox::new(rw_expr(
+                        recv,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    )),
+                    index: SmallBox::new(rw_expr(
+                        index,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    )),
+                },
+            ),
+            ExprKind::Group(inner) => expr_with_meta(
+                e,
+                ExprKind::Group(SmallBox::new(rw_expr(
+                    inner,
                     used,
                     counter,
                     enclosing_locals,
                     out_funcs,
                     lam_caps_out,
-                )),
-                then_branch: SmallBox::new(rw_expr(
-                    then_branch,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                )),
-                else_branch: SmallBox::new(rw_expr(
-                    else_branch,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                )),
-            },
-            Expr::Binary { op, a, b } => Expr::Binary {
-                op: *op,
-                a: SmallBox::new(rw_expr(
-                    a,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                )),
-                b: SmallBox::new(rw_expr(
-                    b,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                )),
-            },
-            Expr::Unary { op, e } => Expr::Unary {
-                op: *op,
-                e: SmallBox::new(rw_expr(
-                    e,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                )),
-            },
-            Expr::Call { callee, args } => Expr::Call {
-                callee: SmallBox::new(rw_expr(
-                    callee,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                )),
-                args: args
-                    .iter()
-                    .map(|a| rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out))
-                    .collect(),
-            },
-            Expr::GetProp { recv, name } => Expr::GetProp {
-                recv: SmallBox::new(rw_expr(
-                    recv,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                )),
-                name: name.clone(),
-            },
-            Expr::Index { recv, index } => Expr::Index {
-                recv: SmallBox::new(rw_expr(
-                    recv,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                )),
-                index: SmallBox::new(rw_expr(
-                    index,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                )),
-            },
-            Expr::Group(g) => Expr::Group(SmallBox::new(rw_expr(
-                g,
-                used,
-                counter,
-                enclosing_locals,
-                out_funcs,
-                lam_caps_out,
-            ))),
-
-            // Core: hoist to a top-level function with extra hidden `__env` param; replace with FnRef
-            Expr::FnLit { params, body } => {
-                // names defined inside the lambda
+                ))),
+            ),
+            ExprKind::FnLit { params, body } => {
                 let mut inner_defs: BTreeSet<String> = params.iter().cloned().collect();
                 let mut uses: BTreeSet<String> = BTreeSet::new();
                 collect_defs_uses_block(body, &mut inner_defs, &mut uses);
 
-                // captures = (uses ∩ enclosing_locals) \ params
                 let mut caps = Vec::<String>::new();
                 for u in uses {
                     if enclosing_locals.contains(&u) && !params.contains(&u) {
@@ -749,19 +889,13 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                 }
                 caps.sort();
 
-                // Fresh name
                 let lam_name = fresh(used, counter);
-
-                // Record capture list
                 lam_caps_out.insert(lam_name.clone(), caps.clone());
 
-                // Create the hoisted function: first param is "__env", then user's params
                 let mut lam_params = Vec::<String>::with_capacity(params.len() + 1);
                 lam_params.push("__env".to_string());
                 lam_params.extend(params.iter().cloned());
 
-                // IMPORTANT: recursively hoist inside the lambda body.
-                // Enclosing scope for nested lambdas = lambda params ∪ captured names.
                 let mut lam_enclosing: BTreeSet<String> = params.iter().cloned().collect();
                 for c in &caps {
                     lam_enclosing.insert(c.clone());
@@ -777,224 +911,271 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                     is_async: false,
                 });
 
-                // Replace literal with a named lam reference
-                Expr::FnRef { name: lam_name }
+                expr_with_meta(e, ExprKind::FnRef { name: lam_name })
             }
+            ExprKind::FnRef { name } => expr_with_meta(e, ExprKind::FnRef { name: name.clone() }),
 
-            // Already a reference (created earlier)
-            Expr::FnRef { name } => Expr::FnRef { name: name.clone() },
+            ExprKind::LitInt(_)
+            | ExprKind::LitF64(_)
+            | ExprKind::LitBool(_)
+            | ExprKind::LitNull
+            | ExprKind::Str(_)
+            | ExprKind::Ident(_)
+            | ExprKind::This => e.clone(),
 
-            // terminals
-            Expr::LitInt(_)
-            | Expr::LitF64(_)
-            | Expr::LitBool(_)
-            | Expr::LitNull
-            | Expr::Str(_)
-            | Expr::Ident(_) => e.clone(),
-
-            Expr::ArrayLit(elems) => Expr::ArrayLit(
-                elems
-                    .iter()
-                    .map(|el| rw_expr(el, used, counter, enclosing_locals, out_funcs, lam_caps_out))
-                    .collect(),
+            ExprKind::ArrayLit(elems) => expr_with_meta(
+                e,
+                ExprKind::ArrayLit(
+                    elems
+                        .iter()
+                        .map(|el| {
+                            rw_expr(el, used, counter, enclosing_locals, out_funcs, lam_caps_out)
+                        })
+                        .collect(),
+                ),
             ),
-
-            Expr::ObjLit(items) => Expr::ObjLit(
-                items
-                    .iter()
-                    .map(|item| match item {
-                        ObjItem::Prop(k, v) => ObjItem::Prop(
-                            k.clone(),
-                            rw_expr(v, used, counter, enclosing_locals, out_funcs, lam_caps_out),
-                        ),
-                        ObjItem::Spread(expr) => ObjItem::Spread(rw_expr(
-                            expr,
-                            used,
-                            counter,
-                            enclosing_locals,
-                            out_funcs,
-                            lam_caps_out,
-                        )),
-                    })
-                    .collect(),
+            ExprKind::ObjLit(items) => expr_with_meta(
+                e,
+                ExprKind::ObjLit(
+                    items
+                        .iter()
+                        .map(|item| match item {
+                            ObjItem::Prop(k, v) => ObjItem::Prop(
+                                k.clone(),
+                                rw_expr(
+                                    v,
+                                    used,
+                                    counter,
+                                    enclosing_locals,
+                                    out_funcs,
+                                    lam_caps_out,
+                                ),
+                            ),
+                            ObjItem::Spread(expr) => ObjItem::Spread(rw_expr(
+                                expr,
+                                used,
+                                counter,
+                                enclosing_locals,
+                                out_funcs,
+                                lam_caps_out,
+                            )),
+                        })
+                        .collect(),
+                ),
             ),
-
-            Expr::GetPropObj { obj, key } => Expr::GetPropObj {
-                obj: SmallBox::new(rw_expr(
-                    obj,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                )),
-                key: key.clone(),
-            },
-
-            Expr::SetPropObj { obj, key, value } => Expr::SetPropObj {
-                obj: SmallBox::new(rw_expr(
-                    obj,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                )),
-                key: key.clone(),
-                value: SmallBox::new(rw_expr(
-                    value,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                )),
-            },
-
-            Expr::In { key, obj } => Expr::In {
-                key: SmallBox::new(rw_expr(
-                    key,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                )),
-                obj: SmallBox::new(rw_expr(
-                    obj,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                )),
-            },
-
-            Expr::DeleteProp { obj, key } => Expr::DeleteProp {
-                obj: SmallBox::new(rw_expr(
-                    obj,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                )),
-                key: key.clone(),
-            },
-
-            Expr::DeleteIndex { obj, index } => Expr::DeleteIndex {
-                obj: SmallBox::new(rw_expr(
-                    obj,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                )),
-                index: SmallBox::new(rw_expr(
-                    index,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                )),
-            },
-
-            Expr::This => Expr::This,
-
-            Expr::SuperProp(name) => Expr::SuperProp(name.clone()),
-            Expr::SuperCall(args) => Expr::SuperCall(
-                args.iter()
-                    .map(|a| rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out))
-                    .collect(),
+            ExprKind::GetPropObj { obj, key } => expr_with_meta(
+                e,
+                ExprKind::GetPropObj {
+                    obj: SmallBox::new(rw_expr(
+                        obj,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    )),
+                    key: key.clone(),
+                },
             ),
-
-            Expr::New { class, args } => Expr::New {
-                class: class.clone(),
-                args: args
-                    .iter()
-                    .map(|a| rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out))
-                    .collect(),
-            },
-
-            Expr::CreateBuiltin { kind, args } => Expr::CreateBuiltin {
-                kind: *kind,
-                args: args
-                    .iter()
-                    .map(|a| rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out))
-                    .collect(),
-            },
-            Expr::CallBuiltinMapMethod { recv, method, args } => Expr::CallBuiltinMapMethod {
-                recv: SmallBox::new(rw_expr(
+            ExprKind::SetPropObj { obj, key, value } => expr_with_meta(
+                e,
+                ExprKind::SetPropObj {
+                    obj: SmallBox::new(rw_expr(
+                        obj,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    )),
+                    key: key.clone(),
+                    value: SmallBox::new(rw_expr(
+                        value,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    )),
+                },
+            ),
+            ExprKind::In { key, obj } => expr_with_meta(
+                e,
+                ExprKind::In {
+                    key: SmallBox::new(rw_expr(
+                        key,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    )),
+                    obj: SmallBox::new(rw_expr(
+                        obj,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    )),
+                },
+            ),
+            ExprKind::DeleteProp { obj, key } => expr_with_meta(
+                e,
+                ExprKind::DeleteProp {
+                    obj: SmallBox::new(rw_expr(
+                        obj,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    )),
+                    key: key.clone(),
+                },
+            ),
+            ExprKind::DeleteIndex { obj, index } => expr_with_meta(
+                e,
+                ExprKind::DeleteIndex {
+                    obj: SmallBox::new(rw_expr(
+                        obj,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    )),
+                    index: SmallBox::new(rw_expr(
+                        index,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    )),
+                },
+            ),
+            ExprKind::SuperProp(name) => expr_with_meta(e, ExprKind::SuperProp(name.clone())),
+            ExprKind::SuperCall(args) => expr_with_meta(
+                e,
+                ExprKind::SuperCall(
+                    args.iter()
+                        .map(|a| {
+                            rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out)
+                        })
+                        .collect(),
+                ),
+            ),
+            ExprKind::New { class, args } => expr_with_meta(
+                e,
+                ExprKind::New {
+                    class: class.clone(),
+                    args: args
+                        .iter()
+                        .map(|a| {
+                            rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out)
+                        })
+                        .collect(),
+                },
+            ),
+            ExprKind::CreateBuiltin { kind, args } => expr_with_meta(
+                e,
+                ExprKind::CreateBuiltin {
+                    kind: *kind,
+                    args: args
+                        .iter()
+                        .map(|a| {
+                            rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out)
+                        })
+                        .collect(),
+                },
+            ),
+            ExprKind::CallBuiltinMapMethod { recv, method, args } => expr_with_meta(
+                e,
+                ExprKind::CallBuiltinMapMethod {
+                    recv: SmallBox::new(rw_expr(
+                        recv,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    )),
+                    method: *method,
+                    args: args
+                        .iter()
+                        .map(|a| {
+                            rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out)
+                        })
+                        .collect(),
+                },
+            ),
+            ExprKind::CallBuiltinSetMethod { recv, method, args } => expr_with_meta(
+                e,
+                ExprKind::CallBuiltinSetMethod {
+                    recv: SmallBox::new(rw_expr(
+                        recv,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    )),
+                    method: *method,
+                    args: args
+                        .iter()
+                        .map(|a| {
+                            rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out)
+                        })
+                        .collect(),
+                },
+            ),
+            ExprKind::CallBuiltinCommonMethod { recv, method } => expr_with_meta(
+                e,
+                ExprKind::CallBuiltinCommonMethod {
+                    recv: SmallBox::new(rw_expr(
+                        recv,
+                        used,
+                        counter,
+                        enclosing_locals,
+                        out_funcs,
+                        lam_caps_out,
+                    )),
+                    method: *method,
+                },
+            ),
+            ExprKind::GetBuiltinSize(recv) => expr_with_meta(
+                e,
+                ExprKind::GetBuiltinSize(SmallBox::new(rw_expr(
                     recv,
                     used,
                     counter,
                     enclosing_locals,
                     out_funcs,
                     lam_caps_out,
-                )),
-                method: *method,
-                args: args
-                    .iter()
-                    .map(|a| rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out))
-                    .collect(),
-            },
-            Expr::CallBuiltinSetMethod { recv, method, args } => Expr::CallBuiltinSetMethod {
-                recv: SmallBox::new(rw_expr(
-                    recv,
+                ))),
+            ),
+            ExprKind::Await(inner) => expr_with_meta(
+                e,
+                ExprKind::Await(SmallBox::new(rw_expr(
+                    inner,
                     used,
                     counter,
                     enclosing_locals,
                     out_funcs,
                     lam_caps_out,
-                )),
-                method: *method,
-                args: args
-                    .iter()
-                    .map(|a| rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out))
-                    .collect(),
-            },
-
-            Expr::CallBuiltinCommonMethod { recv, method } => Expr::CallBuiltinCommonMethod {
-                recv: SmallBox::new(rw_expr(
-                    recv,
-                    used,
-                    counter,
-                    enclosing_locals,
-                    out_funcs,
-                    lam_caps_out,
-                )),
-                method: *method,
-            },
-
-            Expr::GetBuiltinSize(recv) => Expr::GetBuiltinSize(SmallBox::new(rw_expr(
-                recv,
-                used,
-                counter,
-                enclosing_locals,
-                out_funcs,
-                lam_caps_out,
-            ))),
-
-            Expr::Await(inner) => Expr::Await(SmallBox::new(rw_expr(
-                inner,
-                used,
-                counter,
-                enclosing_locals,
-                out_funcs,
-                lam_caps_out,
-            ))),
-            Expr::OptionalChain { base, access } => Expr::OptionalChain {
-                base: SmallBox::new(rw_expr(
+                ))),
+            ),
+            ExprKind::OptionalChain { base, access } => {
+                let rewritten_base = rw_expr(
                     base,
                     used,
                     counter,
                     enclosing_locals,
                     out_funcs,
                     lam_caps_out,
-                )),
-                access: match access {
+                );
+                let rewritten_access = match access {
                     OptionalAccess::Prop(name) => OptionalAccess::Prop(name.clone()),
                     OptionalAccess::Index(expr) => OptionalAccess::Index(SmallBox::new(rw_expr(
                         expr,
@@ -1011,8 +1192,15 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                             })
                             .collect(),
                     ),
-                },
-            },
+                };
+                expr_with_meta(
+                    e,
+                    ExprKind::OptionalChain {
+                        base: SmallBox::new(rewritten_base),
+                        access: rewritten_access,
+                    },
+                )
+            }
         }
     }
 

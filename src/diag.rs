@@ -1,6 +1,5 @@
 // src/diag.rs
 use ariadne::{Color, Fmt, Label, Report, ReportKind, Source};
-use smallvec::SmallVec;
 use std::ops::Range;
 use compact_str::CompactString;
 use std::result::Result;
@@ -22,13 +21,13 @@ impl Span {
     }
 
     #[inline]
-    fn join_spans(&mut self, b: &Span) {
+    fn join_span(&mut self, b: &Span) {
         // Safe even if overlapping; assumes both in same file.
         self.range = self.range.start.min(b.range.start) .. self.range.end.max(b.range.end)
     }
 
     #[inline]
-    fn join3(&mut self, b: &Span, c: &Span) {
+    fn join_spans(&mut self, b: &Span, c: &Span) {
         self.range = self.range.start.min(b.range.start).min(c.range.start) .. self.range.end.max(b.range.end).max(c.range.end)
     }
 }
@@ -37,9 +36,86 @@ impl Span {
 pub struct Meta {
     pub file: Option<FileId>,
     pub span: Span,
+    pub stack_span: Vec<FrontErrorLabel>, // for the stack of calls
     pub escape: EscapeInfo, // future: escape analysis
     pub purity: Purity,     // future: purity analysis
     pub front_error: Option<FrontError>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Node<T> {
+    pub meta: Meta,
+    pub kind: T,
+}
+
+impl<T> Node<T> {
+    #[inline]
+    pub fn new(meta: Meta, kind: T) -> Self {
+        Self { meta, kind }
+    }
+
+    #[inline]
+    pub fn unknown(kind: T) -> Self {
+        Self {
+            meta: Meta::unknown(),
+            kind,
+        }
+    }
+
+    #[inline]
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Node<U> {
+        Node {
+            meta: self.meta,
+            kind: f(self.kind),
+        }
+    }
+
+    #[inline]
+    pub fn with_meta(mut self, meta: Meta) -> Self {
+        self.meta = meta;
+        self
+    }
+
+    #[inline]
+    pub fn into_inner(self) -> T {
+        self.kind
+    }
+
+    #[inline]
+    pub fn meta(&self) -> &Meta {
+        &self.meta
+    }
+
+    #[inline]
+    pub fn meta_mut(&mut self) -> &mut Meta {
+        &mut self.meta
+    }
+
+    #[inline]
+    pub fn kind(&self) -> &T {
+        &self.kind
+    }
+
+    #[inline]
+    pub fn kind_mut(&mut self) -> &mut T {
+        &mut self.kind
+    }
+}
+
+impl<T> std::ops::Deref for Node<T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.kind
+    }
+}
+
+impl<T> std::ops::DerefMut for Node<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.kind
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -65,7 +141,7 @@ pub struct FrontError {
     pub span: Span,
     pub message: FrontErrorMessage,
     pub code: ErrorCode,
-    pub labels: SmallVec<[FrontErrorLabel; 8]>,
+    pub labels: Vec<FrontErrorLabel>, // for the stack of calls
     pub note: Option<FrontErrorMessage>,
 }
 
@@ -91,13 +167,13 @@ impl ErrorCode {
 pub struct FrontErrorLabel {
     pub file_name: CompactString,
     pub span: Span,
-    pub message: FrontErrorMessage,
+    pub message: Option<FrontErrorMessage>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct FrontErrorMessage {
     pub text: CompactString,                             // e.g. "This is of type {}"
-    pub highlighted_strings: SmallVec<[CompactString; 4]>, // values to slot into {}
+    pub highlighted_strings: Vec<CompactString>, // values to slot into {}
     pub color: RegisteredColors,                         // color used for the inserts (and label)
 }
 
@@ -157,7 +233,7 @@ impl FrontErrorMessage {
 /// Convenience for formatting a colored message without constructing a FrontErrorMessage.
 pub fn format_error(
     message: CompactString,
-    params: SmallVec<[CompactString; 4]>,
+    params: Vec<CompactString>,
     color: RegisteredColors,
 ) -> CompactString {
     let m = FrontErrorMessage {
@@ -181,9 +257,15 @@ impl FrontError {
 
         for lab in &self.labels {
             builder = builder.with_label(
-                Label::new((lab.file_name.as_str(), lab.span.range.clone()))
-                    .with_message(lab.message.render())
-                    .with_color(lab.message.color.to_color()),
+                // If error message exists
+                if let Some(msg) = &lab.message {
+                    Label::new((lab.file_name.as_str(), lab.span.range.clone()))
+                        .with_message(msg.render())
+                        .with_color(msg.color.to_color())
+                } else {
+                    // No message, just a label with color
+                    Label::new((lab.file_name.as_str(), lab.span.range.clone()))
+                }
             );
         }
 
