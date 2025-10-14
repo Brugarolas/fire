@@ -4,7 +4,7 @@
 #![allow(unused_unsafe)]
 
 use crate::gc::NAPALM_GC;
-use crate::jit::wir_make_method_closure;
+use crate::jit::{wir_call_closure, wir_make_method_closure};
 use crate::value as v;
 use crate::value::{
     BoxedArray, BoxedClosure, BoxedF64, BoxedMap, BoxedObj, BoxedProxy, BoxedSet, BoxedStr, NULL,
@@ -15,16 +15,196 @@ use crate::value::{
     set_new, shape_slot, value_to_bool, BOOL_TRUE, BOOL_FALSE,
 };
 
-use crate::helpers::collections::{HashMap, HashSet, ConcurrentHashMap};
+use crate::helpers::collections::{ConcurrentHashMap, HashMap, HashSet};
+use crate::wir::{TryExitKind, WirDeferKind};
 use core::hash::{BuildHasher, Hasher};
 type FastBuildHasher = crate::helpers::collections::AesBuildHasher;
-use papaya::HashMap as LockfreeHashMap;
 use core::cmp::min;
+use papaya::HashMap as LockfreeHashMap;
 use parking_lot::{Mutex, RwLock};
+use smallvec::SmallVec;
+use std::cell::RefCell;
 use std::slice;
 use std::sync::OnceLock;
 use tinyvec::TinyVec;
-use smallvec::SmallVec;
+
+type StubPtr = unsafe extern "C" fn(*const i64, usize) -> i64;
+
+#[repr(C)]
+pub struct CatchStubEntry {
+    pub binds_exception: bool,
+    pub stub: StubPtr,
+}
+
+#[repr(C)]
+pub struct RuntimeTryDescriptor {
+    pub func_id: u32,
+    pub region_id: u32,
+    pub catch_stubs: *const CatchStubEntry,
+    pub catch_len: u32,
+    pub finally_stub: Option<StubPtr>,
+    pub continuation_stub: Option<StubPtr>,
+}
+
+#[derive(Clone)]
+struct DeferredAction {
+    kind: WirDeferKind,
+    closure: i64,
+}
+
+struct TryFrame {
+    func_id: u32,
+    region_id: u32,
+    descriptor: *const RuntimeTryDescriptor,
+    locals: Vec<i64>,
+    defers: Vec<DeferredAction>,
+    defers_run: bool,
+}
+
+thread_local! {
+    static TRY_STACK: RefCell<Vec<TryFrame>> = RefCell::new(Vec::new());
+}
+
+fn descriptor<'a>(ptr: *const RuntimeTryDescriptor) -> &'a RuntimeTryDescriptor {
+    unsafe { ptr.as_ref().expect("runtime: descriptor pointer is null") }
+}
+
+fn run_deferred(frame: &mut TryFrame, exit: TryExitKind) {
+    if frame.defers_run {
+        return;
+    }
+    while let Some(action) = frame.defers.pop() {
+        let should_run = match action.kind {
+            WirDeferKind::Always => true,
+            WirDeferKind::OnError => matches!(exit, TryExitKind::Exception | TryExitKind::Rethrow),
+        };
+        if should_run {
+            unsafe {
+                let _ = wir_call_closure(action.closure, std::ptr::null(), 0);
+            }
+        }
+    }
+    frame.defers_run = true;
+}
+
+fn store_locals(frame: &mut TryFrame, args_ptr: *const i64, argc: usize) {
+    if argc == 0 {
+        frame.locals.clear();
+        return;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(args_ptr, argc) };
+    frame.locals.clear();
+    frame.locals.extend_from_slice(slice);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn napalm_rt_try_enter(
+    func_id: i64,
+    region_id: i64,
+    descriptor_ptr: *const RuntimeTryDescriptor,
+) -> i64 {
+    descriptor(descriptor_ptr); // validate pointer in debug builds
+    TRY_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        stack.push(TryFrame {
+            func_id: func_id as u32,
+            region_id: region_id as u32,
+            descriptor: descriptor_ptr,
+            locals: Vec::new(),
+            defers: Vec::new(),
+            defers_run: false,
+        });
+    });
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn napalm_rt_try_leave(
+    func_id: i64,
+    region_id: i64,
+    exit_kind: i32,
+    args_ptr: *const i64,
+    argc: usize,
+) {
+    let exit = match exit_kind {
+        0 => TryExitKind::Normal,
+        1 => TryExitKind::Exception,
+        2 => TryExitKind::Rethrow,
+        _ => TryExitKind::Exception,
+    };
+    TRY_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        if let Some(frame) = stack.last_mut() {
+            debug_assert_eq!(frame.func_id, func_id as u32);
+            debug_assert_eq!(frame.region_id, region_id as u32);
+            store_locals(frame, args_ptr, argc);
+            run_deferred(frame, exit);
+            if matches!(exit, TryExitKind::Normal | TryExitKind::Rethrow) {
+                stack.pop();
+            }
+        } else {
+            panic!("napalm_rt_try_leave called with empty try stack");
+        }
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn napalm_rt_schedule_defer(kind: i32, action: i64) {
+    let kind = match kind {
+        0 => WirDeferKind::Always,
+        1 => WirDeferKind::OnError,
+        _ => WirDeferKind::Always,
+    };
+    TRY_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        if let Some(frame) = stack.last_mut() {
+            frame.defers.push(DeferredAction { kind, closure: action });
+        } else {
+            unsafe {
+                let _ = wir_call_closure(action, std::ptr::null(), 0);
+            }
+        }
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn napalm_rt_throw(func_id: i64, error: i64) -> i64 {
+    TRY_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        while let Some(mut frame) = stack.pop() {
+            run_deferred(&mut frame, TryExitKind::Exception);
+            let desc = descriptor(frame.descriptor);
+
+            // Attempt catch handlers in order.
+            for idx in 0..(desc.catch_len as usize) {
+                let entry = unsafe { desc.catch_stubs.add(idx).as_ref().unwrap() };
+                let mut args = SmallVec::<[i64; 8]>::new();
+                if entry.binds_exception {
+                    args.push(error);
+                }
+                args.extend_from_slice(&frame.locals);
+                let result = unsafe { (entry.stub)(args.as_ptr(), args.len()) };
+                if let Some(finally_stub) = desc.finally_stub {
+                    unsafe {
+                        let _ = finally_stub(frame.locals.as_ptr(), frame.locals.len());
+                    }
+                }
+                return result;
+            }
+
+            // Run finally if present before propagating further.
+            if let Some(finally_stub) = desc.finally_stub {
+                unsafe {
+                    let _ = finally_stub(frame.locals.as_ptr(), frame.locals.len());
+                }
+            }
+        }
+        panic!(
+            "uncaught exception thrown from func={} error={:#x}",
+            func_id, error
+        );
+    })
+}
 
 #[inline(always)]
 fn smi_to_i64(v: i64) -> i64 {
