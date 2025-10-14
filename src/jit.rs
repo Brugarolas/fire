@@ -16,13 +16,14 @@ use parking_lot::Mutex;
 use std::cell::Cell;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::ptr;
 
 #[allow(unused_imports)]
 use crate::gc::NAPALM_GC;
 
 use crate::wir::{
-    Constant, FuncId, Function as WirFunction, Inst, IntBinOp, TryExitKind, Value as WirValue,
-    ValueDef, ValueId,
+    Constant, FuncId, Function as WirFunction, Inst, IntBinOp, TryExitKind, TryRegion,
+    TryRegionId, Value as WirValue, ValueDef, ValueId,
 };
 
 use crate::http::{wir_server_add_route, wir_server_create, wir_server_listen};
@@ -38,16 +39,18 @@ use crate::native_timers::{
 };
 #[allow(unused_imports)]
 use crate::runtime::{
-    napalm_rt_schedule_defer, napalm_rt_throw, napalm_rt_try_enter, napalm_rt_try_leave,
-    napalm_yieldpoint, wir_builtin_entries, wir_builtin_keys, wir_builtin_size, wir_builtin_values,
-    wir_field_register_name, wir_is_map, wir_is_nullish, wir_is_proxy, wir_is_set, wir_is_str,
-    wir_map_clear, wir_map_delete, wir_map_get, wir_map_has, wir_map_new, wir_map_set,
-    wir_map_size, wir_memo_get, wir_memo_put, wir_obj_assign, wir_obj_clone, wir_obj_del_field,
-    wir_obj_del_str, wir_obj_get_field, wir_obj_get_field_deep, wir_obj_get_method,
-    wir_obj_get_proto, wir_obj_get_str, wir_obj_get_str_deep, wir_obj_has_field, wir_obj_has_str,
-    wir_obj_new, wir_obj_set_field, wir_obj_set_proto, wir_obj_set_str, wir_proxy_new, wir_set_add,
-    wir_set_clear, wir_set_delete, wir_set_has, wir_set_new, wir_set_size, wir_string_equals,
-    wir_super_get_method,
+    napalm_rt_register_try_descriptor, napalm_rt_schedule_defer, napalm_rt_stub_unimplemented,
+    napalm_rt_throw, napalm_rt_try_enter, napalm_rt_try_leave, napalm_yieldpoint,
+    RuntimeTryDescriptor, wir_builtin_entries, wir_builtin_keys, wir_builtin_size,
+    wir_builtin_values, wir_field_register_name, wir_is_map, wir_is_nullish, wir_is_proxy,
+    wir_is_set, wir_is_str, wir_map_clear, wir_map_delete, wir_map_get, wir_map_has, wir_map_new,
+    wir_map_set, wir_map_size, wir_memo_get, wir_memo_put, wir_obj_assign, wir_obj_clone,
+    wir_obj_del_field, wir_obj_del_str, wir_obj_get_field, wir_obj_get_field_deep,
+    wir_obj_get_method, wir_obj_get_proto, wir_obj_get_str, wir_obj_get_str_deep,
+    wir_obj_has_field, wir_obj_has_str, wir_obj_new, wir_obj_set_field, wir_obj_set_proto,
+    wir_obj_set_str, wir_proxy_new, wir_set_add, wir_set_clear, wir_set_delete, wir_set_has,
+    wir_set_new, wir_set_size, wir_string_equals, wir_super_get_method,
+    CatchStubEntry,
 };
 #[allow(unused_imports)]
 use crate::value::{
@@ -235,6 +238,8 @@ pub struct JIT {
     heap_keep_alive: Vec<*mut u8>,
     fast_decls: HashMap<u32, cranelift_module::FuncId>,
     stub_decls: HashMap<u32, cranelift_module::FuncId>,
+    try_descriptor_keep_alive: Vec<&'static crate::runtime::RuntimeTryDescriptor>,
+    try_catch_entries_keep_alive: Vec<&'static [crate::runtime::CatchStubEntry]>,
 }
 
 impl Default for JIT {
@@ -982,6 +987,8 @@ impl Default for JIT {
             heap_keep_alive: Vec::new(),
             fast_decls: HashMap::new(),
             stub_decls: HashMap::new(),
+            try_descriptor_keep_alive: Vec::new(),
+            try_catch_entries_keep_alive: Vec::new(),
         }
     }
 }
@@ -1096,6 +1103,43 @@ impl JIT {
         let call = fb.ins().call_indirect(sigref, fptr, args);
         Ok(fb.inst_results(call)[0])
     }
+
+    fn prepare_try_descriptors(
+        &mut self,
+        fun: &WirFunction,
+    ) -> HashMap<TryRegionId, *const RuntimeTryDescriptor> {
+        let mut map = HashMap::new();
+        for region in &fun.try_regions {
+            let catch_entries: Vec<CatchStubEntry> = region
+                .catches
+                .iter()
+                .map(|h| CatchStubEntry {
+                    binds_exception: h.binds_exception,
+                    stub: napalm_rt_stub_unimplemented,
+                })
+                .collect();
+            let catch_slice: &'static [CatchStubEntry] =
+                Box::leak(catch_entries.into_boxed_slice());
+            self.try_catch_entries_keep_alive.push(catch_slice);
+            let descriptor_ref: &'static RuntimeTryDescriptor =
+                Box::leak(Box::new(RuntimeTryDescriptor {
+                    func_id: fun.id.0 as u32,
+                    region_id: region.id.0 as u32,
+                    catch_stubs: catch_slice.as_ptr(),
+                    catch_len: catch_slice.len() as u32,
+                    finally_stub: None,
+                    continuation_stub: None,
+                }));
+            self.try_descriptor_keep_alive.push(descriptor_ref);
+            napalm_rt_register_try_descriptor(
+                fun.id.0 as u32,
+                region.id.0 as u32,
+                descriptor_ref,
+            );
+            map.insert(region.id, descriptor_ref as *const RuntimeTryDescriptor);
+        }
+        map
+    }
 }
 
 impl JIT {
@@ -1158,6 +1202,8 @@ impl JIT {
             .signature
             .returns
             .push(AbiParam::new(types::I64));
+
+        let try_descriptor_map = self.prepare_try_descriptors(fun_ir);
 
         #[cfg(debug_assertions)]
         {
@@ -2365,7 +2411,12 @@ impl JIT {
                             let rid =
                                 fb.ins()
                                     .iconst(types::I64, region.0 as i64);
-                            let descriptor = fb.ins().iconst(ptr_ty, 0);
+                            let desc_ptr = try_descriptor_map
+                                .get(region)
+                                .copied()
+                                .unwrap_or(ptr::null());
+                            let descriptor =
+                                fb.ins().iconst(ptr_ty, desc_ptr as i64);
                             let _ = self.call_import(
                                 &mut fb,
                                 "napalm_rt_try_enter",

@@ -24,6 +24,7 @@ use papaya::HashMap as LockfreeHashMap;
 use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
 use std::cell::RefCell;
+use std::ptr;
 use std::slice;
 use std::sync::OnceLock;
 use tinyvec::TinyVec;
@@ -36,6 +37,9 @@ pub struct CatchStubEntry {
     pub stub: StubPtr,
 }
 
+unsafe impl Send for CatchStubEntry {}
+unsafe impl Sync for CatchStubEntry {}
+
 #[repr(C)]
 pub struct RuntimeTryDescriptor {
     pub func_id: u32,
@@ -45,6 +49,9 @@ pub struct RuntimeTryDescriptor {
     pub finally_stub: Option<StubPtr>,
     pub continuation_stub: Option<StubPtr>,
 }
+
+unsafe impl Send for RuntimeTryDescriptor {}
+unsafe impl Sync for RuntimeTryDescriptor {}
 
 #[derive(Clone)]
 struct DeferredAction {
@@ -65,6 +72,9 @@ thread_local! {
     static TRY_STACK: RefCell<Vec<TryFrame>> = RefCell::new(Vec::new());
 }
 
+static TRY_DESCRIPTOR_REGISTRY: OnceLock<Mutex<HashMap<(u32, u32), usize>>> =
+    OnceLock::new();
+
 fn descriptor(ptr: *const RuntimeTryDescriptor) -> Option<&'static RuntimeTryDescriptor> {
     unsafe { ptr.as_ref() }
 }
@@ -80,7 +90,7 @@ fn run_deferred(frame: &mut TryFrame, exit: TryExitKind) {
         };
         if should_run {
             unsafe {
-                let _ = wir_call_closure(action.closure, std::ptr::null(), 0);
+                let _ = wir_call_closure(action.closure, ptr::null(), 0);
             }
         }
     }
@@ -103,12 +113,25 @@ pub extern "C" fn napalm_rt_try_enter(
     region_id: i64,
     descriptor_ptr: *const RuntimeTryDescriptor,
 ) -> i64 {
+    let func_id_u = func_id as u32;
+    let region_id_u = region_id as u32;
+    let resolved_ptr = if descriptor_ptr.is_null() {
+        TRY_DESCRIPTOR_REGISTRY
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .get(&(func_id_u, region_id_u))
+            .copied()
+            .map(|addr| addr as *const RuntimeTryDescriptor)
+            .unwrap_or(ptr::null())
+    } else {
+        descriptor_ptr
+    };
     TRY_STACK.with(|stack| {
         let mut stack = stack.borrow_mut();
         stack.push(TryFrame {
-            func_id: func_id as u32,
-            region_id: region_id as u32,
-            descriptor: descriptor_ptr,
+            func_id: func_id_u,
+            region_id: region_id_u,
+            descriptor: resolved_ptr,
             locals: Vec::new(),
             defers: Vec::new(),
             defers_run: false,
@@ -161,7 +184,7 @@ pub extern "C" fn napalm_rt_schedule_defer(kind: i32, action: i64) -> i64 {
             frame.defers.push(DeferredAction { kind, closure: action });
         } else {
             unsafe {
-                let _ = wir_call_closure(action, std::ptr::null(), 0);
+                let _ = wir_call_closure(action, ptr::null(), 0);
             }
         }
     });
@@ -174,7 +197,14 @@ pub extern "C" fn napalm_rt_throw(func_id: i64, error: i64) -> i64 {
         let mut stack = stack.borrow_mut();
         while let Some(mut frame) = stack.pop() {
             run_deferred(&mut frame, TryExitKind::Exception);
-            let desc = match descriptor(frame.descriptor) {
+            let desc = match descriptor(frame.descriptor).or_else(|| {
+                TRY_DESCRIPTOR_REGISTRY
+                    .get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock()
+                    .get(&(frame.func_id, frame.region_id))
+                    .copied()
+                    .and_then(|addr| descriptor(addr as *const RuntimeTryDescriptor))
+            }) {
                 Some(d) => d,
                 None => continue,
             };
@@ -208,6 +238,25 @@ pub extern "C" fn napalm_rt_throw(func_id: i64, error: i64) -> i64 {
             func_id, error
         );
     })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn napalm_rt_stub_unimplemented(_argv: *const i64, _argc: usize) -> i64 {
+    panic!("try stub invoked before JIT stub generation is implemented");
+}
+
+pub fn napalm_rt_register_try_descriptor(
+    func_id: u32,
+    region_id: u32,
+    descriptor: &'static RuntimeTryDescriptor,
+) {
+    TRY_DESCRIPTOR_REGISTRY
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .insert(
+            (func_id, region_id),
+            descriptor as *const RuntimeTryDescriptor as usize,
+        );
 }
 
 #[inline(always)]
