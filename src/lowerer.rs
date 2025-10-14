@@ -11,15 +11,15 @@ use std::{collections::BTreeSet, ops::Deref};
 // Bring in the WIR types from your other file/module.
 use crate::wir::{
     AccessorInfo, BindingId, Builder, Constant, FieldId, FuncId, Inst, IntBinOp, MethodInfo,
-    Module, Type, ValueId, next_id,
+    Module, TryExitKind, TryHandler, TryRegion, TryRegionId, Type, ValueId, next_id,
 };
 
+use crate::diag::Node;
 use crate::front::{
     BinOp, Block, CatchClause, ClassDecl, ClassMember, DeferKind, ExportDecl, Expr, ExprKind,
     FuncDecl, ImportDecl, ImportItem, LValue, LValueKind, ListenDecl, ObjItem, ObjPattern,
     OptionalAccess, Program, PropKey, RouteDecl, Stmt, StmtKind, UnOp,
 };
-use crate::diag::Node;
 
 use crate::hoister::hoist_fn_lits_program;
 
@@ -51,6 +51,238 @@ fn expr_with_meta(template: &Expr, kind: ExprKind) -> Expr {
 #[inline]
 fn lvalue_with_meta(template: &LValue, kind: LValueKind) -> LValue {
     Node::new(template.meta.clone(), kind)
+}
+
+#[derive(Clone)]
+struct TryScope {
+    region: TryRegionId,
+}
+
+fn emit_try_leave_chain<'m>(b: &mut Builder<'m>, stack: &[TryScope], exit: TryExitKind) {
+    for scope in stack.iter().rev() {
+        let _ = b.push_node(
+            Inst::TryLeave {
+                region: scope.region,
+                exit,
+            },
+            None,
+            0,
+            true,
+        );
+    }
+}
+
+fn lower_try_stmt_generic<'m, F>(
+    b: &mut Builder<'m>,
+    locals: &mut HashMap<String, ValueId>,
+    fields: &mut HashMap<String, FieldId>,
+    next_field: &mut u32,
+    try_block: &Block,
+    catch: Option<&CatchClause>,
+    finally_block: Option<&Block>,
+    lowering_ctx: &LoweringContext,
+    active_try: &mut Vec<TryScope>,
+    mut lower_block: F,
+) -> LResult<()>
+where
+    F: FnMut(
+        &mut Builder<'m>,
+        &mut HashMap<String, ValueId>,
+        &mut HashMap<String, FieldId>,
+        &mut u32,
+        &Block,
+        &LoweringContext,
+        &mut Vec<TryScope>,
+    ) -> LResult<()>,
+{
+    let stack_depth_before = active_try.len();
+
+    let mut mutated_names = collect_mut_locals_in_block(try_block);
+    if let Some(c) = catch {
+        mutated_names.extend(collect_mut_locals_in_block(&c.body));
+    }
+    if let Some(fin) = finally_block {
+        mutated_names.extend(collect_mut_locals_in_block(fin));
+    }
+    mutated_names.sort();
+    mutated_names.dedup();
+    mutated_names.retain(|name| locals.contains_key(name));
+
+    let try_entry = b.block();
+    let continuation = b.block();
+    let finally_entry = finally_block.map(|_| b.block());
+    let catch_entry = catch.map(|_| b.block());
+
+    let mut cont_params: HashMap<String, ValueId> = HashMap::new();
+    for name in &mutated_names {
+        let param = b.add_block_param(continuation, Type::Int32);
+        cont_params.insert(name.clone(), param);
+    }
+
+    let mut finally_params: Vec<(String, ValueId)> = Vec::new();
+    if let Some(fin_id) = finally_entry {
+        for name in &mutated_names {
+            let param = b.add_block_param(fin_id, Type::Int32);
+            finally_params.push((name.clone(), param));
+        }
+    }
+
+    let catches_meta = if let (Some(catch_clause), Some(handler)) = (catch, catch_entry) {
+        vec![TryHandler {
+            handler,
+            binds_exception: catch_clause.binding.is_some(),
+        }]
+    } else {
+        Vec::new()
+    };
+
+    let region_id = b.add_try_region(TryRegion {
+        id: TryRegionId(0),
+        try_entry,
+        continuation,
+        catches: catches_meta,
+        finally_entry,
+    });
+
+    let _ = b.push_node(Inst::TryEnter { region: region_id }, None, 0, true);
+    b.jump(try_entry, &[]);
+
+    active_try.push(TryScope { region: region_id });
+    let mut region_popped = false;
+
+    let incoming_locals = locals.clone();
+    let gather_args = |map: &HashMap<String, ValueId>| -> Vec<ValueId> {
+        mutated_names
+            .iter()
+            .map(|name| {
+                *map.get(name)
+                    .or_else(|| incoming_locals.get(name))
+                    .expect("mutated local missing in scope")
+            })
+            .collect()
+    };
+
+    let mut cont_has_path = false;
+
+    // Lower try body
+    b.position_at(try_entry);
+    let mut locals_try = incoming_locals.clone();
+    lower_block(
+        b,
+        &mut locals_try,
+        fields,
+        next_field,
+        try_block,
+        lowering_ctx,
+        active_try,
+    )?;
+    if !b.current_block_terminated() {
+        let args = gather_args(&locals_try);
+        let _ = b.push_node(
+            Inst::TryLeave {
+                region: region_id,
+                exit: TryExitKind::Normal,
+            },
+            None,
+            0,
+            true,
+        );
+        if let Some(fin_id) = finally_entry {
+            b.jump(fin_id, &args);
+        } else {
+            b.jump(continuation, &args);
+            cont_has_path = true;
+        }
+    }
+
+    // Lower catch, if present
+    if let (Some(catch_clause), Some(catch_id)) = (catch, catch_entry) {
+        b.position_at(catch_id);
+        let mut locals_catch = incoming_locals.clone();
+        if let Some(binding) = &catch_clause.binding {
+            let err_val = b.add_block_param(catch_id, Type::AnyRef);
+            locals_catch.insert(binding.clone(), err_val);
+        }
+        lower_block(
+            b,
+            &mut locals_catch,
+            fields,
+            next_field,
+            &catch_clause.body,
+            lowering_ctx,
+            active_try,
+        )?;
+        if !b.current_block_terminated() {
+            let args = gather_args(&locals_catch);
+            let _ = b.push_node(
+                Inst::TryLeave {
+                    region: region_id,
+                    exit: TryExitKind::Normal,
+                },
+                None,
+                0,
+                true,
+            );
+            if let Some(fin_id) = finally_entry {
+                b.jump(fin_id, &args);
+            } else {
+                b.jump(continuation, &args);
+                cont_has_path = true;
+            }
+        }
+    }
+
+    // Lower finally, if present
+    if let Some(fin_id) = finally_entry {
+        let popped = active_try
+            .pop()
+            .expect("try scope should be active before finally");
+        debug_assert_eq!(popped.region, region_id);
+        region_popped = true;
+
+        b.position_at(fin_id);
+        let mut locals_finally = incoming_locals.clone();
+        for (name, param) in &finally_params {
+            locals_finally.insert(name.clone(), *param);
+        }
+        lower_block(
+            b,
+            &mut locals_finally,
+            fields,
+            next_field,
+            finally_block.expect("finally block"),
+            lowering_ctx,
+            active_try,
+        )?;
+        if !b.current_block_terminated() {
+            let args = gather_args(&locals_finally);
+            b.jump(continuation, &args);
+            cont_has_path = true;
+        }
+    }
+
+    if !region_popped {
+        let popped = active_try.pop().expect("try scope should still be active");
+        debug_assert_eq!(popped.region, region_id);
+    }
+    debug_assert_eq!(active_try.len(), stack_depth_before);
+
+    b.position_at(continuation);
+    if cont_has_path {
+        for name in &mutated_names {
+            if let Some(&param) = cont_params.get(name) {
+                locals.insert(name.clone(), param);
+            }
+        }
+    } else {
+        for name in &mutated_names {
+            if let Some(val) = incoming_locals.get(name) {
+                locals.insert(name.clone(), *val);
+            }
+        }
+    }
+
+    Ok(())
 }
 // -------------------------
 /// LOWERING (AST → WIR)
@@ -422,6 +654,7 @@ impl<'m> Lowerer<'m> {
             // Per-function table for "fast field" interning.
             let mut fields: HashMap<String, FieldId> = Default::default();
             let mut next_field: u32 = 0;
+            let mut active_try: Vec<TryScope> = Vec::new();
 
             if is_async {
                 // --- Async prologue: d = Deferred()
@@ -448,6 +681,7 @@ impl<'m> Lowerer<'m> {
                     &fdecl.body,
                     &self.lowering_ctx,
                     true, // in_async
+                    &mut active_try,
                 )?;
 
                 // Fallthrough: if the body didn’t explicitly return, resolve with 0 and return d.
@@ -476,6 +710,7 @@ impl<'m> Lowerer<'m> {
                     &mut next_field,
                     &fdecl.body,
                     &self.lowering_ctx,
+                    &mut active_try,
                 )?;
 
                 // Fallthrough return 0 (matches previous convention).
@@ -506,9 +741,10 @@ fn lower_block_free<'m>(
     next_field: &mut u32,
     blk: &Block,
     lowering_ctx: &LoweringContext,
+    active_try: &mut Vec<TryScope>,
 ) -> LResult<()> {
     for s in &blk.stmts {
-        lower_stmt_free(b, locals, fields, next_field, s, lowering_ctx)?; // <-- pass
+        lower_stmt_free(b, locals, fields, next_field, s, lowering_ctx, active_try)?; // <-- pass
     }
     Ok(())
 }
@@ -520,6 +756,7 @@ fn lower_stmt_free<'m>(
     next_field: &mut u32,
     s: &Stmt,
     lowering_ctx: &LoweringContext,
+    active_try: &mut Vec<TryScope>,
 ) -> LResult<()> {
     match s.kind() {
         StmtKind::Var { name, init } => {
@@ -683,6 +920,7 @@ fn lower_stmt_free<'m>(
                 next_field,
                 then_b,
                 lowering_ctx,
+                active_try,
             )?; // <-- pass
             if !b.current_block_terminated() {
                 b.jump(then_end, &[]);
@@ -692,7 +930,15 @@ fn lower_stmt_free<'m>(
             b.position_at(else_id);
             let mut locals_else = incoming.clone();
             if let Some(eb) = else_b {
-                lower_block_free(b, &mut locals_else, fields, next_field, eb, lowering_ctx)?; // <-- pass
+                lower_block_free(
+                    b,
+                    &mut locals_else,
+                    fields,
+                    next_field,
+                    eb,
+                    lowering_ctx,
+                    active_try,
+                )?; // <-- pass
             }
             if !b.current_block_terminated() {
                 b.jump(else_end, &[]);
@@ -759,7 +1005,15 @@ fn lower_stmt_free<'m>(
             b.branch(c, body_b, exit);
 
             b.position_at(body_b);
-            lower_block_free(b, locals, fields, next_field, body, lowering_ctx)?; // <-- pass
+            lower_block_free(
+                b,
+                locals,
+                fields,
+                next_field,
+                body,
+                lowering_ctx,
+                active_try,
+            )?; // <-- pass
             let back_args: Vec<ValueId> =
                 mut_names.iter().map(|n| *locals.get(n).unwrap()).collect();
             b.jump(head, &back_args);
@@ -776,7 +1030,7 @@ fn lower_stmt_free<'m>(
             body,
         } => {
             if let Some(i) = init.as_deref() {
-                lower_stmt_free(b, locals, fields, next_field, i, lowering_ctx)?;
+                lower_stmt_free(b, locals, fields, next_field, i, lowering_ctx, active_try)?;
             } // <-- pass
 
             let head = b.block();
@@ -822,7 +1076,15 @@ fn lower_stmt_free<'m>(
             b.branch(c, body_b, exit);
 
             b.position_at(body_b);
-            lower_block_free(b, locals, fields, next_field, body, lowering_ctx)?; // <-- pass
+            lower_block_free(
+                b,
+                locals,
+                fields,
+                next_field,
+                body,
+                lowering_ctx,
+                active_try,
+            )?; // <-- pass
             if let Some(se) = step {
                 let _ = lower_expr_free(b, locals, fields, next_field, se, lowering_ctx)?;
             } // <-- pass
@@ -835,27 +1097,77 @@ fn lower_stmt_free<'m>(
                 locals.insert(nm, p);
             }
         }
-        StmtKind::Try { .. } => {
-            return Err(LowerError::NotLowerable(
-                "try/catch/finally lowering not implemented yet",
-            ));
+        StmtKind::Try {
+            try_block,
+            catch,
+            finally_block,
+        } => {
+            lower_try_stmt_generic(
+                b,
+                locals,
+                fields,
+                next_field,
+                try_block,
+                catch.as_ref(),
+                finally_block.as_ref(),
+                lowering_ctx,
+                active_try,
+                |b, locals, fields, next_field, block, lowering_ctx, active_try| {
+                    lower_block_free(
+                        b,
+                        locals,
+                        fields,
+                        next_field,
+                        block,
+                        lowering_ctx,
+                        active_try,
+                    )
+                },
+            )?;
         }
-        StmtKind::Throw(_) => {
-            return Err(LowerError::NotLowerable(
-                "throw statements not implemented yet",
-            ));
+        StmtKind::Throw(expr) => {
+            let val = lower_expr_free(b, locals, fields, next_field, expr, lowering_ctx)?;
+            let (_nid, err_res) = b.push_node(
+                Inst::CallNative {
+                    name: "wir_error_from_value".into(),
+                    args: vec![val],
+                    pure: false,
+                    can_throw: false,
+                },
+                Some(Type::AnyRef),
+                1,
+                true,
+            );
+            let err = err_res[0];
+            emit_try_leave_chain(b, active_try, TryExitKind::Exception);
+            let _ = b.push_node(Inst::Throw(err), None, 0, true);
         }
-        StmtKind::Defer { .. } => {
-            return Err(LowerError::NotLowerable(
-                "defer/errdefer lowering not implemented yet",
-            ));
+        StmtKind::Defer { kind, expr } => {
+            let action = lower_expr_free(b, locals, fields, next_field, expr, lowering_ctx)?;
+            let kind_val = match kind {
+                DeferKind::Defer => b.const_i32(0),
+                DeferKind::ErrDefer => b.const_i32(1),
+            };
+            let _ = b.push_node(
+                Inst::CallNative {
+                    name: "napalm_rt_schedule_defer".into(),
+                    args: vec![kind_val, action],
+                    pure: false,
+                    can_throw: false,
+                },
+                Some(Type::Top),
+                1,
+                true,
+            );
         }
         StmtKind::Return(e) => {
             if let Some(e) = e {
                 let v = lower_expr_free(b, locals, fields, next_field, e, lowering_ctx)?;
+                emit_try_leave_chain(b, active_try, TryExitKind::Normal);
                 b.ret(&[v]);
             } else {
                 let z = b.const_i32(0);
+                emit_try_leave_chain(b, active_try, TryExitKind::Normal);
                 b.ret(&[z]);
             }
         }
@@ -1281,9 +1593,19 @@ fn lower_block_free_async<'m>(
     blk: &Block,
     lowering_ctx: &LoweringContext,
     in_async: bool,
+    active_try: &mut Vec<TryScope>,
 ) -> LResult<()> {
     for s in &blk.stmts {
-        lower_stmt_free_async(b, locals, fields, next_field, s, lowering_ctx, in_async)?;
+        lower_stmt_free_async(
+            b,
+            locals,
+            fields,
+            next_field,
+            s,
+            lowering_ctx,
+            in_async,
+            active_try,
+        )?;
     }
     Ok(())
 }
@@ -1296,19 +1618,21 @@ fn lower_stmt_free_async<'m>(
     s: &Stmt,
     lowering_ctx: &LoweringContext,
     in_async: bool,
+    active_try: &mut Vec<TryScope>,
 ) -> LResult<()> {
     match s.kind() {
         StmtKind::Return(eopt) if in_async => {
             let d = *locals.get("__deferred").expect("__deferred present");
-            let v = if let Some(e) = eopt {
+            let ret_val = if let Some(e) = eopt {
                 lower_expr_free_async(b, locals, fields, next_field, e, lowering_ctx, in_async)?
             } else {
                 b.const_i32(0)
             };
+            emit_try_leave_chain(b, active_try, TryExitKind::Normal);
             let (_nid, _r) = b.push_node(
                 Inst::CallNative {
                     name: "wir_deferred_resolve".into(),
-                    args: vec![d, v],
+                    args: vec![d, ret_val],
                     pure: false,
                     can_throw: false,
                 },
@@ -1400,15 +1724,86 @@ fn lower_stmt_free_async<'m>(
         _ => {
             // Forward to the old lowering, but via the *_async versions
             match s.kind() {
-                StmtKind::Try { .. } => Err(LowerError::NotLowerable(
-                    "try/catch/finally lowering not implemented yet",
-                )),
-                StmtKind::Throw(_) => Err(LowerError::NotLowerable(
-                    "throw statements not implemented yet",
-                )),
-                StmtKind::Defer { .. } => Err(LowerError::NotLowerable(
-                    "defer/errdefer lowering not implemented yet",
-                )),
+                StmtKind::Try {
+                    try_block,
+                    catch,
+                    finally_block,
+                } => lower_try_stmt_generic(
+                    b,
+                    locals,
+                    fields,
+                    next_field,
+                    try_block,
+                    catch.as_ref(),
+                    finally_block.as_ref(),
+                    lowering_ctx,
+                    active_try,
+                    |b, locals, fields, next_field, block, lowering_ctx, active_try| {
+                        lower_block_free_async(
+                            b,
+                            locals,
+                            fields,
+                            next_field,
+                            block,
+                            lowering_ctx,
+                            in_async,
+                            active_try,
+                        )
+                    },
+                ),
+                StmtKind::Throw(expr) => {
+                    let val = lower_expr_free_async(
+                        b,
+                        locals,
+                        fields,
+                        next_field,
+                        expr,
+                        lowering_ctx,
+                        in_async,
+                    )?;
+                    let (_nid, err_res) = b.push_node(
+                        Inst::CallNative {
+                            name: "wir_error_from_value".into(),
+                            args: vec![val],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::AnyRef),
+                        1,
+                        true,
+                    );
+                    let err = err_res[0];
+                    emit_try_leave_chain(b, active_try, TryExitKind::Exception);
+                    let _ = b.push_node(Inst::Throw(err), None, 0, true);
+                    Ok(())
+                }
+                StmtKind::Defer { kind, expr } => {
+                    let action = lower_expr_free_async(
+                        b,
+                        locals,
+                        fields,
+                        next_field,
+                        expr,
+                        lowering_ctx,
+                        in_async,
+                    )?;
+                    let kind_val = match kind {
+                        DeferKind::Defer => b.const_i32(0),
+                        DeferKind::ErrDefer => b.const_i32(1),
+                    };
+                    let _ = b.push_node(
+                        Inst::CallNative {
+                            name: "napalm_rt_schedule_defer".into(),
+                            args: vec![kind_val, action],
+                            pure: false,
+                            can_throw: false,
+                        },
+                        Some(Type::Top),
+                        1,
+                        true,
+                    );
+                    Ok(())
+                }
                 StmtKind::Var { name, init } => {
                     let val = if let Some(e) = init {
                         lower_expr_free_async(
@@ -1568,6 +1963,7 @@ fn lower_stmt_free_async<'m>(
                         then_b,
                         lowering_ctx,
                         in_async,
+                        active_try,
                     )?;
                     if !b.current_block_terminated() {
                         b.jump(then_end, &[]);
@@ -1585,6 +1981,7 @@ fn lower_stmt_free_async<'m>(
                             eb,
                             lowering_ctx,
                             in_async,
+                            active_try,
                         )?;
                     }
                     if !b.current_block_terminated() {
@@ -1672,6 +2069,7 @@ fn lower_stmt_free_async<'m>(
                         body,
                         lowering_ctx,
                         in_async,
+                        active_try,
                     )?;
                     let back_args: Vec<ValueId> =
                         mut_names.iter().map(|n| *locals.get(n).unwrap()).collect();
@@ -1698,6 +2096,7 @@ fn lower_stmt_free_async<'m>(
                             i,
                             lowering_ctx,
                             in_async,
+                            active_try,
                         )?;
                     }
 
@@ -1760,6 +2159,7 @@ fn lower_stmt_free_async<'m>(
                         body,
                         lowering_ctx,
                         in_async,
+                        active_try,
                     )?;
                     if let Some(se) = step {
                         let _ = lower_expr_free_async(
@@ -3046,7 +3446,8 @@ fn lower_expr_free<'m>(
                     Ok(b.int_bin(IntBinOp::Sub, zero, v))
                 }
                 UnOp::Pos => Ok(v),
-                UnOp::BitwiseNot => { // handle `~`
+                UnOp::BitwiseNot => {
+                    // handle `~`
                     let neg_one = b.const_i32(-1);
                     Ok(b.int_bin(IntBinOp::Xor, v, neg_one))
                 }
@@ -3122,12 +3523,14 @@ fn lower_expr_free<'m>(
                     let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
                     Ok(b.int_bin(IntBinOp::Sar, va, vb))
                 }
-                ShrU => { // handle `>>>`
+                ShrU => {
+                    // handle `>>>`
                     let va = lower_expr_free(b, locals, fields, next_field, a, lowering_ctx)?;
                     let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
                     Ok(b.int_bin(IntBinOp::ShrU, va, vb)) // ShrU = Unsigned (Logical) Shift Right
                 }
-                StrConcat => { // handle `__`
+                StrConcat => {
+                    // handle `__`
                     let va = lower_expr_free(b, locals, fields, next_field, a, lowering_ctx)?;
                     let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
 
@@ -3571,13 +3974,14 @@ fn lower_expr_free<'m>(
         ExprKind::GetProp { recv, name } => {
             // Static class method read: Class.static → closure with null env
             if let ExprKind::Ident(cn) = recv.kind() {
-                if let Some(&mfid) =
-                    lowering_ctx.funcs.get(&format!("__static_{}_{}", cn, name))
-                {
+                if let Some(&mfid) = lowering_ctx.funcs.get(&format!("__static_{}_{}", cn, name)) {
                     let (_nid, env_null) =
                         b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
                     let (_nid, clos) = b.push_node(
-                        Inst::MakeClosure { callee: mfid, env: env_null[0] },
+                        Inst::MakeClosure {
+                            callee: mfid,
+                            env: env_null[0],
+                        },
                         Some(Type::Closure(None)),
                         1,
                         false,
@@ -3990,7 +4394,6 @@ fn lower_expr_free<'m>(
 
             // --- Property-call fast paths ---
             if let ExprKind::GetProp { recv, name } = callee.kind() {
-
                 // 0a) Promise-style instance methods
                 if name == "then" {
                     let p = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
@@ -4923,7 +5326,10 @@ fn lower_expr_free<'m>(
 
             #[cfg(debug_assertions)]
             {
-                eprintln!("lower_expr_free() ExprKind::Call(...) ExprKind::New({})", class);
+                eprintln!(
+                    "lower_expr_free() ExprKind::Call(...) ExprKind::New({})",
+                    class
+                );
                 eprintln!(
                     "[links] exports        : {:?}",
                     lowering_ctx
@@ -6046,6 +6452,7 @@ impl<'m> Lowerer<'m> {
 
             let mut fields: HashMap<String, FieldId> = Default::default();
             let mut next_field: u32 = 0;
+            let mut active_try: Vec<TryScope> = Vec::new();
 
             if is_async {
                 // Deferred prologue
@@ -6071,6 +6478,7 @@ impl<'m> Lowerer<'m> {
                     body,
                     &self.lowering_ctx,
                     true,
+                    &mut active_try,
                 )?;
 
                 if !b.current_block_terminated() {
@@ -6096,6 +6504,7 @@ impl<'m> Lowerer<'m> {
                     &mut next_field,
                     body,
                     &self.lowering_ctx,
+                    &mut active_try,
                 )?;
                 if !b.current_block_terminated() {
                     let zero = b.const_i32(0);
@@ -6194,10 +6603,7 @@ impl<'m> Lowerer<'m> {
                         finally_block: finally_block.as_ref().map(|blk| rw_block(blk, f)),
                     },
                 ),
-                StmtKind::Throw(expr) => stmt_with_meta(
-                    s,
-                    StmtKind::Throw(rw_expr(expr, f)),
-                ),
+                StmtKind::Throw(expr) => stmt_with_meta(s, StmtKind::Throw(rw_expr(expr, f))),
                 StmtKind::Defer { kind, expr } => stmt_with_meta(
                     s,
                     StmtKind::Defer {
@@ -6205,10 +6611,9 @@ impl<'m> Lowerer<'m> {
                         expr: rw_expr(expr, f),
                     },
                 ),
-                StmtKind::Return(e) => stmt_with_meta(
-                    s,
-                    StmtKind::Return(e.as_ref().map(|x| rw_expr(x, f))),
-                ),
+                StmtKind::Return(e) => {
+                    stmt_with_meta(s, StmtKind::Return(e.as_ref().map(|x| rw_expr(x, f))))
+                }
                 StmtKind::Expr(e) => stmt_with_meta(s, StmtKind::Expr(rw_expr(e, f))),
                 StmtKind::Listen(ld) => {
                     let routes = ld
@@ -6280,10 +6685,9 @@ impl<'m> Lowerer<'m> {
                         index: SmallBox::new(rw_expr(index, f)),
                     },
                 ),
-                ExprKind::Group(inner) => expr_with_meta(
-                    &m,
-                    ExprKind::Group(SmallBox::new(rw_expr(inner, f))),
-                ),
+                ExprKind::Group(inner) => {
+                    expr_with_meta(&m, ExprKind::Group(SmallBox::new(rw_expr(inner, f))))
+                }
                 ExprKind::ArrayLit(items) => expr_with_meta(
                     &m,
                     ExprKind::ArrayLit(items.iter().map(|x| rw_expr(x, f)).collect()),
@@ -6328,10 +6732,9 @@ impl<'m> Lowerer<'m> {
                         key: key.clone(),
                     },
                 ),
-                ExprKind::Await(inner) => expr_with_meta(
-                    &m,
-                    ExprKind::Await(SmallBox::new(rw_expr(inner, f))),
-                ),
+                ExprKind::Await(inner) => {
+                    expr_with_meta(&m, ExprKind::Await(SmallBox::new(rw_expr(inner, f))))
+                }
                 _ => m,
             }
         }
@@ -6443,6 +6846,7 @@ impl<'m> Lowerer<'m> {
             for (i, name) in params.iter().enumerate() {
                 locals.insert(name.clone(), b.param(i + 1));
             }
+            let mut active_try: Vec<TryScope> = Vec::new();
 
             if is_async {
                 // --- Async prologue: d = Deferred()
@@ -6469,6 +6873,7 @@ impl<'m> Lowerer<'m> {
                     &body_rw,
                     &self.lowering_ctx,
                     true,
+                    &mut active_try,
                 )?;
 
                 // Fallthrough: if the body didn’t explicitly return, resolve with 0 and return d.
@@ -6496,6 +6901,7 @@ impl<'m> Lowerer<'m> {
                     next_field,
                     &body_rw,
                     &self.lowering_ctx,
+                    &mut active_try,
                 )?;
                 if !b.current_block_terminated() {
                     let zero = b.const_i32(0);
