@@ -21,7 +21,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::gc::NAPALM_GC;
 
 use crate::wir::{
-    Constant, FuncId, Function as WirFunction, Inst, IntBinOp, Value as WirValue, ValueDef, ValueId,
+    Constant, FuncId, Function as WirFunction, Inst, IntBinOp, TryExitKind, Value as WirValue,
+    ValueDef, ValueId,
 };
 
 use crate::http::{wir_server_add_route, wir_server_create, wir_server_listen};
@@ -37,6 +38,7 @@ use crate::native_timers::{
 };
 #[allow(unused_imports)]
 use crate::runtime::{
+    napalm_rt_schedule_defer, napalm_rt_throw, napalm_rt_try_enter, napalm_rt_try_leave,
     napalm_yieldpoint, wir_builtin_entries, wir_builtin_keys, wir_builtin_size, wir_builtin_values,
     wir_field_register_name, wir_is_map, wir_is_nullish, wir_is_proxy, wir_is_set, wir_is_str,
     wir_map_clear, wir_map_delete, wir_map_get, wir_map_has, wir_map_new, wir_map_set,
@@ -489,6 +491,27 @@ impl Default for JIT {
             jb.symbol(
                 "wir_call_closure",
                 wir_call_closure as *const extern "C" fn(i64, *const i64, i64) -> i64 as *const u8,
+            );
+            jb.symbol(
+                "napalm_rt_try_enter",
+                napalm_rt_try_enter
+                    as *const extern "C" fn(i64, i64, *const crate::runtime::RuntimeTryDescriptor) -> i64
+                    as *const u8,
+            );
+            jb.symbol(
+                "napalm_rt_try_leave",
+                napalm_rt_try_leave
+                    as *const extern "C" fn(i64, i64, i32, *const i64, usize)
+                        -> i64
+                        as *const u8,
+            );
+            jb.symbol(
+                "napalm_rt_schedule_defer",
+                napalm_rt_schedule_defer as *const extern "C" fn(i32, i64) -> i64 as *const u8,
+            );
+            jb.symbol(
+                "napalm_rt_throw",
+                napalm_rt_throw as *const extern "C" fn(i64, i64) -> i64 as *const u8,
             );
             jb.symbol(
                 "wir_alloc_words",
@@ -2331,6 +2354,80 @@ impl JIT {
                             if res_count == 1 {
                                 vmap.bind(node.results[0], obj);
                             }
+                        }
+
+                        // ---------------- Try / Throw support ----------------
+                        Inst::TryEnter { region } => {
+                            use cranelift::prelude::{AbiParam, types};
+                            let fid =
+                                fb.ins()
+                                    .iconst(types::I64, fun_ir.id.0 as i64);
+                            let rid =
+                                fb.ins()
+                                    .iconst(types::I64, region.0 as i64);
+                            let descriptor = fb.ins().iconst(ptr_ty, 0);
+                            let _ = self.call_import(
+                                &mut fb,
+                                "napalm_rt_try_enter",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64)); // func id
+                                    s.params.push(AbiParam::new(types::I64)); // region id
+                                    s.params.push(AbiParam::new(ptr_ty)); // descriptor*
+                                    s.returns.push(AbiParam::new(types::I64)); // result (ignored)
+                                },
+                                &[fid, rid, descriptor],
+                            )?;
+                        }
+
+                        Inst::TryLeave { region, exit } => {
+                            use cranelift::prelude::{AbiParam, types};
+                            let fid =
+                                fb.ins()
+                                    .iconst(types::I64, fun_ir.id.0 as i64);
+                            let rid =
+                                fb.ins()
+                                    .iconst(types::I64, region.0 as i64);
+                            let exit_code = match exit {
+                                TryExitKind::Normal => 0,
+                                TryExitKind::Exception => 1,
+                                TryExitKind::Rethrow => 2,
+                            };
+                            let exit_val = fb.ins().iconst(types::I64, exit_code);
+                            let locals_ptr = fb.ins().iconst(ptr_ty, 0);
+                            let locals_len = fb.ins().iconst(ptr_ty, 0);
+                            let _ = self.call_import(
+                                &mut fb,
+                                "napalm_rt_try_leave",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64)); // func id
+                                    s.params.push(AbiParam::new(types::I64)); // region id
+                                    s.params.push(AbiParam::new(types::I64)); // exit kind
+                                    s.params.push(AbiParam::new(ptr_ty)); // locals ptr
+                                    s.params.push(AbiParam::new(ptr_ty)); // locals len
+                                },
+                                &[fid, rid, exit_val, locals_ptr, locals_len],
+                            )?;
+                        }
+
+                        Inst::Throw(val) => {
+                            use cranelift::prelude::{AbiParam, TrapCode, types};
+                            let fid =
+                                fb.ins()
+                                    .iconst(types::I64, fun_ir.id.0 as i64);
+                            let err = vmap.get_or_emit(*val, &mut fb, fun_ir);
+                            let _ = self.call_import(
+                                &mut fb,
+                                "napalm_rt_throw",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64)); // func id
+                                    s.params.push(AbiParam::new(types::I64)); // error value
+                                    s.returns.push(AbiParam::new(types::I64)); // never returns
+                                },
+                                &[fid, err],
+                            )?;
+                            fb.ins().trap(TrapCode::unwrap_user(0xE2));
+                            block_terminated = true;
+                            terminated = true;
                         }
 
                         // ---------------- Effects / markers ----------------

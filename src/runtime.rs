@@ -65,8 +65,8 @@ thread_local! {
     static TRY_STACK: RefCell<Vec<TryFrame>> = RefCell::new(Vec::new());
 }
 
-fn descriptor<'a>(ptr: *const RuntimeTryDescriptor) -> &'a RuntimeTryDescriptor {
-    unsafe { ptr.as_ref().expect("runtime: descriptor pointer is null") }
+fn descriptor(ptr: *const RuntimeTryDescriptor) -> Option<&'static RuntimeTryDescriptor> {
+    unsafe { ptr.as_ref() }
 }
 
 fn run_deferred(frame: &mut TryFrame, exit: TryExitKind) {
@@ -103,7 +103,6 @@ pub extern "C" fn napalm_rt_try_enter(
     region_id: i64,
     descriptor_ptr: *const RuntimeTryDescriptor,
 ) -> i64 {
-    descriptor(descriptor_ptr); // validate pointer in debug builds
     TRY_STACK.with(|stack| {
         let mut stack = stack.borrow_mut();
         stack.push(TryFrame {
@@ -125,7 +124,7 @@ pub extern "C" fn napalm_rt_try_leave(
     exit_kind: i32,
     args_ptr: *const i64,
     argc: usize,
-) {
+) -> i64 {
     let exit = match exit_kind {
         0 => TryExitKind::Normal,
         1 => TryExitKind::Exception,
@@ -146,10 +145,11 @@ pub extern "C" fn napalm_rt_try_leave(
             panic!("napalm_rt_try_leave called with empty try stack");
         }
     });
+    0
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn napalm_rt_schedule_defer(kind: i32, action: i64) {
+pub extern "C" fn napalm_rt_schedule_defer(kind: i32, action: i64) -> i64 {
     let kind = match kind {
         0 => WirDeferKind::Always,
         1 => WirDeferKind::OnError,
@@ -165,6 +165,7 @@ pub extern "C" fn napalm_rt_schedule_defer(kind: i32, action: i64) {
             }
         }
     });
+    0
 }
 
 #[unsafe(no_mangle)]
@@ -173,7 +174,10 @@ pub extern "C" fn napalm_rt_throw(func_id: i64, error: i64) -> i64 {
         let mut stack = stack.borrow_mut();
         while let Some(mut frame) = stack.pop() {
             run_deferred(&mut frame, TryExitKind::Exception);
-            let desc = descriptor(frame.descriptor);
+            let desc = match descriptor(frame.descriptor) {
+                Some(d) => d,
+                None => continue,
+            };
 
             // Attempt catch handlers in order.
             for idx in 0..(desc.catch_len as usize) {
