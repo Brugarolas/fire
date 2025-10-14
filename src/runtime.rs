@@ -53,6 +53,17 @@ pub struct RuntimeTryDescriptor {
 unsafe impl Send for RuntimeTryDescriptor {}
 unsafe impl Sync for RuntimeTryDescriptor {}
 
+#[repr(C)]
+pub struct RuntimeResumeInfo {
+    pub func_id: u32,
+    pub block_id: u32,
+    pub argc: usize,
+    pub argv: *const i64,
+}
+
+unsafe impl Send for RuntimeResumeInfo {}
+unsafe impl Sync for RuntimeResumeInfo {}
+
 #[derive(Clone)]
 struct DeferredAction {
     kind: WirDeferKind,
@@ -70,6 +81,7 @@ struct TryFrame {
 
 thread_local! {
     static TRY_STACK: RefCell<Vec<TryFrame>> = RefCell::new(Vec::new());
+    static RESUME_INFO: RefCell<Option<RuntimeResumeInfo>> = RefCell::new(None);
 }
 
 static TRY_DESCRIPTOR_REGISTRY: OnceLock<Mutex<HashMap<(u32, u32), usize>>> =
@@ -105,6 +117,51 @@ fn store_locals(frame: &mut TryFrame, args_ptr: *const i64, argc: usize) {
     let slice = unsafe { std::slice::from_raw_parts(args_ptr, argc) };
     frame.locals.clear();
     frame.locals.extend_from_slice(slice);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn napalm_rt_prepare_resume(
+    func_id: i64,
+    block_id: i64,
+    argv: *const i64,
+    argc: usize,
+) -> i64 {
+    RESUME_INFO.with(|cell| {
+        *cell.borrow_mut() = Some(RuntimeResumeInfo {
+            func_id: func_id as u32,
+            block_id: block_id as u32,
+            argc,
+            argv,
+        });
+    });
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn napalm_rt_take_resume(func_id: i64) -> *const RuntimeResumeInfo {
+    RESUME_INFO.with(|cell| {
+        if let Some(info) = cell.borrow().as_ref() {
+            if info.func_id == func_id as u32 {
+                return info as *const RuntimeResumeInfo;
+            }
+        }
+        ptr::null()
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn napalm_rt_clear_resume(func_id: i64) -> i64 {
+    RESUME_INFO.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        if borrow
+            .as_ref()
+            .map(|info| info.func_id == func_id as u32)
+            .unwrap_or(false)
+        {
+            *borrow = None;
+        }
+    });
+    0
 }
 
 #[unsafe(no_mangle)]

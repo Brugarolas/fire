@@ -16,14 +16,19 @@ use parking_lot::Mutex;
 use std::cell::Cell;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::mem;
 use std::ptr;
 
 #[allow(unused_imports)]
 use crate::gc::NAPALM_GC;
 
+const RESUME_INFO_BLOCK_OFFSET: i32 = std::mem::size_of::<u32>() as i32;
+const RESUME_INFO_ARGC_OFFSET: i32 = (std::mem::size_of::<u32>() * 2) as i32;
+const RESUME_INFO_ARGV_OFFSET: i32 = RESUME_INFO_ARGC_OFFSET + std::mem::size_of::<usize>() as i32;
+
 use crate::wir::{
-    Constant, FuncId, Function as WirFunction, Inst, IntBinOp, TryExitKind, TryRegion,
-    TryRegionId, Value as WirValue, ValueDef, ValueId,
+    Constant, FuncId, Function as WirFunction, Inst, IntBinOp, TryExitKind, TryRegion, TryRegionId,
+    Value as WirValue, ValueDef, ValueId, BlockId,
 };
 
 use crate::http::{wir_server_add_route, wir_server_create, wir_server_listen};
@@ -39,7 +44,8 @@ use crate::native_timers::{
 };
 #[allow(unused_imports)]
 use crate::runtime::{
-    napalm_rt_register_try_descriptor, napalm_rt_schedule_defer, napalm_rt_stub_unimplemented,
+    napalm_rt_clear_resume, napalm_rt_prepare_resume, napalm_rt_register_try_descriptor,
+    napalm_rt_schedule_defer, napalm_rt_stub_unimplemented, napalm_rt_take_resume,
     napalm_rt_throw, napalm_rt_try_enter, napalm_rt_try_leave, napalm_yieldpoint,
     RuntimeTryDescriptor, wir_builtin_entries, wir_builtin_keys, wir_builtin_size,
     wir_builtin_values, wir_field_register_name, wir_is_map, wir_is_nullish, wir_is_proxy,
@@ -49,8 +55,8 @@ use crate::runtime::{
     wir_obj_get_method, wir_obj_get_proto, wir_obj_get_str, wir_obj_get_str_deep,
     wir_obj_has_field, wir_obj_has_str, wir_obj_new, wir_obj_set_field, wir_obj_set_proto,
     wir_obj_set_str, wir_proxy_new, wir_set_add, wir_set_clear, wir_set_delete, wir_set_has,
-    wir_set_new, wir_set_size, wir_string_equals, wir_super_get_method,
-    CatchStubEntry,
+    wir_set_new, wir_set_size, wir_string_equals, wir_super_get_method, CatchStubEntry,
+    RuntimeResumeInfo,
 };
 #[allow(unused_imports)]
 use crate::value::{
@@ -240,6 +246,7 @@ pub struct JIT {
     stub_decls: HashMap<u32, cranelift_module::FuncId>,
     try_descriptor_keep_alive: Vec<&'static crate::runtime::RuntimeTryDescriptor>,
     try_catch_entries_keep_alive: Vec<&'static [crate::runtime::CatchStubEntry]>,
+    try_stub_records: Vec<TryStubRecord>,
 }
 
 impl Default for JIT {
@@ -517,6 +524,20 @@ impl Default for JIT {
             jb.symbol(
                 "napalm_rt_throw",
                 napalm_rt_throw as *const extern "C" fn(i64, i64) -> i64 as *const u8,
+            );
+            jb.symbol(
+                "napalm_rt_prepare_resume",
+                napalm_rt_prepare_resume
+                    as *const extern "C" fn(i64, i64, *const i64, usize) -> i64 as *const u8,
+            );
+            jb.symbol(
+                "napalm_rt_take_resume",
+                napalm_rt_take_resume as *const extern "C" fn(i64) -> *const RuntimeResumeInfo
+                    as *const u8,
+            );
+            jb.symbol(
+                "napalm_rt_clear_resume",
+                napalm_rt_clear_resume as *const extern "C" fn(i64) -> i64 as *const u8,
             );
             jb.symbol(
                 "wir_alloc_words",
@@ -989,6 +1010,7 @@ impl Default for JIT {
             stub_decls: HashMap::new(),
             try_descriptor_keep_alive: Vec::new(),
             try_catch_entries_keep_alive: Vec::new(),
+            try_stub_records: Vec::new(),
         }
     }
 }
@@ -1107,9 +1129,10 @@ impl JIT {
     fn prepare_try_descriptors(
         &mut self,
         fun: &WirFunction,
-    ) -> HashMap<TryRegionId, *const RuntimeTryDescriptor> {
+        entry_stub_id: cranelift_module::FuncId,
+    ) -> Result<HashMap<TryRegionId, *const RuntimeTryDescriptor>, String> {
         let mut map = HashMap::new();
-        for region in &fun.try_regions {
+        for (region_idx, region) in fun.try_regions.iter().enumerate() {
             let catch_entries: Vec<CatchStubEntry> = region
                 .catches
                 .iter()
@@ -1121,16 +1144,46 @@ impl JIT {
             let catch_slice: &'static [CatchStubEntry] =
                 Box::leak(catch_entries.into_boxed_slice());
             self.try_catch_entries_keep_alive.push(catch_slice);
-            let descriptor_ref: &'static RuntimeTryDescriptor =
+            let descriptor_ref: &'static mut RuntimeTryDescriptor =
                 Box::leak(Box::new(RuntimeTryDescriptor {
                     func_id: fun.id.0 as u32,
                     region_id: region.id.0 as u32,
                     catch_stubs: catch_slice.as_ptr(),
                     catch_len: catch_slice.len() as u32,
                     finally_stub: None,
-                    continuation_stub: None,
+                    continuation_stub: Some(napalm_rt_stub_unimplemented),
                 }));
+            let mut record = TryStubRecord {
+                descriptor: descriptor_ref as *mut RuntimeTryDescriptor,
+                catch_funcs: Vec::new(),
+                finally_func: None,
+                continuation_func: None,
+            };
+
+            for (catch_idx, handler) in region.catches.iter().enumerate() {
+                let func_id = self.emit_resume_stub(
+                    fun,
+                    handler.handler,
+                    entry_stub_id,
+                    &format!("catch_{}_{}", region.id.0, catch_idx),
+                )?;
+                record.catch_funcs.push((catch_idx, func_id));
+            }
+
+            if let Some(fin_block) = region.finally_entry {
+                let _ = fin_block; // TODO: emit finally stub
+            }
+
+            let cont_func_id = self.emit_resume_stub(
+                fun,
+                region.continuation,
+                entry_stub_id,
+                &format!("cont_{}_{}", region.id.0, region_idx),
+            )?;
+            record.continuation_func = Some(cont_func_id);
+
             self.try_descriptor_keep_alive.push(descriptor_ref);
+            self.try_stub_records.push(record);
             napalm_rt_register_try_descriptor(
                 fun.id.0 as u32,
                 region.id.0 as u32,
@@ -1138,7 +1191,81 @@ impl JIT {
             );
             map.insert(region.id, descriptor_ref as *const RuntimeTryDescriptor);
         }
-        map
+        Ok(map)
+    }
+
+    fn emit_resume_stub(
+        &mut self,
+        fun: &WirFunction,
+        target_block: BlockId,
+        entry_stub_id: cranelift_module::FuncId,
+        label: &str,
+    ) -> Result<cranelift_module::FuncId, String> {
+        use cranelift::prelude::{AbiParam, FunctionBuilder, types};
+
+        let ptr_ty = self.ptr_ty();
+        let mut ctx = self.module.make_context();
+        ctx.func.signature.call_conv = self.module.isa().default_call_conv();
+        ctx.func
+            .signature
+            .params
+            .push(AbiParam::new(ptr_ty)); // argv
+        ctx.func
+            .signature
+            .params
+            .push(AbiParam::new(types::I64)); // argc
+        ctx.func
+            .signature
+            .returns
+            .push(AbiParam::new(types::I64));
+
+        let mut fctx = FunctionBuilderContext::new();
+        {
+            let mut fb = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+            let entry = fb.create_block();
+            fb.append_block_params_for_function_params(entry);
+            fb.switch_to_block(entry);
+
+            let argv = fb.block_params(entry)[0];
+            let argc = fb.block_params(entry)[1];
+            let fid = fb.ins().iconst(types::I64, fun.id.0 as i64);
+            let block = fb.ins().iconst(types::I64, target_block.0 as i64);
+            let _ = self.call_import(
+                &mut fb,
+                "napalm_rt_prepare_resume",
+                |s| {
+                    s.params.push(AbiParam::new(types::I64));
+                    s.params.push(AbiParam::new(types::I64));
+                    s.params.push(AbiParam::new(ptr_ty));
+                    s.params.push(AbiParam::new(types::I64));
+                    s.returns.push(AbiParam::new(types::I64));
+                },
+                &[fid, block, argv, argc],
+            )?;
+
+            let stub_ref = self.module.declare_func_in_func(entry_stub_id, &mut fb.func);
+            let call = fb.ins().call(stub_ref, &[argv, argc]);
+            let res = fb.inst_results(call)[0];
+            fb.ins().return_(&[res]);
+            fb.seal_all_blocks();
+            fb.finalize();
+        }
+
+        let name = format!(
+            "wir_try_stub_{}_{}_{}",
+            fun.id.0,
+            target_block.0,
+            label
+        );
+        let func_id = self
+            .module
+            .declare_function(&name, Linkage::Local, &ctx.func.signature)
+            .map_err(|e| e.to_string())?;
+        self.module
+            .define_function(func_id, &mut ctx)
+            .map_err(|e| e.to_string())?;
+        self.module.clear_context(&mut ctx);
+        Ok(func_id)
     }
 }
 
@@ -1159,6 +1286,29 @@ impl JIT {
             register_funptr(id_raw, code as *const u8);
             let fptr: JitFnPtr = unsafe { std::mem::transmute(code) };
             fptrs.insert(id_raw, fptr);
+        }
+
+        for record in &self.try_stub_records {
+            unsafe {
+                let desc = &mut *record.descriptor;
+                for &(idx, func_id) in &record.catch_funcs {
+                    let code = self.module.get_finalized_function(func_id);
+                    let catch_ptr = desc.catch_stubs as *mut CatchStubEntry;
+                    catch_ptr
+                        .add(idx)
+                        .as_mut()
+                        .unwrap()
+                        .stub = mem::transmute(code);
+                }
+                if let Some(func_id) = record.continuation_func {
+                    let code = self.module.get_finalized_function(func_id);
+                    desc.continuation_stub = Some(mem::transmute(code));
+                }
+                if let Some(func_id) = record.finally_func {
+                    let code = self.module.get_finalized_function(func_id);
+                    desc.finally_stub = Some(mem::transmute(code));
+                }
+            }
         }
 
         Ok(fptrs)
@@ -1203,7 +1353,31 @@ impl JIT {
             .returns
             .push(AbiParam::new(types::I64));
 
-        let try_descriptor_map = self.prepare_try_descriptors(fun_ir);
+        let try_descriptor_map = self.prepare_try_descriptors(fun_ir, stub_func_id)?;
+
+        let mut resume_targets: Vec<BlockId> = Vec::new();
+        for region in &fun_ir.try_regions {
+            resume_targets.push(region.continuation);
+            if let Some(fin) = region.finally_entry {
+                resume_targets.push(fin);
+            }
+            for handler in &region.catches {
+                resume_targets.push(handler.handler);
+            }
+        }
+        resume_targets.sort_by_key(|b| b.0);
+        resume_targets.dedup_by(|a, b| a.0 == b.0);
+        let resume_targets_info: Vec<(BlockId, usize)> = resume_targets
+            .iter()
+            .map(|bid| {
+                let count = fun_ir
+                    .block_params
+                    .get(bid)
+                    .map(|params| params.len())
+                    .unwrap_or(0);
+                (*bid, count)
+            })
+            .collect();
 
         #[cfg(debug_assertions)]
         {
@@ -1236,21 +1410,88 @@ impl JIT {
             let mut saw_any_return = false;
 
             // Precreate one CLIF block per WIR block.
-            let mut clif_of = Vec::with_capacity(fun.blocks.len());
-            for blk in &fun.blocks {
-                let ebb = if blk.id == fun.entry {
-                    entry
-                } else {
-                    fb.create_block()
-                };
-                clif_of.push(ebb);
-                if blk.id != fun.entry {
-                    for &vid in &blk.params {
-                        let p = fb.append_block_param(ebb, types::I64);
-                        vmap.bind(vid, p);
-                    }
+        let mut clif_of = Vec::with_capacity(fun.blocks.len());
+        for blk in &fun.blocks {
+            let ebb = if blk.id == fun.entry {
+                entry
+            } else {
+                fb.create_block()
+            };
+            clif_of.push(ebb);
+            if blk.id != fun.entry {
+                for &vid in &blk.params {
+                    let p = fb.append_block_param(ebb, types::I64);
+                    vmap.bind(vid, p);
                 }
             }
+        }
+
+        let mut entry_body_block = entry;
+        if !resume_targets_info.is_empty() {
+            let normal_entry_block = fb.create_block();
+            clif_of[fun.entry.0 as usize] = normal_entry_block;
+
+            let fid_const = fb.ins().iconst(types::I64, fun.id.0 as i64);
+            let resume_ptr = self.call_import(
+                &mut fb,
+                "napalm_rt_take_resume",
+                |s| {
+                    s.params.push(AbiParam::new(types::I64));
+                    s.returns.push(AbiParam::new(ptr_ty));
+                },
+                &[fid_const],
+            )?;
+            let zero_ptr = fb.ins().iconst(ptr_ty, 0);
+            let has_resume = fb.ins().icmp(IntCC::NotEqual, resume_ptr, zero_ptr);
+            let resume_block = fb.create_block();
+            fb.ins().brif(has_resume, resume_block, &[], normal_entry_block, &[]);
+            fb.switch_to_block(resume_block);
+
+            let mem_flags = MemFlags::trusted();
+            let block_raw = fb.ins().load(types::I32, mem_flags, resume_ptr, RESUME_INFO_BLOCK_OFFSET);
+            let block_val = fb.ins().uextend(types::I64, block_raw);
+            let argv_ptr = fb.ins().load(ptr_ty, mem_flags, resume_ptr, RESUME_INFO_ARGV_OFFSET);
+
+            let mut current_block = resume_block;
+            for (target_block, param_count) in &resume_targets_info {
+                let case_block = fb.create_block();
+                let next_block = fb.create_block();
+                let target_const = fb.ins().iconst(types::I64, target_block.0 as i64);
+                let cmp = fb.ins().icmp(IntCC::Equal, block_val, target_const);
+                fb.ins().brif(cmp, case_block, &[], next_block, &[]);
+                fb.switch_to_block(case_block);
+
+                let mut args: Vec<BlockArg> = Vec::new();
+                for idx in 0..*param_count {
+                    let addr = fb.ins().iadd_imm(argv_ptr, (idx as i64) * 8);
+                    let val = fb.ins().load(types::I64, mem_flags, addr, 0);
+                    args.push(BlockArg::from(val));
+                }
+
+                let _ = self.call_import(
+                    &mut fb,
+                    "napalm_rt_clear_resume",
+                    |s| {
+                        s.params.push(AbiParam::new(types::I64));
+                        s.returns.push(AbiParam::new(types::I64));
+                    },
+                    &[fid_const],
+                )?;
+
+                fb.ins()
+                    .jump(clif_of[target_block.0 as usize], &args);
+                fb.switch_to_block(next_block);
+                current_block = next_block;
+            }
+
+            fb.switch_to_block(current_block);
+            fb.ins().trap(TrapCode::unwrap_user(0xE4));
+
+            fb.switch_to_block(normal_entry_block);
+            entry_body_block = normal_entry_block;
+        }
+
+        fb.switch_to_block(entry_body_block);
 
             // Bind WIR params: load argv[i] as i64s.
             let param_count = fun.sig.params.len();
@@ -2800,6 +3041,13 @@ impl ValueMap {
         self.bind(id, zero);
         zero
     }
+}
+
+struct TryStubRecord {
+    descriptor: *mut RuntimeTryDescriptor,
+    catch_funcs: Vec<(usize, cranelift_module::FuncId)>,
+    finally_func: Option<cranelift_module::FuncId>,
+    continuation_func: Option<cranelift_module::FuncId>,
 }
 
 fn synth_const(values: &Vec<WirValue>, id: ValueId, fb: &mut FunctionBuilder) -> Option<Value> {
