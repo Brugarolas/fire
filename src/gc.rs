@@ -83,7 +83,7 @@ static ALL_MUTATORS: Lazy<Mutex<Vec<MutatorRaw>>> = Lazy::new(|| Mutex::new(Vec:
 // ==================== Helpers ====================================
 // =================================================================
 
-#[inline(always)]
+#[inline]
 unsafe fn read_len_unaligned(base: *const u8) -> usize {
     // Array len is stored as i64 immediately after the header.
     // We use read_unaligned to be resilient to any future packing.
@@ -91,7 +91,7 @@ unsafe fn read_len_unaligned(base: *const u8) -> usize {
     (*len_ptr).max(0) as usize
 }
 
-#[inline(always)]
+#[inline]
 fn size_of_object_from_tag(base: *const u8) -> usize {
     // SAFETY: caller ensures `base` points at a live object start.
     unsafe {
@@ -123,7 +123,7 @@ fn size_of_object_from_tag(base: *const u8) -> usize {
     }
 }
 
-#[inline(always)]
+#[inline]
 fn emit_shadow_roots_to_factory<T: RootsWorkFactory<SlotItem>>(factory: &mut T) {
     let mut edges: SmallVec<[SlotItem; 64]> = SmallVec::new();
     edges.reserve_exact(64);
@@ -154,7 +154,7 @@ impl From<Address> for SlotItem {
 }
 
 impl Slot for SlotItem {
-    #[inline(always)]
+    #[inline]
     fn load(&self) -> Option<ObjectReference> {
         use crate::value::{
             NULL, ObjHeader, TAG_ARRAY, TAG_BOXED_F64, TAG_CLOSURE, TAG_OBJECT, TAG_STRING,
@@ -177,7 +177,7 @@ impl Slot for SlotItem {
         None
     }
 
-    #[inline(always)]
+    #[inline]
     fn store(&self, obj: ObjectReference) {
         let p = self.0.to_mut_ptr::<ValueRepr>();
         let val: ValueRepr = obj.to_raw_address().to_ptr::<u8>() as i64;
@@ -199,7 +199,7 @@ pub struct MemSlice {
 }
 
 impl MemSlice {
-    #[inline(always)]
+    #[inline]
     pub fn new(start: Address, bytes: usize) -> Self {
         Self {
             start,
@@ -207,7 +207,7 @@ impl MemSlice {
             owner: None,
         }
     }
-    #[inline(always)]
+    #[inline]
     pub fn for_object(owner: ObjectReference, start: Address, bytes: usize) -> Self {
         Self {
             start,
@@ -225,7 +225,7 @@ pub struct MemSliceIter {
 
 impl Iterator for MemSliceIter {
     type Item = SlotItem;
-    #[inline(always)]
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.cursor >= self.limit {
             None
@@ -242,7 +242,7 @@ impl MemorySlice for MemSlice {
     type SlotType = SlotItem;
     type SlotIterator = MemSliceIter;
 
-    #[inline(always)]
+    #[inline]
     fn iter_slots(&self) -> Self::SlotIterator {
         MemSliceIter {
             cursor: self.start,
@@ -250,22 +250,22 @@ impl MemorySlice for MemSlice {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn object(&self) -> Option<ObjectReference> {
         self.owner
     }
 
-    #[inline(always)]
+    #[inline]
     fn start(&self) -> Address {
         self.start
     }
 
-    #[inline(always)]
+    #[inline]
     fn bytes(&self) -> usize {
         self.bytes
     }
 
-    #[inline(always)]
+    #[inline]
     fn copy(src: &Self, tgt: &Self) {
         debug_assert_eq!(src.bytes, tgt.bytes, "memcpy slices must be same size");
         debug_assert_eq!(
@@ -326,7 +326,7 @@ impl ObjectModel<NapalmVM> for VMObjModel {
     const UNIFIED_OBJECT_REFERENCE_ADDRESS: bool = true;
 
     // ---- Sizes & alignments ----
-    #[inline(always)]
+    #[inline]
     fn get_current_size(object: ObjectReference) -> usize {
         use crate::value::*;
         let hdr = Self::ref_to_object_start(object).to_ptr::<ObjHeader>();
@@ -343,13 +343,13 @@ impl ObjectModel<NapalmVM> for VMObjModel {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn get_size_when_copied(object: ObjectReference) -> usize {
         // We don’t change layout when copying.
         Self::get_current_size(object)
     }
 
-    #[inline(always)]
+    #[inline]
     fn get_align_when_copied(object: ObjectReference) -> usize {
         use crate::value::*;
         let hdr = Self::ref_to_object_start(object).to_ptr::<ObjHeader>();
@@ -366,27 +366,27 @@ impl ObjectModel<NapalmVM> for VMObjModel {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn get_align_offset_when_copied(_object: ObjectReference) -> usize {
         // object ref == object start, so no offset is needed.
         0
     }
 
     // ---- Object addresses ----
-    #[inline(always)]
+    #[inline]
     fn ref_to_object_start(object: ObjectReference) -> Address {
         // In Napalm, object ref is the start address returned by alloc().
         object.to_raw_address()
     }
 
-    #[inline(always)]
+    #[inline]
     fn ref_to_header(object: ObjectReference) -> Address {
         // We place header at object start.
         object.to_raw_address()
     }
 
     // ---- Copying helpers (used by copying/compacting plans; harmless for StickyImmix) ----
-    #[inline(always)]
+    #[inline]
     fn copy(
         from: ObjectReference,
         semantics: CopySemantics,
@@ -403,7 +403,7 @@ impl ObjectModel<NapalmVM> for VMObjModel {
         to_ref
     }
 
-    #[inline(always)]
+    #[inline]
     fn copy_to(from: ObjectReference, _to: ObjectReference, region: Address) -> Address {
         // Raw byte copy of the whole object.
         let src = Self::ref_to_object_start(from);
@@ -415,7 +415,7 @@ impl ObjectModel<NapalmVM> for VMObjModel {
         region.add(bytes)
     }
 
-    #[inline(always)]
+    #[inline]
     fn get_reference_when_copied_to(_from: ObjectReference, to: Address) -> ObjectReference {
         // With unified refs, the post-copy reference is exactly the region base.
         ObjectReference::from_raw_address(to).expect("MMTk asked for a null target")
@@ -530,7 +530,7 @@ impl ObjectModel<NapalmVM> for VMObjModel {
 }
 
 impl Scanning<NapalmVM> for VMScanning {
-    #[inline(always)]
+    #[inline]
     fn scan_object<SV: mmtk::vm::SlotVisitor<SlotItem>>(
         _tls: VMWorkerThread,
         object: ObjectReference,
@@ -633,7 +633,7 @@ impl Scanning<NapalmVM> for VMScanning {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn scan_vm_specific_roots(_tls: VMWorkerThread, mut factory: impl RootsWorkFactory<SlotItem>) {
         // 1) Shadow stack
         emit_shadow_roots_to_factory(&mut factory);
@@ -702,14 +702,14 @@ impl Scanning<NapalmVM> for VMScanning {
     // ===== extra items your MMTk requires =====
 
     /// Called after a thread’s initial root scan is done.
-    #[inline(always)]
+    #[inline]
     fn notify_initial_thread_scan_complete(_partial_scan: bool, _tls: VMWorkerThread) {
         // No special coordination needed.
     }
 
     /// Scan roots while running on the *mutator* thread (instead of a GC worker).
     /// We emit the same shadow-stack roots; the mutator reference is not needed yet.
-    #[inline(always)]
+    #[inline]
     fn scan_roots_in_mutator_thread(
         _tls: VMWorkerThread,
         _mutator: &'static mut Mutator<NapalmVM>,
@@ -719,13 +719,13 @@ impl Scanning<NapalmVM> for VMScanning {
     }
 
     /// Whether the VM installs a return barrier. Napalm does not.
-    #[inline(always)]
+    #[inline]
     fn supports_return_barrier() -> bool {
         false
     }
 
     /// Prepare for a second root scan if the collector requests it.
-    #[inline(always)]
+    #[inline]
     fn prepare_for_roots_re_scanning() {
         // Nothing to do for shadow-stack only roots.
     }
@@ -734,7 +734,7 @@ impl Scanning<NapalmVM> for VMScanning {
 impl Collection<NapalmVM> for VMCollection {
     /// Request a stop-the-world. In cooperative mode we just set a flag;
     /// mutators will park at the next `yieldpoint()`.
-    #[inline(always)]
+    #[inline]
     fn stop_all_mutators<F>(_tls: VMWorkerThread, mut mutator_visitor: F)
     where
         F: FnMut(&'static mut Mutator<NapalmVM>),
@@ -752,7 +752,7 @@ impl Collection<NapalmVM> for VMCollection {
     }
 
     /// Resume mutators by clearing the flag and waking all parked threads.
-    #[inline(always)]
+    #[inline]
     fn resume_mutators(_tls: VMWorkerThread) {
         STW_REQUESTED.store(false, Release);
         STW_CV.notify_all();
@@ -760,7 +760,7 @@ impl Collection<NapalmVM> for VMCollection {
 
     /// Called by MMTk on a mutator thread that needs to be blocked for GC.
     /// Park until `resume_mutators` clears the flag.
-    #[inline(always)]
+    #[inline]
     fn block_for_gc(_mutator: VMMutatorThread) {
         if !STW_REQUESTED.load(Acquire) {
             return;
@@ -773,7 +773,7 @@ impl Collection<NapalmVM> for VMCollection {
 
     /// Spawn a GC worker thread and run the provided closure on it.
     /// MMTk passes a `GCThreadContext` and a closure `f(worker_tls)` that starts the worker.
-    #[inline(always)]
+    #[inline]
     fn spawn_gc_thread(tls: VMThread, ctx: GCThreadContext<NapalmVM>) {
         std::thread::Builder::new()
             .name("mmtk-gc-worker".to_string())
@@ -788,12 +788,12 @@ impl Collection<NapalmVM> for VMCollection {
 }
 
 impl ActivePlan<NapalmVM> for VMActivePlan {
-    #[inline(always)]
+    #[inline]
     fn is_mutator(_tls: VMThread) -> bool {
         TLS_MUT_PTR.with(|p| !p.get().is_null())
     }
 
-    #[inline(always)]
+    #[inline]
     fn mutator(_tls: VMMutatorThread) -> &'static mut Mutator<NapalmVM> {
         TLS_MUT_PTR.with(|p| {
             let ptr = p.get();
@@ -802,7 +802,7 @@ impl ActivePlan<NapalmVM> for VMActivePlan {
         })
     }
 
-    #[inline(always)]
+    #[inline]
     fn mutators<'a>() -> Box<dyn Iterator<Item = &'a mut Mutator<NapalmVM>> + 'a> {
         let ptrs: Vec<MutatorRaw> = {
             let list = ALL_MUTATORS.lock();
@@ -813,7 +813,7 @@ impl ActivePlan<NapalmVM> for VMActivePlan {
         Box::new(refs.into_iter())
     }
 
-    #[inline(always)]
+    #[inline]
     fn number_of_mutators() -> usize {
         MUTATOR_COUNT.load(Acquire)
     }
@@ -825,25 +825,25 @@ impl ReferenceGlue<NapalmVM> for VMRefGlue {
     type FinalizableType = ObjectReference;
 
     /// Weak/soft refs not implemented yet: nothing to clear.
-    #[inline(always)]
+    #[inline]
     fn clear_referent(_new_reference: ObjectReference) {
         // If/when you add a WeakRef<T> layout, null out its referent field here.
     }
 
     /// No weak objects ⇒ always None.
-    #[inline(always)]
+    #[inline]
     fn get_referent(_object: ObjectReference) -> Option<ObjectReference> {
         None
     }
 
     /// No weak objects ⇒ nothing to set.
-    #[inline(always)]
+    #[inline]
     fn set_referent(_reff: ObjectReference, _referent: ObjectReference) {
         // When you add WeakRef<T>, write `_referent` into the referent slot here.
     }
 
     /// If a plan tries to enqueue cleared references, we just ignore them for now.
-    #[inline(always)]
+    #[inline]
     fn enqueue_references(_references: &[ObjectReference], _tls: VMWorkerThread) {
         // Later: push into a VM-side ReferenceQueue to deliver to user code.
     }
@@ -873,12 +873,12 @@ thread_local! {
 pub struct MutatorThread;
 
 impl MutatorThread {
-    #[inline(always)]
+    #[inline]
     pub fn bind_current_thread(&self) {
         Self::attach_current_thread();
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn attach_current_thread() {
         TLS_MUTATOR.with(|c| {
             if c.borrow().is_none() {
@@ -900,7 +900,7 @@ impl MutatorThread {
         });
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn detach_current_thread() {
         TLS_MUTATOR.with(|c| {
             if let Some(mut mutator_box) = c.borrow_mut().take() {
@@ -919,7 +919,7 @@ impl MutatorThread {
         });
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn with_mutator<R>(f: impl FnOnce(&mut Mutator<NapalmVM>) -> R) -> R {
         TLS_MUTATOR.with(|c| {
             let mut guard = c.borrow_mut();
@@ -963,12 +963,12 @@ static MMTK_GC: Lazy<MMTK<NapalmVM>> = Lazy::new(|| {
 });
 
 /// Initialise the singleton GC (harmless to call multiple times).
-#[inline(always)]
+#[inline]
 pub fn init() {
     Lazy::force(&MMTK_GC);
 }
 
-#[inline(always)]
+#[inline]
 pub fn get_mmtk() -> &'static MMTK<NapalmVM> {
     &*MMTK_GC
 }
@@ -995,7 +995,7 @@ impl NapalmGc {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn collect_now(&self) -> bool {
         use mmtk::memory_manager::handle_user_collection_request;
 
@@ -1008,14 +1008,14 @@ impl NapalmGc {
     }
 
     /// Visit all root slots currently on the shadow stack with a callback.
-    #[inline(always)]
+    #[inline]
     pub fn visit_value_slots<F: FnMut(*mut ValueRepr)>(&self, mut f: F) {
         ShadowStack::with_roots(|slot| f(slot));
     }
 
     /// A convenience 'visit_value' that conditionally applies a function to a single slot
     /// if it looks like a pointer (useful for ad-hoc verifiers).
-    #[inline(always)]
+    #[inline]
     pub fn visit_value<F: FnMut(*mut ValueRepr)>(&self, slot: *mut ValueRepr, mut f: F) {
         unsafe {
             let v = core::ptr::read(slot);
@@ -1027,17 +1027,17 @@ impl NapalmGc {
 
     /// “Any visitor” push/pop helpers are often just wrappers around ShadowStack.
     /// If you meant 'push a range of locals' for a frame, expose that explicitly:
-    #[inline(always)]
+    #[inline]
     pub unsafe fn push_any_visitor(&self, base: *mut ValueRepr, slots: usize) {
         ShadowStack::push_range(base as *mut i64, slots);
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn pop_any_visitor(&self) {
         ShadowStack::pop_range();
     }
 
-    #[inline(always)]
+    #[inline]
     pub unsafe fn alloc_raw(&self, bytes: usize, align: usize) -> *mut u8 {
         MutatorThread::with_mutator(|mutator| {
             let addr = memory_manager::alloc::<NapalmVM>(
@@ -1055,7 +1055,7 @@ impl NapalmGc {
         })
     }
 
-    #[inline(always)]
+    #[inline]
     pub unsafe fn alloc_slow_path(&self, bytes: usize, align: usize) -> *mut u8 {
         MutatorThread::with_mutator(|mutator| {
             let addr = memory_manager::alloc_slow::<NapalmVM>(
@@ -1070,7 +1070,7 @@ impl NapalmGc {
         })
     }
 
-    #[inline(always)]
+    #[inline]
     pub unsafe fn post_alloc_object(&self, obj_ptr: *mut u8, bytes: usize) {
         MutatorThread::with_mutator(|mutator| {
             let objref = ObjectReference::from_raw_address(Address::from_mut_ptr(obj_ptr))
@@ -1084,7 +1084,7 @@ impl NapalmGc {
         });
     }
 
-    #[inline(always)]
+    #[inline]
     pub unsafe fn post_write_barrier(
         &self,
         object_base: *mut u8,
@@ -1105,7 +1105,7 @@ impl NapalmGc {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     pub unsafe fn pre_write_barrier(&self, object_base: *mut u8, slot: *mut ValueRepr) {
         let old_v: ValueRepr = unsafe { core::ptr::read(slot) };
         if is_ptr(old_v) && old_v != NULL {
@@ -1120,25 +1120,25 @@ impl NapalmGc {
     }
 
     /// Bind the current thread as a mutator (safe to call multiple times).
-    #[inline(always)]
+    #[inline]
     pub fn bind_current_thread(&self) {
         MutatorThread::attach_current_thread();
     }
 
     /// Optional shutdown (useful in tests).
-    #[inline(always)]
+    #[inline]
     pub fn shutdown(&self) {
         unimplemented!();
     }
 
-    #[inline(always)]
+    #[inline]
     fn stack_anchor(&self) -> *const u8 {
         let x = 0u8;
         &x as *const u8
     }
 
     /// Downward–growing stack assumption: high == current anchor; low == anchor - guess.
-    #[inline(always)]
+    #[inline]
     fn stack_bounds_guess(&self) -> (Address, Address) {
         let anchor = self.stack_anchor() as usize;
         let hi = anchor;
@@ -1148,7 +1148,7 @@ impl NapalmGc {
 
     /// Platform query: attempt to obtain **exact** stack bounds for the *current* thread.
     /// Returns `(lo, hi)` where the valid stack memory is `[lo, hi)`.
-    #[inline(always)]
+    #[inline]
     fn stack_bounds_current_thread(&self) -> (Address, Address) {
         // Try OS‑specific backends first; fall back to heuristic if they fail.
         if let Some(bounds) = self.stack_bounds_os() {
@@ -1160,7 +1160,7 @@ impl NapalmGc {
 
     /// A stand-alone precise scanner (debug): enumerate a *heap object’s* references
     /// in the same way your MMTk scan does.
-    #[inline(always)]
+    #[inline]
     pub fn scan_object_precise<F: FnMut(*mut ValueRepr)>(&self, obj: ObjectReference, mut f: F) {
         pub const TAG_ARRAY_FLAT: u32 = 6;
 
@@ -1200,7 +1200,7 @@ impl NapalmGc {
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    #[inline(always)]
+    #[inline]
     fn stack_bounds_os(&self) -> Option<(Address, Address)> {
         use core::mem::MaybeUninit;
         use libc::{pthread_attr_destroy, pthread_attr_getstack, pthread_getattr_np, pthread_self};
@@ -1231,7 +1231,7 @@ impl NapalmGc {
     }
 
     #[cfg(target_os = "macos")]
-    #[inline(always)]
+    #[inline]
     fn stack_bounds_os(&self) -> Option<(Address, Address)> {
         use libc::{pthread_get_stackaddr_np, pthread_get_stacksize_np, pthread_self};
 
@@ -1249,7 +1249,7 @@ impl NapalmGc {
     }
 
     #[cfg(target_os = "windows")]
-    #[inline(always)]
+    #[inline]
     fn stack_bounds_os(&self) -> Option<(Address, Address)> {
         use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
 
@@ -1266,12 +1266,12 @@ impl NapalmGc {
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-    #[inline(always)]
+    #[inline]
     fn stack_bounds_os() -> Option<(&self, Address, Address)> {
         None
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn yieldpoint(&self) {
         // Fast path: nothing to do.
         if !STW_REQUESTED.load(Acquire) {
@@ -1287,7 +1287,7 @@ impl NapalmGc {
         // guard drops here
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn maybe_safepoint(&self) {
         SAFEPOINT_TICK.with(|tick| {
             let v = tick.get().wrapping_add(1);
@@ -1316,11 +1316,11 @@ pub struct ShadowStack;
 
 // It's inert for now, but the API is stable.
 impl ShadowStack {
-    #[inline(always)]
+    #[inline]
     pub unsafe fn push_range(base: *mut i64, slots: usize) {
         SHADOW.with(|s| s.borrow_mut().push((base, slots)));
     }
-    #[inline(always)]
+    #[inline]
     pub fn pop_range() {
         SHADOW.with(|s| {
             s.borrow_mut().pop();

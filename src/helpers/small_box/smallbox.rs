@@ -141,7 +141,7 @@ impl<T: ?Sized, Space> SmallBox<T, Space> {
     ///
     /// assert!(large.is_heap() == true);
     /// ```
-    #[inline(always)]
+    #[inline]
     pub fn new(val: T) -> SmallBox<T, Space>
     where T: Sized {
         smallbox!(val)

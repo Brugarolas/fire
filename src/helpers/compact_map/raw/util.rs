@@ -19,7 +19,7 @@ use crate::helpers::compact_map::Equivalent;
 
 // Implement it with a cast otherwise.
 #[cfg(not(feature = "nightly"))]
-#[inline(always)]
+#[inline]
 fn invalid_mut<T>(addr: usize) -> *mut T {
     addr as *mut T
 }

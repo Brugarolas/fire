@@ -11,7 +11,7 @@ use std::ops::{Deref, DerefMut};
 mod tls_prng {
     use std::cell::Cell;
 
-    #[inline(always)]
+    #[inline]
     fn splitmix64_stateless(mut z: u64) -> u64 {
         z ^= z >> 30;
         z = z.wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -20,7 +20,7 @@ mod tls_prng {
         z ^ (z >> 31)
     }
 
-    #[inline(always)]
+    #[inline]
     fn rdcycle_best_effort() -> u64 {
         let mut v: u64 = 0;
         #[cfg(target_arch = "x86_64")]
@@ -40,7 +40,7 @@ mod tls_prng {
         v
     }
 
-    #[inline(always)]
+    #[inline]
     fn addr_noise() -> u64 {
         let stack_addr = {
             let local = 0u8;
@@ -55,7 +55,7 @@ mod tls_prng {
         static TL_BOOTCTR: Cell<u64> = Cell::new(0);
     }
 
-    #[inline(always)]
+    #[inline]
     fn initial_seed() -> u64 {
         TL_BOOTCTR.with(|c| {
             let ctr = {
@@ -68,7 +68,7 @@ mod tls_prng {
         })
     }
 
-    #[inline(always)]
+    #[inline]
     fn wyrand_next(seed_cell: &Cell<u64>) -> u64 {
         let mut s = seed_cell.get();
         if s == 0 {
@@ -83,7 +83,7 @@ mod tls_prng {
     }
 
     /// Return two u64 from the per-thread generator.
-    #[inline(always)]
+    #[inline]
     pub fn fast_two_u64() -> (u64, u64) {
         TL_SEED.with(|seed| {
             let a = wyrand_next(seed);
@@ -112,7 +112,7 @@ mod hasher_impl {
     }
 
     impl AesHasher {
-        #[inline(always)]
+        #[inline]
         pub fn with_keys(k0: u64, k1: u64) -> Self {
             // lanes: hi=k0, lo=k1 (consistent across targets)
             unsafe {
@@ -124,13 +124,13 @@ mod hasher_impl {
             }
         }
 
-        #[inline(always)]
+        #[inline]
         unsafe fn round(&mut self, block_ptr: *const u8) {
             let block = _mm_loadu_si128(block_ptr as *const __m128i);
             self.hash = _mm_aesenc_si128(self.hash, block);
         }
 
-        #[inline(always)]
+        #[inline]
         fn mix_len(&mut self) {
             unsafe {
                 // XOR message length and its bitwise NOT into lanes
@@ -140,7 +140,7 @@ mod hasher_impl {
             }
         }
 
-        #[inline(always)]
+        #[inline]
         fn fold128(x: __m128i) -> u64 {
             unsafe {
                 let mut tmp = core::mem::MaybeUninit::<[u8; 16]>::uninit();
@@ -154,7 +154,7 @@ mod hasher_impl {
     }
 
     impl Hasher for AesHasher {
-        #[inline(always)]
+        #[inline]
         fn write(&mut self, mut bytes: &[u8]) {
             let buf_pos = self.len & 15;
             self.len = self.len.wrapping_add(bytes.len());
@@ -182,20 +182,20 @@ mod hasher_impl {
             }
         }
 
-        #[inline(always)]
+        #[inline]
         fn write_u64(&mut self, i: u64) {
             self.write(&i.to_ne_bytes());
         }
-        #[inline(always)]
+        #[inline]
         fn write_u32(&mut self, i: u32) {
             self.write(&i.to_ne_bytes());
         }
-        #[inline(always)]
+        #[inline]
         fn write_u8(&mut self, i: u8) {
             self.write(&[i]);
         }
 
-        #[inline(always)]
+        #[inline]
         fn finish(&self) -> u64 {
             unsafe {
                 let mut cur = self.hash;
@@ -228,12 +228,12 @@ mod hasher_impl {
     use super::*;
     use core::arch::aarch64::*;
 
-    #[inline(always)]
+    #[inline]
     unsafe fn aes_round_arm(state: uint8x16_t, rk: uint8x16_t) -> uint8x16_t {
         // Equivalent to x86 AESENC (SubBytes+ShiftRows, AddRoundKey, MixColumns)
         vaesmcq_u8(vaeseq_u8(state, rk))
     }
-    #[inline(always)]
+    #[inline]
     unsafe fn aes_last_round_arm(state: uint8x16_t, rk: uint8x16_t) -> uint8x16_t {
         // Final round without MixColumns
         vaeseq_u8(state, rk)
@@ -246,7 +246,7 @@ mod hasher_impl {
     }
 
     impl AesHasher {
-        #[inline(always)]
+        #[inline]
         pub fn with_keys(k0: u64, k1: u64) -> Self {
             // lanes: [lo bytes of k1][lo bytes of k0]
             let mut key = [0u8; 16];
@@ -263,7 +263,7 @@ mod hasher_impl {
     }
 
     impl Hasher for AesHasher {
-        #[inline(always)]
+        #[inline]
         fn write(&mut self, mut bytes: &[u8]) {
             let buf_pos = self.len & 15;
             self.len = self.len.wrapping_add(bytes.len());
@@ -293,20 +293,20 @@ mod hasher_impl {
             }
         }
 
-        #[inline(always)]
+        #[inline]
         fn write_u64(&mut self, i: u64) {
             self.write(&i.to_ne_bytes());
         }
-        #[inline(always)]
+        #[inline]
         fn write_u32(&mut self, i: u32) {
             self.write(&i.to_ne_bytes());
         }
-        #[inline(always)]
+        #[inline]
         fn write_u8(&mut self, i: u8) {
             self.write(&[i]);
         }
 
-        #[inline(always)]
+        #[inline]
         fn finish(&self) -> u64 {
             unsafe {
                 let mut cur = self.hash;
@@ -355,30 +355,30 @@ mod hasher_impl {
     pub struct AesHasher(pub AHasher);
 
     impl AesHasher {
-        #[inline(always)]
+        #[inline]
         pub fn with_keys(k0: u64, k1: u64) -> Self {
             Self(AHasher::new_with_keys(k0, k1))
         }
     }
 
     impl Hasher for AesHasher {
-        #[inline(always)]
+        #[inline]
         fn write(&mut self, bytes: &[u8]) {
             self.0.write(bytes)
         }
-        #[inline(always)]
+        #[inline]
         fn write_u64(&mut self, i: u64) {
             self.0.write_u64(i)
         }
-        #[inline(always)]
+        #[inline]
         fn write_u32(&mut self, i: u32) {
             self.0.write_u32(i)
         }
-        #[inline(always)]
+        #[inline]
         fn write_u8(&mut self, i: u8) {
             self.0.write_u8(i)
         }
-        #[inline(always)]
+        #[inline]
         fn finish(&self) -> u64 {
             self.0.finish()
         }

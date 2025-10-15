@@ -73,11 +73,11 @@ impl<'f> InstCursor<'f> {
     }
 
     // ----- explicit materialization helpers (avoid implicit autoref) -----
-    #[inline(always)]
+    #[inline]
     unsafe fn func_ref(&self) -> &Function {
         &*self.func
     }
-    #[inline(always)]
+    #[inline]
     unsafe fn func_mut(&mut self) -> &mut Function {
         &mut *self.func
     }

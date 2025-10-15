@@ -19,7 +19,7 @@ pub struct SliceVec<'s, T> {
 }
 
 impl<'s, T> Default for SliceVec<'s, T> {
-  #[inline(always)]
+  #[inline]
   fn default() -> Self {
     Self { data: &mut [], len: 0 }
   }
@@ -27,14 +27,14 @@ impl<'s, T> Default for SliceVec<'s, T> {
 
 impl<'s, T> Deref for SliceVec<'s, T> {
   type Target = [T];
-  #[inline(always)]
+  #[inline]
   fn deref(&self) -> &Self::Target {
     &self.data[..self.len]
   }
 }
 
 impl<'s, T> DerefMut for SliceVec<'s, T> {
-  #[inline(always)]
+  #[inline]
   fn deref_mut(&mut self) -> &mut Self::Target {
     &mut self.data[..self.len]
   }
@@ -45,7 +45,7 @@ where
   I: SliceIndex<[T]>,
 {
   type Output = <I as SliceIndex<[T]>>::Output;
-  #[inline(always)]
+  #[inline]
   fn index(&self, index: I) -> &Self::Output {
     &self.deref()[index]
   }
@@ -55,7 +55,7 @@ impl<'s, T, I> IndexMut<I> for SliceVec<'s, T>
 where
   I: SliceIndex<[T]>,
 {
-  #[inline(always)]
+  #[inline]
   fn index_mut(&mut self, index: I) -> &mut Self::Output {
     &mut self.deref_mut()[index]
   }
@@ -77,14 +77,14 @@ impl<'s, T> SliceVec<'s, T> {
   /// ## Safety
   ///
   /// This pointer has provenance over the _entire_ backing slice.
-  #[inline(always)]
+  #[inline]
   #[must_use]
   pub fn as_mut_ptr(&mut self) -> *mut T {
     self.data.as_mut_ptr()
   }
 
   /// Performs a `deref_mut`, into unique slice form.
-  #[inline(always)]
+  #[inline]
   #[must_use]
   pub fn as_mut_slice(&mut self) -> &mut [T] {
     self.deref_mut()
@@ -95,14 +95,14 @@ impl<'s, T> SliceVec<'s, T> {
   /// ## Safety
   ///
   /// This pointer has provenance over the _entire_ backing slice.
-  #[inline(always)]
+  #[inline]
   #[must_use]
   pub fn as_ptr(&self) -> *const T {
     self.data.as_ptr()
   }
 
   /// Performs a `deref`, into shared slice form.
-  #[inline(always)]
+  #[inline]
   #[must_use]
   pub fn as_slice(&self) -> &[T] {
     self.deref()
@@ -111,14 +111,14 @@ impl<'s, T> SliceVec<'s, T> {
   /// The capacity of the `SliceVec`.
   ///
   /// This the length of the initial backing slice.
-  #[inline(always)]
+  #[inline]
   #[must_use]
   pub fn capacity(&self) -> usize {
     self.data.len()
   }
 
   /// Truncates the `SliceVec` down to length 0.
-  #[inline(always)]
+  #[inline]
   pub fn clear(&mut self)
   where
     T: Default,
@@ -287,14 +287,14 @@ impl<'s, T> SliceVec<'s, T> {
   }
 
   /// Checks if the length is 0.
-  #[inline(always)]
+  #[inline]
   #[must_use]
   pub fn is_empty(&self) -> bool {
     self.len == 0
   }
 
   /// The length of the `SliceVec` (in elements).
-  #[inline(always)]
+  #[inline]
   #[must_use]
   pub fn len(&self) -> usize {
     self.len
@@ -345,7 +345,7 @@ impl<'s, T> SliceVec<'s, T> {
   /// assert_eq!(&sv[..], [1, 2]);
   /// // sv.push(3); this would overflow the ArrayVec and panic!
   /// ```
-  #[inline(always)]
+  #[inline]
   pub fn push(&mut self, val: T) {
     if self.len < self.capacity() {
       self.data[self.len] = val;
@@ -515,7 +515,7 @@ impl<'s, T> SliceVec<'s, T> {
   ///   "initialized" by Rust's rules.
   /// * Other than "the memory is initialized" there are no other guarantees
   ///   regarding what you find in the inactive portion of the vec.
-  #[inline(always)]
+  #[inline]
   pub fn set_len(&mut self, new_len: usize) {
     if new_len > self.capacity() {
       // Note(Lokathor): Technically we don't have to panic here, and we could
@@ -651,7 +651,7 @@ impl<'s, T> SliceVec<'s, T> {
   /// assert_eq!(sv.grab_spare_slice().len(), 0);
   /// ```
   #[must_use]
-  #[inline(always)]
+  #[inline]
   pub fn grab_spare_slice(&self) -> &[T] {
     &self.data[self.len..]
   }
@@ -668,7 +668,7 @@ impl<'s, T> SliceVec<'s, T> {
   /// sv.push(11);
   /// assert_eq!(sv.grab_spare_slice_mut().len(), 2);
   /// ```
-  #[inline(always)]
+  #[inline]
   pub fn grab_spare_slice_mut(&mut self) -> &mut [T] {
     &mut self.data[self.len..]
   }
@@ -746,28 +746,28 @@ impl<'p, 's, T: Default> Drop for SliceVecDrain<'p, 's, T> {
 }
 
 impl<'s, T> AsMut<[T]> for SliceVec<'s, T> {
-  #[inline(always)]
+  #[inline]
   fn as_mut(&mut self) -> &mut [T] {
     &mut *self
   }
 }
 
 impl<'s, T> AsRef<[T]> for SliceVec<'s, T> {
-  #[inline(always)]
+  #[inline]
   fn as_ref(&self) -> &[T] {
     &*self
   }
 }
 
 impl<'s, T> Borrow<[T]> for SliceVec<'s, T> {
-  #[inline(always)]
+  #[inline]
   fn borrow(&self) -> &[T] {
     &*self
   }
 }
 
 impl<'s, T> BorrowMut<[T]> for SliceVec<'s, T> {
-  #[inline(always)]
+  #[inline]
   fn borrow_mut(&mut self) -> &mut [T] {
     &mut *self
   }
@@ -785,7 +785,7 @@ impl<'s, T> Extend<T> for SliceVec<'s, T> {
 impl<'s, T> IntoIterator for SliceVec<'s, T> {
   type Item = &'s mut T;
   type IntoIter = core::slice::IterMut<'s, T>;
-  #[inline(always)]
+  #[inline]
   fn into_iter(self) -> Self::IntoIter {
     self.data.iter_mut()
   }

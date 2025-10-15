@@ -934,7 +934,7 @@ impl<'src> Parser<'src> {
         p
     }
 
-    #[inline(always)]
+    #[inline]
     fn peek(&self) -> Option<&SpannedTok> {
         if self.i < self.toks.len() {
             Some(&self.toks[self.i])
@@ -976,7 +976,7 @@ impl<'src> Parser<'src> {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn check(&self, t: &Tok) -> bool {
         if let Some(p) = self.peek() {
             &p.tok == t
@@ -985,7 +985,7 @@ impl<'src> Parser<'src> {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn matches(&mut self, t: &Tok) -> bool {
         if self.check(t) {
             self.i += 1;
@@ -995,7 +995,7 @@ impl<'src> Parser<'src> {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn expect(&mut self, t: Tok, msg: &str) -> PResult<()> {
         if self.check(&t) {
             self.i += 1;
@@ -1033,12 +1033,12 @@ impl<'src> Parser<'src> {
         self.make_error(msg.to_string(), span)
     }
 
-    #[inline(always)]
+    #[inline]
     fn is_eof(&self) -> bool {
         self.i >= self.toks.len()
     }
 
-    #[inline(always)]
+    #[inline]
     fn check_ident(&self, s: &str) -> bool {
         if let Some(p) = self.peek() {
             matches!(&p.tok, Tok::Ident(name) if name == s)
@@ -1047,7 +1047,7 @@ impl<'src> Parser<'src> {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn matches_ident(&mut self, s: &str) -> bool {
         if self.check_ident(s) {
             self.i += 1;

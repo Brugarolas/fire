@@ -7,17 +7,17 @@ impl<T: Default, N: ArrayLength> Array for GenericArray<T, N> {
   type Item = T;
   const CAPACITY: usize = N::USIZE;
 
-  #[inline(always)]
+  #[inline]
   fn as_slice(&self) -> &[T] {
     &*self
   }
 
-  #[inline(always)]
+  #[inline]
   fn as_slice_mut(&mut self) -> &mut [T] {
     &mut *self
   }
 
-  #[inline(always)]
+  #[inline]
   fn default() -> Self {
     <Self as Default>::default()
   }

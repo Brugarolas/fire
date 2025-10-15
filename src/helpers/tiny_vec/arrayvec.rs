@@ -154,14 +154,14 @@ impl<A: Array> Default for ArrayVec<A> {
 
 impl<A: Array> Deref for ArrayVec<A> {
   type Target = [A::Item];
-  #[inline(always)]
+  #[inline]
   fn deref(&self) -> &Self::Target {
     &self.data.as_slice()[..self.len as usize]
   }
 }
 
 impl<A: Array> DerefMut for ArrayVec<A> {
-  #[inline(always)]
+  #[inline]
   fn deref_mut(&mut self) -> &mut Self::Target {
     &mut self.data.as_slice_mut()[..self.len as usize]
   }
@@ -169,14 +169,14 @@ impl<A: Array> DerefMut for ArrayVec<A> {
 
 impl<A: Array, I: SliceIndex<[A::Item]>> Index<I> for ArrayVec<A> {
   type Output = <I as SliceIndex<[A::Item]>>::Output;
-  #[inline(always)]
+  #[inline]
   fn index(&self, index: I) -> &Self::Output {
     &self.deref()[index]
   }
 }
 
 impl<A: Array, I: SliceIndex<[A::Item]>> IndexMut<I> for ArrayVec<A> {
-  #[inline(always)]
+  #[inline]
   fn index_mut(&mut self, index: I) -> &mut Self::Output {
     &mut self.deref_mut()[index]
   }
@@ -352,14 +352,14 @@ impl<A: Array> ArrayVec<A> {
   /// ## Safety
   ///
   /// This pointer has provenance over the _entire_ backing array.
-  #[inline(always)]
+  #[inline]
   #[must_use]
   pub fn as_mut_ptr(&mut self) -> *mut A::Item {
     self.data.as_slice_mut().as_mut_ptr()
   }
 
   /// Performs a `deref_mut`, into unique slice form.
-  #[inline(always)]
+  #[inline]
   #[must_use]
   pub fn as_mut_slice(&mut self) -> &mut [A::Item] {
     self.deref_mut()
@@ -370,14 +370,14 @@ impl<A: Array> ArrayVec<A> {
   /// ## Safety
   ///
   /// This pointer has provenance over the _entire_ backing array.
-  #[inline(always)]
+  #[inline]
   #[must_use]
   pub fn as_ptr(&self) -> *const A::Item {
     self.data.as_slice().as_ptr()
   }
 
   /// Performs a `deref`, into shared slice form.
-  #[inline(always)]
+  #[inline]
   #[must_use]
   pub fn as_slice(&self) -> &[A::Item] {
     self.deref()
@@ -387,7 +387,7 @@ impl<A: Array> ArrayVec<A> {
   ///
   /// This is fixed based on the array type, but can't yet be made a `const fn`
   /// on Stable Rust.
-  #[inline(always)]
+  #[inline]
   #[must_use]
   pub fn capacity(&self) -> usize {
     // Note: This shouldn't use A::CAPACITY, because unsafe code can't rely on
@@ -397,7 +397,7 @@ impl<A: Array> ArrayVec<A> {
   }
 
   /// Truncates the `ArrayVec` down to length 0.
-  #[inline(always)]
+  #[inline]
   pub fn clear(&mut self) {
     self.truncate(0)
   }
@@ -622,21 +622,21 @@ impl<A: Array> ArrayVec<A> {
   }
 
   /// Checks if the length is 0.
-  #[inline(always)]
+  #[inline]
   #[must_use]
   pub fn is_empty(&self) -> bool {
     self.len == 0
   }
 
   /// The length of the `ArrayVec` (in elements).
-  #[inline(always)]
+  #[inline]
   #[must_use]
   pub fn len(&self) -> usize {
     self.len as usize
   }
 
   /// Makes a new, empty `ArrayVec`.
-  #[inline(always)]
+  #[inline]
   #[must_use]
   pub fn new() -> Self {
     Self::default()
@@ -683,7 +683,7 @@ impl<A: Array> ArrayVec<A> {
   /// assert_eq!(&av[..], [1, 2]);
   /// // av.push(3); this would overflow the ArrayVec and panic!
   /// ```
-  #[inline(always)]
+  #[inline]
   pub fn push(&mut self, val: A::Item) {
     let x = self.try_push(val);
     assert!(x.is_none(), "ArrayVec::push> capacity overflow!");
@@ -702,7 +702,7 @@ impl<A: Array> ArrayVec<A> {
   /// assert_eq!(&av[..], [1, 2]);
   /// assert_eq!(av.try_push(3), Some(3));
   /// ```
-  #[inline(always)]
+  #[inline]
   pub fn try_push(&mut self, val: A::Item) -> Option<A::Item> {
     debug_assert!(self.len as usize <= A::CAPACITY);
 
@@ -926,7 +926,7 @@ impl<A: Array> ArrayVec<A> {
   ///   "initialized" by Rust's rules.
   /// * Other than "the memory is initialized" there are no other guarantees
   ///   regarding what you find in the inactive portion of the vec.
-  #[inline(always)]
+  #[inline]
   pub fn set_len(&mut self, new_len: usize) {
     if new_len > A::CAPACITY {
       // Note(Lokathor): Technically we don't have to panic here, and we could
@@ -1190,7 +1190,7 @@ impl<A: Array> ArrayVec<A> {
   /// av.push(13);
   /// assert_eq!(av.grab_spare_slice().len(), 0);
   /// ```
-  #[inline(always)]
+  #[inline]
   pub fn grab_spare_slice(&self) -> &[A::Item] {
     &self.data.as_slice()[self.len as usize..]
   }
@@ -1206,7 +1206,7 @@ impl<A: Array> ArrayVec<A> {
   /// av.push(11);
   /// assert_eq!(av.grab_spare_slice_mut().len(), 2);
   /// ```
-  #[inline(always)]
+  #[inline]
   pub fn grab_spare_slice_mut(&mut self) -> &mut [A::Item] {
     &mut self.data.as_slice_mut()[self.len as usize..]
   }
@@ -1215,7 +1215,7 @@ impl<A: Array> ArrayVec<A> {
 #[cfg(feature = "nightly_slice_partition_dedup")]
 impl<A: Array> ArrayVec<A> {
   /// De-duplicates the vec contents.
-  #[inline(always)]
+  #[inline]
   pub fn dedup(&mut self)
   where
     A::Item: PartialEq,
@@ -1224,7 +1224,7 @@ impl<A: Array> ArrayVec<A> {
   }
 
   /// De-duplicates the vec according to the predicate given.
-  #[inline(always)]
+  #[inline]
   pub fn dedup_by<F>(&mut self, same_bucket: F)
   where
     F: FnMut(&mut A::Item, &mut A::Item) -> bool,
@@ -1237,7 +1237,7 @@ impl<A: Array> ArrayVec<A> {
   }
 
   /// De-duplicates the vec according to the key selector given.
-  #[inline(always)]
+  #[inline]
   pub fn dedup_by_key<F, K>(&mut self, mut key: F)
   where
     F: FnMut(&mut A::Item) -> K,
@@ -1252,7 +1252,7 @@ impl<A> ArrayVec<A> {
   ///
   /// This returns the full array, even if the `ArrayVec` length is currently
   /// less than that.
-  #[inline(always)]
+  #[inline]
   #[must_use]
   pub const fn as_inner(&self) -> &A {
     &self.data
@@ -1367,28 +1367,28 @@ impl<'p, A: Array, I: Iterator<Item = A::Item>> Drop
 }
 
 impl<A: Array> AsMut<[A::Item]> for ArrayVec<A> {
-  #[inline(always)]
+  #[inline]
   fn as_mut(&mut self) -> &mut [A::Item] {
     &mut *self
   }
 }
 
 impl<A: Array> AsRef<[A::Item]> for ArrayVec<A> {
-  #[inline(always)]
+  #[inline]
   fn as_ref(&self) -> &[A::Item] {
     &*self
   }
 }
 
 impl<A: Array> Borrow<[A::Item]> for ArrayVec<A> {
-  #[inline(always)]
+  #[inline]
   fn borrow(&self) -> &[A::Item] {
     &*self
   }
 }
 
 impl<A: Array> BorrowMut<[A::Item]> for ArrayVec<A> {
-  #[inline(always)]
+  #[inline]
   fn borrow_mut(&mut self) -> &mut [A::Item] {
     &mut *self
   }
@@ -1404,7 +1404,7 @@ impl<A: Array> Extend<A::Item> for ArrayVec<A> {
 }
 
 impl<A: Array> From<A> for ArrayVec<A> {
-  #[inline(always)]
+  #[inline]
   /// The output has a length equal to the full array.
   ///
   /// If you want to select a length, use
@@ -1500,13 +1500,13 @@ impl<A: Array> Iterator for ArrayVecIterator<A> {
     self.base += 1;
     return Some(core::mem::take(itemref));
   }
-  #[inline(always)]
+  #[inline]
   fn size_hint(&self) -> (usize, Option<usize>) {
     let s = self.tail - self.base;
     let s = s as usize;
     (s, Some(s))
   }
-  #[inline(always)]
+  #[inline]
   fn count(self) -> usize {
     self.size_hint().0
   }
@@ -1579,7 +1579,7 @@ where
 impl<A: Array> IntoIterator for ArrayVec<A> {
   type Item = A::Item;
   type IntoIter = ArrayVecIterator<A>;
-  #[inline(always)]
+  #[inline]
   fn into_iter(self) -> Self::IntoIter {
     ArrayVecIterator { base: 0, tail: self.len, data: self.data }
   }
@@ -1588,7 +1588,7 @@ impl<A: Array> IntoIterator for ArrayVec<A> {
 impl<'a, A: Array> IntoIterator for &'a mut ArrayVec<A> {
   type Item = &'a mut A::Item;
   type IntoIter = core::slice::IterMut<'a, A::Item>;
-  #[inline(always)]
+  #[inline]
   fn into_iter(self) -> Self::IntoIter {
     self.iter_mut()
   }
@@ -1597,7 +1597,7 @@ impl<'a, A: Array> IntoIterator for &'a mut ArrayVec<A> {
 impl<'a, A: Array> IntoIterator for &'a ArrayVec<A> {
   type Item = &'a A::Item;
   type IntoIter = core::slice::Iter<'a, A::Item>;
-  #[inline(always)]
+  #[inline]
   fn into_iter(self) -> Self::IntoIter {
     self.iter()
   }

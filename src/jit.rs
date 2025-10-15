@@ -1063,7 +1063,7 @@ impl JIT {
 }
 
 impl JIT {
-    #[inline(always)]
+    #[inline]
     fn ptr_ty(&self) -> types::Type {
         self.module.target_config().pointer_type()
     }
@@ -1094,7 +1094,7 @@ impl JIT {
 }
 
 impl JIT {
-    /// Call a host/imported function via an *indirect* call.
+    // Replace the current call_import with a direct-call version.
     fn call_import<'a>(
         &mut self,
         fb: &mut cranelift_frontend::FunctionBuilder<'a>,
@@ -1105,24 +1105,20 @@ impl JIT {
         use cranelift::prelude::*;
         use cranelift_module::Linkage;
 
-        let ptr_ty = self.module.target_config().pointer_type();
-
-        // Build the callee signature and import it into the current function.
+        // 1) Build callee signature (default CC or tu NapalmFast CC más abajo)
         let mut sig = self.module.make_signature();
-        sig.call_conv = self.module.isa().default_call_conv(); // IMPORTANT
+        sig.call_conv = self.module.isa().default_call_conv();
         build_sig(&mut sig);
-        let sigref = fb.import_signature(sig.clone());
 
-        // Declare the external symbol, get a FuncRef for this function body.
+        // 2) Declare the imported function
         let func_id = self
             .module
             .declare_function(name, Linkage::Import, &sig)
             .map_err(|e| e.to_string())?;
         let func_ref = self.module.declare_func_in_func(func_id, &mut fb.func);
 
-        // Get a pointer to the callee, then *indirect* call through that pointer.
-        let fptr = fb.ins().func_addr(ptr_ty, func_ref);
-        let call = fb.ins().call_indirect(sigref, fptr, args);
+        // 3) Direct call — no func_addr, no call_indirect
+        let call = fb.ins().call(func_ref, args);
         Ok(fb.inst_results(call)[0])
     }
 
@@ -3292,7 +3288,7 @@ pub extern "C" fn wir_free_words(p: *mut i64, _n: i64) -> i64 {
 
 // ----- SMI and boxed f64 handling -----
 
-#[inline(always)]
+#[inline]
 fn smi_encode(x: i64) -> i64 {
     (x << 1) | 1
 }
@@ -3311,7 +3307,7 @@ pub extern "C" fn wir_box_f64_runtime(bits: u64) -> i64 {
     Box::into_raw(obj) as i64
 }
 
-#[inline(always)]
+#[inline]
 fn val_to_f64(v: i64) -> Result<f64, &'static str> {
     use crate::value::*;
     if is_imm(v) {
@@ -3332,7 +3328,7 @@ fn val_to_f64(v: i64) -> Result<f64, &'static str> {
     }
 }
 
-#[inline(always)]
+#[inline]
 fn f64_to_val(x: f64) -> i64 {
     let xi = x as i64;
     if (xi as f64) == x {
@@ -3363,7 +3359,7 @@ pub extern "C" fn wir_mul_slow(a: i64, b: i64) -> i64 {
 }
 
 // ----- comparison slow paths (return raw 0/1) -----
-#[inline(always)]
+#[inline]
 fn b2i(b: bool) -> i64 {
     if b { 1 } else { 0 }
 }

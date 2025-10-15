@@ -316,21 +316,21 @@ pub fn napalm_rt_register_try_descriptor(
         );
 }
 
-#[inline(always)]
+#[inline]
 fn smi_to_i64(v: i64) -> i64 {
     v >> 1
 }
-#[inline(always)]
+#[inline]
 fn decode_field_smi(v: i64) -> u32 {
     smi_to_i64(v) as u32
 }
 
-#[inline(always)]
+#[inline]
 fn is_heap_ptr(v: i64) -> bool {
     v::is_ptr(v)
 }
 
-#[inline(always)]
+#[inline]
 fn heap_tag(v: i64) -> Option<u32> {
     if is_heap_ptr(v) {
         unsafe { (v as *const ObjHeader).as_ref().map(|h| h.tag) }
@@ -339,12 +339,12 @@ fn heap_tag(v: i64) -> Option<u32> {
     }
 }
 
-#[inline(always)]
+#[inline]
 fn is_closure_value(v: i64) -> bool {
     matches!(heap_tag(v), Some(TAG_CLOSURE))
 }
 
-#[inline(always)]
+#[inline]
 unsafe fn boxedstr_to_string(p: i64) -> Option<String> {
     if p == 0 {
         return None;
@@ -406,14 +406,14 @@ type FieldCache = ConcurrentHashMap<u32, FieldCacheList>;
 
 static FIELD_CACHE: OnceLock<FieldCache> = OnceLock::new();
 
-#[inline(always)]
+#[inline]
 fn field_cache() -> &'static FieldCache {
     FIELD_CACHE.get_or_init(|| {
         ConcurrentHashMap::new()
     })
 }
 
-#[inline(always)]
+#[inline]
 pub fn cache_lookup(fid: u32, shape: u32) -> Option<usize> {
     let guard = field_cache().pin();
     guard.get(&fid).and_then(|list| list.lookup(shape))
@@ -469,14 +469,14 @@ type NameLookup = LockfreeHashMap<String, u32, FastBuildHasher>;
 static FIELD_NAME_REGISTRY: OnceLock<NameRegistry> = OnceLock::new();
 static FIELD_NAME_LOOKUP: OnceLock<NameLookup> = OnceLock::new();
 
-#[inline(always)]
+#[inline]
 fn field_name_registry() -> &'static NameRegistry {
     FIELD_NAME_REGISTRY.get_or_init(|| {
         NameRegistry::with_hasher(FastBuildHasher::new())
     })
 }
 
-#[inline(always)]
+#[inline]
 fn field_name_lookup() -> &'static NameLookup {
     FIELD_NAME_LOOKUP.get_or_init(|| {
         NameLookup::with_hasher(FastBuildHasher::new())
@@ -484,14 +484,14 @@ fn field_name_lookup() -> &'static NameLookup {
 }
 
 /// Fast lookup: fid → name (clones the String)
-#[inline(always)]
+#[inline]
 pub fn field_name_for_id(fid: u32) -> Option<String> {
     let guard = field_name_registry().pin();
     guard.get(&fid).cloned()
 }
 
 /// Fast lookup: name → fid (copies u32, no allocation)
-#[inline(always)]
+#[inline]
 pub fn field_id_for_name(name: &str) -> Option<u32> {
     let guard = field_name_lookup().pin();
     guard.get(name).copied()
@@ -513,22 +513,22 @@ pub fn register_field_name(fid: u32, name: String) {
     }
 }
 
-#[inline(always)]
+#[inline]
 fn is_proxy(v: i64) -> bool {
     matches!(heap_tag(v), Some(TAG_PROXY))
 }
 
-#[inline(always)]
+#[inline]
 unsafe fn proxy_ref(v: i64) -> &'static BoxedProxy {
     &*(v as *const BoxedProxy)
 }
 
-#[inline(always)]
+#[inline]
 fn proxy_target(proxy: i64) -> i64 {
     unsafe { proxy_ref(proxy).target }
 }
 
-#[inline(always)]
+#[inline]
 fn proxy_handler(proxy: i64) -> i64 {
     unsafe { proxy_ref(proxy).handler }
 }
@@ -895,7 +895,7 @@ enum BuiltinIterKind {
     Entries,
 }
 
-#[inline(always)]
+#[inline]
 fn empty_array() -> i64 {
     array_from_vec(Vec::new())
 }
@@ -1377,24 +1377,24 @@ static MAP2: OnceLock<Map2> = OnceLock::new();
 static MAP3: OnceLock<Map3> = OnceLock::new();
 static MAP4: OnceLock<Map4> = OnceLock::new();
 
-#[inline(always)]
+#[inline]
 fn map1() -> &'static Map1 {
     MAP1.get_or_init(|| LockfreeHashMap::with_hasher(FastBuildHasher::default()))
 }
-#[inline(always)]
+#[inline]
 fn map2() -> &'static Map2 {
     MAP2.get_or_init(|| LockfreeHashMap::with_hasher(FastBuildHasher::default()))
 }
-#[inline(always)]
+#[inline]
 fn map3() -> &'static Map3 {
     MAP3.get_or_init(|| LockfreeHashMap::with_hasher(FastBuildHasher::default()))
 }
-#[inline(always)]
+#[inline]
 fn map4() -> &'static Map4 {
     MAP4.get_or_init(|| LockfreeHashMap::with_hasher(FastBuildHasher::default()))
 }
 
-#[inline(always)]
+#[inline]
 unsafe fn write_out(out_ptr: *mut i64, val: i64) {
     if !out_ptr.is_null() { *out_ptr = val; }
 }

@@ -69,7 +69,7 @@ fn next_req_id() -> u64 {
     NEXT_REQ_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-#[inline(always)]
+#[inline]
 fn runtime_bool(val: i64) -> bool {
     value_to_bool(val).unwrap_or(false)
 }
@@ -163,20 +163,20 @@ fn unroot_deferred(slot: RootSlot) {
 }
 
 /// ---- tiny utils ----
-#[inline(always)]
+#[inline]
 unsafe fn argv_read(argv: *const i64, idx: usize) -> i64 {
     // Use an unaligned 64-bit load to avoid SIGBUS on aarch64 when argv isn’t 8-byte aligned.
     read_unaligned(argv.add(idx))
 }
 
-#[inline(always)]
+#[inline]
 unsafe fn boxedstr_to_string(p: i64) -> String {
     let s = &*(p as *const BoxedStr);
     let bytes = std::slice::from_raw_parts(s.data, s.len);
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-#[inline(always)]
+#[inline]
 fn static_str_value(s: &'static str) -> i64 {
     use crate::value::box_str_borrowed;
     box_str_borrowed(s.as_bytes())
@@ -866,7 +866,7 @@ static HTTP_RESOLVE_CLO: Lazy<i64> = Lazy::new(|| {
     crate::value::closure_new(http_resolve_tramp as usize, 0)
 });
 
-#[inline(always)]
+#[inline]
 fn http_resolve_closure() -> i64 {
     *HTTP_RESOLVE_CLO
 }

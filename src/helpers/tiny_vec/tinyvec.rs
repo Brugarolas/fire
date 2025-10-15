@@ -131,7 +131,7 @@ impl<A: Array> Deref for TinyVec<A> {
 
   impl_mirrored! {
     type Mirror = TinyVec;
-    #[inline(always)]
+    #[inline]
     #[must_use]
     fn deref(self: &Self) -> &Self::Target;
   }
@@ -140,7 +140,7 @@ impl<A: Array> Deref for TinyVec<A> {
 impl<A: Array> DerefMut for TinyVec<A> {
   impl_mirrored! {
     type Mirror = TinyVec;
-    #[inline(always)]
+    #[inline]
     #[must_use]
     fn deref_mut(self: &mut Self) -> &mut Self::Target;
   }
@@ -148,27 +148,27 @@ impl<A: Array> DerefMut for TinyVec<A> {
 
 impl<A: Array, I: SliceIndex<[A::Item]>> Index<I> for TinyVec<A> {
   type Output = <I as SliceIndex<[A::Item]>>::Output;
-  #[inline(always)]
+  #[inline]
   fn index(&self, index: I) -> &Self::Output {
     &self.deref()[index]
   }
 }
 
 impl<A: Array, I: SliceIndex<[A::Item]>> IndexMut<I> for TinyVec<A> {
-  #[inline(always)]
+  #[inline]
   fn index_mut(&mut self, index: I) -> &mut Self::Output {
     &mut self.deref_mut()[index]
   }
 }
 
 impl<A: Array<Item = u8>> std::io::Write for TinyVec<A> {
-  #[inline(always)]
+  #[inline]
   fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
     self.extend_from_slice(buf);
     Ok(buf.len())
   }
 
-  #[inline(always)]
+  #[inline]
   fn flush(&mut self) -> std::io::Result<()> {
     Ok(())
   }
@@ -176,7 +176,7 @@ impl<A: Array<Item = u8>> std::io::Write for TinyVec<A> {
 
 impl<A: Array> TinyVec<A> {
   /// Returns whether elements are on heap
-  #[inline(always)]
+  #[inline]
   #[must_use]
   pub fn is_heap(&self) -> bool {
     match self {
@@ -185,7 +185,7 @@ impl<A: Array> TinyVec<A> {
     }
   }
   /// Returns whether elements are on stack
-  #[inline(always)]
+  #[inline]
   #[must_use]
   pub fn is_inline(&self) -> bool {
     !self.is_heap()
@@ -594,7 +594,7 @@ impl<A: Array> TinyVec<A> {
     pub fn remove(self: &mut Self, index: usize) -> A::Item;
 
     /// The length of the vec (in elements).
-    #[inline(always)]
+    #[inline]
     #[must_use]
     pub fn len(self: &Self) -> usize;
 
@@ -602,7 +602,7 @@ impl<A: Array> TinyVec<A> {
     ///
     /// When not heap allocated this is fixed based on the array type.
     /// Otherwise its the result of the underlying Vec::capacity.
-    #[inline(always)]
+    #[inline]
     #[must_use]
     pub fn capacity(self: &Self) -> usize;
 
@@ -617,7 +617,7 @@ impl<A: Array> TinyVec<A> {
     /// ## Safety
     ///
     /// This pointer has provenance over the _entire_ backing array/buffer.
-    #[inline(always)]
+    #[inline]
     #[must_use]
     pub fn as_mut_ptr(self: &mut Self) -> *mut A::Item;
 
@@ -626,7 +626,7 @@ impl<A: Array> TinyVec<A> {
     /// ## Safety
     ///
     /// This pointer has provenance over the _entire_ backing array/buffer.
-    #[inline(always)]
+    #[inline]
     #[must_use]
     pub fn as_ptr(self: &Self) -> *const A::Item;
   }
@@ -672,28 +672,28 @@ impl<A: Array> TinyVec<A> {
   }
 
   /// Helper for getting the mut slice.
-  #[inline(always)]
+  #[inline]
   #[must_use]
   pub fn as_mut_slice(&mut self) -> &mut [A::Item] {
     self.deref_mut()
   }
 
   /// Helper for getting the shared slice.
-  #[inline(always)]
+  #[inline]
   #[must_use]
   pub fn as_slice(&self) -> &[A::Item] {
     self.deref()
   }
 
   /// Removes all elements from the vec.
-  #[inline(always)]
+  #[inline]
   pub fn clear(&mut self) {
     self.truncate(0)
   }
 
   /// De-duplicates the vec.
   #[cfg(feature = "nightly_slice_partition_dedup")]
-  #[inline(always)]
+  #[inline]
   pub fn dedup(&mut self)
   where
     A::Item: PartialEq,
@@ -703,7 +703,7 @@ impl<A: Array> TinyVec<A> {
 
   /// De-duplicates the vec according to the predicate given.
   #[cfg(feature = "nightly_slice_partition_dedup")]
-  #[inline(always)]
+  #[inline]
   pub fn dedup_by<F>(&mut self, same_bucket: F)
   where
     F: FnMut(&mut A::Item, &mut A::Item) -> bool,
@@ -717,7 +717,7 @@ impl<A: Array> TinyVec<A> {
 
   /// De-duplicates the vec according to the key selector given.
   #[cfg(feature = "nightly_slice_partition_dedup")]
-  #[inline(always)]
+  #[inline]
   pub fn dedup_by_key<F, K>(&mut self, mut key: F)
   where
     F: FnMut(&mut A::Item) -> K,
@@ -800,7 +800,7 @@ impl<A: Array> TinyVec<A> {
   /// This is an internal implementation detail of the `tiny_vec!` macro, and
   /// using it other than from that macro is not supported by this crate's
   /// SemVer guarantee.
-  #[inline(always)]
+  #[inline]
   #[doc(hidden)]
   pub fn constructor_for_capacity(cap: usize) -> TinyVecConstructor<A> {
     if cap <= A::CAPACITY {
@@ -850,14 +850,14 @@ impl<A: Array> TinyVec<A> {
   }
 
   /// If the vec is empty.
-  #[inline(always)]
+  #[inline]
   #[must_use]
   pub fn is_empty(&self) -> bool {
     self.len() == 0
   }
 
   /// Makes a new, empty vec.
-  #[inline(always)]
+  #[inline]
   #[must_use]
   pub fn new() -> Self {
     Self::default()
@@ -1222,28 +1222,28 @@ impl<'p, A: Array, I: Iterator<Item = A::Item>> Drop
 }
 
 impl<A: Array> AsMut<[A::Item]> for TinyVec<A> {
-  #[inline(always)]
+  #[inline]
   fn as_mut(&mut self) -> &mut [A::Item] {
     &mut *self
   }
 }
 
 impl<A: Array> AsRef<[A::Item]> for TinyVec<A> {
-  #[inline(always)]
+  #[inline]
   fn as_ref(&self) -> &[A::Item] {
     &*self
   }
 }
 
 impl<A: Array> Borrow<[A::Item]> for TinyVec<A> {
-  #[inline(always)]
+  #[inline]
   fn borrow(&self) -> &[A::Item] {
     &*self
   }
 }
 
 impl<A: Array> BorrowMut<[A::Item]> for TinyVec<A> {
-  #[inline(always)]
+  #[inline]
   fn borrow_mut(&mut self) -> &mut [A::Item] {
     &mut *self
   }
@@ -1277,7 +1277,7 @@ impl<A: Array> Extend<A::Item> for TinyVec<A> {
 }
 
 impl<A: Array> From<ArrayVec<A>> for TinyVec<A> {
-  #[inline(always)]
+  #[inline]
   fn from(arr: ArrayVec<A>) -> Self {
     TinyVec::Inline(arr)
   }
@@ -1409,11 +1409,11 @@ impl<A: Array> Iterator for TinyVecIterator<A> {
     #[inline]
     fn next(self: &mut Self) -> Option<Self::Item>;
 
-    #[inline(always)]
+    #[inline]
     #[must_use]
     fn size_hint(self: &Self) -> (usize, Option<usize>);
 
-    #[inline(always)]
+    #[inline]
     fn count(self: Self) -> usize;
 
     #[inline]
@@ -1457,7 +1457,7 @@ where
 impl<A: Array> IntoIterator for TinyVec<A> {
   type Item = A::Item;
   type IntoIter = TinyVecIterator<A>;
-  #[inline(always)]
+  #[inline]
   fn into_iter(self) -> Self::IntoIter {
     match self {
       TinyVec::Inline(a) => TinyVecIterator::Inline(a.into_iter()),
@@ -1469,7 +1469,7 @@ impl<A: Array> IntoIterator for TinyVec<A> {
 impl<'a, A: Array> IntoIterator for &'a mut TinyVec<A> {
   type Item = &'a mut A::Item;
   type IntoIter = core::slice::IterMut<'a, A::Item>;
-  #[inline(always)]
+  #[inline]
   fn into_iter(self) -> Self::IntoIter {
     self.iter_mut()
   }
@@ -1478,7 +1478,7 @@ impl<'a, A: Array> IntoIterator for &'a mut TinyVec<A> {
 impl<'a, A: Array> IntoIterator for &'a TinyVec<A> {
   type Item = &'a A::Item;
   type IntoIter = core::slice::Iter<'a, A::Item>;
-  #[inline(always)]
+  #[inline]
   fn into_iter(self) -> Self::IntoIter {
     self.iter()
   }

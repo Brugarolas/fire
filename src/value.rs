@@ -28,21 +28,21 @@ pub type ValueRepr = i64;
 const PTR_TAG_MASK: ValueRepr = 0b111;
 
 // ---- Pointer / immediate tests ----
-#[inline(always)]
+#[inline]
 pub fn is_ptr(v: ValueRepr) -> bool {
     v != NULL && (v & PTR_TAG_MASK) == 0
 }
-#[inline(always)]
+#[inline]
 pub fn is_imm(v: ValueRepr) -> bool {
     (v & 1) == 1
 }
 
 // ---- Small Int (SMI) encoding ----
-#[inline(always)]
+#[inline]
 pub fn make_smi(n: i64) -> ValueRepr {
     (n << 1) | 1
 }
-#[inline(always)]
+#[inline]
 pub fn smi_to_i64(v: ValueRepr) -> i64 {
     v >> 1
 } // arithmetic shift
@@ -54,17 +54,17 @@ pub const NULL: ValueRepr = 0;
 pub const BOOL_FALSE: ValueRepr = 0b010;
 pub const BOOL_TRUE: ValueRepr = 0b110;
 
-#[inline(always)]
+#[inline]
 pub fn is_bool(v: ValueRepr) -> bool {
     matches!(v, BOOL_FALSE | BOOL_TRUE)
 }
 
-#[inline(always)]
+#[inline]
 pub fn bool_to_value(b: bool) -> ValueRepr {
     if b { BOOL_TRUE } else { BOOL_FALSE }
 }
 
-#[inline(always)]
+#[inline]
 pub fn value_to_bool(v: ValueRepr) -> Option<bool> {
     match v {
         BOOL_FALSE => Some(false),
@@ -73,7 +73,7 @@ pub fn value_to_bool(v: ValueRepr) -> Option<bool> {
     }
 }
 
-#[inline(always)]
+#[inline]
 pub fn to_bool(v: ValueRepr) -> bool {
     value_to_bool(v).unwrap_or(v != NULL)
 }
@@ -172,7 +172,7 @@ impl PartialEq for Value {
 impl Eq for Value {}
 
 impl Borrow<Value> for i64 {
-    #[inline(always)]
+    #[inline]
     fn borrow(&self) -> &Value {
         unsafe { &*(self as *const i64 as *const Value) }
     }
@@ -209,7 +209,7 @@ pub struct BoxedF64 {
     pub val: f64,
 }
 
-#[inline(always)]
+#[inline]
 pub fn box_f64(x: f64) -> ValueRepr {
     unsafe {
         let size = mem::size_of::<BoxedF64>();
@@ -267,7 +267,7 @@ pub fn box_f64(x: f64) -> ValueRepr {
     }
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn unbox_f64(v: ValueRepr) -> f64 {
     debug_assert!(is_ptr(v));
     let p = v as *const BoxedF64;
@@ -296,11 +296,11 @@ pub struct BoxedArray {
 }
 
 impl BoxedArray {
-    #[inline(always)]
+    #[inline]
     pub fn len(&self) -> usize {
         self.buf.len()
     }
-    #[inline(always)]
+    #[inline]
     pub fn cap(&self) -> usize {
         self.buf.capacity()
     }
@@ -358,7 +358,7 @@ fn alloc_array_from_vec(mut buf: Vec<i64>) -> ValueRepr {
     }
 }
 
-#[inline(always)]
+#[inline]
 pub fn array_from_vec(buf: Vec<ValueRepr>) -> ValueRepr {
     alloc_array_from_vec(buf)
 }
@@ -374,33 +374,33 @@ pub fn array_new(len: usize) -> ValueRepr {
     box_array_with_len(len)
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn as_boxed_array_mut(v: ValueRepr) -> *mut BoxedArray {
     v as *mut BoxedArray
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn as_boxed_array_ref(v: ValueRepr) -> *const BoxedArray {
     v as *const BoxedArray
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn array_len(arr_v: ValueRepr) -> usize {
     (&*as_boxed_array_ref(arr_v)).buf.len()
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn array_len_smi(arr_v: ValueRepr) -> ValueRepr {
     make_smi(array_len(arr_v) as i64)
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn array_get(arr_v: ValueRepr, idx: usize) -> ValueRepr {
     let a = &*as_boxed_array_ref(arr_v);
     *a.buf.get(idx).unwrap_or(&NULL)
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn array_set(arr_v: ValueRepr, idx: usize, val: ValueRepr) -> ValueRepr {
     let a = &mut *as_boxed_array_mut(arr_v);
     if idx >= a.buf.len() {
@@ -415,14 +415,14 @@ pub unsafe fn array_set(arr_v: ValueRepr, idx: usize, val: ValueRepr) -> ValueRe
     0
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn array_set_len(arr_v: ValueRepr, new_len: usize) -> ValueRepr {
     let a = &mut *as_boxed_array_mut(arr_v);
     a.buf.resize(new_len, 0);
     0
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn array_push(arr_v: ValueRepr, val: ValueRepr) -> ValueRepr {
     let a = &mut *as_boxed_array_mut(arr_v);
     a.buf.push(val);
@@ -435,13 +435,13 @@ pub unsafe fn array_push(arr_v: ValueRepr, val: ValueRepr) -> ValueRepr {
     make_smi(a.buf.len() as i64)
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn array_pop(arr_v: ValueRepr) -> ValueRepr {
     let a = &mut *as_boxed_array_mut(arr_v);
     a.buf.pop().unwrap_or(NULL)
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn array_shift(arr_v: ValueRepr) -> ValueRepr {
     let a = &mut *as_boxed_array_mut(arr_v);
     if a.buf.is_empty() {
@@ -451,7 +451,7 @@ pub unsafe fn array_shift(arr_v: ValueRepr) -> ValueRepr {
     a.buf.remove(0)
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn array_unshift(arr_v: ValueRepr, val: ValueRepr) -> ValueRepr {
     let a = &mut *as_boxed_array_mut(arr_v);
     a.buf.insert(0, val);
@@ -639,11 +639,11 @@ pub unsafe fn array_copy(dst_v: ValueRepr, src_v: ValueRepr, n: usize) -> ValueR
     0
 }
 
-#[inline(always)]
+#[inline]
 fn smi(x: i64) -> i64 {
     (x << 1) | 1
 }
-#[inline(always)]
+#[inline]
 fn smi_to_i64_wrapped(v: i64) -> i64 {
     v >> 1
 } // arithmetic shift
@@ -814,7 +814,7 @@ pub struct BoxedStr {
     pub data: *const u8, // points to UTF-8 bytes (NUL-terminated OK, not required)
 }
 
-#[inline(always)]
+#[inline]
 unsafe fn value_as_str_slice<'a>(v: ValueRepr) -> Option<&'a str> {
     if !is_ptr(v) {
         return None;
@@ -831,7 +831,7 @@ unsafe fn value_as_str_slice<'a>(v: ValueRepr) -> Option<&'a str> {
     str::from_utf8(bytes).ok()
 }
 
-#[inline(always)]
+#[inline]
 pub fn box_str_borrowed(bytes: &[u8]) -> ValueRepr {
     unsafe {
         let size = mem::size_of::<BoxedStr>();
@@ -1305,7 +1305,7 @@ pub struct BoxedClosure {
     pub env: Vec<i64>,   // captured values
 }
 
-#[inline(always)]
+#[inline]
 pub fn closure_new(code_ptr: usize, env_len: usize) -> ValueRepr {
     unsafe {
         let size = core::mem::size_of::<BoxedClosure>();
@@ -1372,18 +1372,18 @@ pub fn closure_new(code_ptr: usize, env_len: usize) -> ValueRepr {
     }
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn as_closure_mut(v: ValueRepr) -> *mut BoxedClosure {
     v as *mut BoxedClosure
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn closure_get_env_slot(v: ValueRepr, idx: usize) -> ValueRepr {
     let c = &*as_closure_mut(v);
     *c.env.as_ptr().add(idx)
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn closure_set_env_slot(v: ValueRepr, idx: usize, val: ValueRepr) {
     let c = &mut *as_closure_mut(v);
     let slot: *mut ValueRepr = c.env.as_mut_ptr().add(idx);
@@ -1537,7 +1537,7 @@ fn shapes() -> &'static RwLock<ShapeTable> {
 
 const EMPTY_SHAPE_ID: u32 = 0;
 
-#[inline(always)]
+#[inline]
 pub fn obj_new() -> ValueRepr {
     unsafe {
         let size = mem::size_of::<BoxedObj>();
@@ -1601,39 +1601,39 @@ pub fn obj_new() -> ValueRepr {
     }
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn as_obj_mut(v: ValueRepr) -> *mut BoxedObj {
     v as *mut BoxedObj
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn obj_shape(obj_v: ValueRepr) -> u32 {
     let o = &*as_obj_mut(obj_v);
     o.shape
 }
 
-#[inline(always)]
+#[inline]
 pub fn shape_slot(shape_id: u32, fid: u32) -> Option<usize> {
     shapes().read().slot(shape_id, fid)
 }
 
-#[inline(always)]
+#[inline]
 pub fn shape_field_count(shape_id: u32) -> usize {
     shapes().read().field_count(shape_id)
 }
 
-#[inline(always)]
+#[inline]
 pub fn shape_fields(shape_id: u32) -> Vec<u32> {
     shapes().read().fields(shape_id).to_vec()
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn obj_get_slot(obj_v: ValueRepr, slot: usize) -> ValueRepr {
     let o = &*as_obj_mut(obj_v);
     o.slots.get(slot).copied().unwrap_or(NULL)
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn obj_set_slot_known(obj_v: ValueRepr, slot: usize, val: ValueRepr) {
     let o = &mut *as_obj_mut(obj_v);
     if o.slots.len() <= slot {
@@ -1647,7 +1647,7 @@ pub unsafe fn obj_set_slot_known(obj_v: ValueRepr, slot: usize, val: ValueRepr) 
     }
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn obj_set_proto(obj_v: ValueRepr, proto: ValueRepr) -> ValueRepr {
     let o = &mut *as_obj_mut(obj_v);
     o.proto = proto;
@@ -1658,7 +1658,7 @@ pub unsafe fn obj_set_proto(obj_v: ValueRepr, proto: ValueRepr) -> ValueRepr {
     0
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn obj_get_proto(obj_v: ValueRepr) -> ValueRepr {
     let o = &*as_obj_mut(obj_v);
     o.proto
@@ -1666,7 +1666,7 @@ pub unsafe fn obj_get_proto(obj_v: ValueRepr) -> ValueRepr {
 
 // ---- FieldId-based (u32) helpers ----
 
-#[inline(always)]
+#[inline]
 pub unsafe fn obj_get_field(obj_v: ValueRepr, fid: u32) -> ValueRepr {
     let o = &*as_obj_mut(obj_v);
     if let Some(slot) = shape_slot(o.shape, fid) {
@@ -1676,7 +1676,7 @@ pub unsafe fn obj_get_field(obj_v: ValueRepr, fid: u32) -> ValueRepr {
     }
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn obj_set_field(obj_v: ValueRepr, fid: u32, val: ValueRepr) -> ValueRepr {
     let o = &mut *as_obj_mut(obj_v);
     let mut slot = shape_slot(o.shape, fid);
@@ -1713,13 +1713,13 @@ pub unsafe fn obj_set_field(obj_v: ValueRepr, fid: u32, val: ValueRepr) -> Value
     val
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn obj_has_field(obj_v: ValueRepr, fid: u32) -> ValueRepr {
     let o = &*as_obj_mut(obj_v);
     bool_to_value(shape_slot(o.shape, fid).is_some())
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn obj_del_field(obj_v: ValueRepr, fid: u32) -> ValueRepr {
     let o = &mut *as_obj_mut(obj_v);
     let removal = {
@@ -1743,7 +1743,7 @@ pub unsafe fn obj_del_field(obj_v: ValueRepr, fid: u32) -> ValueRepr {
     }
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn obj_get_field_deep(mut obj_v: ValueRepr, fid: u32) -> ValueRepr {
     while obj_v != NULL {
         let o = &*(obj_v as *const BoxedObj);
@@ -1757,13 +1757,13 @@ pub unsafe fn obj_get_field_deep(mut obj_v: ValueRepr, fid: u32) -> ValueRepr {
 
 // ---- String-key helpers ----
 
-#[inline(always)]
+#[inline]
 pub unsafe fn obj_get_str(obj_v: ValueRepr, key: &str) -> ValueRepr {
     let o = &*as_obj_mut(obj_v);
     o.dict.get(key).cloned().unwrap_or(NULL)
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn obj_set_str(obj_v: ValueRepr, key: &str, val: ValueRepr) -> ValueRepr {
     let o = &mut *as_obj_mut(obj_v);
     let cell = o.dict.entry(key.to_string()).or_insert(NULL);
@@ -1776,19 +1776,19 @@ pub unsafe fn obj_set_str(obj_v: ValueRepr, key: &str, val: ValueRepr) -> ValueR
     val
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn obj_has_str(obj_v: ValueRepr, key: &str) -> ValueRepr {
     let o = &*as_obj_mut(obj_v);
     bool_to_value(o.dict.contains_key(key))
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn obj_del_str(obj_v: ValueRepr, key: &str) -> ValueRepr {
     let o = &mut *as_obj_mut(obj_v);
     bool_to_value(o.dict.remove(key).is_some())
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn obj_get_str_deep(mut obj_v: ValueRepr, key: &str) -> ValueRepr {
     while obj_v != NULL {
         let o = &*(obj_v as *const BoxedObj);
@@ -1800,7 +1800,7 @@ pub unsafe fn obj_get_str_deep(mut obj_v: ValueRepr, key: &str) -> ValueRepr {
     NULL
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn obj_assign(dst_v: ValueRepr, src_v: ValueRepr) -> ValueRepr {
     if dst_v == NULL || src_v == NULL || (dst_v & 1) == 1 || (src_v & 1) == 1 {
         return 0;
@@ -1830,7 +1830,7 @@ pub unsafe fn obj_assign(dst_v: ValueRepr, src_v: ValueRepr) -> ValueRepr {
     0
 }
 
-#[inline(always)]
+#[inline]
 pub unsafe fn obj_clone_shallow(src_v: ValueRepr) -> ValueRepr {
     if src_v == NULL || (src_v & 1) == 1 {
         return obj_new();
@@ -1891,7 +1891,7 @@ pub struct BoxedProxy {
     pub handler: ValueRepr,
 }
 
-#[inline(always)]
+#[inline]
 pub fn map_new() -> ValueRepr {
     unsafe {
         let size = mem::size_of::<BoxedMap>();
@@ -1935,7 +1935,7 @@ pub fn map_new() -> ValueRepr {
     }
 }
 
-#[inline(always)]
+#[inline]
 pub fn set_new() -> ValueRepr {
     unsafe {
         let size = mem::size_of::<BoxedSet>();
@@ -1979,7 +1979,7 @@ pub fn set_new() -> ValueRepr {
     }
 }
 
-#[inline(always)]
+#[inline]
 pub fn proxy_new(target: ValueRepr, handler: ValueRepr) -> ValueRepr {
     unsafe {
         let size = mem::size_of::<BoxedProxy>();
@@ -2091,7 +2091,7 @@ pub fn fmt_value(v: i64) -> String {
     format!("{:#x}", v as u64)
 }
 
-#[inline(always)]
+#[inline]
 pub fn dbg_classify(v: i64) -> &'static str {
     // We only say what we can know without dereferencing:
     // - "null"      => 0
