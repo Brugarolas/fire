@@ -132,7 +132,6 @@ impl ProgramBuilder {
     }
 
     fn resolve_all_modules(&self) -> Result<(), String> {
-        // Iterate in a deterministic order for consistent error reporting.
         let mut paths: Vec<&Arc<PathBuf>> = self.programs.keys().collect();
         paths.sort();
 
@@ -140,18 +139,18 @@ impl ProgramBuilder {
             let prog = self.programs.get(path).expect("Program must exist");
             let file_name = path.to_string_lossy();
 
-            let mut resolver = Resolver::new(CompactString::from(file_name));
+            let mut resolver = Resolver::new(CompactString::from(file_name.as_ref()));
             if let Err(err) = resolver.resolve_program(prog) {
-                // If the resolver finds an error, we need the source code to report it.
                 let source = self
                     .sources
                     .get(path)
                     .expect("Source code must exist for resolved program");
 
-                // Ariadne emits the error to stderr.
-                let _ = err.emit((path.to_string_lossy().as_ref(), source));
+                // CORRECTED LOGIC:
+                // 1. Let Ariadne print its beautiful, detailed report.
+                let _ = err.emit((file_name.as_ref(), source));
 
-                // Return a simple error string to stop compilation.
+                // 2. Return a simple message to stop compilation. The user will see the report above.
                 return Err(format!("Semantic error in {:?}", path));
             }
         }

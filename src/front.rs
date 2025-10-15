@@ -286,6 +286,8 @@ pub struct ModuleAST<'a> {
 pub struct ExportItem<'a> {
     pub name: &'a str,
     pub binding: BindingId,
+    // Diagnostic info
+    pub meta: Meta,
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +295,8 @@ pub struct ImportRequest<'a> {
     pub from_path: Arc<PathBuf>,
     pub names: Vec<&'a str>,
     pub resolved: Vec<(&'a str, BindingId)>,
+    // Diagnostic info
+    pub meta: Meta,
 }
 
 #[derive(Debug, Clone)]
@@ -300,6 +304,8 @@ pub struct ClassDecl {
     pub name: String,
     pub base: Option<String>, // name after `extends`
     pub members: Vec<ClassMember>,
+    // Diagnostic info
+    pub meta: Meta,
 }
 
 #[derive(Debug, Clone)]
@@ -350,6 +356,8 @@ pub struct FuncDecl {
     pub params: Vec<String>,
     pub body: Block,
     pub is_async: bool,
+    // Diagnostic info
+    pub meta: Meta,
 }
 
 #[derive(Debug, Clone)]
@@ -379,6 +387,8 @@ pub struct ObjPattern {
 pub struct CatchClause {
     pub binding: Option<String>,
     pub body: Block,
+    // Diagnostic info
+    pub meta: Meta,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -715,6 +725,8 @@ pub enum ImportItem {
 pub struct ImportDecl {
     pub specifier: String,      // "./math", "../lib/util", etc.
     pub items: Vec<ImportItem>, // vacío => import "path"; (solo efectos)
+    // Diagnostic info
+    pub meta: Meta,
 }
 
 #[derive(Debug, Clone)]
@@ -931,6 +943,24 @@ impl<'src> Parser<'src> {
         }
     }
 
+    fn get_current_token(&self) -> Option<&SpannedTok> {
+        if self.i == 0 {
+            None
+        } else if self.i - 1 < self.toks.len() {
+            Some(&self.toks[self.i - 1])
+        } else {
+            None
+        }
+    }
+
+    fn get_current_span(&self) -> std::ops::Range<usize> {
+        if let Some(tok) = self.get_current_token() {
+            tok.span.clone()
+        } else {
+            0..0
+        }
+    }
+
     fn next(&mut self) -> PResult<SpannedTok> {
         if self.is_eof() {
             let span = if let Some(last) = self.toks.last() {
@@ -1082,6 +1112,7 @@ impl<'src> Parser<'src> {
                     stmts: toplevel_stmts,
                 },
                 is_async: true, // Allows top-level async
+                meta: Meta::new(self.file_id, Span::new(0, 0)),
             });
         }
 
@@ -1173,6 +1204,7 @@ impl<'src> Parser<'src> {
                     ExportItem {
                         name: name_intern,
                         binding,
+                        meta: Meta::new(self.file_id, Span::with_range(self.get_current_span())),
                     },
                 );
             }
@@ -1216,6 +1248,7 @@ impl<'src> Parser<'src> {
                         from_path: abs_arc.clone(),
                         names: Vec::new(),
                         resolved: Vec::new(),
+                        meta: Meta::new(self.file_id, Span::with_range(self.get_current_span())),
                     });
                 req.names.extend(names_bumped);
 
@@ -1276,6 +1309,7 @@ impl<'src> Parser<'src> {
             name,
             base,
             members,
+            meta: Meta::new(self.file_id, Span::with_range(self.get_current_span())),
         })
     }
 
@@ -1490,6 +1524,7 @@ impl<'src> Parser<'src> {
             return Ok(ImportDecl {
                 specifier: spec,
                 items: vec![],
+                meta: Meta::new(self.file_id, Span::with_range(t.span.clone())),
             });
         }
 
@@ -1525,6 +1560,7 @@ impl<'src> Parser<'src> {
             return Ok(ImportDecl {
                 specifier: spec,
                 items: vec![ImportItem::Namespace { alias }],
+                meta: Meta::new(self.file_id, Span::with_range(t.span.clone())),
             });
         }
 
@@ -1597,6 +1633,7 @@ impl<'src> Parser<'src> {
         Ok(ImportDecl {
             specifier: spec,
             items,
+            meta: Meta::new(self.file_id, Span::with_range(t.span.clone())),
         })
     }
 
@@ -1847,6 +1884,7 @@ impl<'src> Parser<'src> {
             params,
             body,
             is_async,
+            meta: Meta::new(self.file_id, Span::with_range(self.get_current_span())),
         })
     }
 
@@ -2155,6 +2193,7 @@ impl<'src> Parser<'src> {
                 catch_clause = Some(CatchClause {
                     binding,
                     body: catch_block,
+                    meta: Meta::new(self.file_id, Span::with_range(self.get_current_span())),
                 });
             }
 

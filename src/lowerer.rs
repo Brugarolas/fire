@@ -6599,6 +6599,7 @@ impl<'m> Lowerer<'m> {
                         catch: catch.as_ref().map(|clause| CatchClause {
                             binding: clause.binding.clone(),
                             body: rw_block(&clause.body, f),
+                            meta: clause.meta.clone(),
                         }),
                         finally_block: finally_block.as_ref().map(|blk| rw_block(blk, f)),
                     },

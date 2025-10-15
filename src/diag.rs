@@ -21,6 +21,10 @@ impl Span {
         }
     }
 
+    pub fn with_range(range: Range<usize>) -> Self {
+        Span { range }
+    }
+
     #[inline]
     pub fn set(&mut self, start: usize, end: usize) {
         self.range = start..end;
@@ -321,6 +325,7 @@ impl Meta {
             ..Default::default()
         }
     }
+
     pub fn unknown() -> Self {
         Meta {
             file: None,

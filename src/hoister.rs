@@ -560,6 +560,7 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                             out_funcs,
                             lam_caps_out,
                         ),
+                        meta: clause.meta.clone(),
                     }
                 });
 
@@ -909,6 +910,7 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                     params: lam_params,
                     body: body_rewritten,
                     is_async: false,
+                    meta: e.meta.clone(),
                 });
 
                 expr_with_meta(e, ExprKind::FnRef { name: lam_name })
@@ -1223,6 +1225,7 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
             params: f.params.clone(),
             body: rew_body,
             is_async: f.is_async,
+            meta: f.meta.clone(),
         });
     }
 

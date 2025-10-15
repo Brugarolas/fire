@@ -28,6 +28,7 @@ impl Resolver {
     /// Creates a new Resolver for a given file.
     pub fn new(file_name: CompactString) -> Self {
         let mut layered_map: LayeredMap<String, SymbolInfo> = LayeredMap::new();
+
         layered_map.insert_cell("print".into(), SymbolInfo { declared_at: Span::new(0,0), used: true }); // Built-in function
         layered_map.insert_cell("this".into(), SymbolInfo { declared_at: Span::new(0,0), used: true }); // Built-in variable
 
