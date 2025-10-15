@@ -15,6 +15,7 @@ Features I still have not implemented:
 - Add reactive programming (pure reactive programming - and patterns like Stream, Sinks (a là Carboxyl), Event/Emitter/Pipe/Listener)
 
 Optimizations:
+- Implement a lot of core runtime functions inside the JIT (big perf wins)
 - Implement CompactStr (inlined strings) - in the entire engine maybe?
 - Implement SmallVec where it makes sense
 - Implement SmallMap where it makes sense
@@ -25,7 +26,6 @@ Optimizations:
 - Same for the optimizer and optimizations (probably big wins here)
 - Explore String interning
 - Explore blending classes/inheritance/objects/interfaces in a single HashMap for not having to loop the proto to find properties
-- Create our own HashMap and HashSet using my AES hasher and hashbrown structures, and using them everywhere
 - Add Escape Analysis: and store those variables in the stack not in the GC
 - Add Inlining, for methods with 6 lines of code or less, that are called at least from 3 spots, or inside of a loop, or inside a method that's inside a loop, etc. This will be the first whole-program optimization
 - Add Loop Fusion, Deforestation when functional programming is added

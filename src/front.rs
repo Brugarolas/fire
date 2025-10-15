@@ -3,6 +3,7 @@
 #![allow(unused_variables)]
 
 use crate::helpers::collections::{HashMap, HashSet};
+use crate::helpers::layered::LayeredMap;
 use ariadne::Source;
 use hybrid_rc::Arc;
 use logos::Logos;
@@ -22,7 +23,7 @@ use crate::wir::{
     Module, Type, ValueId, next_id,
 };
 use crate::diag::{
-    ErrorCode, FileId, FrontError, FrontErrorLabel, FrontErrorMessage, Meta, Node, Span,
+    ErrorCode, FileId, FrontError, FrontErrorLabel, FrontErrorMessage, Meta, Node, Span, RegisteredColors,
 };
 
 /// -------------------------

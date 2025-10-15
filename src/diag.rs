@@ -22,6 +22,16 @@ impl Span {
     }
 
     #[inline]
+    pub fn set(&mut self, start: usize, end: usize) {
+        self.range = start..end;
+    }
+
+    #[inline]
+    pub fn set_span(&mut self, span: Range<usize>) {
+        self.range = span;
+    }
+
+    #[inline]
     pub fn join_span(&mut self, b: &Span) {
         // Safe even if overlapping; assumes both in same file.
         self.range = self.range.start.min(b.range.start) .. self.range.end.max(b.range.end)
@@ -158,6 +168,9 @@ pub enum ErrorCode {
     SyntaxError,
     TypeError,
     NameError,
+    AlreadyDefined,
+    NotDefined,
+    DefinedUnused,
     // ... add more
 }
 
@@ -167,6 +180,9 @@ impl ErrorCode {
             ErrorCode::SyntaxError => "E001",
             ErrorCode::TypeError => "E002",
             ErrorCode::NameError => "E003",
+            ErrorCode::AlreadyDefined => "E004",
+            ErrorCode::NotDefined => "E005",
+            ErrorCode::DefinedUnused => "E006",
         }
     }
 }

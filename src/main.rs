@@ -18,6 +18,7 @@ mod runtime;
 mod value;
 mod wir;
 mod diag;
+mod resolver;
 
 use crate::helpers::collections::HashMap;
 use crate::native_timers::invoke_and_pump;

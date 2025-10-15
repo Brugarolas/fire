@@ -17,6 +17,9 @@ use crate::helpers::collections::{HashMap, HashSet};
 use crate::lowerer::{LinkInfo, Lowerer};
 use crate::opt::optimization::optimization_passes;
 use crate::wir::{BindingId, Builder as WirBuilder, CallConv, FuncId, IdRemap, Inst, Type};
+use crate::helpers::layered::LayeredMap;
+use crate::resolver::Resolver;
+use compact_str::CompactString;
 
 /// -----------------------------------------
 /// Minimal infra
@@ -89,6 +92,7 @@ pub struct ProgramBuilder {
     visited: RefCell<HashSet<Arc<PathBuf>>>,
     /// Per-module full AST (what `Lowerer` needs).
     programs: HashMap<Arc<PathBuf>, Program>,
+    sources: HashMap<Arc<PathBuf>, String>,
 }
 
 pub struct BuiltBundle {
@@ -104,16 +108,18 @@ impl ProgramBuilder {
             pending: RefCell::new(Vec::new()),
             visited: RefCell::new(HashSet::new()),
             programs: HashMap::default(),
+            sources: HashMap::default(),
         }
     }
 
     pub fn build_whole_program(&mut self, entry: &str) -> Result<crate::wir::Module, String> {
         // 1) parse + bind
-        let entry_abs =
-            std::fs::canonicalize(entry).map_err(|e| format!("canonicalize({entry}): {e}"))?;
+        let entry_abs = std::fs::canonicalize(entry).map_err(|e| format!("canonicalize({entry}): {e}"))?;
         let entry_arc = Arc::new(entry_abs);
 
         self.build_from_entry(entry)?;
+
+        self.resolve_all_modules()?;
 
         // 2) lower + optimize en paralelo
         let shards = self.lower_all_modules_parallel_sharded()?;
@@ -123,6 +129,33 @@ impl ProgramBuilder {
 
         // 4) merge a un único WIR
         self.merge_wir_shards(shards, &order, &entry_arc)
+    }
+
+    fn resolve_all_modules(&self) -> Result<(), String> {
+        // Iterate in a deterministic order for consistent error reporting.
+        let mut paths: Vec<&Arc<PathBuf>> = self.programs.keys().collect();
+        paths.sort();
+
+        for path in paths {
+            let prog = self.programs.get(path).expect("Program must exist");
+            let file_name = path.to_string_lossy();
+
+            let mut resolver = Resolver::new(CompactString::from(file_name));
+            if let Err(err) = resolver.resolve_program(prog) {
+                // If the resolver finds an error, we need the source code to report it.
+                let source = self
+                    .sources
+                    .get(path)
+                    .expect("Source code must exist for resolved program");
+
+                // Ariadne emits the error to stderr.
+                let _ = err.emit((path.to_string_lossy().as_ref(), source));
+
+                // Return a simple error string to stop compilation.
+                return Err(format!("Semantic error in {:?}", path));
+            }
+        }
+        Ok(())
     }
 
     fn merge_wir_shards(
@@ -387,8 +420,7 @@ impl ProgramBuilder {
     /// Resolves the entry to an absolute path, parses it, drains the queue of modules
     /// discovered through `import`, and binds named imports to exporters.
     pub fn build_from_entry(&mut self, entry: &str) -> Result<crate::wir::Module, String> {
-        let abs =
-            std::fs::canonicalize(entry).map_err(|e| format!("canonicalize({entry}): {e}"))?;
+        let abs = std::fs::canonicalize(entry).map_err(|e| format!("canonicalize({entry}): {e}"))?;
         let abs = Arc::new(abs);
 
         self.enqueue_if_new(abs.clone());
@@ -605,6 +637,8 @@ impl ProgramBuilder {
             .loader
             .read_to_string(&abs)
             .map_err(|e| format!("read_to_string({:?}): {e}", abs))?;
+
+        self.sources.insert(abs.clone(), src.clone());
 
         // 2) Create ModuleAST box (non-'static → 'static)
         let ast_box_nonstatic: Box<ModuleAST<'_>> = Box::new(ModuleAST {

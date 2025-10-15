@@ -1,3 +1,7 @@
+use crate::helpers::collections::{HashMap};
+use std::fmt::{Debug, Display};
+use std::hash::Hash;
+
 /////////////////////////////////////////////////////////////////////////////////////
 /// Layered Hash Map
 /////////////////////////////////////////////////////////////////////////////////////
@@ -53,7 +57,7 @@ fn pool_put_vec_12(mut v: Vec<usize>) {
 struct MapSlot<K, V> {
     key: K,
     // top of this Vec is the "current" version for that key
-    versions: Vec<(u64, Arc<Mutex<V>>)>,
+    versions: Vec<(u64, V)>,
 }
 
 /// Each layer in the stack has:
@@ -75,31 +79,31 @@ struct LayerInfo {
 #[derive(Debug, Clone)]
 pub struct LayeredMap<K, V>
 where
-    K: Debug + Display + PartialEq + Eq + Hash + Clone,
-    V: Debug + Default,
+    K: Hash + Clone + Eq,
+    V: Default + Clone,
 {
     map_id: u64,
     layer_stack: Vec<LayerInfo>,
     slots: Vec<MapSlot<K, V>>,
-    key_index: FastHashMap<K, usize>,
+    key_index: HashMap<K, usize>,
 
     last_key_ptr: u64,
     last_value_ptr: u64,
     layer_counter: u64,
 
-    return_register: Vec<Option<Arc<Mutex<V>>>>,
+    return_register: Vec<Option<V>>,
 }
 
 impl<K, V> LayeredMap<K, V>
 where
-    K: Debug + Display + Eq + Hash + Clone,
-    V: Debug + Default,
+    K: Hash + Clone + Eq,
+    V: Default + Clone,
 {
     /// Create a new LayeredMap with some initial capacity.
     /// We do a single "random-ish" step for `map_id`.
     pub fn new() -> Self {
         let address_seed = addr_u64(&0u8); // or something
-        let map_id = 0xcafe_f00d_1234_5678_u64
+        let map_id = 0xcafe_f00d_fafa_feed_u64
             .wrapping_mul(address_seed)
             .rotate_left(17)
             ^ 0xdead_beef;
@@ -108,7 +112,7 @@ where
             map_id,
             layer_stack: Vec::with_capacity(24), // you asked for default 8 or 32, adapt as you like
             slots: Vec::with_capacity(12),
-            key_index: FastHashMap::with_capacity_and_hasher(256 * 256, FastBuildHasher::new()),
+            key_index: HashMap::with_capacity(256 * 256),
 
             last_key_ptr: 1,   // some nonzero default
             last_value_ptr: 1, // some nonzero default
@@ -136,8 +140,6 @@ where
 
         self.return_register.push(None);
 
-        trace!("[LM] Entering layer: {}", self.layer_stack.len());
-
         // Decide capacity:
         let depth = self.layer_stack.len();
         let changed = if depth == 0 || depth == 1 {
@@ -161,39 +163,48 @@ where
 
     /// Exit the current layer (like popping a scope).
     /// We pop the last layer and revert changes in each changed slot.
-    /// If after popping the top version in a slot, the slot is empty,
-    /// we remove the key from `key_index`.
-    pub fn exit_layer(&mut self) {
+    ///
+    /// Returns a Vec containing the (key, value) pairs of all items that were
+    /// defined in the layer that was just exited.
+    pub fn exit_layer(&mut self) -> Vec<(K, V)> {
         let layer_info = self.layer_stack.pop().expect("No layer to exit");
         let layer_id = layer_info.layer_id;
 
         self.return_register.pop().expect("No return register to exit");
 
-        trace!("[LM] Exiting layer: {}", self.layer_stack.len());
+        // This will hold the items that were unique to the popped layer.
+        let mut exited_scope_items = Vec::new();
 
         // Revert changes
         for &slot_idx in layer_info.changed_indices.iter().rev() {
             let slot = &mut self.slots[slot_idx];
             if let Some(&(top_layer_id, _)) = slot.versions.last() {
                 if top_layer_id == layer_id {
-                    slot.versions.pop();
+                    // This item was defined in the scope we are exiting.
+                    // Pop it and add it to our results.
+                    if let Some((_, val)) = slot.versions.pop() {
+                        exited_scope_items.push((slot.key.clone(), val));
+                    }
+
+                    // If the slot is now empty, the key is no longer accessible.
                     if slot.versions.is_empty() {
-                        // remove from key_index
                         self.key_index.remove(&slot.key);
                     }
                 } else {
-                    panic!("Internal error: mismatch layer");
+                    // This should not happen with correct usage.
+                    panic!("Internal error: layer mismatch during exit_layer");
                 }
             } else {
-                panic!("Internal error: no versions in slot but changed?");
+                panic!("Internal error: no versions in slot but marked as changed?");
             }
         }
 
-        // Return the Vec to the pool if capacity=12
+        // Return the Vec to the pool if its capacity allows.
         if layer_info.changed_indices.capacity() == 12 {
             pool_put_vec_12(layer_info.changed_indices);
         }
-        // else it’s dropped
+
+        exited_scope_items
     }
 
     /// Insert a value for a given key in the current top layer.
@@ -210,7 +221,7 @@ where
         let layer_id = current_layer.layer_id;
 
         // Shared cell we'll store
-        let cell = Arc::new(Mutex::new(value));
+        let cell = value;
 
         // Existing slot?
         if let Some(&slot_idx) = self.key_index.get(&key) {
@@ -236,7 +247,7 @@ where
 
     /// Get the current value for a given key.
     /// We find the slot, then return the top version’s value.
-    pub fn get(&self, key: &K) -> Option<Arc<Mutex<V>>> {
+    pub fn get(&self, key: &K) -> Option<V> {
         let slot_idx = self.key_index.get(key)?;
         let slot     = &self.slots[*slot_idx];
         let (_, cell) = slot.versions.last()?;
@@ -251,12 +262,12 @@ where
     /// Set the special scoped return register
     pub fn set_return(&mut self, value: V) {
         if let Some(last) = self.return_register.last_mut() {
-            *last = Some(Arc::new(Mutex::new(value)));
+            *last = Some(value);
         }
     }
 
     /// Get the special scoped return register value
-    pub fn take_return(&mut self) -> Option<Arc<Mutex<V>>> {
+    pub fn take_return(&mut self) -> Option<V> {
         self.return_register
             .last_mut()
             .and_then(|slot| slot.take())
@@ -275,20 +286,20 @@ where
 
     /// Obtain the shared cell for `key`, creating an `Arc<Mutex<V::default()>>`
     /// if the variable does not yet exist in the current scope.
-    pub fn capture_cell(&mut self, key: &K) -> Arc<Mutex<V>> {
+    pub fn capture_cell(&mut self, key: &K) -> V {
         if let Some(existing) = self.get(key) {
             return existing;               // clone of Rc
         }
 
         // create a brand-new cell and store it in the current layer
-        let cell = Arc::new(Mutex::new(V::default()));
+        let cell = V::default();
         self.insert_cell(key.clone(), cell.clone());
         cell
     }
 
     /// Directly insert an **existing** `Arc<Mutex<V>>` into the map
     /// (used when a closure wants to share an outer cell).
-    pub fn insert_cell(&mut self, key: K, cell: Arc<Mutex<V>>) {
+    pub fn insert_cell(&mut self, key: K, cell: V) {
         let current_layer = self.layer_stack.last_mut()
             .expect("enter_layer must be called first");
         let layer_id = current_layer.layer_id;
@@ -315,9 +326,19 @@ where
     }
 
     /// Return the *currently-visible* Rc cell for `key`, if any.
-    pub fn find_cell(&self, key: &K) -> Option<Arc<Mutex<V>>> {
+    pub fn find_cell(&self, key: &K) -> Option<V> {
         // `get()` probably returns Option<&Arc<…>>
         self.get(key).map(|cell| cell.clone())
+    }
+
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        if let Some(&slot_idx) = self.key_index.get(key) {
+            let slot = &mut self.slots[slot_idx];
+            if let Some(&mut (_, ref mut cell)) = slot.versions.last_mut() {
+                return Some(cell);
+            }
+        }
+        None
     }
 
     pub fn iter_keys(&self) -> Vec<K> where K: Clone {
@@ -329,9 +350,34 @@ where
     /// Each key keeps a stack of versions; the last entry is the one that is
     /// visible in the current lexical layer.
     #[inline]
-    pub fn values_cells(&self) -> impl Iterator<Item = &Arc<Mutex<V>>> {
+    pub fn values_cells(&self) -> impl Iterator<Item = &V> {
         self.slots
             .iter()
             .filter_map(|slot| slot.versions.last().map(|(_, cell)| cell))
+    }
+
+    /// Checks if a key has a value defined specifically in the current (top-most) layer.
+    ///
+    /// This is used to detect variable shadowing or redeclaration within the same scope.
+    /// It returns `true` only if the most recent version of the key belongs to the
+    /// current layer's ID.
+    pub fn is_in_current_layer(&self, key: &K) -> bool {
+        // First, get the ID of the current layer. If there's no layer, nothing can be in it.
+        if let Some(current_layer) = self.layer_stack.last() {
+            // Next, find the slot for the key. If the key doesn't exist at all, it's not in this layer.
+            if let Some(&slot_idx) = self.key_index.get(key) {
+                let slot = &self.slots[slot_idx];
+
+                // Finally, check the top-most version in that slot.
+                if let Some((top_layer_id, _)) = slot.versions.last() {
+                    // The key is in the current layer if and only if the top version's
+                    // layer ID matches the current layer's ID.
+                    return *top_layer_id == current_layer.layer_id;
+                }
+            }
+        }
+
+        // If any of the above checks fail, the key is not defined in the current layer.
+        false
     }
 }
