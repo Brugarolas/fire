@@ -1,5 +1,5 @@
 use crate::diag::{ErrorCode, FrontError, FrontErrorMessage, RegisteredColors, Span, FileId};
-use crate::front::{Block, ClassDecl, Expr, ExprKind, FuncDecl, LValue, LValueKind, Program, Stmt, StmtKind};
+use crate::front::{Block, ClassDecl, Expr, ExprKind, FuncDecl, LValue, LValueKind, Program, Stmt, StmtKind, ObjItem};
 use crate::helpers::layered::{self, LayeredMap};
 use compact_str::CompactString;
 
@@ -186,6 +186,22 @@ impl Resolver {
                 self.resolve_expr(recv)?;
                 for arg in args {
                     self.resolve_expr(arg)?;
+                }
+            }
+            ExprKind::Conditional { cond, then_branch, else_branch } => {
+                self.resolve_expr(cond)?;
+                self.resolve_expr(then_branch)?;
+                self.resolve_expr(else_branch)?;
+            }
+            ExprKind::ObjLit(items) => {
+                for item in items {
+                    match item {
+                        // The key is an identifier/string, not an expression to be resolved.
+                        // But the value is an expression that needs resolving.
+                        ObjItem::Prop(_key, value) => self.resolve_expr(value)?,
+                        // The spread expression also needs resolving.
+                        ObjItem::Spread(expr) => self.resolve_expr(expr)?,
+                    }
                 }
             }
             ExprKind::GetBuiltinSize(recv) => self.resolve_expr(recv)?,
