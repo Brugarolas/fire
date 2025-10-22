@@ -365,6 +365,12 @@ pub enum Inst {
     TryLeave {
         region: TryRegionId,
         exit: TryExitKind,
+        locals: Vec<ValueId>,
+    },
+    TryFinallyEnter {
+        region: TryRegionId,
+        locals: Vec<ValueId>,
+        error: Option<ValueId>,
     },
 
     // ---- Effect / bookkeeping ----

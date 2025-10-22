@@ -2,6 +2,7 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
+mod diag;
 mod event_loop;
 mod front;
 mod gc;
@@ -14,11 +15,10 @@ mod modules;
 mod native_promises;
 mod native_timers;
 mod opt;
+mod resolver;
 mod runtime;
 mod value;
 mod wir;
-mod diag;
-mod resolver;
 
 use crate::helpers::collections::HashMap;
 use crate::native_timers::invoke_and_pump;

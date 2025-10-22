@@ -7,12 +7,12 @@ use crate::gc::NAPALM_GC;
 use crate::jit::{wir_call_closure, wir_make_method_closure};
 use crate::value as v;
 use crate::value::{
-    BoxedArray, BoxedClosure, BoxedF64, BoxedMap, BoxedObj, BoxedProxy, BoxedSet, BoxedStr, NULL,
-    ObjHeader, TAG_ARRAY, TAG_BOXED_F64, TAG_CLOSURE, TAG_MAP, TAG_OBJECT, TAG_PROXY, TAG_SET,
-    TAG_STRING, Value, ValueRepr, allocate_new_string, array_from_vec, bool_to_value, is_imm,
-    make_smi, map_new, obj_assign, obj_clone_shallow, obj_get_field_deep, obj_get_proto,
-    obj_get_slot, obj_get_str_deep, obj_set_proto, obj_set_slot_known, obj_shape, proxy_new,
-    set_new, shape_slot, value_to_bool, BOOL_TRUE, BOOL_FALSE,
+    BOOL_FALSE, BOOL_TRUE, BoxedArray, BoxedClosure, BoxedF64, BoxedMap, BoxedObj, BoxedProxy,
+    BoxedSet, BoxedStr, NULL, ObjHeader, TAG_ARRAY, TAG_BOXED_F64, TAG_CLOSURE, TAG_MAP,
+    TAG_OBJECT, TAG_PROXY, TAG_SET, TAG_STRING, Value, ValueRepr, allocate_new_string,
+    array_from_vec, bool_to_value, is_imm, make_smi, map_new, obj_assign, obj_clone_shallow,
+    obj_get_field_deep, obj_get_proto, obj_get_slot, obj_get_str_deep, obj_set_proto,
+    obj_set_slot_known, obj_shape, proxy_new, set_new, shape_slot, value_to_bool,
 };
 
 use crate::helpers::collections::{ConcurrentHashMap, HashMap, HashSet};
@@ -82,10 +82,10 @@ struct TryFrame {
 thread_local! {
     static TRY_STACK: RefCell<Vec<TryFrame>> = RefCell::new(Vec::new());
     static RESUME_INFO: RefCell<Option<RuntimeResumeInfo>> = RefCell::new(None);
+    static RETURN_SLOT: RefCell<Option<i64>> = RefCell::new(None);
 }
 
-static TRY_DESCRIPTOR_REGISTRY: OnceLock<Mutex<HashMap<(u32, u32), usize>>> =
-    OnceLock::new();
+static TRY_DESCRIPTOR_REGISTRY: OnceLock<Mutex<HashMap<(u32, u32), usize>>> = OnceLock::new();
 
 fn descriptor(ptr: *const RuntimeTryDescriptor) -> Option<&'static RuntimeTryDescriptor> {
     unsafe { ptr.as_ref() }
@@ -165,6 +165,26 @@ pub extern "C" fn napalm_rt_clear_resume(func_id: i64) -> i64 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn napalm_rt_mark_return(val: i64) -> i64 {
+    RETURN_SLOT.with(|slot| {
+        *slot.borrow_mut() = Some(val);
+    });
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn napalm_rt_clear_return() -> i64 {
+    RETURN_SLOT.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    0
+}
+
+fn take_pending_return() -> Option<i64> {
+    RETURN_SLOT.with(|slot| slot.borrow_mut().take())
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn napalm_rt_try_enter(
     func_id: i64,
     region_id: i64,
@@ -238,7 +258,10 @@ pub extern "C" fn napalm_rt_schedule_defer(kind: i32, action: i64) -> i64 {
     TRY_STACK.with(|stack| {
         let mut stack = stack.borrow_mut();
         if let Some(frame) = stack.last_mut() {
-            frame.defers.push(DeferredAction { kind, closure: action });
+            frame.defers.push(DeferredAction {
+                kind,
+                closure: action,
+            });
         } else {
             unsafe {
                 let _ = wir_call_closure(action, ptr::null(), 0);
@@ -250,6 +273,9 @@ pub extern "C" fn napalm_rt_schedule_defer(kind: i32, action: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn napalm_rt_throw(func_id: i64, error: i64) -> i64 {
+    RETURN_SLOT.with(|slot| {
+        slot.borrow_mut().take();
+    });
     TRY_STACK.with(|stack| {
         let mut stack = stack.borrow_mut();
         while let Some(mut frame) = stack.pop() {
@@ -275,10 +301,8 @@ pub extern "C" fn napalm_rt_throw(func_id: i64, error: i64) -> i64 {
                 }
                 args.extend_from_slice(&frame.locals);
                 let result = unsafe { (entry.stub)(args.as_ptr(), args.len()) };
-                if let Some(finally_stub) = desc.finally_stub {
-                    unsafe {
-                        let _ = finally_stub(frame.locals.as_ptr(), frame.locals.len());
-                    }
+                if let Some(ret) = take_pending_return() {
+                    return ret;
                 }
                 return result;
             }
@@ -288,6 +312,11 @@ pub extern "C" fn napalm_rt_throw(func_id: i64, error: i64) -> i64 {
                 unsafe {
                     let _ = finally_stub(frame.locals.as_ptr(), frame.locals.len());
                 }
+                if let Some(ret) = take_pending_return() {
+                    return ret;
+                }
+                // no override: continue propagating original error
+                continue;
             }
         }
         panic!(
@@ -408,9 +437,7 @@ static FIELD_CACHE: OnceLock<FieldCache> = OnceLock::new();
 
 #[inline]
 fn field_cache() -> &'static FieldCache {
-    FIELD_CACHE.get_or_init(|| {
-        ConcurrentHashMap::new()
-    })
+    FIELD_CACHE.get_or_init(|| ConcurrentHashMap::new())
 }
 
 #[inline]
@@ -471,16 +498,12 @@ static FIELD_NAME_LOOKUP: OnceLock<NameLookup> = OnceLock::new();
 
 #[inline]
 fn field_name_registry() -> &'static NameRegistry {
-    FIELD_NAME_REGISTRY.get_or_init(|| {
-        NameRegistry::with_hasher(FastBuildHasher::new())
-    })
+    FIELD_NAME_REGISTRY.get_or_init(|| NameRegistry::with_hasher(FastBuildHasher::new()))
 }
 
 #[inline]
 fn field_name_lookup() -> &'static NameLookup {
-    FIELD_NAME_LOOKUP.get_or_init(|| {
-        NameLookup::with_hasher(FastBuildHasher::new())
-    })
+    FIELD_NAME_LOOKUP.get_or_init(|| NameLookup::with_hasher(FastBuildHasher::new()))
 }
 
 /// Fast lookup: fid → name (clones the String)
@@ -1355,16 +1378,34 @@ pub extern "C" fn wir_obj_clone(obj: i64) -> i64 {
 // -------- Keys (flattened to avoid nested lookups) --------
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(C)]
-struct Key1 { fid: u32, a: i64 }
+struct Key1 {
+    fid: u32,
+    a: i64,
+}
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(C)]
-struct Key2 { fid: u32, a: i64, b: i64 }
+struct Key2 {
+    fid: u32,
+    a: i64,
+    b: i64,
+}
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(C)]
-struct Key3 { fid: u32, a: i64, b: i64, c: i64 }
+struct Key3 {
+    fid: u32,
+    a: i64,
+    b: i64,
+    c: i64,
+}
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(C)]
-struct Key4 { fid: u32, a: i64, b: i64, c: i64, d: i64 }
+struct Key4 {
+    fid: u32,
+    a: i64,
+    b: i64,
+    c: i64,
+    d: i64,
+}
 
 // -------- Global tables (one per arity, lock-free) --------
 type Map1 = LockfreeHashMap<Key1, i64, FastBuildHasher>;
@@ -1396,14 +1437,16 @@ fn map4() -> &'static Map4 {
 
 #[inline]
 unsafe fn write_out(out_ptr: *mut i64, val: i64) {
-    if !out_ptr.is_null() { *out_ptr = val; }
+    if !out_ptr.is_null() {
+        *out_ptr = val;
+    }
 }
 
 // -------- FFI: arity 1 --------
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_memo_get(fid: i64, key: i64, out_ptr: *mut i64) -> i64 {
     let fid_u = fid as u32;
-    let p = map1().pin();                    // holds a local GC guard
+    let p = map1().pin(); // holds a local GC guard
     if let Some(&v) = p.get(&Key1 { fid: fid_u, a: key }) {
         unsafe { write_out(out_ptr, v) }
         1
@@ -1425,17 +1468,30 @@ pub extern "C" fn wir_memo_put(fid: i64, key: i64, val: i64) -> i64 {
 pub extern "C" fn wir_memo_get2(fid: i64, k0: i64, k1: i64, out_ptr: *mut i64) -> i64 {
     let fid_u = fid as u32;
     let p = map2().pin();
-    if let Some(&v) = p.get(&Key2 { fid: fid_u, a: k0, b: k1 }) {
+    if let Some(&v) = p.get(&Key2 {
+        fid: fid_u,
+        a: k0,
+        b: k1,
+    }) {
         unsafe { write_out(out_ptr, v) }
         1
-    } else { 0 }
+    } else {
+        0
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_memo_put2(fid: i64, k0: i64, k1: i64, val: i64) -> i64 {
     let fid_u = fid as u32;
     let p = map2().pin();
-    let _ = p.insert(Key2 { fid: fid_u, a: k0, b: k1 }, val);
+    let _ = p.insert(
+        Key2 {
+            fid: fid_u,
+            a: k0,
+            b: k1,
+        },
+        val,
+    );
     0
 }
 
@@ -1444,38 +1500,75 @@ pub extern "C" fn wir_memo_put2(fid: i64, k0: i64, k1: i64, val: i64) -> i64 {
 pub extern "C" fn wir_memo_get3(fid: i64, k0: i64, k1: i64, k2: i64, out_ptr: *mut i64) -> i64 {
     let fid_u = fid as u32;
     let p = map3().pin();
-    if let Some(&v) = p.get(&Key3 { fid: fid_u, a: k0, b: k1, c: k2 }) {
+    if let Some(&v) = p.get(&Key3 {
+        fid: fid_u,
+        a: k0,
+        b: k1,
+        c: k2,
+    }) {
         unsafe { write_out(out_ptr, v) }
         1
-    } else { 0 }
+    } else {
+        0
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_memo_put3(fid: i64, k0: i64, k1: i64, k2: i64, val: i64) -> i64 {
     let fid_u = fid as u32;
     let p = map3().pin();
-    let _ = p.insert(Key3 { fid: fid_u, a: k0, b: k1, c: k2 }, val);
+    let _ = p.insert(
+        Key3 {
+            fid: fid_u,
+            a: k0,
+            b: k1,
+            c: k2,
+        },
+        val,
+    );
     0
 }
 
 // -------- FFI: arity 4 --------
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_memo_get4(
-    fid: i64, k0: i64, k1: i64, k2: i64, k3: i64, out_ptr: *mut i64,
+    fid: i64,
+    k0: i64,
+    k1: i64,
+    k2: i64,
+    k3: i64,
+    out_ptr: *mut i64,
 ) -> i64 {
     let fid_u = fid as u32;
     let p = map4().pin();
-    if let Some(&v) = p.get(&Key4 { fid: fid_u, a: k0, b: k1, c: k2, d: k3 }) {
+    if let Some(&v) = p.get(&Key4 {
+        fid: fid_u,
+        a: k0,
+        b: k1,
+        c: k2,
+        d: k3,
+    }) {
         unsafe { write_out(out_ptr, v) }
         1
-    } else { 0 }
+    } else {
+        0
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_memo_put4(fid: i64, k0: i64, k1: i64, k2: i64, k3: i64, val: i64) -> i64 {
     let fid_u = fid as u32;
     let p = map4().pin();
-    let _ = p.insert(Key4 { fid: fid_u, a: k0, b: k1, c: k2, d: k3 }, val);
+    let _ = p.insert(
+        Key4 {
+            fid: fid_u,
+            a: k0,
+            b: k1,
+            c: k2,
+            d: k3,
+        },
+        val,
+    );
     0
 }
 

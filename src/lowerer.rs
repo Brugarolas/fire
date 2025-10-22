@@ -56,14 +56,28 @@ fn lvalue_with_meta(template: &LValue, kind: LValueKind) -> LValue {
 #[derive(Clone)]
 struct TryScope {
     region: TryRegionId,
+    locals: Vec<String>,
 }
 
-fn emit_try_leave_chain<'m>(b: &mut Builder<'m>, stack: &[TryScope], exit: TryExitKind) {
+fn emit_try_leave_chain<'m>(
+    b: &mut Builder<'m>,
+    stack: &[TryScope],
+    locals: &HashMap<String, ValueId>,
+    exit: TryExitKind,
+) {
     for scope in stack.iter().rev() {
+        let mut captured: Vec<ValueId> = Vec::with_capacity(scope.locals.len());
+        for name in &scope.locals {
+            let val = *locals
+                .get(name)
+                .unwrap_or_else(|| panic!("missing local '{}' for try scope", name));
+            captured.push(val);
+        }
         let _ = b.push_node(
             Inst::TryLeave {
                 region: scope.region,
                 exit,
+                locals: captured,
             },
             None,
             0,
@@ -147,7 +161,10 @@ where
     let _ = b.push_node(Inst::TryEnter { region: region_id }, None, 0, true);
     b.jump(try_entry, &[]);
 
-    active_try.push(TryScope { region: region_id });
+    active_try.push(TryScope {
+        region: region_id,
+        locals: mutated_names.clone(),
+    });
     let mut region_popped = false;
 
     let incoming_locals = locals.clone();
@@ -178,10 +195,12 @@ where
     )?;
     if !b.current_block_terminated() {
         let args = gather_args(&locals_try);
+        let locals_vec = args.clone();
         let _ = b.push_node(
             Inst::TryLeave {
                 region: region_id,
                 exit: TryExitKind::Normal,
+                locals: locals_vec,
             },
             None,
             0,
@@ -203,6 +222,10 @@ where
             let err_val = b.add_block_param(catch_id, Type::AnyRef);
             locals_catch.insert(binding.clone(), err_val);
         }
+        for name in &mutated_names {
+            let param = b.add_block_param(catch_id, Type::Int32);
+            locals_catch.insert(name.clone(), param);
+        }
         lower_block(
             b,
             &mut locals_catch,
@@ -214,10 +237,12 @@ where
         )?;
         if !b.current_block_terminated() {
             let args = gather_args(&locals_catch);
+            let locals_vec = args.clone();
             let _ = b.push_node(
                 Inst::TryLeave {
                     region: region_id,
                     exit: TryExitKind::Normal,
+                    locals: locals_vec,
                 },
                 None,
                 0,
@@ -1139,7 +1164,7 @@ fn lower_stmt_free<'m>(
                 true,
             );
             let err = err_res[0];
-            emit_try_leave_chain(b, active_try, TryExitKind::Exception);
+            emit_try_leave_chain(b, active_try, locals, TryExitKind::Exception);
             let _ = b.push_node(Inst::Throw(err), None, 0, true);
         }
         StmtKind::Defer { kind, expr } => {
@@ -1163,11 +1188,33 @@ fn lower_stmt_free<'m>(
         StmtKind::Return(e) => {
             if let Some(e) = e {
                 let v = lower_expr_free(b, locals, fields, next_field, e, lowering_ctx)?;
-                emit_try_leave_chain(b, active_try, TryExitKind::Normal);
+                let _ = b.push_node(
+                    Inst::CallNative {
+                        name: "napalm_rt_mark_return".into(),
+                        args: vec![v],
+                        pure: false,
+                        can_throw: false,
+                    },
+                    Some(Type::Top),
+                    1,
+                    true,
+                );
+                emit_try_leave_chain(b, active_try, locals, TryExitKind::Normal);
                 b.ret(&[v]);
             } else {
                 let z = b.const_i32(0);
-                emit_try_leave_chain(b, active_try, TryExitKind::Normal);
+                let _ = b.push_node(
+                    Inst::CallNative {
+                        name: "napalm_rt_mark_return".into(),
+                        args: vec![z],
+                        pure: false,
+                        can_throw: false,
+                    },
+                    Some(Type::Top),
+                    1,
+                    true,
+                );
+                emit_try_leave_chain(b, active_try, locals, TryExitKind::Normal);
                 b.ret(&[z]);
             }
         }
@@ -1628,7 +1675,18 @@ fn lower_stmt_free_async<'m>(
             } else {
                 b.const_i32(0)
             };
-            emit_try_leave_chain(b, active_try, TryExitKind::Normal);
+            let _ = b.push_node(
+                Inst::CallNative {
+                    name: "napalm_rt_mark_return".into(),
+                    args: vec![ret_val],
+                    pure: false,
+                    can_throw: false,
+                },
+                Some(Type::Top),
+                1,
+                true,
+            );
+            emit_try_leave_chain(b, active_try, locals, TryExitKind::Normal);
             let (_nid, _r) = b.push_node(
                 Inst::CallNative {
                     name: "wir_deferred_resolve".into(),
@@ -1773,7 +1831,7 @@ fn lower_stmt_free_async<'m>(
                         true,
                     );
                     let err = err_res[0];
-                    emit_try_leave_chain(b, active_try, TryExitKind::Exception);
+                    emit_try_leave_chain(b, active_try, locals, TryExitKind::Exception);
                     let _ = b.push_node(Inst::Throw(err), None, 0, true);
                     Ok(())
                 }

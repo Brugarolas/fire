@@ -14,11 +14,11 @@ use std::{
 
 use crate::front::{ExportDecl, ImportItem, ModuleAST, Parser, Program};
 use crate::helpers::collections::{HashMap, HashSet};
+use crate::helpers::layered::LayeredMap;
 use crate::lowerer::{LinkInfo, Lowerer};
 use crate::opt::optimization::optimization_passes;
-use crate::wir::{BindingId, Builder as WirBuilder, CallConv, FuncId, IdRemap, Inst, Type};
-use crate::helpers::layered::LayeredMap;
 use crate::resolver::Resolver;
+use crate::wir::{BindingId, Builder as WirBuilder, CallConv, FuncId, IdRemap, Inst, Type};
 use compact_str::CompactString;
 
 /// -----------------------------------------
@@ -114,7 +114,8 @@ impl ProgramBuilder {
 
     pub fn build_whole_program(&mut self, entry: &str) -> Result<crate::wir::Module, String> {
         // 1) parse + bind
-        let entry_abs = std::fs::canonicalize(entry).map_err(|e| format!("canonicalize({entry}): {e}"))?;
+        let entry_abs =
+            std::fs::canonicalize(entry).map_err(|e| format!("canonicalize({entry}): {e}"))?;
         let entry_arc = Arc::new(entry_abs);
 
         self.build_from_entry(entry)?;
@@ -419,7 +420,8 @@ impl ProgramBuilder {
     /// Resolves the entry to an absolute path, parses it, drains the queue of modules
     /// discovered through `import`, and binds named imports to exporters.
     pub fn build_from_entry(&mut self, entry: &str) -> Result<crate::wir::Module, String> {
-        let abs = std::fs::canonicalize(entry).map_err(|e| format!("canonicalize({entry}): {e}"))?;
+        let abs =
+            std::fs::canonicalize(entry).map_err(|e| format!("canonicalize({entry}): {e}"))?;
         let abs = Arc::new(abs);
 
         self.enqueue_if_new(abs.clone());

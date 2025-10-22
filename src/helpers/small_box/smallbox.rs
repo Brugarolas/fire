@@ -17,8 +17,8 @@ use core::ptr::NonNull;
 use std::alloc::Layout;
 use std::alloc::{self, handle_alloc_error};
 use std::boxed::Box;
-use std::ptr::addr_of_mut;
 use std::ptr::addr_of;
+use std::ptr::addr_of_mut;
 use std::ptr::copy_nonoverlapping;
 use std::ptr::drop_in_place;
 
@@ -143,14 +143,18 @@ impl<T: ?Sized, Space> SmallBox<T, Space> {
     /// ```
     #[inline]
     pub fn new(val: T) -> SmallBox<T, Space>
-    where T: Sized {
+    where
+        T: Sized,
+    {
         smallbox!(val)
     }
 
     #[doc(hidden)]
     #[inline]
     pub unsafe fn new_unchecked<U>(val: U, ptr: *const T) -> SmallBox<T, Space>
-    where U: Sized {
+    where
+        U: Sized,
+    {
         let val = ManuallyDrop::new(val);
         Self::new_copy(&val, ptr)
     }
@@ -208,7 +212,9 @@ impl<T: ?Sized, Space> SmallBox<T, Space> {
     }
 
     unsafe fn new_copy<U>(val: &U, metadata_ptr: *const T) -> SmallBox<T, Space>
-    where U: ?Sized {
+    where
+        U: ?Sized,
+    {
         let layout = Layout::for_value::<U>(val);
         let space_layout = Layout::new::<Space>();
 
@@ -313,7 +319,9 @@ impl<T: ?Sized, Space> SmallBox<T, Space> {
     /// ```
     #[inline]
     pub fn into_inner(self) -> T
-    where T: Sized {
+    where
+        T: Sized,
+    {
         let this = ManuallyDrop::new(self);
         let ret_val: T = unsafe { this.as_ptr().read() };
 
@@ -501,7 +509,8 @@ impl<T: ?Sized, Space> ops::Drop for SmallBox<T, Space> {
 }
 
 impl<T: Clone, Space> Clone for SmallBox<T, Space>
-where T: Sized
+where
+    T: Sized,
 {
     fn clone(&self) -> Self {
         let val: &T = self;

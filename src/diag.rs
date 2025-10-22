@@ -1,10 +1,10 @@
 // src/diag.rs
 use ariadne::{Color, Fmt, Label, Report, ReportKind, Source};
-use std::ops::Range;
 use compact_str::CompactString;
-use std::result::Result;
-use std::io::Error;
 use smallvec::SmallVec;
+use std::io::Error;
+use std::ops::Range;
+use std::result::Result;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FileId(pub u32);
@@ -16,9 +16,7 @@ pub struct Span {
 
 impl Span {
     pub fn new(start: usize, end: usize) -> Self {
-        Span {
-            range: start..end,
-        }
+        Span { range: start..end }
     }
 
     pub fn with_range(range: Range<usize>) -> Self {
@@ -38,12 +36,13 @@ impl Span {
     #[inline]
     pub fn join_span(&mut self, b: &Span) {
         // Safe even if overlapping; assumes both in same file.
-        self.range = self.range.start.min(b.range.start) .. self.range.end.max(b.range.end)
+        self.range = self.range.start.min(b.range.start)..self.range.end.max(b.range.end)
     }
 
     #[inline]
     pub fn join_spans(&mut self, b: &Span, c: &Span) {
-        self.range = self.range.start.min(b.range.start).min(c.range.start) .. self.range.end.max(b.range.end).max(c.range.end)
+        self.range = self.range.start.min(b.range.start).min(c.range.start)
+            ..self.range.end.max(b.range.end).max(c.range.end)
     }
 
     #[inline]
@@ -59,8 +58,8 @@ pub struct Meta {
     pub file: Option<FileId>,
     pub span: Span,
     pub stack_span: Vec<FrontErrorLabel>, // for the stack of calls
-    pub escape: EscapeInfo, // future: escape analysis
-    pub purity: Purity,     // future: purity analysis
+    pub escape: EscapeInfo,               // future: escape analysis
+    pub purity: Purity,                   // future: purity analysis
     pub front_error: Option<FrontError>,
 }
 
@@ -200,9 +199,9 @@ pub struct FrontErrorLabel {
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct FrontErrorMessage {
-    pub text: CompactString,                             // e.g. "This is of type {}"
+    pub text: CompactString,                     // e.g. "This is of type {}"
     pub highlighted_strings: Vec<CompactString>, // values to slot into {}
-    pub color: RegisteredColors,                         // color used for the inserts (and label)
+    pub color: RegisteredColors,                 // color used for the inserts (and label)
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -301,7 +300,7 @@ impl FrontError {
                 } else {
                     // No message, just a label with color
                     Label::new((lab.file_name.as_str(), lab.span.range.clone()))
-                }
+                },
             );
         }
 
@@ -309,9 +308,7 @@ impl FrontError {
             builder = builder.with_note(note.render());
         }
 
-        let report= builder
-            .finish()
-            .print((source.0, Source::from(source.1)));
+        let report = builder.finish().print((source.0, Source::from(source.1)));
 
         return report;
     }

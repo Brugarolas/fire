@@ -1,5 +1,8 @@
-use crate::diag::{ErrorCode, FrontError, FrontErrorMessage, RegisteredColors, Span, FileId};
-use crate::front::{Block, ClassDecl, Expr, ExprKind, FuncDecl, LValue, LValueKind, Program, Stmt, StmtKind, ObjItem};
+use crate::diag::{ErrorCode, FileId, FrontError, FrontErrorMessage, RegisteredColors, Span};
+use crate::front::{
+    Block, ClassDecl, Expr, ExprKind, FuncDecl, LValue, LValueKind, ObjItem, Program, Stmt,
+    StmtKind,
+};
 use crate::helpers::layered::{self, LayeredMap};
 use compact_str::CompactString;
 
@@ -29,8 +32,20 @@ impl Resolver {
     pub fn new(file_name: CompactString) -> Self {
         let mut layered_map: LayeredMap<String, SymbolInfo> = LayeredMap::new();
 
-        layered_map.insert_cell("print".into(), SymbolInfo { declared_at: Span::new(0,0), used: true }); // Built-in function
-        layered_map.insert_cell("this".into(), SymbolInfo { declared_at: Span::new(0,0), used: true }); // Built-in variable
+        layered_map.insert_cell(
+            "print".into(),
+            SymbolInfo {
+                declared_at: Span::new(0, 0),
+                used: true,
+            },
+        ); // Built-in function
+        layered_map.insert_cell(
+            "this".into(),
+            SymbolInfo {
+                declared_at: Span::new(0, 0),
+                used: true,
+            },
+        ); // Built-in variable
 
         Self {
             symbols: layered_map,
@@ -67,7 +82,7 @@ impl Resolver {
         self.enter_scope();
         for param_name in &func.params {
             // Parameters are declared and implicitly used.
-            self.declare(param_name.clone(), Span::new(0,0))?; // Note: Need spans on params
+            self.declare(param_name.clone(), Span::new(0, 0))?; // Note: Need spans on params
             self.mark_as_used(param_name);
         }
         self.resolve_block(&func.body)?;
@@ -77,7 +92,7 @@ impl Resolver {
 
     /// Resolves a class declaration.
     fn resolve_class(&mut self, class: &ClassDecl) -> Result<(), FrontError> {
-        self.declare(class.name.clone(), Span::new(0,0))?; // Note: Need spans on class decl
+        self.declare(class.name.clone(), Span::new(0, 0))?; // Note: Need spans on class decl
         // Future work: resolve members, superclass, etc.
         Ok(())
     }
@@ -104,7 +119,11 @@ impl Resolver {
                 self.declare(name.clone(), stmt.meta.span.clone())?;
             }
             StmtKind::Expr(expr) => self.resolve_expr(expr)?,
-            StmtKind::If { cond, then_b, else_b } => {
+            StmtKind::If {
+                cond,
+                then_b,
+                else_b,
+            } => {
                 self.resolve_expr(cond)?;
                 self.resolve_block(then_b)?;
                 if let Some(else_block) = else_b {
@@ -115,7 +134,12 @@ impl Resolver {
                 self.resolve_expr(cond)?;
                 self.resolve_block(body)?;
             }
-            StmtKind::For { init, cond, step, body } => {
+            StmtKind::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
                 self.enter_scope();
                 if let Some(init_stmt) = init {
                     self.resolve_stmt(init_stmt)?;
@@ -146,7 +170,10 @@ impl Resolver {
                     return Err(FrontError {
                         file_name: self.file_name.clone(),
                         span: expr.meta.span.clone(),
-                        message: FrontErrorMessage::plain(format!("Cannot find value `{}` in this scope", name)),
+                        message: FrontErrorMessage::plain(format!(
+                            "Cannot find value `{}` in this scope",
+                            name
+                        )),
                         code: ErrorCode::NotDefined,
                         labels: vec![],
                         note: None,
@@ -188,7 +215,11 @@ impl Resolver {
                     self.resolve_expr(arg)?;
                 }
             }
-            ExprKind::Conditional { cond, then_branch, else_branch } => {
+            ExprKind::Conditional {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
                 self.resolve_expr(cond)?;
                 self.resolve_expr(then_branch)?;
                 self.resolve_expr(else_branch)?;
@@ -219,7 +250,10 @@ impl Resolver {
                     return Err(FrontError {
                         file_name: self.file_name.clone(),
                         span: lvalue.meta.span.clone(),
-                        message: FrontErrorMessage::plain(format!("Cannot assign to undeclared variable `{}`", name)),
+                        message: FrontErrorMessage::plain(format!(
+                            "Cannot assign to undeclared variable `{}`",
+                            name
+                        )),
                         code: ErrorCode::NotDefined,
                         labels: vec![],
                         note: None,
@@ -257,7 +291,9 @@ impl Resolver {
                     },
                     code: ErrorCode::DefinedUnused,
                     labels: vec![],
-                    note: Some(FrontErrorMessage::plain("Prefix with an underscore to ignore: `_` or `_myVar`")),
+                    note: Some(FrontErrorMessage::plain(
+                        "Prefix with an underscore to ignore: `_` or `_myVar`",
+                    )),
                 });
             }
         }
@@ -270,13 +306,19 @@ impl Resolver {
             return Err(FrontError {
                 file_name: self.file_name.clone(),
                 span: span.clone(),
-                message: FrontErrorMessage::plain(format!("`{}` is already declared in this scope", name)),
+                message: FrontErrorMessage::plain(format!(
+                    "`{}` is already declared in this scope",
+                    name
+                )),
                 code: ErrorCode::AlreadyDefined,
                 labels: vec![], // Future: add a label pointing to the original declaration
                 note: None,
             });
         }
-        let info = SymbolInfo { declared_at: span, used: false };
+        let info = SymbolInfo {
+            declared_at: span,
+            used: false,
+        };
         self.symbols.insert(name, info);
         Ok(())
     }

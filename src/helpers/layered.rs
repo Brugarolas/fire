@@ -1,4 +1,4 @@
-use crate::helpers::collections::{HashMap};
+use crate::helpers::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
 
@@ -31,9 +31,9 @@ thread_local! {
 /// otherwise create a new one with capacity 12.
 fn pool_get_vec_12() -> Vec<usize> {
     VEC_POOL_12.with(|pool| {
-        let mut guard = pool.lock().unwrap();          // ← was borrow_mut()
+        let mut guard = pool.lock().unwrap(); // ← was borrow_mut()
         if let Some(mut v) = guard.pop() {
-            v.clear();                                 // ensure length == 0
+            v.clear(); // ensure length == 0
             v
         } else {
             Vec::with_capacity(12)
@@ -46,7 +46,7 @@ fn pool_put_vec_12(mut v: Vec<usize>) {
     if v.capacity() == 12 {
         v.clear();
         VEC_POOL_12.with(|pool| {
-            pool.lock().unwrap().push(v);              // ← was borrow_mut()
+            pool.lock().unwrap().push(v); // ← was borrow_mut()
         });
     }
     // else: drop and let the allocator reclaim it
@@ -170,7 +170,9 @@ where
         let layer_info = self.layer_stack.pop().expect("No layer to exit");
         let layer_id = layer_info.layer_id;
 
-        self.return_register.pop().expect("No return register to exit");
+        self.return_register
+            .pop()
+            .expect("No return register to exit");
 
         // This will hold the items that were unique to the popped layer.
         let mut exited_scope_items = Vec::new();
@@ -249,7 +251,7 @@ where
     /// We find the slot, then return the top version’s value.
     pub fn get(&self, key: &K) -> Option<V> {
         let slot_idx = self.key_index.get(key)?;
-        let slot     = &self.slots[*slot_idx];
+        let slot = &self.slots[*slot_idx];
         let (_, cell) = slot.versions.last()?;
         Some(cell.clone())
     }
@@ -268,9 +270,7 @@ where
 
     /// Get the special scoped return register value
     pub fn take_return(&mut self) -> Option<V> {
-        self.return_register
-            .last_mut()
-            .and_then(|slot| slot.take())
+        self.return_register.last_mut().and_then(|slot| slot.take())
     }
 
     /// Get the layer id of the last layer
@@ -288,7 +288,7 @@ where
     /// if the variable does not yet exist in the current scope.
     pub fn capture_cell(&mut self, key: &K) -> V {
         if let Some(existing) = self.get(key) {
-            return existing;               // clone of Rc
+            return existing; // clone of Rc
         }
 
         // create a brand-new cell and store it in the current layer
@@ -300,7 +300,9 @@ where
     /// Directly insert an **existing** `Arc<Mutex<V>>` into the map
     /// (used when a closure wants to share an outer cell).
     pub fn insert_cell(&mut self, key: K, cell: V) {
-        let current_layer = self.layer_stack.last_mut()
+        let current_layer = self
+            .layer_stack
+            .last_mut()
             .expect("enter_layer must be called first");
         let layer_id = current_layer.layer_id;
 
@@ -341,7 +343,10 @@ where
         None
     }
 
-    pub fn iter_keys(&self) -> Vec<K> where K: Clone {
+    pub fn iter_keys(&self) -> Vec<K>
+    where
+        K: Clone,
+    {
         self.key_index.keys().cloned().collect()
     }
 

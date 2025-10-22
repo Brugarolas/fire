@@ -10,20 +10,25 @@ use logos::Logos;
 use smallbox::SmallBox;
 use std::collections::hash_map::Entry;
 use std::path::PathBuf;
-use std::{collections::BTreeSet, ops::Deref, sync::atomic::{AtomicU32, Ordering}};
+use std::{
+    collections::BTreeSet,
+    ops::Deref,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use compact_str::CompactString;
 
 use smallvec::SmallVec;
 
 // Bring in the WIR types from your other file/module.
+use crate::diag::{
+    ErrorCode, FileId, FrontError, FrontErrorLabel, FrontErrorMessage, Meta, Node,
+    RegisteredColors, Span,
+};
 use crate::modules::{FSLoader, ModuleId, ModuleLoader, ModulesCTX, ProgramBuilder};
 use crate::wir::{
     AccessorInfo, BindingId, Builder, Constant, FieldId, FuncId, Inst, IntBinOp, MethodInfo,
     Module, Type, ValueId, next_id,
-};
-use crate::diag::{
-    ErrorCode, FileId, FrontError, FrontErrorLabel, FrontErrorMessage, Meta, Node, Span, RegisteredColors,
 };
 
 /// -------------------------
@@ -784,12 +789,7 @@ pub struct ParseError {
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "{} at {}",
-            self.msg,
-            self.meta.span.range.start
-        )
+        write!(f, "{} at {}", self.msg, self.meta.span.range.start)
     }
 }
 
@@ -1827,10 +1827,9 @@ impl<'src> Parser<'src> {
         let name = match t.tok {
             Tok::Ident(s) => s,
             ref tok => {
-                return Err(self.make_error(
-                    format!("expected method name, found {:?}", tok),
-                    t.span,
-                ));
+                return Err(
+                    self.make_error(format!("expected method name, found {:?}", tok), t.span)
+                );
             }
         };
         self.expect(Tok::LParen, "expected '(' after method name")?;
@@ -2145,7 +2144,10 @@ impl<'src> Parser<'src> {
                         None
                     };
                     self.expect(Tok::Semi, "expected ';' after for init")?;
-                    Some(SmallBox::new(stmt_unknown(StmtKind::Var { name, init: init_e })))
+                    Some(SmallBox::new(stmt_unknown(StmtKind::Var {
+                        name,
+                        init: init_e,
+                    })))
                 }
             } else {
                 let e = self.expr()?;
@@ -2204,9 +2206,9 @@ impl<'src> Parser<'src> {
             };
 
             if catch_clause.is_none() && finally_block.is_none() {
-                return Err(self.err_here(
-                    "try statement must include at least a catch or finally clause",
-                ));
+                return Err(
+                    self.err_here("try statement must include at least a catch or finally clause")
+                );
             }
 
             Ok(stmt_unknown(StmtKind::Try {
@@ -2349,10 +2351,7 @@ impl<'src> Parser<'src> {
                 })
             };
 
-            Ok(expr!(Assign(
-                SmallBox::new(lv),
-                SmallBox::new(final_rhs)
-            )))
+            Ok(expr!(Assign(SmallBox::new(lv), SmallBox::new(final_rhs))))
         } else {
             Ok(left)
         }
@@ -2495,13 +2494,26 @@ impl<'src> Parser<'src> {
         loop {
             if self.matches(&Tok::Shl) {
                 let rhs = self.parse_term()?;
-                e = expr!(Binary { op: BinOp::Shl, a: SmallBox::new(e), b: SmallBox::new(rhs) });
+                e = expr!(Binary {
+                    op: BinOp::Shl,
+                    a: SmallBox::new(e),
+                    b: SmallBox::new(rhs)
+                });
             } else if self.matches(&Tok::Shr) {
                 let rhs = self.parse_term()?;
-                e = expr!(Binary { op: BinOp::Shr, a: SmallBox::new(e), b: SmallBox::new(rhs) });
-            } else if self.matches(&Tok::ShrU) { // + Add logic for `>>>`
-                let rhs = self.parse_term()?;    // +
-                e = expr!(Binary { op: BinOp::ShrU, a: SmallBox::new(e), b: SmallBox::new(rhs) }); // +
+                e = expr!(Binary {
+                    op: BinOp::Shr,
+                    a: SmallBox::new(e),
+                    b: SmallBox::new(rhs)
+                });
+            } else if self.matches(&Tok::ShrU) {
+                // + Add logic for `>>>`
+                let rhs = self.parse_term()?; // +
+                e = expr!(Binary {
+                    op: BinOp::ShrU,
+                    a: SmallBox::new(e),
+                    b: SmallBox::new(rhs)
+                }); // +
             } else {
                 break;
             }
@@ -2586,7 +2598,7 @@ impl<'src> Parser<'src> {
                 op: UnOp::Neg,
                 e: SmallBox::new(e),
             }))
-        }  else if self.matches(&Tok::BitwiseNot) {
+        } else if self.matches(&Tok::BitwiseNot) {
             let e = self.parse_unary()?;
             Ok(expr!(Unary {
                 op: UnOp::BitwiseNot,
@@ -3270,10 +3282,13 @@ impl<'src> Parser<'src> {
                 let name = match t.tok {
                     Tok::Ident(s) => s,
                     ref tok => {
-                        return Err(self.make_error(format!(
+                        return Err(self.make_error(
+                            format!(
                                 "expected identifier after '...' in object pattern, found {:?}",
                                 tok
-                            ), t.span,));
+                            ),
+                            t.span,
+                        ));
                     }
                 };
                 rest = Some(name);
@@ -3368,7 +3383,10 @@ impl<'src> Parser<'src> {
             let name = match t.tok {
                 Tok::Ident(s) => s,
                 ref tok => {
-                    return Err(self.make_error(format!("expected identifier after '.' in delete, found {:?}", tok), t.span,));
+                    return Err(self.make_error(
+                        format!("expected identifier after '.' in delete, found {:?}", tok),
+                        t.span,
+                    ));
                 }
             };
             return Ok(expr!(DeleteProp {

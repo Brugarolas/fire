@@ -89,11 +89,7 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
             collect_defs_uses_stmt(s, defs, uses);
         }
     }
-    fn collect_defs_uses_stmt(
-        s: &Stmt,
-        defs: &mut BTreeSet<String>,
-        uses: &mut BTreeSet<String>,
-    ) {
+    fn collect_defs_uses_stmt(s: &Stmt, defs: &mut BTreeSet<String>, uses: &mut BTreeSet<String>) {
         match &s.kind {
             StmtKind::Var { name, init } => {
                 defs.insert(name.clone());
@@ -451,14 +447,7 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                         lam_caps_out,
                     ),
                     else_b: else_b.as_ref().map(|b| {
-                        rw_block(
-                            b,
-                            used,
-                            counter,
-                            enclosing_locals,
-                            out_funcs,
-                            lam_caps_out,
-                        )
+                        rw_block(b, used, counter, enclosing_locals, out_funcs, lam_caps_out)
                     }),
                 },
             ),
@@ -564,16 +553,9 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                     }
                 });
 
-                let finally_rw = finally_block.as_ref().map(|b| {
-                    rw_block(
-                        b,
-                        used,
-                        counter,
-                        enclosing_locals,
-                        out_funcs,
-                        lam_caps_out,
-                    )
-                });
+                let finally_rw = finally_block
+                    .as_ref()
+                    .map(|b| rw_block(b, used, counter, enclosing_locals, out_funcs, lam_caps_out));
 
                 stmt_with_meta(
                     s,
@@ -827,7 +809,9 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                     )),
                     args: args
                         .iter()
-                        .map(|a| rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out))
+                        .map(|a| {
+                            rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out)
+                        })
                         .collect(),
                 },
             ),
