@@ -64,6 +64,7 @@ impl Resolver {
         }
 
         for func in &prog.functions {
+            self.mark_as_used(&func.name);
             self.resolve_func(func)?;
         }
 

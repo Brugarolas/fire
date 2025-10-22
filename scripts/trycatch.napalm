@@ -1,0 +1,76 @@
+print("===== try/finally (no throw) =====");
+try {
+  print("body: normal");
+} finally {
+  print("finally: normal");
+}
+print("after normal try");
+
+print("===== try/catch/finally (throw handled) =====");
+try {
+  print("body: throwing");
+  throw "boom";
+} catch (err) {
+  print(["caught", err]);
+} finally {
+  print("finally after handled throw");
+}
+print("after handled throw");
+
+fn return_from_try() {
+  try {
+    print("return_from_try: body");
+    return 42;
+  } finally {
+    print("return_from_try: finally");
+  }
+  return -1;
+}
+
+print(["return_from_try result", return_from_try()]);
+
+fn return_from_finally() {
+  try {
+    print("return_from_finally: body");
+    return 1;
+  } finally {
+    print("return_from_finally: overriding return");
+    return 77;
+  }
+}
+
+print(["return_from_finally result", return_from_finally()]);
+
+fn throw_from_finally() {
+  try {
+    print("throw_from_finally: body");
+  } finally {
+    print("throw_from_finally: throwing");
+    throw "finally error";
+  }
+}
+
+try {
+  throw_from_finally();
+} catch (err) {
+  print(["caught from finally", err]);
+}
+print("after throw_from_finally");
+
+print("===== nested try with rethrow =====");
+try {
+  try {
+    print("inner body");
+    throw "inner fault";
+  } catch (err) {
+    print(["inner caught", err]);
+    throw err;
+  } finally {
+    print("inner finally");
+  }
+} catch (outer) {
+  print(["outer caught", outer]);
+} finally {
+  print("outer finally");
+}
+print("after nested try");

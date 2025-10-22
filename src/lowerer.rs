@@ -118,6 +118,9 @@ where
     if let Some(fin) = finally_block {
         mutated_names.extend(collect_mut_locals_in_block(fin));
     }
+    if locals.contains_key("__deferred") {
+        mutated_names.push("__deferred".to_string());
+    }
     mutated_names.sort();
     mutated_names.dedup();
     mutated_names.retain(|name| locals.contains_key(name));
@@ -193,7 +196,7 @@ where
         lowering_ctx,
         active_try,
     )?;
-    if !b.current_block_terminated() {
+    if !b.block_has_terminator(try_entry) {
         let args = gather_args(&locals_try);
         let locals_vec = args.clone();
         let _ = b.push_node(
@@ -235,7 +238,7 @@ where
             lowering_ctx,
             active_try,
         )?;
-        if !b.current_block_terminated() {
+        if !b.block_has_terminator(catch_id) {
             let args = gather_args(&locals_catch);
             let locals_vec = args.clone();
             let _ = b.push_node(
@@ -279,7 +282,7 @@ where
             lowering_ctx,
             active_try,
         )?;
-        if !b.current_block_terminated() {
+        if !b.block_has_terminator(fin_id) {
             let args = gather_args(&locals_finally);
             b.jump(continuation, &args);
             cont_has_path = true;

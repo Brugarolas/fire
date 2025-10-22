@@ -1177,6 +1177,23 @@ impl<'m> Builder<'m> {
         id
     }
 
+    pub fn block_has_terminator(&self, block: BlockId) -> bool {
+        let blk = match self.func.blocks.iter().find(|b| b.id == block) {
+            Some(b) => b,
+            None => return false,
+        };
+        if let Some(&inst_id) = blk.insts.last() {
+            use crate::wir::Inst;
+            matches!(
+                self.func.nodes[inst_id.0 as usize].kind,
+                Inst::Return(_) | Inst::Throw(_)
+                    | Inst::Jump(_, _) | Inst::Branch { .. } | Inst::Switch { .. }
+            )
+        } else {
+            false
+        }
+    }
+
     pub fn add_try_region(&mut self, mut region: TryRegion) -> TryRegionId {
         let id = TryRegionId(self.func.try_regions.len() as u32);
         region.id = id;

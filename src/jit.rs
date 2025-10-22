@@ -1129,7 +1129,14 @@ impl JIT {
 
         // 3) Direct call — no func_addr, no call_indirect
         let call = fb.ins().call(func_ref, args);
-        Ok(fb.inst_results(call)[0])
+        let results = fb.inst_results(call);
+        if let Some(&val) = results.first() {
+            Ok(val)
+        } else {
+            Err(format!(
+                "call_import: callee `{name}` declared without return value"
+            ))
+        }
     }
 
     fn prepare_try_descriptors(
@@ -1359,6 +1366,16 @@ impl JIT {
 
         let fun_ir: &WirFunction = fun;
 
+        #[cfg(debug_assertions)]
+        if fun.id.0 == 9 {
+            for blk in &fun.blocks {
+                eprintln!(
+                    "[jit-debug] wir#{:?} params={:?} insts={:?}",
+                    blk.id, blk.params, blk.insts
+                );
+            }
+        }
+
         let fast_func_id = self.ensure_fast_decl(fun)?;
         let stub_func_id = self.ensure_stub_decl(fun)?;
 
@@ -1406,15 +1423,23 @@ impl JIT {
         resume_targets.dedup_by(|a, b| a.0 == b.0);
         let resume_targets_info: Vec<(BlockId, usize)> = resume_targets
             .iter()
-            .map(|bid| {
+            .filter_map(|bid| {
                 let count = fun_ir
                     .block_params
                     .get(bid)
                     .map(|params| params.len())
                     .unwrap_or(0);
-                (*bid, count)
+                if count == 0 {
+                    None
+                } else {
+                    Some((*bid, count))
+                }
             })
             .collect();
+        #[cfg(debug_assertions)]
+        if fun.id.0 == 9 {
+            eprintln!("[jit-debug] resume targets {:?}", resume_targets_info);
+        }
 
         #[cfg(debug_assertions)]
         {
@@ -1452,12 +1477,18 @@ impl JIT {
 
             let entry_params = fb.block_params(entry).to_vec();
 
-            let mut vmap = ValueMap::new();
-            let mut terminated = false;
-            let mut saw_any_return = false;
+        let mut vmap = ValueMap::new();
+        let mut terminated = false;
+        let mut saw_any_return = false;
 
-            // Precreate one CLIF block per WIR block.
-            let mut clif_of = Vec::with_capacity(fun.blocks.len());
+        // Precreate one CLIF block per WIR block.
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[jit-debug] fun{} has {} wir blocks",
+            fun.id.0,
+            fun.blocks.len()
+        );
+        let mut clif_of = Vec::with_capacity(fun.blocks.len());
             for blk in &fun.blocks {
                 let ebb = if blk.id == fun.entry {
                     entry
@@ -1470,6 +1501,17 @@ impl JIT {
                         let p = fb.append_block_param(ebb, types::I64);
                         vmap.bind(vid, p);
                     }
+                }
+
+                #[cfg(debug_assertions)]
+                {
+                    eprintln!(
+                        "[jit-debug] fun{} CLIF block {:?} for BlockId#{:?} params={}",
+                        fun.id.0,
+                        ebb,
+                        blk.id,
+                        blk.params.len()
+                    );
                 }
             }
 
@@ -1530,6 +1572,13 @@ impl JIT {
                         &[fid_const],
                     )?;
 
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "[jit-debug] fun{} jump to {:?} with {} args",
+                        fun_ir.id.0,
+                        target_block,
+                        args.len()
+                    );
                     fb.ins().jump(clif_of[target_block.0 as usize], &args);
                     fb.switch_to_block(next_block);
                     current_block = next_block;
@@ -1542,7 +1591,9 @@ impl JIT {
                 entry_body_block = normal_entry_block;
             }
 
-            fb.switch_to_block(entry_body_block);
+            if entry_body_block != entry {
+                fb.switch_to_block(entry_body_block);
+            }
 
             // Bind WIR params: load argv[i] as i64s.
             let param_count = fun.sig.params.len();
@@ -1574,6 +1625,10 @@ impl JIT {
 
                 let cur_ebb = clif_of[bid];
                 if bid != fun.entry.0 as usize {
+                    if block.insts.is_empty() && block.params.is_empty() {
+                        fb.seal_block(cur_ebb);
+                        continue;
+                    }
                     fb.switch_to_block(cur_ebb);
                 }
 
@@ -2758,6 +2813,7 @@ impl JIT {
                                     s.params.push(AbiParam::new(types::I64)); // exit kind
                                     s.params.push(AbiParam::new(ptr_ty)); // locals ptr
                                     s.params.push(AbiParam::new(ptr_ty)); // locals len
+                                    s.returns.push(AbiParam::new(types::I64)); // result (ignored)
                                 },
                                 &[fid, rid, exit_val, locals_ptr, locals_len],
                             )?;
@@ -2872,9 +2928,20 @@ impl JIT {
             fb.finalize();
 
             // Materialize fast (register ABI) body.
-            self.module
-                .define_function(fast_func_id, &mut fast_ctx)
-                .map_err(|e| e.to_string())?;
+            if let Err(err) = self.module.define_function(fast_func_id, &mut fast_ctx) {
+                use cranelift::codegen::print_errors::pretty_verifier_error;
+                if let cranelift_module::ModuleError::Compilation(
+                    cranelift::codegen::CodegenError::Verifier(errors),
+                ) = err
+                {
+                    let pretty = pretty_verifier_error(&fast_ctx.func, None, errors);
+                    #[cfg(debug_assertions)]
+                    eprintln!("{pretty}");
+                    return Err(pretty);
+                } else {
+                    return Err(err.to_string());
+                }
+            }
             self.module.clear_context(&mut fast_ctx);
 
             // Build stub that adapts (argv*, argc) -> fast(params...)
