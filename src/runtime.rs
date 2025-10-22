@@ -800,7 +800,7 @@ fn proxy_delete_with_name(proxy: i64, key_ptr: i64, key: &str) -> i64 {
     proxy_default_delete(proxy, key)
 }
 
-fn proxy_get_field(proxy: i64, fid: u32, receiver: i64) -> i64 {
+pub(crate) fn proxy_get_field(proxy: i64, fid: u32, receiver: i64) -> i64 {
     if let Some(name) = field_name_for_id(fid) {
         proxy_get_with_name(proxy, 0, &name, receiver)
     } else {
@@ -808,7 +808,7 @@ fn proxy_get_field(proxy: i64, fid: u32, receiver: i64) -> i64 {
     }
 }
 
-fn proxy_set_field(proxy: i64, fid: u32, val: i64, receiver: i64) -> i64 {
+pub(crate) fn proxy_set_field(proxy: i64, fid: u32, val: i64, receiver: i64) -> i64 {
     if let Some(name) = field_name_for_id(fid) {
         proxy_set_with_name(proxy, 0, &name, val, receiver)
     } else {
@@ -816,7 +816,7 @@ fn proxy_set_field(proxy: i64, fid: u32, val: i64, receiver: i64) -> i64 {
     }
 }
 
-fn proxy_has_field(proxy: i64, fid: u32) -> i64 {
+pub(crate) fn proxy_has_field(proxy: i64, fid: u32) -> i64 {
     if let Some(name) = field_name_for_id(fid) {
         proxy_has_with_name(proxy, 0, &name)
     } else {
@@ -824,7 +824,7 @@ fn proxy_has_field(proxy: i64, fid: u32) -> i64 {
     }
 }
 
-fn proxy_delete_field(proxy: i64, fid: u32) -> i64 {
+pub(crate) fn proxy_delete_field(proxy: i64, fid: u32) -> i64 {
     if let Some(name) = field_name_for_id(fid) {
         return proxy_delete_with_name(proxy, 0, &name);
     }

@@ -16,9 +16,218 @@ use crate::helpers::collections::HashMap;
 use parking_lot::Mutex;
 use std::cell::Cell;
 use std::mem;
+use std::mem::offset_of;
 use std::ptr;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+#[repr(C)]
+struct FieldInlineCache {
+    shape: AtomicU32,
+    slot: AtomicUsize,
+}
+
+impl FieldInlineCache {
+    const INVALID_SHAPE: u32 = u32::MAX;
+    const ABSENT_SLOT: usize = usize::MAX;
+
+    const fn new() -> Self {
+        Self {
+            shape: AtomicU32::new(Self::INVALID_SHAPE),
+            slot: AtomicUsize::new(Self::ABSENT_SLOT),
+        }
+    }
+
+    fn update(&self, shape: u32, slot: Option<usize>) {
+        let slot_val = slot.unwrap_or(Self::ABSENT_SLOT);
+        self.slot.store(slot_val, Ordering::Relaxed);
+        // publish new shape after slot update so readers never observe stale slot with fresh shape
+        self.shape.store(shape, Ordering::Release);
+    }
+
+    fn mark_absent(&self, shape: u32) {
+        self.slot.store(Self::ABSENT_SLOT, Ordering::Relaxed);
+        self.shape.store(shape, Ordering::Release);
+    }
+
+    fn invalidate(&self) {
+        self.slot.store(Self::ABSENT_SLOT, Ordering::Relaxed);
+        self.shape.store(Self::INVALID_SHAPE, Ordering::Release);
+    }
+}
+
+const OBJ_TAG_OFFSET: i32 = offset_of!(BoxedObj, hdr) as i32 + offset_of!(ObjHeader, tag) as i32;
+const OBJ_SHAPE_OFFSET: i32 = offset_of!(BoxedObj, shape) as i32;
+const OBJ_SLOTS_OFFSET: i32 = offset_of!(BoxedObj, slots) as i32;
+const FIELD_IC_SHAPE_OFFSET: i32 = offset_of!(FieldInlineCache, shape) as i32;
+const FIELD_IC_SLOT_OFFSET: i32 = offset_of!(FieldInlineCache, slot) as i32;
+
+#[inline]
+fn ic_from_ptr(ptr: *mut FieldInlineCache) -> Option<&'static FieldInlineCache> {
+    unsafe { ptr.as_ref() }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_obj_get_field_slow(ic_ptr: *mut FieldInlineCache, obj: i64, fid: i64) -> i64 {
+    if obj == 0 {
+        if let Some(ic) = ic_from_ptr(ic_ptr) {
+            ic.invalidate();
+        }
+        return 0;
+    }
+    let fid_u = fid as u32;
+
+    if crate::value::is_ptr(obj) {
+        unsafe {
+            let hdr = &*(obj as *const crate::value::ObjHeader);
+            if hdr.tag == crate::value::TAG_PROXY {
+                if let Some(ic) = ic_from_ptr(ic_ptr) {
+                    ic.invalidate();
+                }
+                return crate::runtime::proxy_get_field(obj, fid_u, obj);
+            }
+        }
+    }
+
+    unsafe {
+        let shape = crate::value::obj_shape(obj);
+        if let Some(slot) = crate::value::shape_slot(shape, fid_u) {
+            if let Some(ic) = ic_from_ptr(ic_ptr) {
+                ic.update(shape, Some(slot));
+            }
+            crate::value::obj_get_slot(obj, slot)
+        } else {
+            if let Some(ic) = ic_from_ptr(ic_ptr) {
+                ic.mark_absent(shape);
+            }
+            crate::value::NULL
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_obj_set_field_slow(
+    ic_ptr: *mut FieldInlineCache,
+    obj: i64,
+    fid: i64,
+    val: i64,
+) -> i64 {
+    if obj == 0 {
+        if let Some(ic) = ic_from_ptr(ic_ptr) {
+            ic.invalidate();
+        }
+        return 0;
+    }
+    let fid_u = fid as u32;
+
+    if crate::value::is_ptr(obj) {
+        unsafe {
+            let hdr = &*(obj as *const crate::value::ObjHeader);
+            if hdr.tag == crate::value::TAG_PROXY {
+                if let Some(ic) = ic_from_ptr(ic_ptr) {
+                    ic.invalidate();
+                }
+                return crate::runtime::proxy_set_field(obj, fid_u, val, obj);
+            }
+        }
+    }
+
+    unsafe {
+        crate::value::obj_set_field(obj, fid_u, val);
+        let new_shape = crate::value::obj_shape(obj);
+        if let Some(ic) = ic_from_ptr(ic_ptr) {
+            let slot = crate::value::shape_slot(new_shape, fid_u);
+            ic.update(new_shape, slot);
+        }
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_obj_has_field_slow(ic_ptr: *mut FieldInlineCache, obj: i64, fid: i64) -> i64 {
+    if obj == 0 {
+        if let Some(ic) = ic_from_ptr(ic_ptr) {
+            ic.invalidate();
+        }
+        return crate::value::BOOL_FALSE;
+    }
+
+    let fid_u = fid as u32;
+
+    if crate::value::is_ptr(obj) {
+        unsafe {
+            let hdr = &*(obj as *const crate::value::ObjHeader);
+            if hdr.tag == crate::value::TAG_PROXY {
+                if let Some(ic) = ic_from_ptr(ic_ptr) {
+                    ic.invalidate();
+                }
+                return crate::runtime::proxy_has_field(obj, fid_u);
+            }
+        }
+    }
+
+    unsafe {
+        let shape = crate::value::obj_shape(obj);
+        if let Some(slot) = crate::value::shape_slot(shape, fid_u) {
+            if let Some(ic) = ic_from_ptr(ic_ptr) {
+                ic.update(shape, Some(slot));
+            }
+            crate::value::BOOL_TRUE
+        } else {
+            if let Some(ic) = ic_from_ptr(ic_ptr) {
+                ic.mark_absent(shape);
+            }
+            crate::value::BOOL_FALSE
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_obj_del_field_slow(ic_ptr: *mut FieldInlineCache, obj: i64, fid: i64) -> i64 {
+    if obj == 0 {
+        if let Some(ic) = ic_from_ptr(ic_ptr) {
+            ic.invalidate();
+        }
+        return crate::value::BOOL_FALSE;
+    }
+
+    let fid_u = fid as u32;
+
+    if crate::value::is_ptr(obj) {
+        unsafe {
+            let hdr = &*(obj as *const crate::value::ObjHeader);
+            if hdr.tag == crate::value::TAG_PROXY {
+                if let Some(ic) = ic_from_ptr(ic_ptr) {
+                    ic.invalidate();
+                }
+                return crate::runtime::proxy_delete_field(obj, fid_u);
+            }
+        }
+    }
+
+    unsafe {
+        let before = crate::value::obj_shape(obj);
+        let res = crate::value::obj_del_field(obj, fid_u);
+        if let Some(ic) = ic_from_ptr(ic_ptr) {
+            let ok = crate::value::value_to_bool(res).unwrap_or(false);
+            if ok {
+                let new_shape = crate::value::obj_shape(obj);
+                ic.mark_absent(new_shape);
+            } else {
+                ic.mark_absent(before);
+            }
+        }
+        res
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_obj_store_slot(obj: i64, slot: i64, val: i64) -> i64 {
+    unsafe {
+        crate::value::obj_set_slot_known(obj, slot as usize, val);
+    }
+    0
+}
 
 #[allow(unused_imports)]
 use crate::gc::NAPALM_GC;
@@ -52,16 +261,15 @@ use crate::runtime::{
     napalm_yieldpoint, wir_builtin_entries, wir_builtin_keys, wir_builtin_size, wir_builtin_values,
     wir_field_register_name, wir_is_map, wir_is_nullish, wir_is_proxy, wir_is_set, wir_is_str,
     wir_map_clear, wir_map_delete, wir_map_get, wir_map_has, wir_map_new, wir_map_set,
-    wir_map_size, wir_memo_get, wir_memo_put, wir_obj_assign, wir_obj_clone, wir_obj_del_field,
-    wir_obj_del_str, wir_obj_get_field, wir_obj_get_field_deep, wir_obj_get_method,
-    wir_obj_get_proto, wir_obj_get_str, wir_obj_get_str_deep, wir_obj_has_field, wir_obj_has_str,
-    wir_obj_new, wir_obj_set_field, wir_obj_set_proto, wir_obj_set_str, wir_proxy_new, wir_set_add,
-    wir_set_clear, wir_set_delete, wir_set_has, wir_set_new, wir_set_size, wir_string_equals,
-    wir_super_get_method,
+    wir_map_size, wir_memo_get, wir_memo_put, wir_obj_assign, wir_obj_clone, wir_obj_del_str,
+    wir_obj_get_field_deep, wir_obj_get_method, wir_obj_get_proto, wir_obj_get_str,
+    wir_obj_get_str_deep, wir_obj_has_str, wir_obj_new, wir_obj_set_proto, wir_obj_set_str,
+    wir_proxy_new, wir_set_add, wir_set_clear, wir_set_delete, wir_set_has, wir_set_new,
+    wir_set_size, wir_string_equals, wir_super_get_method,
 };
 #[allow(unused_imports)]
 use crate::value::{
-    BOOL_FALSE, BOOL_TRUE, BoxedArray, BoxedClosure, ObjHeader, TAG_ARRAY, closure_new,
+    BOOL_FALSE, BOOL_TRUE, BoxedArray, BoxedClosure, BoxedObj, ObjHeader, TAG_ARRAY, closure_new,
     closure_set_env_slot, wir_array_copy, wir_array_fill, wir_array_filter, wir_array_find,
     wir_array_find_index, wir_array_for_each, wir_array_get, wir_array_len, wir_array_map,
     wir_array_new, wir_array_pop, wir_array_push, wir_array_reduce, wir_array_set,
@@ -180,6 +388,13 @@ impl JIT {
         self.fast_decls.insert(fid.0, func_id);
         Ok(func_id)
     }
+
+    fn alloc_field_ic(&mut self) -> *mut FieldInlineCache {
+        let ic = Box::new(FieldInlineCache::new());
+        let ptr = ic.as_ref() as *const FieldInlineCache as *mut FieldInlineCache;
+        self.field_inline_caches.push(ic);
+        ptr
+    }
 }
 
 /// ABI: `unsafe extern "C" fn(argv: *const i64, argc: usize) -> i64`
@@ -248,6 +463,7 @@ pub struct JIT {
     try_descriptor_keep_alive: Vec<&'static crate::runtime::RuntimeTryDescriptor>,
     try_catch_entries_keep_alive: Vec<&'static [crate::runtime::CatchStubEntry]>,
     try_stub_records: Vec<TryStubRecord>,
+    field_inline_caches: Vec<Box<FieldInlineCache>>,
 }
 
 impl Default for JIT {
@@ -337,10 +553,16 @@ impl Default for JIT {
 
             fn napalm_yieldpoint() -> i64;
 
-            fn wir_obj_get_field(obj: i64, field_id: i64) -> i64;
-            fn wir_obj_set_field(obj: i64, field_id: i64, val: i64) -> i64;
-            fn wir_obj_has_field(obj: i64, field_id: i64) -> i64;
-            fn wir_obj_del_field(obj: i64, field_id: i64) -> i64;
+            fn jit_obj_get_field_slow(ic: *mut FieldInlineCache, obj: i64, field_id: i64) -> i64;
+            fn jit_obj_set_field_slow(
+                ic: *mut FieldInlineCache,
+                obj: i64,
+                field_id: i64,
+                val: i64,
+            ) -> i64;
+            fn jit_obj_has_field_slow(ic: *mut FieldInlineCache, obj: i64, field_id: i64) -> i64;
+            fn jit_obj_del_field_slow(ic: *mut FieldInlineCache, obj: i64, field_id: i64) -> i64;
+            fn jit_obj_store_slot(obj: i64, slot: i64, val: i64) -> i64;
 
             fn wir_obj_get_str(obj: i64, key: i64) -> i64;
             fn wir_obj_set_str(obj: i64, key: i64, val: i64) -> i64;
@@ -691,20 +913,32 @@ impl Default for JIT {
             );
 
             jb.symbol(
-                "wir_obj_get_field",
-                wir_obj_get_field as *const extern "C" fn(i64, i64) -> i64 as *const u8,
+                "jit_obj_get_field_slow",
+                jit_obj_get_field_slow
+                    as *const extern "C" fn(*mut FieldInlineCache, i64, i64) -> i64
+                    as *const u8,
             );
             jb.symbol(
-                "wir_obj_set_field",
-                wir_obj_set_field as *const extern "C" fn(i64, i64, i64) -> i64 as *const u8,
+                "jit_obj_set_field_slow",
+                jit_obj_set_field_slow
+                    as *const extern "C" fn(*mut FieldInlineCache, i64, i64, i64) -> i64
+                    as *const u8,
             );
             jb.symbol(
-                "wir_obj_has_field",
-                wir_obj_has_field as *const extern "C" fn(i64, i64) -> i64 as *const u8,
+                "jit_obj_has_field_slow",
+                jit_obj_has_field_slow
+                    as *const extern "C" fn(*mut FieldInlineCache, i64, i64) -> i64
+                    as *const u8,
             );
             jb.symbol(
-                "wir_obj_del_field",
-                wir_obj_del_field as *const extern "C" fn(i64, i64) -> i64 as *const u8,
+                "jit_obj_del_field_slow",
+                jit_obj_del_field_slow
+                    as *const extern "C" fn(*mut FieldInlineCache, i64, i64) -> i64
+                    as *const u8,
+            );
+            jb.symbol(
+                "jit_obj_store_slot",
+                jit_obj_store_slot as *const extern "C" fn(i64, i64, i64) -> i64 as *const u8,
             );
 
             jb.symbol(
@@ -1021,6 +1255,7 @@ impl Default for JIT {
             try_descriptor_keep_alive: Vec::new(),
             try_catch_entries_keep_alive: Vec::new(),
             try_stub_records: Vec::new(),
+            field_inline_caches: Vec::new(),
         }
     }
 }
@@ -1076,6 +1311,25 @@ impl JIT {
     #[inline]
     fn ptr_ty(&self) -> types::Type {
         self.module.target_config().pointer_type()
+    }
+
+    #[inline]
+    fn value_as_ptr<'a>(&self, fb: &mut FunctionBuilder<'a>, val: Value) -> Value {
+        let ptr_ty = self.ptr_ty();
+        match ptr_ty {
+            types::I64 => val,
+            types::I32 => fb.ins().ireduce(ptr_ty, val),
+            _ => fb.ins().ireduce(ptr_ty, val),
+        }
+    }
+
+    #[inline]
+    fn ptr_to_i64<'a>(&self, fb: &mut FunctionBuilder<'a>, val: Value) -> Value {
+        match self.ptr_ty() {
+            types::I64 => val,
+            types::I32 => fb.ins().uextend(types::I64, val),
+            _ => fb.ins().uextend(types::I64, val),
+        }
     }
 
     /// Indirect call to a JITed function by emitting `func_addr` and then `call_indirect`.
@@ -1477,18 +1731,18 @@ impl JIT {
 
             let entry_params = fb.block_params(entry).to_vec();
 
-        let mut vmap = ValueMap::new();
-        let mut terminated = false;
-        let mut saw_any_return = false;
+            let mut vmap = ValueMap::new();
+            let mut terminated = false;
+            let mut saw_any_return = false;
 
-        // Precreate one CLIF block per WIR block.
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[jit-debug] fun{} has {} wir blocks",
-            fun.id.0,
-            fun.blocks.len()
-        );
-        let mut clif_of = Vec::with_capacity(fun.blocks.len());
+            // Precreate one CLIF block per WIR block.
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[jit-debug] fun{} has {} wir blocks",
+                fun.id.0,
+                fun.blocks.len()
+            );
+            let mut clif_of = Vec::with_capacity(fun.blocks.len());
             for blk in &fun.blocks {
                 let ebb = if blk.id == fun.entry {
                     entry
@@ -2294,33 +2548,266 @@ impl JIT {
                         Inst::CallNative { name, args, .. } => {
                             use cranelift::prelude::{AbiParam, types};
 
-                            // We route "wir_print_str" via wir_print_i64 (keeps all args i64).
-                            let import_name: &str = if name == "wir_print_str" {
-                                "wir_print_i64"
-                            } else {
-                                name
-                            };
+                            match name.as_str() {
+                                "wir_obj_has_field" => {
+                                    use cranelift::codegen::ir::instructions::BlockArg;
+                                    use cranelift::prelude::{IntCC, MemFlags};
 
-                            // Gather argv values first.
-                            let mut argv = Vec::with_capacity(args.len());
-                            for a in args {
-                                argv.push(vmap.get_or_emit(*a, &mut fb, fun_ir));
-                            }
+                                    let ptr_ty = self.ptr_ty();
+                                    let ic_raw = self.alloc_field_ic();
+                                    let ic_ptr = fb.ins().iconst(ptr_ty, ic_raw as i64);
 
-                            // Build signature: (i64, i64, ...) -> i64
-                            let out = self.call_import(
-                                &mut fb,
-                                import_name,
-                                |s| {
-                                    for _ in 0..argv.len() {
-                                        s.params.push(AbiParam::new(types::I64));
+                                    let recv = vmap.get_or_emit(args[0], &mut fb, fun_ir);
+                                    let fid_smi = vmap.get_or_emit(args[1], &mut fb, fun_ir);
+                                    let fid = fb.ins().ushr_imm(fid_smi, 1);
+
+                                    let zero = fb.ins().iconst(types::I64, 0);
+                                    let bool_true = fb.ins().iconst(types::I64, BOOL_TRUE);
+                                    let bool_false = fb.ins().iconst(types::I64, BOOL_FALSE);
+
+                                    let bb_check = fb.create_block();
+                                    let bb_cache = fb.create_block();
+                                    let bb_slot_state = fb.create_block();
+                                    let bb_slow = fb.create_block();
+                                    let bb_exit = fb.create_block();
+                                    let res_phi = fb.append_block_param(bb_exit, types::I64);
+
+                                    let is_null = fb.ins().icmp(IntCC::Equal, recv, zero);
+                                    fb.ins().brif(
+                                        is_null,
+                                        bb_exit,
+                                        &[BlockArg::from(bool_false)],
+                                        bb_check,
+                                        &[] as &[BlockArg],
+                                    );
+
+                                    fb.switch_to_block(bb_check);
+                                    let recv_ptr = self.value_as_ptr(&mut fb, recv);
+                                    let tag_u32 = fb.ins().load(
+                                        types::I32,
+                                        MemFlags::trusted(),
+                                        recv_ptr,
+                                        OBJ_TAG_OFFSET,
+                                    );
+                                    let tag = fb.ins().uextend(types::I64, tag_u32);
+                                    let proxy_tag =
+                                        fb.ins().iconst(types::I64, crate::value::TAG_PROXY as i64);
+                                    let is_proxy = fb.ins().icmp(IntCC::Equal, tag, proxy_tag);
+                                    fb.ins().brif(
+                                        is_proxy,
+                                        bb_slow,
+                                        &[] as &[BlockArg],
+                                        bb_cache,
+                                        &[] as &[BlockArg],
+                                    );
+
+                                    fb.switch_to_block(bb_cache);
+                                    let shape_u32 = fb.ins().load(
+                                        types::I32,
+                                        MemFlags::trusted(),
+                                        recv_ptr,
+                                        OBJ_SHAPE_OFFSET,
+                                    );
+                                    let shape = fb.ins().uextend(types::I64, shape_u32);
+                                    let cached_shape_u32 = fb.ins().load(
+                                        types::I32,
+                                        MemFlags::trusted(),
+                                        ic_ptr,
+                                        FIELD_IC_SHAPE_OFFSET,
+                                    );
+                                    let cached_shape =
+                                        fb.ins().uextend(types::I64, cached_shape_u32);
+                                    let shape_match =
+                                        fb.ins().icmp(IntCC::Equal, shape, cached_shape);
+                                    fb.ins().brif(
+                                        shape_match,
+                                        bb_slot_state,
+                                        &[] as &[BlockArg],
+                                        bb_slow,
+                                        &[] as &[BlockArg],
+                                    );
+
+                                    fb.switch_to_block(bb_slot_state);
+                                    let cached_slot = fb.ins().load(
+                                        ptr_ty,
+                                        MemFlags::trusted(),
+                                        ic_ptr,
+                                        FIELD_IC_SLOT_OFFSET,
+                                    );
+                                    let absent = fb.ins().iconst(ptr_ty, -1);
+                                    let has_slot =
+                                        fb.ins().icmp(IntCC::NotEqual, cached_slot, absent);
+                                    fb.ins().brif(
+                                        has_slot,
+                                        bb_exit,
+                                        &[BlockArg::from(bool_true)],
+                                        bb_exit,
+                                        &[BlockArg::from(bool_false)],
+                                    );
+
+                                    fb.switch_to_block(bb_slow);
+                                    let slow = self.call_import(
+                                        &mut fb,
+                                        "jit_obj_has_field_slow",
+                                        |s| {
+                                            s.params.push(AbiParam::new(ptr_ty));
+                                            s.params.push(AbiParam::new(types::I64));
+                                            s.params.push(AbiParam::new(types::I64));
+                                            s.returns.push(AbiParam::new(types::I64));
+                                        },
+                                        &[ic_ptr, recv, fid],
+                                    )?;
+                                    fb.ins().jump(bb_exit, &[BlockArg::from(slow)]);
+
+                                    fb.switch_to_block(bb_exit);
+                                    if res_count == 1 {
+                                        vmap.bind(node.results[0], res_phi);
                                     }
-                                    s.returns.push(AbiParam::new(types::I64));
-                                },
-                                &argv,
-                            )?;
-                            if res_count == 1 {
-                                vmap.bind(node.results[0], out);
+                                }
+                                "wir_obj_del_field" => {
+                                    use cranelift::codegen::ir::instructions::BlockArg;
+                                    use cranelift::prelude::{IntCC, MemFlags};
+
+                                    let ptr_ty = self.ptr_ty();
+                                    let ic_raw = self.alloc_field_ic();
+                                    let ic_ptr = fb.ins().iconst(ptr_ty, ic_raw as i64);
+
+                                    let recv = vmap.get_or_emit(args[0], &mut fb, fun_ir);
+                                    let fid_smi = vmap.get_or_emit(args[1], &mut fb, fun_ir);
+                                    let fid = fb.ins().ushr_imm(fid_smi, 1);
+
+                                    let zero = fb.ins().iconst(types::I64, 0);
+                                    let bool_false = fb.ins().iconst(types::I64, BOOL_FALSE);
+
+                                    let bb_check = fb.create_block();
+                                    let bb_cache = fb.create_block();
+                                    let bb_slot_state = fb.create_block();
+                                    let bb_slow = fb.create_block();
+                                    let bb_exit = fb.create_block();
+                                    let res_phi = fb.append_block_param(bb_exit, types::I64);
+
+                                    let is_null = fb.ins().icmp(IntCC::Equal, recv, zero);
+                                    fb.ins().brif(
+                                        is_null,
+                                        bb_exit,
+                                        &[BlockArg::from(bool_false)],
+                                        bb_check,
+                                        &[] as &[BlockArg],
+                                    );
+
+                                    fb.switch_to_block(bb_check);
+                                    let recv_ptr = self.value_as_ptr(&mut fb, recv);
+                                    let tag_u32 = fb.ins().load(
+                                        types::I32,
+                                        MemFlags::trusted(),
+                                        recv_ptr,
+                                        OBJ_TAG_OFFSET,
+                                    );
+                                    let tag = fb.ins().uextend(types::I64, tag_u32);
+                                    let proxy_tag =
+                                        fb.ins().iconst(types::I64, crate::value::TAG_PROXY as i64);
+                                    let is_proxy = fb.ins().icmp(IntCC::Equal, tag, proxy_tag);
+                                    fb.ins().brif(
+                                        is_proxy,
+                                        bb_slow,
+                                        &[] as &[BlockArg],
+                                        bb_cache,
+                                        &[] as &[BlockArg],
+                                    );
+
+                                    fb.switch_to_block(bb_cache);
+                                    let shape_u32 = fb.ins().load(
+                                        types::I32,
+                                        MemFlags::trusted(),
+                                        recv_ptr,
+                                        OBJ_SHAPE_OFFSET,
+                                    );
+                                    let shape = fb.ins().uextend(types::I64, shape_u32);
+                                    let cached_shape_u32 = fb.ins().load(
+                                        types::I32,
+                                        MemFlags::trusted(),
+                                        ic_ptr,
+                                        FIELD_IC_SHAPE_OFFSET,
+                                    );
+                                    let cached_shape =
+                                        fb.ins().uextend(types::I64, cached_shape_u32);
+                                    let shape_match =
+                                        fb.ins().icmp(IntCC::Equal, shape, cached_shape);
+                                    fb.ins().brif(
+                                        shape_match,
+                                        bb_slot_state,
+                                        &[] as &[BlockArg],
+                                        bb_slow,
+                                        &[] as &[BlockArg],
+                                    );
+
+                                    fb.switch_to_block(bb_slot_state);
+                                    let cached_slot = fb.ins().load(
+                                        ptr_ty,
+                                        MemFlags::trusted(),
+                                        ic_ptr,
+                                        FIELD_IC_SLOT_OFFSET,
+                                    );
+                                    let absent = fb.ins().iconst(ptr_ty, -1);
+                                    let has_slot =
+                                        fb.ins().icmp(IntCC::NotEqual, cached_slot, absent);
+                                    fb.ins().brif(
+                                        has_slot,
+                                        bb_slow,
+                                        &[] as &[BlockArg],
+                                        bb_exit,
+                                        &[BlockArg::from(bool_false)],
+                                    );
+
+                                    fb.switch_to_block(bb_slow);
+                                    let slow = self.call_import(
+                                        &mut fb,
+                                        "jit_obj_del_field_slow",
+                                        |s| {
+                                            s.params.push(AbiParam::new(ptr_ty));
+                                            s.params.push(AbiParam::new(types::I64));
+                                            s.params.push(AbiParam::new(types::I64));
+                                            s.returns.push(AbiParam::new(types::I64));
+                                        },
+                                        &[ic_ptr, recv, fid],
+                                    )?;
+                                    fb.ins().jump(bb_exit, &[BlockArg::from(slow)]);
+
+                                    fb.switch_to_block(bb_exit);
+                                    if res_count == 1 {
+                                        vmap.bind(node.results[0], res_phi);
+                                    }
+                                }
+                                _ => {
+                                    // We route "wir_print_str" via wir_print_i64 (keeps all args i64).
+                                    let import_name: &str = if name == "wir_print_str" {
+                                        "wir_print_i64"
+                                    } else {
+                                        name
+                                    };
+
+                                    // Gather argv values first.
+                                    let mut argv = Vec::with_capacity(args.len());
+                                    for a in args {
+                                        argv.push(vmap.get_or_emit(*a, &mut fb, fun_ir));
+                                    }
+
+                                    // Build signature: (i64, i64, ...) -> i64
+                                    let out = self.call_import(
+                                        &mut fb,
+                                        import_name,
+                                        |s| {
+                                            for _ in 0..argv.len() {
+                                                s.params.push(AbiParam::new(types::I64));
+                                            }
+                                            s.returns.push(AbiParam::new(types::I64));
+                                        },
+                                        &argv,
+                                    )?;
+                                    if res_count == 1 {
+                                        vmap.bind(node.results[0], out);
+                                    }
+                                }
                             }
                         }
 
@@ -2590,56 +3077,259 @@ impl JIT {
                         }
 
                         Inst::LoadField { obj, field, .. } => {
-                            use cranelift::prelude::{AbiParam, types};
+                            use cranelift::codegen::ir::instructions::BlockArg;
+                            use cranelift::prelude::{AbiParam, IntCC, MemFlags, types};
 
-                            let o = vmap.get_or_emit(*obj, &mut fb, fun_ir);
+                            let ptr_ty = self.ptr_ty();
+                            let ic_raw = self.alloc_field_ic();
+                            let ic_ptr = fb.ins().iconst(ptr_ty, ic_raw as i64);
 
-                            // field id -> SMI
-                            let raw = fb.ins().iconst(types::I64, field.0 as i64);
-                            let sh = fb.ins().ishl_imm(raw, 1);
-                            let fid = fb.ins().iadd_imm(sh, 1);
+                            let recv = vmap.get_or_emit(*obj, &mut fb, fun_ir);
+                            let zero = fb.ins().iconst(types::I64, 0);
 
-                            let out = self.call_import(
+                            let bb_check = fb.create_block();
+                            let bb_cache = fb.create_block();
+                            let bb_slot_state = fb.create_block();
+                            let bb_load = fb.create_block();
+                            let bb_absent = fb.create_block();
+                            let bb_slow = fb.create_block();
+                            let bb_exit = fb.create_block();
+                            let res_phi = fb.append_block_param(bb_exit, types::I64);
+
+                            let is_null = fb.ins().icmp(IntCC::Equal, recv, zero);
+                            fb.ins().brif(
+                                is_null,
+                                bb_exit,
+                                &[BlockArg::from(zero)],
+                                bb_check,
+                                &[] as &[BlockArg],
+                            );
+
+                            fb.switch_to_block(bb_check);
+                            let recv_ptr = self.value_as_ptr(&mut fb, recv);
+                            let tag_u32 = fb.ins().load(
+                                types::I32,
+                                MemFlags::trusted(),
+                                recv_ptr,
+                                OBJ_TAG_OFFSET,
+                            );
+                            let tag = fb.ins().uextend(types::I64, tag_u32);
+                            let proxy_tag =
+                                fb.ins().iconst(types::I64, crate::value::TAG_PROXY as i64);
+                            let is_proxy = fb.ins().icmp(IntCC::Equal, tag, proxy_tag);
+                            fb.ins().brif(
+                                is_proxy,
+                                bb_slow,
+                                &[] as &[BlockArg],
+                                bb_cache,
+                                &[] as &[BlockArg],
+                            );
+
+                            fb.switch_to_block(bb_cache);
+                            let shape_u32 = fb.ins().load(
+                                types::I32,
+                                MemFlags::trusted(),
+                                recv_ptr,
+                                OBJ_SHAPE_OFFSET,
+                            );
+                            let shape = fb.ins().uextend(types::I64, shape_u32);
+                            let cached_shape_u32 = fb.ins().load(
+                                types::I32,
+                                MemFlags::trusted(),
+                                ic_ptr,
+                                FIELD_IC_SHAPE_OFFSET,
+                            );
+                            let cached_shape = fb.ins().uextend(types::I64, cached_shape_u32);
+                            let shape_match = fb.ins().icmp(IntCC::Equal, shape, cached_shape);
+                            fb.ins().brif(
+                                shape_match,
+                                bb_slot_state,
+                                &[] as &[BlockArg],
+                                bb_slow,
+                                &[] as &[BlockArg],
+                            );
+
+                            fb.switch_to_block(bb_slot_state);
+                            let cached_slot = fb.ins().load(
+                                ptr_ty,
+                                MemFlags::trusted(),
+                                ic_ptr,
+                                FIELD_IC_SLOT_OFFSET,
+                            );
+                            let absent = fb.ins().iconst(ptr_ty, -1);
+                            let has_slot = fb.ins().icmp(IntCC::NotEqual, cached_slot, absent);
+                            fb.ins().brif(
+                                has_slot,
+                                bb_load,
+                                &[] as &[BlockArg],
+                                bb_absent,
+                                &[] as &[BlockArg],
+                            );
+
+                            fb.switch_to_block(bb_load);
+                            let slots_ptr = fb.ins().load(
+                                ptr_ty,
+                                MemFlags::trusted(),
+                                recv_ptr,
+                                OBJ_SLOTS_OFFSET,
+                            );
+                            let slot_index = self.ptr_to_i64(&mut fb, cached_slot);
+                            let byte_off = fb.ins().imul_imm(slot_index, 8);
+                            let off_ptr = self.value_as_ptr(&mut fb, byte_off);
+                            let addr = fb.ins().iadd(slots_ptr, off_ptr);
+                            let val = fb.ins().load(types::I64, MemFlags::trusted(), addr, 0);
+                            fb.ins().jump(bb_exit, &[BlockArg::from(val)]);
+
+                            fb.switch_to_block(bb_absent);
+                            fb.ins().jump(bb_exit, &[BlockArg::from(zero)]);
+
+                            fb.switch_to_block(bb_slow);
+                            let fid_const = fb.ins().iconst(types::I64, field.0 as i64);
+                            let slow = self.call_import(
                                 &mut fb,
-                                "wir_obj_get_field",
+                                "jit_obj_get_field_slow",
                                 |s| {
-                                    s.params.push(AbiParam::new(types::I64)); // obj
-                                    s.params.push(AbiParam::new(types::I64)); // field_id (SMI)
-                                    s.returns.push(AbiParam::new(types::I64)); // value or 0
+                                    s.params.push(AbiParam::new(ptr_ty));
+                                    s.params.push(AbiParam::new(types::I64));
+                                    s.params.push(AbiParam::new(types::I64));
+                                    s.returns.push(AbiParam::new(types::I64));
                                 },
-                                &[o, fid],
+                                &[ic_ptr, recv, fid_const],
                             )?;
+                            fb.ins().jump(bb_exit, &[BlockArg::from(slow)]);
+
+                            fb.switch_to_block(bb_exit);
                             if res_count == 1 {
-                                vmap.bind(node.results[0], out);
+                                vmap.bind(node.results[0], res_phi);
                             }
                         }
 
                         Inst::StoreField {
                             obj, field, val, ..
                         } => {
-                            use cranelift::prelude::{AbiParam, types};
+                            use cranelift::codegen::ir::instructions::BlockArg;
+                            use cranelift::prelude::{AbiParam, IntCC, MemFlags, types};
 
-                            let o = vmap.get_or_emit(*obj, &mut fb, fun_ir);
-                            let v = vmap.get_or_emit(*val, &mut fb, fun_ir);
+                            let ptr_ty = self.ptr_ty();
+                            let ic_raw = self.alloc_field_ic();
+                            let ic_ptr = fb.ins().iconst(ptr_ty, ic_raw as i64);
 
-                            // field id -> SMI
-                            let raw = fb.ins().iconst(types::I64, field.0 as i64);
-                            let sh = fb.ins().ishl_imm(raw, 1);
-                            let fid = fb.ins().iadd_imm(sh, 1);
+                            let recv = vmap.get_or_emit(*obj, &mut fb, fun_ir);
+                            let value = vmap.get_or_emit(*val, &mut fb, fun_ir);
+                            let zero = fb.ins().iconst(types::I64, 0);
 
-                            let out = self.call_import(
+                            let bb_check = fb.create_block();
+                            let bb_cache = fb.create_block();
+                            let bb_slot_state = fb.create_block();
+                            let bb_store = fb.create_block();
+                            let bb_slow = fb.create_block();
+                            let bb_exit = fb.create_block();
+                            let res_phi = fb.append_block_param(bb_exit, types::I64);
+
+                            let is_null = fb.ins().icmp(IntCC::Equal, recv, zero);
+                            fb.ins().brif(
+                                is_null,
+                                bb_exit,
+                                &[BlockArg::from(zero)],
+                                bb_check,
+                                &[] as &[BlockArg],
+                            );
+
+                            fb.switch_to_block(bb_check);
+                            let recv_ptr = self.value_as_ptr(&mut fb, recv);
+                            let tag_u32 = fb.ins().load(
+                                types::I32,
+                                MemFlags::trusted(),
+                                recv_ptr,
+                                OBJ_TAG_OFFSET,
+                            );
+                            let tag = fb.ins().uextend(types::I64, tag_u32);
+                            let proxy_tag =
+                                fb.ins().iconst(types::I64, crate::value::TAG_PROXY as i64);
+                            let is_proxy = fb.ins().icmp(IntCC::Equal, tag, proxy_tag);
+                            fb.ins().brif(
+                                is_proxy,
+                                bb_slow,
+                                &[] as &[BlockArg],
+                                bb_cache,
+                                &[] as &[BlockArg],
+                            );
+
+                            fb.switch_to_block(bb_cache);
+                            let shape_u32 = fb.ins().load(
+                                types::I32,
+                                MemFlags::trusted(),
+                                recv_ptr,
+                                OBJ_SHAPE_OFFSET,
+                            );
+                            let shape = fb.ins().uextend(types::I64, shape_u32);
+                            let cached_shape_u32 = fb.ins().load(
+                                types::I32,
+                                MemFlags::trusted(),
+                                ic_ptr,
+                                FIELD_IC_SHAPE_OFFSET,
+                            );
+                            let cached_shape = fb.ins().uextend(types::I64, cached_shape_u32);
+                            let shape_match = fb.ins().icmp(IntCC::Equal, shape, cached_shape);
+                            fb.ins().brif(
+                                shape_match,
+                                bb_slot_state,
+                                &[] as &[BlockArg],
+                                bb_slow,
+                                &[] as &[BlockArg],
+                            );
+
+                            fb.switch_to_block(bb_slot_state);
+                            let cached_slot = fb.ins().load(
+                                ptr_ty,
+                                MemFlags::trusted(),
+                                ic_ptr,
+                                FIELD_IC_SLOT_OFFSET,
+                            );
+                            let absent = fb.ins().iconst(ptr_ty, -1);
+                            let has_slot = fb.ins().icmp(IntCC::NotEqual, cached_slot, absent);
+                            fb.ins().brif(
+                                has_slot,
+                                bb_store,
+                                &[] as &[BlockArg],
+                                bb_slow,
+                                &[] as &[BlockArg],
+                            );
+
+                            fb.switch_to_block(bb_store);
+                            let slot_index = self.ptr_to_i64(&mut fb, cached_slot);
+                            let _ = self.call_import(
                                 &mut fb,
-                                "wir_obj_set_field",
+                                "jit_obj_store_slot",
                                 |s| {
-                                    s.params.push(AbiParam::new(types::I64)); // obj
-                                    s.params.push(AbiParam::new(types::I64)); // field_id (SMI)
-                                    s.params.push(AbiParam::new(types::I64)); // val
-                                    s.returns.push(AbiParam::new(types::I64)); // status / 0 (ignored)
+                                    s.params.push(AbiParam::new(types::I64));
+                                    s.params.push(AbiParam::new(types::I64));
+                                    s.params.push(AbiParam::new(types::I64));
+                                    s.returns.push(AbiParam::new(types::I64));
                                 },
-                                &[o, fid, v],
+                                &[recv, slot_index, value],
                             )?;
+                            fb.ins().jump(bb_exit, &[BlockArg::from(zero)]);
+
+                            fb.switch_to_block(bb_slow);
+                            let fid_const = fb.ins().iconst(types::I64, field.0 as i64);
+                            let slow = self.call_import(
+                                &mut fb,
+                                "jit_obj_set_field_slow",
+                                |s| {
+                                    s.params.push(AbiParam::new(ptr_ty));
+                                    s.params.push(AbiParam::new(types::I64));
+                                    s.params.push(AbiParam::new(types::I64));
+                                    s.params.push(AbiParam::new(types::I64));
+                                    s.returns.push(AbiParam::new(types::I64));
+                                },
+                                &[ic_ptr, recv, fid_const, value],
+                            )?;
+                            fb.ins().jump(bb_exit, &[BlockArg::from(slow)]);
+
+                            fb.switch_to_block(bb_exit);
                             if res_count == 1 {
-                                vmap.bind(node.results[0], out);
+                                vmap.bind(node.results[0], res_phi);
                             }
                         }
 

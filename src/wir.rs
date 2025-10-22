@@ -1186,8 +1186,11 @@ impl<'m> Builder<'m> {
             use crate::wir::Inst;
             matches!(
                 self.func.nodes[inst_id.0 as usize].kind,
-                Inst::Return(_) | Inst::Throw(_)
-                    | Inst::Jump(_, _) | Inst::Branch { .. } | Inst::Switch { .. }
+                Inst::Return(_)
+                    | Inst::Throw(_)
+                    | Inst::Jump(_, _)
+                    | Inst::Branch { .. }
+                    | Inst::Switch { .. }
             )
         } else {
             false
