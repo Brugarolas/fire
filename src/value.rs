@@ -404,13 +404,15 @@ pub unsafe fn array_get(arr_v: ValueRepr, idx: usize) -> ValueRepr {
 pub unsafe fn array_set(arr_v: ValueRepr, idx: usize, val: ValueRepr) -> ValueRepr {
     let a = &mut *as_boxed_array_mut(arr_v);
     if idx >= a.buf.len() {
-        a.buf.resize(idx + 1, 0);
+        a.buf.resize_with(idx + 1, || 0);
     }
     let slot: *mut i64 = a.buf.as_mut_ptr().add(idx);
     *slot = val;
 
     #[cfg(feature = "gc")]
-    NAPALM_GC.post_write_barrier(arr_v as *mut u8, slot, val);
+    if is_ptr(val) {
+        NAPALM_GC.post_write_barrier(arr_v as *mut u8, slot, val);
+    }
 
     0
 }
@@ -430,7 +432,9 @@ pub unsafe fn array_push(arr_v: ValueRepr, val: ValueRepr) -> ValueRepr {
     let slot = a.buf.as_mut_ptr().add(last);
 
     #[cfg(feature = "gc")]
-    NAPALM_GC.post_write_barrier(arr_v as *mut u8, slot, val);
+    if is_ptr(val) {
+        NAPALM_GC.post_write_barrier(arr_v as *mut u8, slot, val);
+    }
 
     make_smi(a.buf.len() as i64)
 }
@@ -458,7 +462,9 @@ pub unsafe fn array_unshift(arr_v: ValueRepr, val: ValueRepr) -> ValueRepr {
     let slot = a.buf.as_mut_ptr(); // index 0
 
     #[cfg(feature = "gc")]
-    NAPALM_GC.post_write_barrier(arr_v as *mut u8, slot, val);
+    if is_ptr(val) {
+        NAPALM_GC.post_write_barrier(arr_v as *mut u8, slot, val);
+    }
 
     make_smi(a.buf.len() as i64)
 }
@@ -554,7 +560,7 @@ pub unsafe fn array_filter(arr_v: ValueRepr, clo_ptr: ValueRepr) -> ValueRepr {
     }
 
     let a = &*as_boxed_array_ref(arr_v);
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(a.buf.len() / 2); // Heuristic capacity
     for &x in &a.buf {
         let args = [x];
         let ok = wir_call_closure(clo_ptr, args.as_ptr(), 1);
@@ -599,16 +605,27 @@ pub unsafe fn array_reduce(
 pub unsafe fn array_fill(arr_v: ValueRepr, val: ValueRepr) -> ValueRepr {
     let a = &mut *as_boxed_array_mut(arr_v);
     let base = a.buf.as_mut_ptr();
-    for i in 0..a.buf.len() {
-        let slot = base.add(i);
-        *slot = val;
+    let len = a.buf.len();
 
-        #[cfg(feature = "gc")]
-        {
+    #[cfg(feature = "gc")]
+    if is_ptr(val) {
+        for i in 0..len {
+            let slot = base.add(i);
+            *slot = val;
             NAPALM_GC.post_write_barrier(arr_v as *mut u8, slot, val);
             NAPALM_GC.maybe_safepoint();
         }
+    } else {
+        for i in 0..len {
+            *base.add(i) = val;
+        }
     }
+
+    #[cfg(not(feature = "gc"))]
+    for i in 0..len {
+        *base.add(i) = val;
+    }
+
     0
 }
 
@@ -618,21 +635,28 @@ pub unsafe fn array_copy(dst_v: ValueRepr, src_v: ValueRepr, n: usize) -> ValueR
     let s = &*as_boxed_array_ref(src_v);
 
     if d.buf.len() < n {
-        d.buf.resize(n, 0);
+        d.buf.resize_with(n, || 0);
     }
 
     let nn = n.min(s.buf.len());
     let dptr = d.buf.as_mut_ptr();
     let sptr = s.buf.as_ptr();
 
-    for i in 0..nn {
-        let v = *sptr.add(i);
-        let slot = dptr.add(i);
-        *slot = v;
-
-        #[cfg(feature = "gc")]
-        NAPALM_GC.post_write_barrier(dst_v as *mut u8, slot, v);
+    #[cfg(feature = "gc")]
+    {
+        for i in 0..nn {
+            let v = *sptr.add(i);
+            let slot = dptr.add(i);
+            *slot = v;
+            if is_ptr(v) {
+                NAPALM_GC.post_write_barrier(dst_v as *mut u8, slot, v);
+            }
+        }
     }
+
+    #[cfg(not(feature = "gc"))]
+    ptr::copy_nonoverlapping(sptr, dptr, nn);
+
     for i in nn..n {
         *dptr.add(i) = 0;
     }
@@ -1160,7 +1184,8 @@ pub unsafe extern "C" fn wir_string_pad_end(s_val: i64, max_len_smi: i64, fill_v
         return s_val;
     }
     let needed = target_len - s.len();
-    let mut result = s.to_string();
+    let mut result = String::with_capacity(target_len);
+    result.push_str(s);
     result.extend(fill.chars().cycle().take(needed));
     allocate_new_string(&result)
 }
@@ -1178,7 +1203,7 @@ pub unsafe extern "C" fn wir_string_pad_start(s_val: i64, max_len_smi: i64, fill
         return s_val;
     }
     let needed = target_len - s.len();
-    let mut padding = String::with_capacity(needed);
+    let mut padding = String::with_capacity(target_len);
     padding.extend(fill.chars().cycle().take(needed));
     padding.push_str(s);
     allocate_new_string(&padding)
@@ -1395,7 +1420,9 @@ pub unsafe fn closure_set_env_slot(v: ValueRepr, idx: usize, val: ValueRepr) {
     *slot = val;
 
     #[cfg(feature = "gc")]
-    NAPALM_GC.post_write_barrier(v as *mut u8, slot, val);
+    if is_ptr(val) {
+        NAPALM_GC.post_write_barrier(v as *mut u8, slot, val);
+    }
 }
 
 // ============================================================================
@@ -1637,11 +1664,11 @@ pub unsafe fn obj_get_slot(obj_v: ValueRepr, slot: usize) -> ValueRepr {
 pub unsafe fn obj_set_slot_known(obj_v: ValueRepr, slot: usize, val: ValueRepr) {
     let o = &mut *as_obj_mut(obj_v);
     if o.slots.len() <= slot {
-        o.slots.resize(slot + 1, NULL);
+        o.slots.resize_with(slot + 1, || NULL);
     }
     o.slots[slot] = val;
     #[cfg(feature = "gc")]
-    {
+    if is_ptr(val) {
         let slot_ptr = o.slots.as_mut_ptr().add(slot);
         NAPALM_GC.post_write_barrier(obj_v as *mut u8, slot_ptr, val);
     }
@@ -1653,7 +1680,9 @@ pub unsafe fn obj_set_proto(obj_v: ValueRepr, proto: ValueRepr) -> ValueRepr {
     o.proto = proto;
 
     #[cfg(feature = "gc")]
-    NAPALM_GC.post_write_barrier(obj_v as *mut u8, &mut o.proto, proto);
+    if is_ptr(proto) {
+        NAPALM_GC.post_write_barrier(obj_v as *mut u8, &mut o.proto, proto);
+    }
 
     0
 }
@@ -1694,7 +1723,7 @@ pub unsafe fn obj_set_field(obj_v: ValueRepr, fid: u32, val: ValueRepr) -> Value
         }
 
         if o.slots.len() < new_len {
-            o.slots.resize(new_len, NULL);
+            o.slots.resize_with(new_len, || NULL);
         }
 
         slot = Some(new_slot);
@@ -1702,11 +1731,11 @@ pub unsafe fn obj_set_field(obj_v: ValueRepr, fid: u32, val: ValueRepr) -> Value
 
     let slot = slot.expect("slot must exist after ensure_add");
     if o.slots.len() <= slot {
-        o.slots.resize(slot + 1, NULL);
+        o.slots.resize_with(slot + 1, || NULL);
     }
     o.slots[slot] = val;
     #[cfg(feature = "gc")]
-    {
+    if is_ptr(val) {
         let slot_ptr = o.slots.as_mut_ptr().add(slot);
         NAPALM_GC.post_write_barrier(obj_v as *mut u8, slot_ptr, val);
     }
@@ -1771,7 +1800,9 @@ pub unsafe fn obj_set_str(obj_v: ValueRepr, key: &str, val: ValueRepr) -> ValueR
     *cell = val;
 
     #[cfg(feature = "gc")]
-    NAPALM_GC.post_write_barrier(obj_v as *mut u8, slot, val);
+    if is_ptr(val) {
+        NAPALM_GC.post_write_barrier(obj_v as *mut u8, slot, val);
+    }
 
     val
 }
@@ -1814,7 +1845,7 @@ pub unsafe fn obj_assign(dst_v: ValueRepr, src_v: ValueRepr) -> ValueRepr {
         *entry = val;
 
         #[cfg(feature = "gc")]
-        {
+        if is_ptr(val) {
             let slot: *mut ValueRepr = entry as *mut ValueRepr;
             NAPALM_GC.post_write_barrier(dst_v as *mut u8, slot, val);
         }
@@ -1847,20 +1878,21 @@ pub unsafe fn obj_clone_shallow(src_v: ValueRepr) -> ValueRepr {
 
     #[cfg(feature = "gc")]
     {
-        NAPALM_GC.post_write_barrier(clone_v as *mut u8, &mut clone.proto, src.proto);
+        if is_ptr(src.proto) {
+            NAPALM_GC.post_write_barrier(clone_v as *mut u8, &mut clone.proto, src.proto);
+        }
         let len = clone.slots.len();
         let ptr = clone.slots.as_mut_ptr();
         for i in 0..len {
-            let slot_ptr = ptr.add(i);
-            let val = *slot_ptr;
-            if is_ptr(val) && val != NULL {
-                NAPALM_GC.post_write_barrier(clone_v as *mut u8, slot_ptr, val);
+            let val = *ptr.add(i);
+            if is_ptr(val) {
+                NAPALM_GC.post_write_barrier(clone_v as *mut u8, ptr.add(i), val);
             }
         }
         for val in clone.dict.values_mut() {
-            let slot_ptr = val as *mut ValueRepr;
             let v = *val;
-            if is_ptr(v) && v != NULL {
+            if is_ptr(v) {
+                let slot_ptr = val as *mut ValueRepr;
                 NAPALM_GC.post_write_barrier(clone_v as *mut u8, slot_ptr, v);
             }
         }
@@ -2021,10 +2053,10 @@ pub fn proxy_new(target: ValueRepr, handler: ValueRepr) -> ValueRepr {
         {
             NAPALM_GC.post_alloc_object(p, size);
             let proxy_obj = &mut *proxy;
-            if is_ptr(target) && target != NULL {
+            if is_ptr(target) {
                 NAPALM_GC.post_write_barrier(p, &mut proxy_obj.target, target);
             }
-            if is_ptr(handler) && handler != NULL {
+            if is_ptr(handler) {
                 NAPALM_GC.post_write_barrier(p, &mut proxy_obj.handler, handler);
             }
         }
