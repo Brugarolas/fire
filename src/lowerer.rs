@@ -111,24 +111,27 @@ where
 {
     let stack_depth_before = active_try.len();
 
-    let mut mutated_names = collect_mut_locals_in_block(try_block);
+    let mut mutated_names: Vec<String> = locals.keys().cloned().collect();
+    mutated_names.extend(collect_mut_locals_in_block(try_block));
     if let Some(c) = catch {
         mutated_names.extend(collect_mut_locals_in_block(&c.body));
     }
     if let Some(fin) = finally_block {
         mutated_names.extend(collect_mut_locals_in_block(fin));
     }
-    if locals.contains_key("__deferred") {
-        mutated_names.push("__deferred".to_string());
-    }
-    mutated_names.sort();
-    mutated_names.dedup();
-    mutated_names.retain(|name| locals.contains_key(name));
-
     let try_entry = b.block();
     let continuation = b.block();
     let finally_entry = finally_block.map(|_| b.block());
     let catch_entry = catch.map(|_| b.block());
+
+    mutated_names.sort();
+    mutated_names.dedup();
+    mutated_names.retain(|name| locals.contains_key(name));
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[lower_try] try_entry={:?} continuation={:?} mutated={:?}",
+        try_entry, continuation, mutated_names
+    );
 
     let mut cont_params: HashMap<String, ValueId> = HashMap::new();
     for name in &mutated_names {
@@ -197,6 +200,12 @@ where
         active_try,
     )?;
     if !b.block_has_terminator(try_entry) {
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[lower_try] after try-body mutated={:?} keys={:?}",
+            mutated_names,
+            locals_try.keys().collect::<Vec<_>>()
+        );
         let args = gather_args(&locals_try);
         let locals_vec = args.clone();
         let _ = b.push_node(
@@ -239,6 +248,12 @@ where
             active_try,
         )?;
         if !b.block_has_terminator(catch_id) {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[lower_try] catch path mutated={:?} keys={:?}",
+                mutated_names,
+                locals_catch.keys().collect::<Vec<_>>()
+            );
             let args = gather_args(&locals_catch);
             let locals_vec = args.clone();
             let _ = b.push_node(
@@ -283,6 +298,12 @@ where
             active_try,
         )?;
         if !b.block_has_terminator(fin_id) {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[lower_try] finally path mutated={:?} keys={:?}",
+                mutated_names,
+                locals_finally.keys().collect::<Vec<_>>()
+            );
             let args = gather_args(&locals_finally);
             b.jump(continuation, &args);
             cont_has_path = true;
