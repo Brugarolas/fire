@@ -42,7 +42,7 @@ tinyvec_macros = "0.1.1"
 #stringzilla = "4.0.11" # Fast string handling
 compact_str = "0.9.0" # String drop-in replacement
 
-parking_lot = "0.12.4" # Concurrency primitives
+parking_lot = "0.12.5" # Concurrency primitives
 #syncrs = "0.5.0" # Spinlock based sync primitives
 
 #log = "0.4.28" # Log tracing
@@ -71,26 +71,34 @@ bumpalo = "3.19.0"
 mimalloc = "0.1.48"
 
 libc = "0.2.176"
-windows-sys = { version = "0.61.0", features = ["Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_System_Threading"] }
 
-tokio = { version = "1.46.1", features = ["full", "rt-multi-thread", "macros"] }
-axum = "0.8.4"
+tokio = { version = "1.48.0", features = ["full", "rt-multi-thread", "macros"] }
+axum = "0.8.6"
 tokio-stream = "0.1.17"
 futures-util = "0.3.31"
-reqwest = "0.12.23"
+reqwest = "0.12.24"
 
-serde = "1.0.225"
+serde = "1.0.228"
 serde_json = "1.0.145"
 
-cranelift = "0.124.2"
-cranelift-module = "0.124.2"
-cranelift-object = "0.124.2"
-cranelift-jit = "0.124.2"
-cranelift-native = "0.124.2"
-cranelift-codegen = "0.124.2"
-cranelift-frontend = "0.124.2"
+cranelift = "0.125.3"
+cranelift-module = "0.125.3"
+cranelift-object = "0.125.3"
+cranelift-jit = "0.125.3"
+cranelift-native = "0.125.3"
+cranelift-codegen = "0.125.3"
+cranelift-frontend = "0.125.3"
 
-memmap2 = "0.9.8"
+# cranelift = { git = "file:///Users/andres/Documents/GitHub/wasmtime" }
+# cranelift-module = { git = "file:///Users/andres/Documents/GitHub/wasmtime" }
+# cranelift-object = { git = "file:///Users/andres/Documents/GitHub/wasmtime" }
+# cranelift-jit = { git = "file:///Users/andres/Documents/GitHub/wasmtime" }
+# cranelift-native = { git = "file:///Users/andres/Documents/GitHub/wasmtime" }
+# cranelift-codegen = { git = "file:///Users/andres/Documents/GitHub/wasmtime" }
+# cranelift-frontend = { git = "file:///Users/andres/Documents/GitHub/wasmtime" }
+
+memmap2 = "0.9.9"
 target-lexicon = "0.13.3"
 memoffset = "0.9.1"
 
