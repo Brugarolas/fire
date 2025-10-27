@@ -22,45 +22,95 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 #[repr(C)]
-struct FieldInlineCache {
+struct FieldCacheEntry {
     shape: AtomicU32,
     slot: AtomicUsize,
+}
+
+impl FieldCacheEntry {
+    const fn new() -> Self {
+        Self {
+            shape: AtomicU32::new(u32::MAX),
+            slot: AtomicUsize::new(usize::MAX),
+        }
+    }
+}
+
+#[repr(C)]
+struct FieldInlineCache {
+    entries: [FieldCacheEntry; FieldInlineCache::PIC_SIZE],
 }
 
 impl FieldInlineCache {
     const INVALID_SHAPE: u32 = u32::MAX;
     const ABSENT_SLOT: usize = usize::MAX;
+    const PIC_SIZE: usize = 8;
 
     const fn new() -> Self {
         Self {
-            shape: AtomicU32::new(Self::INVALID_SHAPE),
-            slot: AtomicUsize::new(Self::ABSENT_SLOT),
+            entries: [
+                FieldCacheEntry::new(),
+                FieldCacheEntry::new(),
+                FieldCacheEntry::new(),
+                FieldCacheEntry::new(),
+                FieldCacheEntry::new(),
+                FieldCacheEntry::new(),
+                FieldCacheEntry::new(),
+                FieldCacheEntry::new(),
+            ],
+        }
+    }
+
+    fn invalidate(&self) {
+        for entry in &self.entries {
+            entry.slot.store(Self::ABSENT_SLOT, Ordering::Relaxed);
+            entry
+                .shape
+                .store(Self::INVALID_SHAPE, Ordering::Release);
         }
     }
 
     fn update(&self, shape: u32, slot: Option<usize>) {
+        if shape == Self::INVALID_SHAPE {
+            return;
+        }
         let slot_val = slot.unwrap_or(Self::ABSENT_SLOT);
-        self.slot.store(slot_val, Ordering::Relaxed);
-        // publish new shape after slot update so readers never observe stale slot with fresh shape
-        self.shape.store(shape, Ordering::Release);
+        for entry in &self.entries {
+            if entry.shape.load(Ordering::Acquire) == shape {
+                entry.slot.store(slot_val, Ordering::Relaxed);
+                return;
+            }
+        }
+        self.install_entry(shape, slot_val);
+    }
+
+    fn install_entry(&self, shape: u32, slot: usize) {
+        for idx in (1..Self::PIC_SIZE).rev() {
+            let prev_shape = self.entries[idx - 1].shape.load(Ordering::Acquire);
+            let prev_slot = self.entries[idx - 1].slot.load(Ordering::Relaxed);
+            self.entries[idx].slot.store(prev_slot, Ordering::Relaxed);
+            self.entries[idx].shape.store(prev_shape, Ordering::Release);
+        }
+        self.entries[0].slot.store(slot, Ordering::Relaxed);
+        self.entries[0].shape.store(shape, Ordering::Release);
     }
 
     fn mark_absent(&self, shape: u32) {
-        self.slot.store(Self::ABSENT_SLOT, Ordering::Relaxed);
-        self.shape.store(shape, Ordering::Release);
-    }
-
-    fn invalidate(&self) {
-        self.slot.store(Self::ABSENT_SLOT, Ordering::Relaxed);
-        self.shape.store(Self::INVALID_SHAPE, Ordering::Release);
+        self.update(shape, None);
     }
 }
 
 const OBJ_TAG_OFFSET: i32 = offset_of!(BoxedObj, hdr) as i32 + offset_of!(ObjHeader, tag) as i32;
 const OBJ_SHAPE_OFFSET: i32 = offset_of!(BoxedObj, shape) as i32;
 const OBJ_SLOTS_OFFSET: i32 = offset_of!(BoxedObj, slots) as i32;
-const FIELD_IC_SHAPE_OFFSET: i32 = offset_of!(FieldInlineCache, shape) as i32;
-const FIELD_IC_SLOT_OFFSET: i32 = offset_of!(FieldInlineCache, slot) as i32;
+const FIELD_IC_ENTRIES_OFFSET: i32 = offset_of!(FieldInlineCache, entries) as i32;
+const FIELD_IC_ENTRY_STRIDE: i32 = std::mem::size_of::<FieldCacheEntry>() as i32;
+const FIELD_IC_ENTRY_SHAPE_OFFSET: i32 = offset_of!(FieldCacheEntry, shape) as i32;
+const FIELD_IC_ENTRY_SLOT_OFFSET: i32 = offset_of!(FieldCacheEntry, slot) as i32;
+const FIELD_IC_SHAPE_OFFSET: i32 =
+    FIELD_IC_ENTRIES_OFFSET + FIELD_IC_ENTRY_SHAPE_OFFSET;
+const FIELD_IC_SLOT_OFFSET: i32 =
+    FIELD_IC_ENTRIES_OFFSET + FIELD_IC_ENTRY_SLOT_OFFSET;
 const ARRAY_BUF_OFFSET: i32 = offset_of!(BoxedArray, buf) as i32;
 const VEC_PTR_OFFSET: i32 = 0;
 const VEC_LEN_OFFSET: i32 = core::mem::size_of::<usize>() as i32;
@@ -3936,6 +3986,8 @@ impl JIT {
                                     let bb_check = fb.create_block();
                                     let bb_cache = fb.create_block();
                                     let bb_slot_state = fb.create_block();
+                                    let slot_param =
+                                        fb.append_block_param(bb_slot_state, ptr_ty);
                                     let bb_slow = fb.create_block();
                                     let bb_exit = fb.create_block();
                                     let res_phi = fb.append_block_param(bb_exit, types::I64);
@@ -3969,6 +4021,11 @@ impl JIT {
                                         &[] as &[BlockArg],
                                     );
 
+                                    let check_blocks: [Block; FieldInlineCache::PIC_SIZE] =
+                                        std::array::from_fn(|_| fb.create_block());
+                                    let hit_blocks: [Block; FieldInlineCache::PIC_SIZE] =
+                                        std::array::from_fn(|_| fb.create_block());
+
                                     fb.switch_to_block(bb_cache);
                                     let shape_u32 = fb.ins().load(
                                         types::I32,
@@ -3977,30 +4034,52 @@ impl JIT {
                                         OBJ_SHAPE_OFFSET,
                                     );
                                     let shape = fb.ins().uextend(types::I64, shape_u32);
-                                    let cached_shape_u32 = fb.ins().load(
-                                        types::I32,
-                                        MemFlags::trusted(),
-                                        ic_ptr,
-                                        FIELD_IC_SHAPE_OFFSET,
-                                    );
-                                    let cached_shape =
-                                        fb.ins().uextend(types::I64, cached_shape_u32);
-                                    let shape_match =
-                                        fb.ins().icmp(IntCC::Equal, shape, cached_shape);
-                                    fb.ins().brif(
-                                        shape_match,
-                                        bb_slot_state,
-                                        &[] as &[BlockArg],
-                                        bb_slow,
-                                        &[] as &[BlockArg],
-                                    );
+                                    fb.ins().jump(check_blocks[0], &[] as &[BlockArg]);
+
+                                    for idx in 0..FieldInlineCache::PIC_SIZE {
+                                        let miss_block = if idx + 1 < FieldInlineCache::PIC_SIZE {
+                                            check_blocks[idx + 1]
+                                        } else {
+                                            bb_slow
+                                        };
+
+                                        fb.switch_to_block(check_blocks[idx]);
+                                        let shape_off = FIELD_IC_SHAPE_OFFSET
+                                            + (idx as i32) * FIELD_IC_ENTRY_STRIDE;
+                                        let cached_shape_u32 = fb.ins().load(
+                                            types::I32,
+                                            MemFlags::trusted(),
+                                            ic_ptr,
+                                            shape_off,
+                                        );
+                                        let cached_shape =
+                                            fb.ins().uextend(types::I64, cached_shape_u32);
+                                        let shape_match =
+                                            fb.ins().icmp(IntCC::Equal, shape, cached_shape);
+                                        fb.ins().brif(
+                                            shape_match,
+                                            hit_blocks[idx],
+                                            &[] as &[BlockArg],
+                                            miss_block,
+                                            &[] as &[BlockArg],
+                                        );
+
+                                        fb.switch_to_block(hit_blocks[idx]);
+                                        let slot_off = FIELD_IC_SLOT_OFFSET
+                                            + (idx as i32) * FIELD_IC_ENTRY_STRIDE;
+                                        let slot_ptr =
+                                            fb.ins().iadd_imm(ic_ptr, slot_off as i64);
+                                        fb.ins()
+                                            .jump(bb_slot_state, &[BlockArg::from(slot_ptr)]);
+                                    }
 
                                     fb.switch_to_block(bb_slot_state);
+                                    let slot_ptr_val = slot_param;
                                     let cached_slot = fb.ins().load(
                                         ptr_ty,
                                         MemFlags::trusted(),
-                                        ic_ptr,
-                                        FIELD_IC_SLOT_OFFSET,
+                                        slot_ptr_val,
+                                        0,
                                     );
                                     let absent = fb.ins().iconst(ptr_ty, -1);
                                     let has_slot =
@@ -4050,6 +4129,8 @@ impl JIT {
                                     let bb_check = fb.create_block();
                                     let bb_cache = fb.create_block();
                                     let bb_slot_state = fb.create_block();
+                                    let slot_param =
+                                        fb.append_block_param(bb_slot_state, ptr_ty);
                                     let bb_slow = fb.create_block();
                                     let bb_exit = fb.create_block();
                                     let res_phi = fb.append_block_param(bb_exit, types::I64);
@@ -4083,6 +4164,11 @@ impl JIT {
                                         &[] as &[BlockArg],
                                     );
 
+                                    let check_blocks: [Block; FieldInlineCache::PIC_SIZE] =
+                                        std::array::from_fn(|_| fb.create_block());
+                                    let hit_blocks: [Block; FieldInlineCache::PIC_SIZE] =
+                                        std::array::from_fn(|_| fb.create_block());
+
                                     fb.switch_to_block(bb_cache);
                                     let shape_u32 = fb.ins().load(
                                         types::I32,
@@ -4091,30 +4177,52 @@ impl JIT {
                                         OBJ_SHAPE_OFFSET,
                                     );
                                     let shape = fb.ins().uextend(types::I64, shape_u32);
-                                    let cached_shape_u32 = fb.ins().load(
-                                        types::I32,
-                                        MemFlags::trusted(),
-                                        ic_ptr,
-                                        FIELD_IC_SHAPE_OFFSET,
-                                    );
-                                    let cached_shape =
-                                        fb.ins().uextend(types::I64, cached_shape_u32);
-                                    let shape_match =
-                                        fb.ins().icmp(IntCC::Equal, shape, cached_shape);
-                                    fb.ins().brif(
-                                        shape_match,
-                                        bb_slot_state,
-                                        &[] as &[BlockArg],
-                                        bb_slow,
-                                        &[] as &[BlockArg],
-                                    );
+                                    fb.ins().jump(check_blocks[0], &[] as &[BlockArg]);
+
+                                    for idx in 0..FieldInlineCache::PIC_SIZE {
+                                        let miss_block = if idx + 1 < FieldInlineCache::PIC_SIZE {
+                                            check_blocks[idx + 1]
+                                        } else {
+                                            bb_slow
+                                        };
+
+                                        fb.switch_to_block(check_blocks[idx]);
+                                        let shape_off = FIELD_IC_SHAPE_OFFSET
+                                            + (idx as i32) * FIELD_IC_ENTRY_STRIDE;
+                                        let cached_shape_u32 = fb.ins().load(
+                                            types::I32,
+                                            MemFlags::trusted(),
+                                            ic_ptr,
+                                            shape_off,
+                                        );
+                                        let cached_shape =
+                                            fb.ins().uextend(types::I64, cached_shape_u32);
+                                        let shape_match =
+                                            fb.ins().icmp(IntCC::Equal, shape, cached_shape);
+                                        fb.ins().brif(
+                                            shape_match,
+                                            hit_blocks[idx],
+                                            &[] as &[BlockArg],
+                                            miss_block,
+                                            &[] as &[BlockArg],
+                                        );
+
+                                        fb.switch_to_block(hit_blocks[idx]);
+                                        let slot_off = FIELD_IC_SLOT_OFFSET
+                                            + (idx as i32) * FIELD_IC_ENTRY_STRIDE;
+                                        let slot_ptr =
+                                            fb.ins().iadd_imm(ic_ptr, slot_off as i64);
+                                        fb.ins()
+                                            .jump(bb_slot_state, &[BlockArg::from(slot_ptr)]);
+                                    }
 
                                     fb.switch_to_block(bb_slot_state);
+                                    let slot_ptr_val = slot_param;
                                     let cached_slot = fb.ins().load(
                                         ptr_ty,
                                         MemFlags::trusted(),
-                                        ic_ptr,
-                                        FIELD_IC_SLOT_OFFSET,
+                                        slot_ptr_val,
+                                        0,
                                     );
                                     let absent = fb.ins().iconst(ptr_ty, -1);
                                     let has_slot =
@@ -4458,7 +4566,11 @@ impl JIT {
                             let bb_check = fb.create_block();
                             let bb_cache = fb.create_block();
                             let bb_slot_state = fb.create_block();
+                            let slot_param =
+                                fb.append_block_param(bb_slot_state, ptr_ty);
                             let bb_load = fb.create_block();
+                            let load_slot_idx =
+                                fb.append_block_param(bb_load, types::I64);
                             let bb_absent = fb.create_block();
                             let bb_slow = fb.create_block();
                             let bb_exit = fb.create_block();
@@ -4485,13 +4597,18 @@ impl JIT {
                             let proxy_tag =
                                 fb.ins().iconst(types::I64, crate::value::TAG_PROXY as i64);
                             let is_proxy = fb.ins().icmp(IntCC::Equal, tag, proxy_tag);
-                            fb.ins().brif(
-                                is_proxy,
-                                bb_slow,
-                                &[] as &[BlockArg],
-                                bb_cache,
-                                &[] as &[BlockArg],
-                            );
+                                    fb.ins().brif(
+                                        is_proxy,
+                                        bb_slow,
+                                        &[] as &[BlockArg],
+                                        bb_cache,
+                                        &[] as &[BlockArg],
+                                    );
+
+                            let check_blocks: [Block; FieldInlineCache::PIC_SIZE] =
+                                std::array::from_fn(|_| fb.create_block());
+                            let hit_blocks: [Block; FieldInlineCache::PIC_SIZE] =
+                                std::array::from_fn(|_| fb.create_block());
 
                             fb.switch_to_block(bb_cache);
                             let shape_u32 = fb.ins().load(
@@ -4501,47 +4618,72 @@ impl JIT {
                                 OBJ_SHAPE_OFFSET,
                             );
                             let shape = fb.ins().uextend(types::I64, shape_u32);
-                            let cached_shape_u32 = fb.ins().load(
-                                types::I32,
-                                MemFlags::trusted(),
-                                ic_ptr,
-                                FIELD_IC_SHAPE_OFFSET,
-                            );
-                            let cached_shape = fb.ins().uextend(types::I64, cached_shape_u32);
-                            let shape_match = fb.ins().icmp(IntCC::Equal, shape, cached_shape);
-                            fb.ins().brif(
-                                shape_match,
-                                bb_slot_state,
-                                &[] as &[BlockArg],
-                                bb_slow,
-                                &[] as &[BlockArg],
-                            );
+                            fb.ins().jump(check_blocks[0], &[] as &[BlockArg]);
+
+                            for idx in 0..FieldInlineCache::PIC_SIZE {
+                                let miss_block = if idx + 1 < FieldInlineCache::PIC_SIZE {
+                                    check_blocks[idx + 1]
+                                } else {
+                                    bb_slow
+                                };
+
+                                fb.switch_to_block(check_blocks[idx]);
+                                let shape_off = FIELD_IC_SHAPE_OFFSET
+                                    + (idx as i32) * FIELD_IC_ENTRY_STRIDE;
+                                let cached_shape_u32 = fb.ins().load(
+                                    types::I32,
+                                    MemFlags::trusted(),
+                                    ic_ptr,
+                                    shape_off,
+                                );
+                                let cached_shape =
+                                    fb.ins().uextend(types::I64, cached_shape_u32);
+                                let shape_match =
+                                    fb.ins().icmp(IntCC::Equal, shape, cached_shape);
+                                fb.ins().brif(
+                                    shape_match,
+                                    hit_blocks[idx],
+                                    &[] as &[BlockArg],
+                                    miss_block,
+                                    &[] as &[BlockArg],
+                                );
+
+                                fb.switch_to_block(hit_blocks[idx]);
+                                let slot_off = FIELD_IC_SLOT_OFFSET
+                                    + (idx as i32) * FIELD_IC_ENTRY_STRIDE;
+                                let slot_ptr =
+                                    fb.ins().iadd_imm(ic_ptr, slot_off as i64);
+                                fb.ins()
+                                    .jump(bb_slot_state, &[BlockArg::from(slot_ptr)]);
+                            }
 
                             fb.switch_to_block(bb_slot_state);
+                            let slot_ptr_val = slot_param;
                             let cached_slot = fb.ins().load(
                                 ptr_ty,
                                 MemFlags::trusted(),
-                                ic_ptr,
-                                FIELD_IC_SLOT_OFFSET,
+                                slot_ptr_val,
+                                0,
                             );
                             let absent = fb.ins().iconst(ptr_ty, -1);
+                            let slot_index = self.ptr_to_i64(&mut fb, cached_slot);
                             let has_slot = fb.ins().icmp(IntCC::NotEqual, cached_slot, absent);
                             fb.ins().brif(
                                 has_slot,
                                 bb_load,
-                                &[] as &[BlockArg],
+                                &[BlockArg::from(slot_index)],
                                 bb_absent,
                                 &[] as &[BlockArg],
                             );
 
                             fb.switch_to_block(bb_load);
+                            let slot_index = load_slot_idx;
                             let slots_ptr = fb.ins().load(
                                 ptr_ty,
                                 MemFlags::trusted(),
                                 recv_ptr,
                                 OBJ_SLOTS_OFFSET,
                             );
-                            let slot_index = self.ptr_to_i64(&mut fb, cached_slot);
                             let byte_off = fb.ins().imul_imm(slot_index, 8);
                             let off_ptr = self.value_as_ptr(&mut fb, byte_off);
                             let addr = fb.ins().iadd(slots_ptr, off_ptr);
@@ -4589,7 +4731,11 @@ impl JIT {
                             let bb_check = fb.create_block();
                             let bb_cache = fb.create_block();
                             let bb_slot_state = fb.create_block();
+                            let slot_param =
+                                fb.append_block_param(bb_slot_state, ptr_ty);
                             let bb_store = fb.create_block();
+                            let store_slot_idx =
+                                fb.append_block_param(bb_store, types::I64);
                             let bb_slow = fb.create_block();
                             let bb_exit = fb.create_block();
                             let res_phi = fb.append_block_param(bb_exit, types::I64);
@@ -4615,13 +4761,18 @@ impl JIT {
                             let proxy_tag =
                                 fb.ins().iconst(types::I64, crate::value::TAG_PROXY as i64);
                             let is_proxy = fb.ins().icmp(IntCC::Equal, tag, proxy_tag);
-                            fb.ins().brif(
-                                is_proxy,
-                                bb_slow,
-                                &[] as &[BlockArg],
-                                bb_cache,
-                                &[] as &[BlockArg],
-                            );
+                                    fb.ins().brif(
+                                        is_proxy,
+                                        bb_slow,
+                                        &[] as &[BlockArg],
+                                        bb_cache,
+                                        &[] as &[BlockArg],
+                                    );
+
+                            let check_blocks: [Block; FieldInlineCache::PIC_SIZE] =
+                                std::array::from_fn(|_| fb.create_block());
+                            let hit_blocks: [Block; FieldInlineCache::PIC_SIZE] =
+                                std::array::from_fn(|_| fb.create_block());
 
                             fb.switch_to_block(bb_cache);
                             let shape_u32 = fb.ins().load(
@@ -4631,41 +4782,66 @@ impl JIT {
                                 OBJ_SHAPE_OFFSET,
                             );
                             let shape = fb.ins().uextend(types::I64, shape_u32);
-                            let cached_shape_u32 = fb.ins().load(
-                                types::I32,
-                                MemFlags::trusted(),
-                                ic_ptr,
-                                FIELD_IC_SHAPE_OFFSET,
-                            );
-                            let cached_shape = fb.ins().uextend(types::I64, cached_shape_u32);
-                            let shape_match = fb.ins().icmp(IntCC::Equal, shape, cached_shape);
-                            fb.ins().brif(
-                                shape_match,
-                                bb_slot_state,
-                                &[] as &[BlockArg],
-                                bb_slow,
-                                &[] as &[BlockArg],
-                            );
+                            fb.ins().jump(check_blocks[0], &[] as &[BlockArg]);
+
+                            for idx in 0..FieldInlineCache::PIC_SIZE {
+                                let miss_block = if idx + 1 < FieldInlineCache::PIC_SIZE {
+                                    check_blocks[idx + 1]
+                                } else {
+                                    bb_slow
+                                };
+
+                                fb.switch_to_block(check_blocks[idx]);
+                                let shape_off = FIELD_IC_SHAPE_OFFSET
+                                    + (idx as i32) * FIELD_IC_ENTRY_STRIDE;
+                                let cached_shape_u32 = fb.ins().load(
+                                    types::I32,
+                                    MemFlags::trusted(),
+                                    ic_ptr,
+                                    shape_off,
+                                );
+                                let cached_shape =
+                                    fb.ins().uextend(types::I64, cached_shape_u32);
+                                let shape_match =
+                                    fb.ins().icmp(IntCC::Equal, shape, cached_shape);
+                                fb.ins().brif(
+                                    shape_match,
+                                    hit_blocks[idx],
+                                    &[] as &[BlockArg],
+                                    miss_block,
+                                    &[] as &[BlockArg],
+                                );
+
+                                fb.switch_to_block(hit_blocks[idx]);
+                                let slot_off = FIELD_IC_SLOT_OFFSET
+                                    + (idx as i32) * FIELD_IC_ENTRY_STRIDE;
+                                let slot_ptr =
+                                    fb.ins().iadd_imm(ic_ptr, slot_off as i64);
+                                fb.ins()
+                                    .jump(bb_slot_state, &[BlockArg::from(slot_ptr)]);
+                            }
 
                             fb.switch_to_block(bb_slot_state);
+                            let slot_ptr_val = slot_param;
                             let cached_slot = fb.ins().load(
                                 ptr_ty,
                                 MemFlags::trusted(),
-                                ic_ptr,
-                                FIELD_IC_SLOT_OFFSET,
+                                slot_ptr_val,
+                                0,
                             );
                             let absent = fb.ins().iconst(ptr_ty, -1);
+                            let slot_index = self.ptr_to_i64(&mut fb, cached_slot);
                             let has_slot = fb.ins().icmp(IntCC::NotEqual, cached_slot, absent);
                             fb.ins().brif(
                                 has_slot,
                                 bb_store,
-                                &[] as &[BlockArg],
+                                &[BlockArg::from(slot_index)],
                                 bb_slow,
                                 &[] as &[BlockArg],
                             );
 
                             fb.switch_to_block(bb_store);
-                            let slot_index = self.ptr_to_i64(&mut fb, cached_slot);
+                            let slot_index = store_slot_idx;
                             let _ = self.call_import(
                                 &mut fb,
                                 "jit_obj_store_slot",
