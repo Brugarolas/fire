@@ -309,7 +309,7 @@ use crate::value::{
     wir_string_pad_start, wir_string_repeat, wir_string_replace, wir_string_replace_all,
     wir_string_slice, wir_string_split, wir_string_starts_with, wir_string_substring,
     wir_string_to_lower_case, wir_string_to_upper_case, wir_string_trim, wir_string_trim_end,
-    wir_string_trim_start, jit_string_alloc,
+    wir_string_trim_start, jit_string_intern_bytes,
 };
 
 impl JIT {
@@ -982,8 +982,9 @@ impl Default for JIT {
                 wir_string_concat_coerce as *const u8,
             );
             jb.symbol(
-                "jit_string_alloc",
-                jit_string_alloc as *const extern "C" fn(usize) -> *mut BoxedStr as *const u8,
+                "jit_string_intern_bytes",
+                jit_string_intern_bytes as *const extern "C" fn(*const u8, usize) -> i64
+                    as *const u8,
             );
             jb.symbol("memcmp", libc::memcmp as *const u8);
             jb.symbol("memcpy", libc::memcpy as *const u8);
@@ -1435,21 +1436,23 @@ impl JIT {
         }
     }
 
-    fn call_jit_string_alloc<'a>(
+    fn call_jit_intern_bytes<'a>(
         &mut self,
         fb: &mut cranelift_frontend::FunctionBuilder<'a>,
+        ptr: cranelift::prelude::Value,
         len: cranelift::prelude::Value,
     ) -> Result<cranelift::prelude::Value, String> {
         use cranelift::prelude::{AbiParam, types};
         let ptr_ty = self.ptr_ty();
         self.call_import(
             fb,
-            "jit_string_alloc",
+            "jit_string_intern_bytes",
             |s| {
                 s.params.push(AbiParam::new(ptr_ty));
-                s.returns.push(AbiParam::new(ptr_ty));
+                s.params.push(AbiParam::new(types::I64));
+                s.returns.push(AbiParam::new(types::I64));
             },
-            &[len],
+            &[ptr, len],
         )
     }
 
@@ -2987,17 +2990,20 @@ impl JIT {
                                     let char_ptr = self.value_as_ptr(&mut fb, char_addr);
                                     let ch = fb.ins().load(types::I8, MemFlags::trusted(), char_ptr, 0);
 
-                                    let len_one_ptr = self.value_as_ptr(&mut fb, one);
-                                    let new_str_ptr = self.call_jit_string_alloc(&mut fb, len_one_ptr)?;
-                                    let new_data_ptr = fb.ins().load(
-                                        self.ptr_ty(),
-                                        MemFlags::trusted(),
-                                        new_str_ptr,
-                                        STR_DATA_OFFSET,
+                                    let char_slot = fb.func.create_sized_stack_slot(
+                                        StackSlotData::new(
+                                            StackSlotKind::ExplicitSlot,
+                                            1u32,
+                                            0,
+                                        ),
                                     );
-                                    fb.ins().store(MemFlags::trusted(), ch, new_data_ptr, 0);
-                                    let result = self.ptr_to_i64(&mut fb, new_str_ptr);
-                                    fb.ins().jump(exit_block, &[BlockArg::from(result)]);
+                                    let buf_ptr =
+                                        fb.ins().stack_addr(self.ptr_ty(), char_slot, 0);
+                                    fb.ins().store(MemFlags::trusted(), ch, buf_ptr, 0);
+                                    let len_one = fb.ins().iconst(types::I64, 1);
+                                    let interned =
+                                        self.call_jit_intern_bytes(&mut fb, buf_ptr, len_one)?;
+                                    fb.ins().jump(exit_block, &[BlockArg::from(interned)]);
 
                                     fb.switch_to_block(slow_block);
                                     let slow = self.call_import(
@@ -3196,14 +3202,39 @@ impl JIT {
                                     );
 
                                     fb.switch_to_block(bb_alloc);
-                                    let total_len_ptr = self.value_as_ptr(&mut fb, total_len);
-                                    let new_str_ptr = self.call_jit_string_alloc(&mut fb, total_len_ptr)?;
-                                    let dst_ptr = fb.ins().load(
-                                        self.ptr_ty(),
-                                        MemFlags::trusted(),
-                                        new_str_ptr,
-                                        STR_DATA_OFFSET,
+                                    let is_empty =
+                                        fb.ins().icmp(IntCC::Equal, total_len, zero);
+                                    let bb_empty = fb.create_block();
+                                    let bb_copy = fb.create_block();
+                                    fb.ins().brif(
+                                        is_empty,
+                                        bb_empty,
+                                        &[] as &[BlockArg],
+                                        bb_copy,
+                                        &[] as &[BlockArg],
                                     );
+
+                                    fb.switch_to_block(bb_empty);
+                                    let ptr_zero = fb.ins().iconst(self.ptr_ty(), 0);
+                                    let len_zero = fb.ins().iconst(types::I64, 0);
+                                    let empty_res =
+                                        self.call_jit_intern_bytes(&mut fb, ptr_zero, len_zero)?;
+                                    fb.ins().jump(exit_block, &[BlockArg::from(empty_res)]);
+
+                                    fb.switch_to_block(bb_copy);
+                                    let len_plus7 = fb.ins().iadd_imm(total_len, 7);
+                                    let words = fb.ins().ushr_imm(len_plus7, 3);
+                                    let ptr_ty_cached = self.ptr_ty();
+                                    let buf_words = self.call_import(
+                                        &mut fb,
+                                        "wir_alloc_words",
+                                        |s| {
+                                            s.params.push(AbiParam::new(types::I64));
+                                            s.returns.push(AbiParam::new(ptr_ty_cached));
+                                        },
+                                        &[words],
+                                    )?;
+                                    let buf_ptr = buf_words;
 
                                     let len_a_zero = fb.ins().icmp(IntCC::Equal, len_a, zero);
                                     let bb_copy_a = fb.create_block();
@@ -3224,7 +3255,7 @@ impl JIT {
                                         STR_DATA_OFFSET,
                                     );
                                     let len_a_ptr = self.value_as_ptr(&mut fb, len_a);
-                                    let _ = self.call_memcpy(&mut fb, dst_ptr, data_a, len_a_ptr)?;
+                                    let _ = self.call_memcpy(&mut fb, buf_ptr, data_a, len_a_ptr)?;
                                     fb.ins().jump(bb_after_a, &[] as &[BlockArg]);
 
                                     fb.switch_to_block(bb_after_a);
@@ -3246,16 +3277,28 @@ impl JIT {
                                         b_ptr,
                                         STR_DATA_OFFSET,
                                     );
-                                    let dst_i64 = self.ptr_to_i64(&mut fb, dst_ptr);
-                                    let dst_b_i64 = fb.ins().iadd(dst_i64, len_a);
+                                    let buf_i64 = self.ptr_to_i64(&mut fb, buf_ptr);
+                                    let dst_b_i64 = fb.ins().iadd(buf_i64, len_a);
                                     let dst_b_ptr = self.value_as_ptr(&mut fb, dst_b_i64);
                                     let len_b_ptr = self.value_as_ptr(&mut fb, len_b);
                                     let _ = self.call_memcpy(&mut fb, dst_b_ptr, data_b, len_b_ptr)?;
                                     fb.ins().jump(bb_after_b, &[] as &[BlockArg]);
 
                                     fb.switch_to_block(bb_after_b);
-                                    let result = self.ptr_to_i64(&mut fb, new_str_ptr);
-                                    fb.ins().jump(exit_block, &[BlockArg::from(result)]);
+                                    let interned =
+                                        self.call_jit_intern_bytes(&mut fb, buf_ptr, total_len)?;
+                                    let ptr_ty_cached = self.ptr_ty();
+                                    let _ = self.call_import(
+                                        &mut fb,
+                                        "wir_free_words",
+                                        |s| {
+                                            s.params.push(AbiParam::new(ptr_ty_cached));
+                                            s.params.push(AbiParam::new(types::I64));
+                                            s.returns.push(AbiParam::new(types::I64));
+                                        },
+                                        &[buf_words, words],
+                                    )?;
+                                    fb.ins().jump(exit_block, &[BlockArg::from(interned)]);
 
                                     fb.switch_to_block(slow_block);
                                     let slow_res = self.call_import(
@@ -3382,14 +3425,39 @@ impl JIT {
                                     );
 
                                     fb.switch_to_block(bb_alloc);
-                                    let total_len_ptr = self.value_as_ptr(&mut fb, total_len);
-                                    let new_str_ptr = self.call_jit_string_alloc(&mut fb, total_len_ptr)?;
-                                    let dst_ptr = fb.ins().load(
-                                        self.ptr_ty(),
-                                        MemFlags::trusted(),
-                                        new_str_ptr,
-                                        STR_DATA_OFFSET,
+                                    let is_empty =
+                                        fb.ins().icmp(IntCC::Equal, total_len, zero);
+                                    let bb_empty = fb.create_block();
+                                    let bb_copy = fb.create_block();
+                                    fb.ins().brif(
+                                        is_empty,
+                                        bb_empty,
+                                        &[] as &[BlockArg],
+                                        bb_copy,
+                                        &[] as &[BlockArg],
                                     );
+
+                                    fb.switch_to_block(bb_empty);
+                                    let ptr_zero = fb.ins().iconst(self.ptr_ty(), 0);
+                                    let len_zero = fb.ins().iconst(types::I64, 0);
+                                    let empty_res =
+                                        self.call_jit_intern_bytes(&mut fb, ptr_zero, len_zero)?;
+                                    fb.ins().jump(exit_block, &[BlockArg::from(empty_res)]);
+
+                                    fb.switch_to_block(bb_copy);
+                                    let len_plus7 = fb.ins().iadd_imm(total_len, 7);
+                                    let words = fb.ins().ushr_imm(len_plus7, 3);
+                                    let ptr_ty_cached = self.ptr_ty();
+                                    let buf_words = self.call_import(
+                                        &mut fb,
+                                        "wir_alloc_words",
+                                        |s| {
+                                            s.params.push(AbiParam::new(types::I64));
+                                            s.returns.push(AbiParam::new(ptr_ty_cached));
+                                        },
+                                        &[words],
+                                    )?;
+                                    let buf_ptr = buf_words;
 
                                     let len_a_zero = fb.ins().icmp(IntCC::Equal, len_a, zero);
                                     let bb_copy_a = fb.create_block();
@@ -3410,7 +3478,7 @@ impl JIT {
                                         STR_DATA_OFFSET,
                                     );
                                     let len_a_ptr = self.value_as_ptr(&mut fb, len_a);
-                                    let _ = self.call_memcpy(&mut fb, dst_ptr, data_a, len_a_ptr)?;
+                                    let _ = self.call_memcpy(&mut fb, buf_ptr, data_a, len_a_ptr)?;
                                     fb.ins().jump(bb_after_a, &[] as &[BlockArg]);
 
                                     fb.switch_to_block(bb_after_a);
@@ -3432,16 +3500,28 @@ impl JIT {
                                         b_ptr,
                                         STR_DATA_OFFSET,
                                     );
-                                    let dst_i64 = self.ptr_to_i64(&mut fb, dst_ptr);
-                                    let dst_b_i64 = fb.ins().iadd(dst_i64, len_a);
+                                    let buf_i64 = self.ptr_to_i64(&mut fb, buf_ptr);
+                                    let dst_b_i64 = fb.ins().iadd(buf_i64, len_a);
                                     let dst_b_ptr = self.value_as_ptr(&mut fb, dst_b_i64);
                                     let len_b_ptr = self.value_as_ptr(&mut fb, len_b);
                                     let _ = self.call_memcpy(&mut fb, dst_b_ptr, data_b, len_b_ptr)?;
                                     fb.ins().jump(bb_after_b, &[] as &[BlockArg]);
 
                                     fb.switch_to_block(bb_after_b);
-                                    let result = self.ptr_to_i64(&mut fb, new_str_ptr);
-                                    fb.ins().jump(exit_block, &[BlockArg::from(result)]);
+                                    let interned =
+                                        self.call_jit_intern_bytes(&mut fb, buf_ptr, total_len)?;
+                                    let ptr_ty_cached = self.ptr_ty();
+                                    let _ = self.call_import(
+                                        &mut fb,
+                                        "wir_free_words",
+                                        |s| {
+                                            s.params.push(AbiParam::new(ptr_ty_cached));
+                                            s.params.push(AbiParam::new(types::I64));
+                                            s.returns.push(AbiParam::new(types::I64));
+                                        },
+                                        &[buf_words, words],
+                                    )?;
+                                    fb.ins().jump(exit_block, &[BlockArg::from(interned)]);
 
                                     fb.switch_to_block(slow_block);
                                     let slow_res = self.call_import(
