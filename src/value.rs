@@ -2226,6 +2226,35 @@ mod tests {
     }
 
     #[test]
+    fn box_str_borrowed_interns_canonical_pointer() {
+        ensure_gc_attached();
+        let canonical = allocate_new_string("borrowed");
+        let borrowed_once = box_str_borrowed(b"borrowed");
+        let borrowed_twice = box_str_borrowed(b"borrowed");
+        assert_eq!(
+            borrowed_once, canonical,
+            "box_str_borrowed must canonicalise borrowed bytes"
+        );
+        assert_eq!(
+            borrowed_once, borrowed_twice,
+            "box_str_borrowed should reuse the interned pointer"
+        );
+    }
+
+    #[test]
+    fn jit_string_intern_bytes_matches_intern_string() {
+        ensure_gc_attached();
+        let data = b"jit-interned".to_vec();
+        let from_jit =
+            unsafe { jit_string_intern_bytes(data.as_ptr(), data.len()) };
+        let canonical = intern_string("jit-interned");
+        assert_eq!(
+            from_jit, canonical,
+            "jit helper must return the canonical interned pointer"
+        );
+    }
+
+    #[test]
     fn borrowed_and_interned_compare_equal_by_content() {
         ensure_gc_attached();
         let interned = allocate_new_string("shared");

@@ -107,9 +107,6 @@ static STREAM_RX: Lazy<Mutex<HashMap<(u64, u64), mpsc::Receiver<Vec<u8>>>>> =
 static STREAM_TX: Lazy<Mutex<HashMap<(u64, u64), mpsc::Sender<Vec<u8>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// Keep owned byte buffers alive for strings we create on the VM side.
-static HTTP_BYTES_KEEPALIVE: Lazy<Mutex<Vec<Box<[u8]>>>> = Lazy::new(|| Mutex::new(Vec::new()));
-
 /// ---------- Messages crossing threads (pure Rust data) ----------
 pub struct ReqMsg {
     pub server_id: u64,
@@ -184,14 +181,8 @@ fn static_str_value(s: &'static str) -> i64 {
 
 fn box_str_keepalive(bytes: Vec<u8>) -> i64 {
     use crate::value::box_str_borrowed;
-    let boxed: Box<[u8]> = bytes.into_boxed_slice();
-    let ptr = boxed.as_ptr();
-    let len = boxed.len();
-    // SAFETY: we keep 'boxed' alive globally.
-    let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-    let v = box_str_borrowed(slice);
-    HTTP_BYTES_KEEPALIVE.lock().push(boxed);
-    v
+    // The interner copies the bytes, so the temporary Vec can drop immediately.
+    box_str_borrowed(bytes.as_slice())
 }
 
 /// Convert a VM value to (status, body, headers). Supports:
