@@ -1045,6 +1045,55 @@ fn alloc_boxed_str_for_interned(key: &str) -> ValueRepr {
     }
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_string_alloc(len: usize) -> *mut BoxedStr {
+    let header_size = mem::size_of::<BoxedStr>();
+    let total_size = header_size + len;
+    let align = mem::align_of::<BoxedStr>();
+
+    unsafe {
+        #[cfg(feature = "gc")]
+        let p = {
+            let mut p = NAPALM_GC.alloc_raw(total_size.max(header_size), align);
+            if p.is_null() {
+                p = NAPALM_GC.alloc_slow_path(total_size.max(header_size), align);
+            }
+            p
+        };
+        #[cfg(not(feature = "gc"))]
+        let p = {
+            use std::alloc::{Layout, alloc, handle_alloc_error};
+            let layout =
+                Layout::from_size_align_unchecked(total_size.max(1), mem::align_of::<BoxedStr>());
+            let p = alloc(layout);
+            if p.is_null() {
+                handle_alloc_error(layout);
+            }
+            p
+        };
+
+        let obj_ptr = p as *mut BoxedStr;
+        let data_ptr = (obj_ptr as *mut u8).add(header_size);
+
+        ptr::write(
+            obj_ptr,
+            BoxedStr {
+                hdr: ObjHeader {
+                    tag: TAG_STRING,
+                    aux: 0,
+                },
+                len,
+                data: data_ptr,
+            },
+        );
+
+        #[cfg(feature = "gc")]
+        NAPALM_GC.post_alloc_object(p, total_size.max(header_size));
+
+        obj_ptr
+    }
+}
+
 /// Runtime helper for string indexing `str[i]`.
 /// Returns a new 1-character string or NULL if out of bounds.
 #[unsafe(no_mangle)]
