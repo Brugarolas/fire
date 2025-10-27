@@ -51,8 +51,13 @@ fn run_on_function(func: &mut Function) {
                     return; // calls someone else
                 }
             }
-            // reject any non-direct call shape
-            Inst::CallIC { .. } | Inst::CallClosure { .. } | Inst::CallNative { .. } => return,
+            // reject any non-direct call shape (except benign mark_return)
+            Inst::CallNative { name, .. } => {
+                if name != "napalm_rt_mark_return" {
+                    return;
+                }
+            }
+            Inst::CallIC { .. } | Inst::CallClosure { .. } => return,
 
             // allowed pure compute/control/markers:
             Inst::Const(_)

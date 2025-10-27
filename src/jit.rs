@@ -3785,6 +3785,7 @@ impl JIT {
                                     let idx = fb.block_params(loop_block)[0];
                                     let beyond = fb.ins().icmp(IntCC::UnsignedGreaterThan, idx, limit);
                                     let cmp_block = fb.create_block();
+                                    let _cmp_param = fb.append_block_param(cmp_block, types::I64);
                                     fb.ins().brif(
                                         beyond,
                                         exit_block,
