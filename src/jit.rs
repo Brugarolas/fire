@@ -64,6 +64,12 @@ const FIELD_IC_SLOT_OFFSET: i32 = offset_of!(FieldInlineCache, slot) as i32;
 const ARRAY_BUF_OFFSET: i32 = offset_of!(BoxedArray, buf) as i32;
 const VEC_PTR_OFFSET: i32 = 0;
 const VEC_LEN_OFFSET: i32 = core::mem::size_of::<usize>() as i32;
+const STR_LEN_OFFSET: i32 = offset_of!(BoxedStr, len) as i32;
+const STR_DATA_OFFSET: i32 = offset_of!(BoxedStr, data) as i32;
+const STR_AUX_OFFSET: i32 =
+    offset_of!(BoxedStr, hdr) as i32 + offset_of!(ObjHeader, aux) as i32;
+const PTR_TAG_MASK: i64 = 0b111;
+const SMI_ZERO: i64 = 1;
 
 #[inline]
 fn ic_from_ptr(ptr: *mut FieldInlineCache) -> Option<&'static FieldInlineCache> {
@@ -293,16 +299,17 @@ use crate::runtime::{
 };
 #[allow(unused_imports)]
 use crate::value::{
-    BOOL_FALSE, BOOL_TRUE, BoxedArray, BoxedClosure, BoxedObj, ObjHeader, TAG_ARRAY, closure_new,
-    closure_set_env_slot, wir_array_copy, wir_array_fill, wir_array_filter, wir_array_find,
-    wir_array_find_index, wir_array_for_each, wir_array_get, wir_array_len, wir_array_map,
-    wir_array_new, wir_array_pop, wir_array_push, wir_array_reduce, wir_array_set,
-    wir_array_set_len, wir_array_shift, wir_array_slice, wir_array_unshift, wir_string_concat,
-    wir_string_ends_with, wir_string_get_char, wir_string_includes, wir_string_index_of,
-    wir_string_last_index_of, wir_string_len, wir_string_pad_end, wir_string_pad_start,
-    wir_string_repeat, wir_string_replace, wir_string_replace_all, wir_string_slice,
-    wir_string_split, wir_string_starts_with, wir_string_substring, wir_string_to_lower_case,
-    wir_string_to_upper_case, wir_string_trim, wir_string_trim_end, wir_string_trim_start,
+    BOOL_FALSE, BOOL_TRUE, BoxedArray, BoxedClosure, BoxedObj, BoxedStr, ObjHeader, STR_FLAG_INTERNED,
+    TAG_ARRAY, TAG_STRING, closure_new, closure_set_env_slot, wir_array_copy, wir_array_fill,
+    wir_array_filter, wir_array_find, wir_array_find_index, wir_array_for_each, wir_array_get,
+    wir_array_len, wir_array_map, wir_array_new, wir_array_pop, wir_array_push, wir_array_reduce,
+    wir_array_set, wir_array_set_len, wir_array_shift, wir_array_slice, wir_array_unshift,
+    wir_string_concat, wir_string_ends_with, wir_string_get_char, wir_string_includes,
+    wir_string_index_of, wir_string_last_index_of, wir_string_len, wir_string_pad_end,
+    wir_string_pad_start, wir_string_repeat, wir_string_replace, wir_string_replace_all,
+    wir_string_slice, wir_string_split, wir_string_starts_with, wir_string_substring,
+    wir_string_to_lower_case, wir_string_to_upper_case, wir_string_trim, wir_string_trim_end,
+    wir_string_trim_start,
 };
 
 impl JIT {
@@ -974,6 +981,7 @@ impl Default for JIT {
                 "wir_string_concat_coerce",
                 wir_string_concat_coerce as *const u8,
             );
+            jb.symbol("memcmp", libc::memcmp as *const u8);
             jb.symbol(
                 "wir_obj_get_str",
                 wir_obj_get_str as *const extern "C" fn(i64, i64) -> i64 as *const u8,
@@ -1420,6 +1428,28 @@ impl JIT {
                 "call_import: callee `{name}` declared without return value"
             ))
         }
+    }
+
+    fn call_memcmp<'a>(
+        &mut self,
+        fb: &mut cranelift_frontend::FunctionBuilder<'a>,
+        lhs: cranelift::prelude::Value,
+        rhs: cranelift::prelude::Value,
+        len: cranelift::prelude::Value,
+    ) -> Result<cranelift::prelude::Value, String> {
+        use cranelift::prelude::{AbiParam, types};
+        let ptr_ty = self.ptr_ty();
+        self.call_import(
+            fb,
+            "memcmp",
+            |s| {
+                s.params.push(AbiParam::new(ptr_ty));
+                s.params.push(AbiParam::new(ptr_ty));
+                s.params.push(AbiParam::new(ptr_ty));
+                s.returns.push(AbiParam::new(types::I32));
+            },
+            &[lhs, rhs, len],
+        )
     }
 
     fn prepare_try_descriptors(
@@ -2807,6 +2837,260 @@ impl JIT {
                             use cranelift::prelude::{AbiParam, types};
 
                             match name.as_str() {
+                                "wir_string_len" => {
+                                    use cranelift::codegen::ir::instructions::BlockArg;
+                                    use cranelift::prelude::{IntCC, MemFlags};
+
+                                    let str_val = vmap.get_or_emit(args[0], &mut fb, fun_ir);
+                                    let zero = fb.ins().iconst(types::I64, 0);
+                                    let smi_zero = fb.ins().iconst(types::I64, SMI_ZERO);
+                                    let mask = fb.ins().iconst(types::I64, PTR_TAG_MASK);
+                                    let str_tag = fb.ins().iconst(types::I64, TAG_STRING as i64);
+
+                                    let bb_check_ptr = fb.create_block();
+                                    let bb_check_tag = fb.create_block();
+                                    let bb_fast = fb.create_block();
+                                    let bb_exit = fb.create_block();
+                                    let res_phi = fb.append_block_param(bb_exit, types::I64);
+
+                                    let is_null = fb.ins().icmp(IntCC::Equal, str_val, zero);
+                                    fb.ins().brif(
+                                        is_null,
+                                        bb_exit,
+                                        &[BlockArg::from(smi_zero)],
+                                        bb_check_ptr,
+                                        &[] as &[BlockArg],
+                                    );
+
+                                    fb.switch_to_block(bb_check_ptr);
+                                    let masked = fb.ins().band(str_val, mask);
+                                    let not_ptr =
+                                        fb.ins().icmp(IntCC::NotEqual, masked, zero);
+                                    fb.ins().brif(
+                                        not_ptr,
+                                        bb_exit,
+                                        &[BlockArg::from(smi_zero)],
+                                        bb_check_tag,
+                                        &[] as &[BlockArg],
+                                    );
+
+                                    fb.switch_to_block(bb_check_tag);
+                                    let str_ptr = self.value_as_ptr(&mut fb, str_val);
+                                    let tag_u32 = fb.ins().load(
+                                        types::I32,
+                                        MemFlags::trusted(),
+                                        str_ptr,
+                                        OBJ_TAG_OFFSET,
+                                    );
+                                    let tag = fb.ins().uextend(types::I64, tag_u32);
+                                    let is_string = fb.ins().icmp(IntCC::Equal, tag, str_tag);
+                                    fb.ins().brif(
+                                        is_string,
+                                        bb_fast,
+                                        &[] as &[BlockArg],
+                                        bb_exit,
+                                        &[BlockArg::from(smi_zero)],
+                                    );
+
+                                    fb.switch_to_block(bb_fast);
+                                    let len_raw = fb.ins().load(
+                                        self.ptr_ty(),
+                                        MemFlags::trusted(),
+                                        str_ptr,
+                                        STR_LEN_OFFSET,
+                                    );
+                                    let len_i64 = self.ptr_to_i64(&mut fb, len_raw);
+                                    let len_shift = fb.ins().ishl_imm(len_i64, 1);
+                                    let len_smi = fb.ins().iadd_imm(len_shift, 1);
+                                    fb.ins().jump(bb_exit, &[BlockArg::from(len_smi)]);
+
+                                    fb.switch_to_block(bb_exit);
+                                    if res_count == 1 {
+                                        vmap.bind(node.results[0], res_phi);
+                                    }
+                                }
+                                "wir_string_equals" => {
+                                    use cranelift::codegen::ir::instructions::BlockArg;
+                                    use cranelift::prelude::{IntCC, MemFlags};
+
+                                    let lhs = vmap.get_or_emit(args[0], &mut fb, fun_ir);
+                                    let rhs = vmap.get_or_emit(args[1], &mut fb, fun_ir);
+
+                                    let bool_true = fb.ins().iconst(types::I64, BOOL_TRUE);
+                                    let bool_false = fb.ins().iconst(types::I64, BOOL_FALSE);
+                                    let zero = fb.ins().iconst(types::I64, 0);
+                                    let mask = fb.ins().iconst(types::I64, PTR_TAG_MASK);
+                                    let str_tag = fb.ins().iconst(types::I64, TAG_STRING as i64);
+                                    let intern_flag =
+                                        fb.ins().iconst(types::I32, STR_FLAG_INTERNED as i64);
+
+                                    let bb_check_lhs = fb.create_block();
+                                    let bb_check_rhs = fb.create_block();
+                                    let bb_check_tags = fb.create_block();
+                                    let bb_len = fb.create_block();
+                                    let bb_intern = fb.create_block();
+                                    let bb_cmp_bytes = fb.create_block();
+                                    let bb_after_intern = fb.create_block();
+                                    let bb_exit = fb.create_block();
+                                    let res_phi = fb.append_block_param(bb_exit, types::I64);
+
+                                    let same = fb.ins().icmp(IntCC::Equal, lhs, rhs);
+                                    fb.ins().brif(
+                                        same,
+                                        bb_exit,
+                                        &[BlockArg::from(bool_true)],
+                                        bb_check_lhs,
+                                        &[] as &[BlockArg],
+                                    );
+
+                                    fb.switch_to_block(bb_check_lhs);
+                                    let lhs_masked = fb.ins().band(lhs, mask);
+                                    let lhs_not_ptr =
+                                        fb.ins().icmp(IntCC::NotEqual, lhs_masked, zero);
+                                    let lhs_is_null = fb.ins().icmp(IntCC::Equal, lhs, zero);
+                                    let lhs_bad = fb.ins().bor(lhs_not_ptr, lhs_is_null);
+                                    fb.ins().brif(
+                                        lhs_bad,
+                                        bb_exit,
+                                        &[BlockArg::from(bool_false)],
+                                        bb_check_rhs,
+                                        &[] as &[BlockArg],
+                                    );
+
+                                    fb.switch_to_block(bb_check_rhs);
+                                    let rhs_masked = fb.ins().band(rhs, mask);
+                                    let rhs_not_ptr =
+                                        fb.ins().icmp(IntCC::NotEqual, rhs_masked, zero);
+                                    let rhs_is_null = fb.ins().icmp(IntCC::Equal, rhs, zero);
+                                    let rhs_bad = fb.ins().bor(rhs_not_ptr, rhs_is_null);
+                                    fb.ins().brif(
+                                        rhs_bad,
+                                        bb_exit,
+                                        &[BlockArg::from(bool_false)],
+                                        bb_check_tags,
+                                        &[] as &[BlockArg],
+                                    );
+
+                                    fb.switch_to_block(bb_check_tags);
+                                    let lhs_ptr = self.value_as_ptr(&mut fb, lhs);
+                                    let rhs_ptr = self.value_as_ptr(&mut fb, rhs);
+                                    let lhs_tag_u32 = fb.ins().load(
+                                        types::I32,
+                                        MemFlags::trusted(),
+                                        lhs_ptr,
+                                        OBJ_TAG_OFFSET,
+                                    );
+                                    let rhs_tag_u32 = fb.ins().load(
+                                        types::I32,
+                                        MemFlags::trusted(),
+                                        rhs_ptr,
+                                        OBJ_TAG_OFFSET,
+                                    );
+                                    let lhs_tag = fb.ins().uextend(types::I64, lhs_tag_u32);
+                                    let rhs_tag = fb.ins().uextend(types::I64, rhs_tag_u32);
+                                    let lhs_is_str = fb.ins().icmp(IntCC::Equal, lhs_tag, str_tag);
+                                    let rhs_is_str = fb.ins().icmp(IntCC::Equal, rhs_tag, str_tag);
+                                    let both_str = fb.ins().band(lhs_is_str, rhs_is_str);
+                                    fb.ins().brif(
+                                        both_str,
+                                        bb_len,
+                                        &[] as &[BlockArg],
+                                        bb_exit,
+                                        &[BlockArg::from(bool_false)],
+                                    );
+
+                                    fb.switch_to_block(bb_len);
+                                    let len_a_raw = fb.ins().load(
+                                        self.ptr_ty(),
+                                        MemFlags::trusted(),
+                                        lhs_ptr,
+                                        STR_LEN_OFFSET,
+                                    );
+                                    let len_b_raw = fb.ins().load(
+                                        self.ptr_ty(),
+                                        MemFlags::trusted(),
+                                        rhs_ptr,
+                                        STR_LEN_OFFSET,
+                                    );
+                                    let len_a = self.ptr_to_i64(&mut fb, len_a_raw);
+                                    let len_b = self.ptr_to_i64(&mut fb, len_b_raw);
+                                    let lens_equal = fb.ins().icmp(IntCC::Equal, len_a, len_b);
+                                    fb.ins().brif(
+                                        lens_equal,
+                                        bb_intern,
+                                        &[] as &[BlockArg],
+                                        bb_exit,
+                                        &[BlockArg::from(bool_false)],
+                                    );
+
+                                    fb.switch_to_block(bb_intern);
+                                    let len_zero = fb.ins().icmp(IntCC::Equal, len_a, zero);
+                                    fb.ins().brif(
+                                        len_zero,
+                                        bb_exit,
+                                        &[BlockArg::from(bool_true)],
+                                        bb_cmp_bytes,
+                                        &[] as &[BlockArg],
+                                    );
+
+                                    fb.switch_to_block(bb_cmp_bytes);
+                                    let aux_a = fb.ins().load(
+                                        types::I32,
+                                        MemFlags::trusted(),
+                                        lhs_ptr,
+                                        STR_AUX_OFFSET,
+                                    );
+                                    let aux_b = fb.ins().load(
+                                        types::I32,
+                                        MemFlags::trusted(),
+                                        rhs_ptr,
+                                        STR_AUX_OFFSET,
+                                    );
+                                    let aux_a_flag = fb.ins().band(aux_a, intern_flag);
+                                    let aux_b_flag = fb.ins().band(aux_b, intern_flag);
+                                    let a_interned =
+                                        fb.ins().icmp_imm(IntCC::NotEqual, aux_a_flag, 0);
+                                    let b_interned =
+                                        fb.ins().icmp_imm(IntCC::NotEqual, aux_b_flag, 0);
+                                    let both_interned = fb.ins().band(a_interned, b_interned);
+                                    fb.ins().brif(
+                                        both_interned,
+                                        bb_exit,
+                                        &[BlockArg::from(bool_false)],
+                                        bb_after_intern,
+                                        &[] as &[BlockArg],
+                                    );
+
+                                    fb.switch_to_block(bb_after_intern);
+                                    let data_a = fb.ins().load(
+                                        self.ptr_ty(),
+                                        MemFlags::trusted(),
+                                        lhs_ptr,
+                                        STR_DATA_OFFSET,
+                                    );
+                                    let data_b = fb.ins().load(
+                                        self.ptr_ty(),
+                                        MemFlags::trusted(),
+                                        rhs_ptr,
+                                        STR_DATA_OFFSET,
+                                    );
+                                    let cmp_res = self.call_memcmp(
+                                        &mut fb,
+                                        data_a,
+                                        data_b,
+                                        len_a_raw,
+                                    )?;
+                                    let equal_bytes =
+                                        fb.ins().icmp_imm(IntCC::Equal, cmp_res, 0);
+                                    let final_res =
+                                        fb.ins().select(equal_bytes, bool_true, bool_false);
+                                    fb.ins().jump(bb_exit, &[BlockArg::from(final_res)]);
+
+                                    fb.switch_to_block(bb_exit);
+                                    if res_count == 1 {
+                                        vmap.bind(node.results[0], res_phi);
+                                    }
+                                }
                                 "wir_obj_has_field" => {
                                     use cranelift::codegen::ir::instructions::BlockArg;
                                     use cranelift::prelude::{IntCC, MemFlags};
