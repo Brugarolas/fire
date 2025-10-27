@@ -5,7 +5,7 @@
 
 use crate::event_loop::EVENT_LOOP;
 use crate::runtime::{wir_obj_new, wir_obj_set_str};
-use crate::value::{BoxedClosure, ObjHeader, TAG_STRING, closure_new, closure_set_env_slot};
+use crate::value::{BoxedClosure, ObjHeader, closure_new, closure_set_env_slot};
 use std::slice;
 
 use once_cell::sync::Lazy;
@@ -65,17 +65,7 @@ struct BoxedPromise {
 // Tiny helper: allocate a BoxedStr for a *static* &str key
 // tiny helper (already present above, keep one copy)
 fn static_str_value(s: &'static str) -> i64 {
-    use crate::value::ObjHeader;
-    use crate::value::{BoxedStr, TAG_STRING};
-    let obj = Box::new(BoxedStr {
-        hdr: ObjHeader {
-            tag: TAG_STRING,
-            aux: 0,
-        },
-        len: s.as_bytes().len(),
-        data: s.as_ptr(),
-    });
-    Box::into_raw(obj) as i64
+    crate::value::intern_string(s)
 }
 
 // ---- core helpers ----

@@ -697,6 +697,22 @@ impl Scanning<NapalmVM> for VMScanning {
                 factory.create_process_roots_work(edges.to_vec());
             }
         }
+
+        // 6) Interned strings – keep canonical pointers alive
+        #[cfg(feature = "gc")]
+        {
+            let mut edges: SmallVec<[SlotItem; 64]> = SmallVec::new();
+            crate::value::interned_string_slots(|slot| {
+                edges.push(SlotItem(Address::from_ptr(slot.cast::<u8>())));
+                if edges.len() == 64 {
+                    factory.create_process_roots_work(edges.to_vec());
+                    edges.clear();
+                }
+            });
+            if !edges.is_empty() {
+                factory.create_process_roots_work(edges.to_vec());
+            }
+        }
     }
 
     // ===== extra items your MMTk requires =====

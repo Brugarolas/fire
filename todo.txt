@@ -9,6 +9,7 @@ Features I still have not implemented:
 - Generators and Generators inside Generators (a là JavaScript)
 - Fibers (a là Wren)/Coroutines (a là C++)
 - Ranges (a là Wren & custom: 1..100 -> 1, 2, 3, ...; 1..100::5 -> 5, 10, 15, ...; 1..100::-1 -> 100, 99, 98, ...;)
+- Add comprehensions support
 - Decorators (a là TypeScript)
 - Extend existing Classes with computed properties and operator overloading (a là TypeScript)
 - Add functional programming (a là fp-core)

@@ -8,8 +8,9 @@ use crate::jit::{wir_call_closure, wir_make_method_closure};
 use crate::value as v;
 use crate::value::{
     BOOL_FALSE, BOOL_TRUE, BoxedArray, BoxedClosure, BoxedF64, BoxedMap, BoxedObj, BoxedProxy,
-    BoxedSet, BoxedStr, NULL, ObjHeader, TAG_ARRAY, TAG_BOXED_F64, TAG_CLOSURE, TAG_MAP,
-    TAG_OBJECT, TAG_PROXY, TAG_SET, TAG_STRING, Value, ValueRepr, allocate_new_string,
+    BoxedSet, BoxedStr, NULL, ObjHeader, STR_FLAG_INTERNED, TAG_ARRAY, TAG_BOXED_F64,
+    TAG_CLOSURE, TAG_MAP, TAG_OBJECT, TAG_PROXY, TAG_SET, TAG_STRING, Value, ValueRepr,
+    allocate_new_string,
     array_from_vec, bool_to_value, is_imm, make_smi, map_new, obj_assign, obj_clone_shallow,
     obj_get_field_deep, obj_get_proto, obj_get_slot, obj_get_str_deep, obj_set_proto,
     obj_set_slot_known, obj_shape, proxy_new, set_new, shape_slot, value_to_bool,
@@ -1323,6 +1324,10 @@ pub unsafe extern "C" fn wir_string_equals(s1_val: i64, s2_val: i64) -> i64 {
     let s2 = &*(s2_val as *const BoxedStr);
 
     if s1.len != s2.len {
+        return bool_to_value(false);
+    }
+
+    if (s1.hdr.aux & STR_FLAG_INTERNED != 0) && (s2.hdr.aux & STR_FLAG_INTERNED != 0) {
         return bool_to_value(false);
     }
 

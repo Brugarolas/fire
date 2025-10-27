@@ -4014,40 +4014,7 @@ impl JIT {
     }
 
     fn alloc_boxed_str(&mut self, s: &str) -> i64 {
-        use crate::value::{BoxedStr, ObjHeader, TAG_STRING};
-        use std::alloc::{Layout, alloc, handle_alloc_error};
-        use std::ptr::copy_nonoverlapping;
-
-        let len = s.as_bytes().len();
-        // At least 1 byte, but force 8-byte alignment for ARM64 safety.
-        let layout = Layout::from_size_align(len.max(1), 8).unwrap();
-
-        unsafe {
-            // Allocate an 8-byte aligned raw buffer and copy the bytes.
-            let buf = alloc(layout);
-            if buf.is_null() {
-                handle_alloc_error(layout);
-            }
-            if len > 0 {
-                copy_nonoverlapping(s.as_ptr(), buf, len);
-            }
-            // Keep the raw buffer alive (we leak like other boxed heap objs — until GC arrives).
-            self.heap_keep_alive.push(buf);
-
-            // Now box the metadata object that points to the aligned buffer.
-            let obj = Box::new(BoxedStr {
-                hdr: ObjHeader {
-                    tag: TAG_STRING,
-                    aux: 0,
-                },
-                len,
-                data: buf as *const u8, // 8-byte aligned
-            });
-            let ptr = Box::into_raw(obj) as *mut u8;
-            self.heap_keep_alive.push(ptr);
-
-            ptr as i64 // even pointer => heap object
-        }
+        crate::value::intern_string(s)
     }
 }
 /// Value binder: maps WIR ValueIds to CLIF Values.

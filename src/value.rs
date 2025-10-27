@@ -157,6 +157,13 @@ impl PartialEq for Value {
                     return false;
                 }
 
+                if (s1.hdr.aux & STR_FLAG_INTERNED != 0)
+                    && (s2.hdr.aux & STR_FLAG_INTERNED != 0)
+                {
+                    // Distinct interned strings always differ.
+                    return false;
+                }
+
                 let bytes1 = std::slice::from_raw_parts(s1.data, s1.len);
                 let bytes2 = std::slice::from_raw_parts(s2.data, s2.len);
                 return bytes1 == bytes2;
@@ -198,6 +205,9 @@ pub const TAG_OBJECT: u32 = 5;
 pub const TAG_MAP: u32 = 6;
 pub const TAG_SET: u32 = 7;
 pub const TAG_PROXY: u32 = 8;
+
+// Aux flags for BoxedStr objects.
+pub const STR_FLAG_INTERNED: u32 = 1 << 0;
 
 // ============================================================================
 // Boxed f64
@@ -838,6 +848,62 @@ pub struct BoxedStr {
     pub data: *const u8, // points to UTF-8 bytes (NUL-terminated OK, not required)
 }
 
+#[derive(Default)]
+struct StringInterner {
+    table: HashMap<Box<str>, ValueRepr>,
+}
+
+impl StringInterner {
+    #[inline]
+    fn get(&self, s: &str) -> Option<ValueRepr> {
+        self.table.get(s).copied()
+    }
+
+    #[inline]
+    fn intern(&mut self, s: &str) -> ValueRepr {
+        if let Some(&val) = self.table.get(s) {
+            return val;
+        }
+
+        let key: Box<str> = s.into();
+        let val = alloc_boxed_str_for_interned(&key);
+        let old = self.table.insert(key, val);
+        debug_assert!(old.is_none(), "interned string reinserted unexpectedly");
+        val
+    }
+
+    #[cfg(feature = "gc")]
+    fn visit_value_slots<F: FnMut(*mut ValueRepr)>(&mut self, mut f: F) {
+        for val in self.table.values_mut() {
+            f(val as *mut ValueRepr);
+        }
+    }
+}
+
+static STRING_INTERNER: OnceLock<RwLock<StringInterner>> = OnceLock::new();
+
+#[inline]
+fn string_interner() -> &'static RwLock<StringInterner> {
+    STRING_INTERNER.get_or_init(|| RwLock::new(StringInterner::default()))
+}
+
+#[inline]
+pub fn intern_string(s: &str) -> ValueRepr {
+    let interner = string_interner();
+    if let Some(val) = interner.read().get(s) {
+        return val;
+    }
+    interner.write().intern(s)
+}
+
+#[cfg(feature = "gc")]
+#[inline]
+pub fn interned_string_slots<F: FnMut(*mut ValueRepr)>(mut f: F) {
+    let interner = string_interner();
+    let mut guard = interner.write();
+    guard.visit_value_slots(|slot| f(slot));
+}
+
 #[inline]
 unsafe fn value_as_str_slice<'a>(v: ValueRepr) -> Option<&'a str> {
     if !is_ptr(v) {
@@ -919,70 +985,63 @@ pub fn box_str_borrowed(bytes: &[u8]) -> ValueRepr {
 /// The single memory block contains the BoxedStr header followed by the character data.
 #[inline]
 pub fn allocate_new_string(s: &str) -> ValueRepr {
-    let bytes = s.as_bytes();
-    let len = bytes.len();
+    intern_string(s)
+}
 
-    // Step 1: Calculate the total size for our single allocation.
-    // It's the size of the fixed header struct PLUS the size of the string's byte data.
-    let header_size = mem::size_of::<BoxedStr>();
-    let total_size = header_size + len;
-
-    // The alignment of the allocation is determined by the header struct,
-    // which is the most restrictive requirement.
-    let align = mem::align_of::<BoxedStr>();
-
+#[inline]
+fn alloc_boxed_str_for_interned(key: &str) -> ValueRepr {
+    #[cfg(feature = "gc")]
     unsafe {
-        // Step 2: Perform a SINGLE allocation for the entire object.
-        // This `total_size` is guaranteed to be >= sizeof(BoxedStr),
-        // which will satisfy MMTk's minimum object size requirement.
-        #[cfg(feature = "gc")]
-        let p = {
-            let mut p = NAPALM_GC.alloc_raw(total_size, align);
-            if p.is_null() {
-                p = NAPALM_GC.alloc_slow_path(total_size, align);
-            }
-            p
-        };
-        #[cfg(not(feature = "gc"))]
-        let p = {
-            use std::alloc::{Layout, alloc, handle_alloc_error};
-            let layout = Layout::from_size_align_unchecked(total_size, align);
-            let p = alloc(layout);
-            if p.is_null() {
-                handle_alloc_error(layout);
-            }
-            p
+        let bytes = key.as_bytes();
+        let len = bytes.len();
+        let header_size = mem::size_of::<BoxedStr>();
+        let total_size = header_size + len;
+        let align = mem::align_of::<BoxedStr>();
+        let alloc_size = if align > 1 {
+            (total_size + (align - 1)) & !(align - 1)
+        } else {
+            total_size
         };
 
-        // Step 3: Set up the pointers.
-        // `obj_ptr` points to the start of the block, where the header will live.
+        let mut p = NAPALM_GC.alloc_raw(alloc_size, align);
+        if p.is_null() {
+            p = NAPALM_GC.alloc_slow_path(alloc_size, align);
+        }
+
         let obj_ptr = p as *mut BoxedStr;
-        // `data_ptr` points to the memory location IMMEDIATELY AFTER the header struct.
         let data_ptr = (obj_ptr as *mut u8).add(header_size);
 
-        // Step 4: Write the header struct into the beginning of the block.
-        // The crucial part is that `data` now points inside its own allocation block.
         ptr::write(
             obj_ptr,
             BoxedStr {
                 hdr: ObjHeader {
                     tag: TAG_STRING,
-                    aux: 0,
+                    aux: STR_FLAG_INTERNED,
                 },
                 len,
-                data: data_ptr, // The `data` pointer points to the area right after this struct.
+                data: data_ptr,
             },
         );
 
-        // Step 5: Copy the actual string bytes into the data area.
-        ptr::copy_nonoverlapping(bytes.as_ptr(), data_ptr, len);
+        if len != 0 {
+            ptr::copy_nonoverlapping(bytes.as_ptr(), data_ptr, len);
+        }
 
-        // Step 6: Notify the GC about the full object allocation.
-        #[cfg(feature = "gc")]
-        NAPALM_GC.post_alloc_object(p, total_size);
-
-        // Return the pointer to the start of the object.
+        NAPALM_GC.post_alloc_object(p, alloc_size);
         p as ValueRepr
+    }
+
+    #[cfg(not(feature = "gc"))]
+    {
+        let obj = Box::new(BoxedStr {
+            hdr: ObjHeader {
+                tag: TAG_STRING,
+                aux: STR_FLAG_INTERNED,
+            },
+            len: key.len(),
+            data: key.as_ptr(),
+        });
+        Box::into_raw(obj) as ValueRepr
     }
 }
 
@@ -2143,5 +2202,64 @@ pub fn dbg_addr(v: i64) -> String {
         format!("{}", v)
     } else {
         format!("0x{:x}", v as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "gc")]
+    fn ensure_gc_attached() {
+        crate::gc::NAPALM_GC.bind_current_thread();
+    }
+
+    #[cfg(not(feature = "gc"))]
+    fn ensure_gc_attached() {}
+
+    fn borrowed_from_static(s: &'static str) -> ValueRepr {
+        let obj = Box::new(BoxedStr {
+            hdr: ObjHeader {
+                tag: TAG_STRING,
+                aux: 0,
+            },
+            len: s.len(),
+            data: s.as_ptr(),
+        });
+        Box::into_raw(obj) as ValueRepr
+    }
+
+    #[test]
+    fn intern_reuses_pointer_for_same_content() {
+        ensure_gc_attached();
+        let a = allocate_new_string("napalm");
+        let b = allocate_new_string("napalm");
+        assert_eq!(a, b, "interned strings should reuse pointer");
+
+        unsafe {
+            let s = &*(a as *const BoxedStr);
+            assert!(
+                s.hdr.aux & STR_FLAG_INTERNED != 0,
+                "interned string must set aux flag"
+            );
+        }
+    }
+
+    #[test]
+    fn intern_distinguishes_different_content() {
+        ensure_gc_attached();
+        let a = allocate_new_string("foo");
+        let b = allocate_new_string("bar");
+        assert_ne!(a, b, "different strings should not share pointer");
+    }
+
+    #[test]
+    fn borrowed_and_interned_compare_equal_by_content() {
+        ensure_gc_attached();
+        let interned = allocate_new_string("shared");
+        let borrowed = borrowed_from_static("shared");
+        let va = Value(interned);
+        let vb = Value(borrowed);
+        assert_eq!(va, vb, "borrowed string must compare equal to interned");
     }
 }
