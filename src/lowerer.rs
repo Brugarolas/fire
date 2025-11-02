@@ -10,8 +10,8 @@ use std::{collections::BTreeSet, ops::Deref};
 
 // Bring in the WIR types from your other file/module.
 use crate::wir::{
-    AccessorInfo, BindingId, Builder, Constant, FieldId, FuncId, Inst, IntBinOp, MethodInfo,
-    Module, TryExitKind, TryHandler, TryRegion, TryRegionId, Type, ValueId, next_id,
+    AccessorInfo, BindingId, BlockId, Builder, Constant, FieldId, FuncId, Inst, IntBinOp,
+    MethodInfo, Module, TryExitKind, TryHandler, TryRegion, TryRegionId, Type, ValueId, next_id,
 };
 
 use crate::diag::Node;
@@ -56,7 +56,17 @@ fn lvalue_with_meta(template: &LValue, kind: LValueKind) -> LValue {
 #[derive(Clone)]
 struct TryScope {
     region: TryRegionId,
+    continuation: BlockId,
+    finally: Option<BlockId>,
     locals: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct TryLeaveInfo {
+    region: TryRegionId,
+    continuation: BlockId,
+    finally: Option<BlockId>,
+    locals: Vec<ValueId>,
 }
 
 fn emit_try_leave_chain<'m>(
@@ -64,7 +74,8 @@ fn emit_try_leave_chain<'m>(
     stack: &[TryScope],
     locals: &HashMap<String, ValueId>,
     exit: TryExitKind,
-) {
+) -> Vec<TryLeaveInfo> {
+    let mut out: Vec<TryLeaveInfo> = Vec::with_capacity(stack.len());
     for scope in stack.iter().rev() {
         let mut captured: Vec<ValueId> = Vec::with_capacity(scope.locals.len());
         for name in &scope.locals {
@@ -73,17 +84,25 @@ fn emit_try_leave_chain<'m>(
                 .unwrap_or_else(|| panic!("missing local '{}' for try scope", name));
             captured.push(val);
         }
+        let locals_vec = captured.clone();
         let _ = b.push_node(
             Inst::TryLeave {
                 region: scope.region,
                 exit,
-                locals: captured,
+                locals: locals_vec,
             },
             None,
             0,
             true,
         );
+        out.push(TryLeaveInfo {
+            region: scope.region,
+            continuation: scope.continuation,
+            finally: scope.finally,
+            locals: captured,
+        });
     }
+    out
 }
 
 fn lower_try_stmt_generic<'m, F>(
@@ -133,16 +152,29 @@ where
         try_entry, continuation, mutated_names
     );
 
+    let mut mutated_types: HashMap<String, Type> = HashMap::new();
+    for name in &mutated_names {
+        if let Some(&vid) = locals.get(name) {
+            if let Some(ty) = b.value_ty(vid) {
+                mutated_types.insert(name.clone(), ty);
+            } else {
+                mutated_types.insert(name.clone(), Type::Top);
+            }
+        }
+    }
+
     let mut cont_params: HashMap<String, ValueId> = HashMap::new();
     for name in &mutated_names {
-        let param = b.add_block_param(continuation, Type::Int32);
+        let ty = mutated_types.get(name).cloned().unwrap_or(Type::Top);
+        let param = b.add_block_param(continuation, ty);
         cont_params.insert(name.clone(), param);
     }
 
     let mut finally_params: Vec<(String, ValueId)> = Vec::new();
     if let Some(fin_id) = finally_entry {
         for name in &mutated_names {
-            let param = b.add_block_param(fin_id, Type::Int32);
+            let ty = mutated_types.get(name).cloned().unwrap_or(Type::Top);
+            let param = b.add_block_param(fin_id, ty);
             finally_params.push((name.clone(), param));
         }
     }
@@ -169,6 +201,8 @@ where
 
     active_try.push(TryScope {
         region: region_id,
+        continuation,
+        finally: finally_entry,
         locals: mutated_names.clone(),
     });
     let mut region_popped = false;
@@ -212,13 +246,23 @@ where
             Inst::TryLeave {
                 region: region_id,
                 exit: TryExitKind::Normal,
-                locals: locals_vec,
+                locals: locals_vec.clone(),
             },
             None,
             0,
             true,
         );
         if let Some(fin_id) = finally_entry {
+            let _ = b.push_node(
+                Inst::TryFinallyEnter {
+                    region: region_id,
+                    locals: locals_vec,
+                    error: None,
+                },
+                None,
+                0,
+                true,
+            );
             b.jump(fin_id, &args);
         } else {
             b.jump(continuation, &args);
@@ -235,7 +279,8 @@ where
             locals_catch.insert(binding.clone(), err_val);
         }
         for name in &mutated_names {
-            let param = b.add_block_param(catch_id, Type::Int32);
+            let ty = mutated_types.get(name).cloned().unwrap_or(Type::Top);
+            let param = b.add_block_param(catch_id, ty);
             locals_catch.insert(name.clone(), param);
         }
         lower_block(
@@ -260,13 +305,23 @@ where
                 Inst::TryLeave {
                     region: region_id,
                     exit: TryExitKind::Normal,
-                    locals: locals_vec,
+                    locals: locals_vec.clone(),
                 },
                 None,
                 0,
                 true,
             );
             if let Some(fin_id) = finally_entry {
+                let _ = b.push_node(
+                    Inst::TryFinallyEnter {
+                        region: region_id,
+                        locals: locals_vec,
+                        error: None,
+                    },
+                    None,
+                    0,
+                    true,
+                );
                 b.jump(fin_id, &args);
             } else {
                 b.jump(continuation, &args);
@@ -1188,7 +1243,7 @@ fn lower_stmt_free<'m>(
                 true,
             );
             let err = err_res[0];
-            emit_try_leave_chain(b, active_try, locals, TryExitKind::Exception);
+            let _ = emit_try_leave_chain(b, active_try, locals, TryExitKind::Exception);
             let _ = b.push_node(Inst::Throw(err), None, 0, true);
         }
         StmtKind::Defer { kind, expr } => {
@@ -1223,7 +1278,7 @@ fn lower_stmt_free<'m>(
                     1,
                     true,
                 );
-                emit_try_leave_chain(b, active_try, locals, TryExitKind::Normal);
+                let _ = emit_try_leave_chain(b, active_try, locals, TryExitKind::Normal);
                 b.ret(&[v]);
             } else {
                 let z = b.const_i32(0);
@@ -1238,7 +1293,7 @@ fn lower_stmt_free<'m>(
                     1,
                     true,
                 );
-                emit_try_leave_chain(b, active_try, locals, TryExitKind::Normal);
+                let _ = emit_try_leave_chain(b, active_try, locals, TryExitKind::Normal);
                 b.ret(&[z]);
             }
         }
@@ -1710,7 +1765,7 @@ fn lower_stmt_free_async<'m>(
                 1,
                 true,
             );
-            emit_try_leave_chain(b, active_try, locals, TryExitKind::Normal);
+            let _ = emit_try_leave_chain(b, active_try, locals, TryExitKind::Normal);
             let (_nid, _r) = b.push_node(
                 Inst::CallNative {
                     name: "wir_deferred_resolve".into(),
@@ -1855,7 +1910,7 @@ fn lower_stmt_free_async<'m>(
                         true,
                     );
                     let err = err_res[0];
-                    emit_try_leave_chain(b, active_try, locals, TryExitKind::Exception);
+                    let _ = emit_try_leave_chain(b, active_try, locals, TryExitKind::Exception);
                     let _ = b.push_node(Inst::Throw(err), None, 0, true);
                     Ok(())
                 }

@@ -1269,6 +1269,13 @@ impl<'m> Builder<'m> {
         res[0]
     }
 
+    pub fn value_ty(&self, val: ValueId) -> Option<Type> {
+        self.func
+            .values
+            .get(val.0 as usize)
+            .and_then(|v| v.ty.clone())
+    }
+
     pub fn add_block_param(&mut self, b: BlockId, ty: Type) -> ValueId {
         let vid = ValueId(self.func.values.len() as u32);
         self.func.values.push(Value {
@@ -1488,7 +1495,8 @@ impl EffectKind {
             | crate::wir::Inst::LoadMethod { .. }
             | crate::wir::Inst::LoadSuperMethod { .. }
             | crate::wir::Inst::InstanceOf { .. }
-            | crate::wir::Inst::TryLeave { .. } => EffectKind::Entry,
+            | crate::wir::Inst::TryLeave { .. }
+            | crate::wir::Inst::TryFinallyEnter { .. } => EffectKind::Entry,
 
             crate::wir::Inst::Safepoint => EffectKind::Safepoint,
 

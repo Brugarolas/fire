@@ -157,9 +157,7 @@ impl PartialEq for Value {
                     return false;
                 }
 
-                if (s1.hdr.aux & STR_FLAG_INTERNED != 0)
-                    && (s2.hdr.aux & STR_FLAG_INTERNED != 0)
-                {
+                if (s1.hdr.aux & STR_FLAG_INTERNED != 0) && (s2.hdr.aux & STR_FLAG_INTERNED != 0) {
                     // Distinct interned strings always differ.
                     return false;
                 }
@@ -2245,8 +2243,7 @@ mod tests {
     fn jit_string_intern_bytes_matches_intern_string() {
         ensure_gc_attached();
         let data = b"jit-interned".to_vec();
-        let from_jit =
-            unsafe { jit_string_intern_bytes(data.as_ptr(), data.len()) };
+        let from_jit = unsafe { jit_string_intern_bytes(data.as_ptr(), data.len()) };
         let canonical = intern_string("jit-interned");
         assert_eq!(
             from_jit, canonical,

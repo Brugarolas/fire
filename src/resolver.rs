@@ -227,8 +227,30 @@ impl Resolver {
             }
             StmtKind::Return(Some(expr)) => self.resolve_expr(expr)?,
             StmtKind::Throw(expr) => self.resolve_expr(expr)?,
-            // Add other statements like Try/Catch, Defer, etc. here
-            _ => {} // For unhandled statements
+            StmtKind::Defer { expr, .. } => self.resolve_expr(expr)?,
+            StmtKind::Try {
+                try_block,
+                catch,
+                finally_block,
+            } => {
+                self.resolve_block(try_block)?;
+
+                if let Some(catch_clause) = catch {
+                    self.enter_scope();
+                    if let Some(binding) = &catch_clause.binding {
+                        self.declare(binding.clone(), catch_clause.meta.span.clone())?;
+                    }
+                    for stmt in &catch_clause.body.stmts {
+                        self.resolve_stmt(stmt)?;
+                    }
+                    self.exit_scope()?;
+                }
+
+                if let Some(fin_block) = finally_block {
+                    self.resolve_block(fin_block)?;
+                }
+            }
+            _ => {} // Statements that need no additional resolution work
         }
         Ok(())
     }

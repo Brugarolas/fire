@@ -64,9 +64,7 @@ impl FieldInlineCache {
     fn invalidate(&self) {
         for entry in &self.entries {
             entry.slot.store(Self::ABSENT_SLOT, Ordering::Relaxed);
-            entry
-                .shape
-                .store(Self::INVALID_SHAPE, Ordering::Release);
+            entry.shape.store(Self::INVALID_SHAPE, Ordering::Release);
         }
     }
 
@@ -107,17 +105,14 @@ const FIELD_IC_ENTRIES_OFFSET: i32 = offset_of!(FieldInlineCache, entries) as i3
 const FIELD_IC_ENTRY_STRIDE: i32 = std::mem::size_of::<FieldCacheEntry>() as i32;
 const FIELD_IC_ENTRY_SHAPE_OFFSET: i32 = offset_of!(FieldCacheEntry, shape) as i32;
 const FIELD_IC_ENTRY_SLOT_OFFSET: i32 = offset_of!(FieldCacheEntry, slot) as i32;
-const FIELD_IC_SHAPE_OFFSET: i32 =
-    FIELD_IC_ENTRIES_OFFSET + FIELD_IC_ENTRY_SHAPE_OFFSET;
-const FIELD_IC_SLOT_OFFSET: i32 =
-    FIELD_IC_ENTRIES_OFFSET + FIELD_IC_ENTRY_SLOT_OFFSET;
+const FIELD_IC_SHAPE_OFFSET: i32 = FIELD_IC_ENTRIES_OFFSET + FIELD_IC_ENTRY_SHAPE_OFFSET;
+const FIELD_IC_SLOT_OFFSET: i32 = FIELD_IC_ENTRIES_OFFSET + FIELD_IC_ENTRY_SLOT_OFFSET;
 const ARRAY_BUF_OFFSET: i32 = offset_of!(BoxedArray, buf) as i32;
 const VEC_PTR_OFFSET: i32 = 0;
 const VEC_LEN_OFFSET: i32 = core::mem::size_of::<usize>() as i32;
 const STR_LEN_OFFSET: i32 = offset_of!(BoxedStr, len) as i32;
 const STR_DATA_OFFSET: i32 = offset_of!(BoxedStr, data) as i32;
-const STR_AUX_OFFSET: i32 =
-    offset_of!(BoxedStr, hdr) as i32 + offset_of!(ObjHeader, aux) as i32;
+const STR_AUX_OFFSET: i32 = offset_of!(BoxedStr, hdr) as i32 + offset_of!(ObjHeader, aux) as i32;
 const PTR_TAG_MASK: i64 = 0b111;
 const SMI_ZERO: i64 = 1;
 
@@ -349,17 +344,17 @@ use crate::runtime::{
 };
 #[allow(unused_imports)]
 use crate::value::{
-    BOOL_FALSE, BOOL_TRUE, BoxedArray, BoxedClosure, BoxedObj, BoxedStr, ObjHeader, STR_FLAG_INTERNED,
-    TAG_ARRAY, TAG_STRING, closure_new, closure_set_env_slot, wir_array_copy, wir_array_fill,
-    wir_array_filter, wir_array_find, wir_array_find_index, wir_array_for_each, wir_array_get,
-    wir_array_len, wir_array_map, wir_array_new, wir_array_pop, wir_array_push, wir_array_reduce,
-    wir_array_set, wir_array_set_len, wir_array_shift, wir_array_slice, wir_array_unshift,
-    wir_string_concat, wir_string_ends_with, wir_string_get_char, wir_string_includes,
-    wir_string_index_of, wir_string_last_index_of, wir_string_len, wir_string_pad_end,
-    wir_string_pad_start, wir_string_repeat, wir_string_replace, wir_string_replace_all,
-    wir_string_slice, wir_string_split, wir_string_starts_with, wir_string_substring,
-    wir_string_to_lower_case, wir_string_to_upper_case, wir_string_trim, wir_string_trim_end,
-    wir_string_trim_start, jit_string_intern_bytes,
+    BOOL_FALSE, BOOL_TRUE, BoxedArray, BoxedClosure, BoxedObj, BoxedStr, ObjHeader,
+    STR_FLAG_INTERNED, TAG_ARRAY, TAG_STRING, closure_new, closure_set_env_slot,
+    jit_string_intern_bytes, wir_array_copy, wir_array_fill, wir_array_filter, wir_array_find,
+    wir_array_find_index, wir_array_for_each, wir_array_get, wir_array_len, wir_array_map,
+    wir_array_new, wir_array_pop, wir_array_push, wir_array_reduce, wir_array_set,
+    wir_array_set_len, wir_array_shift, wir_array_slice, wir_array_unshift, wir_string_concat,
+    wir_string_ends_with, wir_string_get_char, wir_string_includes, wir_string_index_of,
+    wir_string_last_index_of, wir_string_len, wir_string_pad_end, wir_string_pad_start,
+    wir_string_repeat, wir_string_replace, wir_string_replace_all, wir_string_slice,
+    wir_string_split, wir_string_starts_with, wir_string_substring, wir_string_to_lower_case,
+    wir_string_to_upper_case, wir_string_trim, wir_string_trim_end, wir_string_trim_start,
 };
 
 impl JIT {
@@ -2952,8 +2947,7 @@ impl JIT {
                                     let res_phi = fb.append_block_param(exit_block, types::I64);
 
                                     let s_masked = fb.ins().band(s_val, mask);
-                                    let s_not_ptr =
-                                        fb.ins().icmp(IntCC::NotEqual, s_masked, zero);
+                                    let s_not_ptr = fb.ins().icmp(IntCC::NotEqual, s_masked, zero);
                                     let s_is_null = fb.ins().icmp(IntCC::Equal, s_val, zero);
                                     let s_bad = fb.ins().bor(s_not_ptr, s_is_null);
                                     let bb_check_tag = fb.create_block();
@@ -3017,8 +3011,11 @@ impl JIT {
                                         STR_LEN_OFFSET,
                                     );
                                     let len_i64 = self.ptr_to_i64(&mut fb, len_raw);
-                                    let out_of_bounds =
-                                        fb.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, idx_i64, len_i64);
+                                    let out_of_bounds = fb.ins().icmp(
+                                        IntCC::UnsignedGreaterThanOrEqual,
+                                        idx_i64,
+                                        len_i64,
+                                    );
                                     let bb_fast = fb.create_block();
                                     fb.ins().brif(
                                         out_of_bounds,
@@ -3038,17 +3035,13 @@ impl JIT {
                                     let data_i64 = self.ptr_to_i64(&mut fb, data_ptr);
                                     let char_addr = fb.ins().iadd(data_i64, idx_i64);
                                     let char_ptr = self.value_as_ptr(&mut fb, char_addr);
-                                    let ch = fb.ins().load(types::I8, MemFlags::trusted(), char_ptr, 0);
+                                    let ch =
+                                        fb.ins().load(types::I8, MemFlags::trusted(), char_ptr, 0);
 
                                     let char_slot = fb.func.create_sized_stack_slot(
-                                        StackSlotData::new(
-                                            StackSlotKind::ExplicitSlot,
-                                            1u32,
-                                            0,
-                                        ),
+                                        StackSlotData::new(StackSlotKind::ExplicitSlot, 1u32, 0),
                                     );
-                                    let buf_ptr =
-                                        fb.ins().stack_addr(self.ptr_ty(), char_slot, 0);
+                                    let buf_ptr = fb.ins().stack_addr(self.ptr_ty(), char_slot, 0);
                                     fb.ins().store(MemFlags::trusted(), ch, buf_ptr, 0);
                                     let len_one = fb.ins().iconst(types::I64, 1);
                                     let interned =
@@ -3100,8 +3093,7 @@ impl JIT {
 
                                     fb.switch_to_block(bb_check_ptr);
                                     let masked = fb.ins().band(str_val, mask);
-                                    let not_ptr =
-                                        fb.ins().icmp(IntCC::NotEqual, masked, zero);
+                                    let not_ptr = fb.ins().icmp(IntCC::NotEqual, masked, zero);
                                     fb.ins().brif(
                                         not_ptr,
                                         bb_exit,
@@ -3241,7 +3233,8 @@ impl JIT {
                                     let len_a = self.ptr_to_i64(&mut fb, len_a_raw);
                                     let len_b = self.ptr_to_i64(&mut fb, len_b_raw);
                                     let total_len = fb.ins().iadd(len_a, len_b);
-                                    let overflow = fb.ins().icmp(IntCC::UnsignedLessThan, total_len, len_a);
+                                    let overflow =
+                                        fb.ins().icmp(IntCC::UnsignedLessThan, total_len, len_a);
                                     let bb_alloc = fb.create_block();
                                     fb.ins().brif(
                                         overflow,
@@ -3252,8 +3245,7 @@ impl JIT {
                                     );
 
                                     fb.switch_to_block(bb_alloc);
-                                    let is_empty =
-                                        fb.ins().icmp(IntCC::Equal, total_len, zero);
+                                    let is_empty = fb.ins().icmp(IntCC::Equal, total_len, zero);
                                     let bb_empty = fb.create_block();
                                     let bb_copy = fb.create_block();
                                     fb.ins().brif(
@@ -3305,7 +3297,8 @@ impl JIT {
                                         STR_DATA_OFFSET,
                                     );
                                     let len_a_ptr = self.value_as_ptr(&mut fb, len_a);
-                                    let _ = self.call_memcpy(&mut fb, buf_ptr, data_a, len_a_ptr)?;
+                                    let _ =
+                                        self.call_memcpy(&mut fb, buf_ptr, data_a, len_a_ptr)?;
                                     fb.ins().jump(bb_after_a, &[] as &[BlockArg]);
 
                                     fb.switch_to_block(bb_after_a);
@@ -3331,7 +3324,8 @@ impl JIT {
                                     let dst_b_i64 = fb.ins().iadd(buf_i64, len_a);
                                     let dst_b_ptr = self.value_as_ptr(&mut fb, dst_b_i64);
                                     let len_b_ptr = self.value_as_ptr(&mut fb, len_b);
-                                    let _ = self.call_memcpy(&mut fb, dst_b_ptr, data_b, len_b_ptr)?;
+                                    let _ =
+                                        self.call_memcpy(&mut fb, dst_b_ptr, data_b, len_b_ptr)?;
                                     fb.ins().jump(bb_after_b, &[] as &[BlockArg]);
 
                                     fb.switch_to_block(bb_after_b);
@@ -3464,7 +3458,8 @@ impl JIT {
                                     let len_a = self.ptr_to_i64(&mut fb, len_a_raw);
                                     let len_b = self.ptr_to_i64(&mut fb, len_b_raw);
                                     let total_len = fb.ins().iadd(len_a, len_b);
-                                    let overflow = fb.ins().icmp(IntCC::UnsignedLessThan, total_len, len_a);
+                                    let overflow =
+                                        fb.ins().icmp(IntCC::UnsignedLessThan, total_len, len_a);
                                     let bb_alloc = fb.create_block();
                                     fb.ins().brif(
                                         overflow,
@@ -3475,8 +3470,7 @@ impl JIT {
                                     );
 
                                     fb.switch_to_block(bb_alloc);
-                                    let is_empty =
-                                        fb.ins().icmp(IntCC::Equal, total_len, zero);
+                                    let is_empty = fb.ins().icmp(IntCC::Equal, total_len, zero);
                                     let bb_empty = fb.create_block();
                                     let bb_copy = fb.create_block();
                                     fb.ins().brif(
@@ -3528,7 +3522,8 @@ impl JIT {
                                         STR_DATA_OFFSET,
                                     );
                                     let len_a_ptr = self.value_as_ptr(&mut fb, len_a);
-                                    let _ = self.call_memcpy(&mut fb, buf_ptr, data_a, len_a_ptr)?;
+                                    let _ =
+                                        self.call_memcpy(&mut fb, buf_ptr, data_a, len_a_ptr)?;
                                     fb.ins().jump(bb_after_a, &[] as &[BlockArg]);
 
                                     fb.switch_to_block(bb_after_a);
@@ -3554,7 +3549,8 @@ impl JIT {
                                     let dst_b_i64 = fb.ins().iadd(buf_i64, len_a);
                                     let dst_b_ptr = self.value_as_ptr(&mut fb, dst_b_i64);
                                     let len_b_ptr = self.value_as_ptr(&mut fb, len_b);
-                                    let _ = self.call_memcpy(&mut fb, dst_b_ptr, data_b, len_b_ptr)?;
+                                    let _ =
+                                        self.call_memcpy(&mut fb, dst_b_ptr, data_b, len_b_ptr)?;
                                     fb.ins().jump(bb_after_b, &[] as &[BlockArg]);
 
                                     fb.switch_to_block(bb_after_b);
@@ -3756,14 +3752,9 @@ impl JIT {
                                         rhs_ptr,
                                         STR_DATA_OFFSET,
                                     );
-                                    let cmp_res = self.call_memcmp(
-                                        &mut fb,
-                                        data_a,
-                                        data_b,
-                                        len_a_raw,
-                                    )?;
-                                    let equal_bytes =
-                                        fb.ins().icmp_imm(IntCC::Equal, cmp_res, 0);
+                                    let cmp_res =
+                                        self.call_memcmp(&mut fb, data_a, data_b, len_a_raw)?;
+                                    let equal_bytes = fb.ins().icmp_imm(IntCC::Equal, cmp_res, 0);
                                     let final_res =
                                         fb.ins().select(equal_bytes, bool_true, bool_false);
                                     fb.ins().jump(bb_exit, &[BlockArg::from(final_res)]);
@@ -3793,7 +3784,8 @@ impl JIT {
 
                                     // haystack pointer/tag checks
                                     let hay_mask = fb.ins().band(hay_val, mask);
-                                    let hay_not_ptr = fb.ins().icmp(IntCC::NotEqual, hay_mask, zero);
+                                    let hay_not_ptr =
+                                        fb.ins().icmp(IntCC::NotEqual, hay_mask, zero);
                                     let hay_is_null = fb.ins().icmp(IntCC::Equal, hay_val, zero);
                                     let hay_bad = fb.ins().bor(hay_not_ptr, hay_is_null);
                                     let bb_hay_tag = fb.create_block();
@@ -3826,8 +3818,10 @@ impl JIT {
 
                                     fb.switch_to_block(bb_need_ptr);
                                     let need_mask = fb.ins().band(needle_val, mask);
-                                    let need_not_ptr = fb.ins().icmp(IntCC::NotEqual, need_mask, zero);
-                                    let need_is_null = fb.ins().icmp(IntCC::Equal, needle_val, zero);
+                                    let need_not_ptr =
+                                        fb.ins().icmp(IntCC::NotEqual, need_mask, zero);
+                                    let need_is_null =
+                                        fb.ins().icmp(IntCC::Equal, needle_val, zero);
                                     let need_bad = fb.ins().bor(need_not_ptr, need_is_null);
                                     let bb_need_tag = fb.create_block();
                                     fb.ins().brif(
@@ -3847,7 +3841,8 @@ impl JIT {
                                         OBJ_TAG_OFFSET,
                                     );
                                     let need_tag = fb.ins().uextend(types::I64, need_tag_u32);
-                                    let need_is_str = fb.ins().icmp(IntCC::Equal, need_tag, str_tag);
+                                    let need_is_str =
+                                        fb.ins().icmp(IntCC::Equal, need_tag, str_tag);
                                     let bb_lengths = fb.create_block();
                                     fb.ins().brif(
                                         need_is_str,
@@ -3883,7 +3878,8 @@ impl JIT {
                                     );
 
                                     fb.switch_to_block(bb_check_sizes);
-                                    let shorter = fb.ins().icmp(IntCC::UnsignedLessThan, hay_len, need_len);
+                                    let shorter =
+                                        fb.ins().icmp(IntCC::UnsignedLessThan, hay_len, need_len);
                                     let bb_loop_entry = fb.create_block();
                                     fb.ins().brif(
                                         shorter,
@@ -3913,7 +3909,8 @@ impl JIT {
 
                                     fb.switch_to_block(loop_block);
                                     let idx = fb.block_params(loop_block)[0];
-                                    let beyond = fb.ins().icmp(IntCC::UnsignedGreaterThan, idx, limit);
+                                    let beyond =
+                                        fb.ins().icmp(IntCC::UnsignedGreaterThan, idx, limit);
                                     let cmp_block = fb.create_block();
                                     let _cmp_param = fb.append_block_param(cmp_block, types::I64);
                                     fb.ins().brif(
@@ -3986,8 +3983,7 @@ impl JIT {
                                     let bb_check = fb.create_block();
                                     let bb_cache = fb.create_block();
                                     let bb_slot_state = fb.create_block();
-                                    let slot_param =
-                                        fb.append_block_param(bb_slot_state, ptr_ty);
+                                    let slot_param = fb.append_block_param(bb_slot_state, ptr_ty);
                                     let bb_slow = fb.create_block();
                                     let bb_exit = fb.create_block();
                                     let res_phi = fb.append_block_param(bb_exit, types::I64);
@@ -4067,20 +4063,14 @@ impl JIT {
                                         fb.switch_to_block(hit_blocks[idx]);
                                         let slot_off = FIELD_IC_SLOT_OFFSET
                                             + (idx as i32) * FIELD_IC_ENTRY_STRIDE;
-                                        let slot_ptr =
-                                            fb.ins().iadd_imm(ic_ptr, slot_off as i64);
-                                        fb.ins()
-                                            .jump(bb_slot_state, &[BlockArg::from(slot_ptr)]);
+                                        let slot_ptr = fb.ins().iadd_imm(ic_ptr, slot_off as i64);
+                                        fb.ins().jump(bb_slot_state, &[BlockArg::from(slot_ptr)]);
                                     }
 
                                     fb.switch_to_block(bb_slot_state);
                                     let slot_ptr_val = slot_param;
-                                    let cached_slot = fb.ins().load(
-                                        ptr_ty,
-                                        MemFlags::trusted(),
-                                        slot_ptr_val,
-                                        0,
-                                    );
+                                    let cached_slot =
+                                        fb.ins().load(ptr_ty, MemFlags::trusted(), slot_ptr_val, 0);
                                     let absent = fb.ins().iconst(ptr_ty, -1);
                                     let has_slot =
                                         fb.ins().icmp(IntCC::NotEqual, cached_slot, absent);
@@ -4129,8 +4119,7 @@ impl JIT {
                                     let bb_check = fb.create_block();
                                     let bb_cache = fb.create_block();
                                     let bb_slot_state = fb.create_block();
-                                    let slot_param =
-                                        fb.append_block_param(bb_slot_state, ptr_ty);
+                                    let slot_param = fb.append_block_param(bb_slot_state, ptr_ty);
                                     let bb_slow = fb.create_block();
                                     let bb_exit = fb.create_block();
                                     let res_phi = fb.append_block_param(bb_exit, types::I64);
@@ -4210,20 +4199,14 @@ impl JIT {
                                         fb.switch_to_block(hit_blocks[idx]);
                                         let slot_off = FIELD_IC_SLOT_OFFSET
                                             + (idx as i32) * FIELD_IC_ENTRY_STRIDE;
-                                        let slot_ptr =
-                                            fb.ins().iadd_imm(ic_ptr, slot_off as i64);
-                                        fb.ins()
-                                            .jump(bb_slot_state, &[BlockArg::from(slot_ptr)]);
+                                        let slot_ptr = fb.ins().iadd_imm(ic_ptr, slot_off as i64);
+                                        fb.ins().jump(bb_slot_state, &[BlockArg::from(slot_ptr)]);
                                     }
 
                                     fb.switch_to_block(bb_slot_state);
                                     let slot_ptr_val = slot_param;
-                                    let cached_slot = fb.ins().load(
-                                        ptr_ty,
-                                        MemFlags::trusted(),
-                                        slot_ptr_val,
-                                        0,
-                                    );
+                                    let cached_slot =
+                                        fb.ins().load(ptr_ty, MemFlags::trusted(), slot_ptr_val, 0);
                                     let absent = fb.ins().iconst(ptr_ty, -1);
                                     let has_slot =
                                         fb.ins().icmp(IntCC::NotEqual, cached_slot, absent);
@@ -4566,11 +4549,9 @@ impl JIT {
                             let bb_check = fb.create_block();
                             let bb_cache = fb.create_block();
                             let bb_slot_state = fb.create_block();
-                            let slot_param =
-                                fb.append_block_param(bb_slot_state, ptr_ty);
+                            let slot_param = fb.append_block_param(bb_slot_state, ptr_ty);
                             let bb_load = fb.create_block();
-                            let load_slot_idx =
-                                fb.append_block_param(bb_load, types::I64);
+                            let load_slot_idx = fb.append_block_param(bb_load, types::I64);
                             let bb_absent = fb.create_block();
                             let bb_slow = fb.create_block();
                             let bb_exit = fb.create_block();
@@ -4597,13 +4578,13 @@ impl JIT {
                             let proxy_tag =
                                 fb.ins().iconst(types::I64, crate::value::TAG_PROXY as i64);
                             let is_proxy = fb.ins().icmp(IntCC::Equal, tag, proxy_tag);
-                                    fb.ins().brif(
-                                        is_proxy,
-                                        bb_slow,
-                                        &[] as &[BlockArg],
-                                        bb_cache,
-                                        &[] as &[BlockArg],
-                                    );
+                            fb.ins().brif(
+                                is_proxy,
+                                bb_slow,
+                                &[] as &[BlockArg],
+                                bb_cache,
+                                &[] as &[BlockArg],
+                            );
 
                             let check_blocks: [Block; FieldInlineCache::PIC_SIZE] =
                                 std::array::from_fn(|_| fb.create_block());
@@ -4628,18 +4609,16 @@ impl JIT {
                                 };
 
                                 fb.switch_to_block(check_blocks[idx]);
-                                let shape_off = FIELD_IC_SHAPE_OFFSET
-                                    + (idx as i32) * FIELD_IC_ENTRY_STRIDE;
+                                let shape_off =
+                                    FIELD_IC_SHAPE_OFFSET + (idx as i32) * FIELD_IC_ENTRY_STRIDE;
                                 let cached_shape_u32 = fb.ins().load(
                                     types::I32,
                                     MemFlags::trusted(),
                                     ic_ptr,
                                     shape_off,
                                 );
-                                let cached_shape =
-                                    fb.ins().uextend(types::I64, cached_shape_u32);
-                                let shape_match =
-                                    fb.ins().icmp(IntCC::Equal, shape, cached_shape);
+                                let cached_shape = fb.ins().uextend(types::I64, cached_shape_u32);
+                                let shape_match = fb.ins().icmp(IntCC::Equal, shape, cached_shape);
                                 fb.ins().brif(
                                     shape_match,
                                     hit_blocks[idx],
@@ -4649,22 +4628,16 @@ impl JIT {
                                 );
 
                                 fb.switch_to_block(hit_blocks[idx]);
-                                let slot_off = FIELD_IC_SLOT_OFFSET
-                                    + (idx as i32) * FIELD_IC_ENTRY_STRIDE;
-                                let slot_ptr =
-                                    fb.ins().iadd_imm(ic_ptr, slot_off as i64);
-                                fb.ins()
-                                    .jump(bb_slot_state, &[BlockArg::from(slot_ptr)]);
+                                let slot_off =
+                                    FIELD_IC_SLOT_OFFSET + (idx as i32) * FIELD_IC_ENTRY_STRIDE;
+                                let slot_ptr = fb.ins().iadd_imm(ic_ptr, slot_off as i64);
+                                fb.ins().jump(bb_slot_state, &[BlockArg::from(slot_ptr)]);
                             }
 
                             fb.switch_to_block(bb_slot_state);
                             let slot_ptr_val = slot_param;
-                            let cached_slot = fb.ins().load(
-                                ptr_ty,
-                                MemFlags::trusted(),
-                                slot_ptr_val,
-                                0,
-                            );
+                            let cached_slot =
+                                fb.ins().load(ptr_ty, MemFlags::trusted(), slot_ptr_val, 0);
                             let absent = fb.ins().iconst(ptr_ty, -1);
                             let slot_index = self.ptr_to_i64(&mut fb, cached_slot);
                             let has_slot = fb.ins().icmp(IntCC::NotEqual, cached_slot, absent);
@@ -4731,11 +4704,9 @@ impl JIT {
                             let bb_check = fb.create_block();
                             let bb_cache = fb.create_block();
                             let bb_slot_state = fb.create_block();
-                            let slot_param =
-                                fb.append_block_param(bb_slot_state, ptr_ty);
+                            let slot_param = fb.append_block_param(bb_slot_state, ptr_ty);
                             let bb_store = fb.create_block();
-                            let store_slot_idx =
-                                fb.append_block_param(bb_store, types::I64);
+                            let store_slot_idx = fb.append_block_param(bb_store, types::I64);
                             let bb_slow = fb.create_block();
                             let bb_exit = fb.create_block();
                             let res_phi = fb.append_block_param(bb_exit, types::I64);
@@ -4761,13 +4732,13 @@ impl JIT {
                             let proxy_tag =
                                 fb.ins().iconst(types::I64, crate::value::TAG_PROXY as i64);
                             let is_proxy = fb.ins().icmp(IntCC::Equal, tag, proxy_tag);
-                                    fb.ins().brif(
-                                        is_proxy,
-                                        bb_slow,
-                                        &[] as &[BlockArg],
-                                        bb_cache,
-                                        &[] as &[BlockArg],
-                                    );
+                            fb.ins().brif(
+                                is_proxy,
+                                bb_slow,
+                                &[] as &[BlockArg],
+                                bb_cache,
+                                &[] as &[BlockArg],
+                            );
 
                             let check_blocks: [Block; FieldInlineCache::PIC_SIZE] =
                                 std::array::from_fn(|_| fb.create_block());
@@ -4792,18 +4763,16 @@ impl JIT {
                                 };
 
                                 fb.switch_to_block(check_blocks[idx]);
-                                let shape_off = FIELD_IC_SHAPE_OFFSET
-                                    + (idx as i32) * FIELD_IC_ENTRY_STRIDE;
+                                let shape_off =
+                                    FIELD_IC_SHAPE_OFFSET + (idx as i32) * FIELD_IC_ENTRY_STRIDE;
                                 let cached_shape_u32 = fb.ins().load(
                                     types::I32,
                                     MemFlags::trusted(),
                                     ic_ptr,
                                     shape_off,
                                 );
-                                let cached_shape =
-                                    fb.ins().uextend(types::I64, cached_shape_u32);
-                                let shape_match =
-                                    fb.ins().icmp(IntCC::Equal, shape, cached_shape);
+                                let cached_shape = fb.ins().uextend(types::I64, cached_shape_u32);
+                                let shape_match = fb.ins().icmp(IntCC::Equal, shape, cached_shape);
                                 fb.ins().brif(
                                     shape_match,
                                     hit_blocks[idx],
@@ -4813,22 +4782,16 @@ impl JIT {
                                 );
 
                                 fb.switch_to_block(hit_blocks[idx]);
-                                let slot_off = FIELD_IC_SLOT_OFFSET
-                                    + (idx as i32) * FIELD_IC_ENTRY_STRIDE;
-                                let slot_ptr =
-                                    fb.ins().iadd_imm(ic_ptr, slot_off as i64);
-                                fb.ins()
-                                    .jump(bb_slot_state, &[BlockArg::from(slot_ptr)]);
+                                let slot_off =
+                                    FIELD_IC_SLOT_OFFSET + (idx as i32) * FIELD_IC_ENTRY_STRIDE;
+                                let slot_ptr = fb.ins().iadd_imm(ic_ptr, slot_off as i64);
+                                fb.ins().jump(bb_slot_state, &[BlockArg::from(slot_ptr)]);
                             }
 
                             fb.switch_to_block(bb_slot_state);
                             let slot_ptr_val = slot_param;
-                            let cached_slot = fb.ins().load(
-                                ptr_ty,
-                                MemFlags::trusted(),
-                                slot_ptr_val,
-                                0,
-                            );
+                            let cached_slot =
+                                fb.ins().load(ptr_ty, MemFlags::trusted(), slot_ptr_val, 0);
                             let absent = fb.ins().iconst(ptr_ty, -1);
                             let slot_index = self.ptr_to_i64(&mut fb, cached_slot);
                             let has_slot = fb.ins().icmp(IntCC::NotEqual, cached_slot, absent);
