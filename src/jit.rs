@@ -332,15 +332,15 @@ use crate::runtime::{
     CatchStubEntry, RuntimeResumeInfo, RuntimeTryDescriptor, napalm_rt_clear_resume,
     napalm_rt_clear_return, napalm_rt_mark_return, napalm_rt_prepare_resume,
     napalm_rt_register_try_descriptor, napalm_rt_schedule_defer, napalm_rt_stub_unimplemented,
-    napalm_rt_take_resume, napalm_rt_throw, napalm_rt_try_enter, napalm_rt_try_leave,
-    napalm_yieldpoint, wir_builtin_entries, wir_builtin_keys, wir_builtin_size, wir_builtin_values,
-    wir_field_register_name, wir_is_map, wir_is_nullish, wir_is_proxy, wir_is_set, wir_is_str,
-    wir_map_clear, wir_map_delete, wir_map_get, wir_map_has, wir_map_new, wir_map_set,
-    wir_map_size, wir_memo_get, wir_memo_put, wir_obj_assign, wir_obj_clone, wir_obj_del_str,
-    wir_obj_get_field_deep, wir_obj_get_method, wir_obj_get_proto, wir_obj_get_str,
-    wir_obj_get_str_deep, wir_obj_has_str, wir_obj_new, wir_obj_set_proto, wir_obj_set_str,
-    wir_proxy_new, wir_set_add, wir_set_clear, wir_set_delete, wir_set_has, wir_set_new,
-    wir_set_size, wir_string_equals, wir_super_get_method,
+    napalm_rt_take_resume, napalm_rt_throw, napalm_rt_try_enter, napalm_rt_try_finally_enter,
+    napalm_rt_try_finally_exit, napalm_rt_try_leave, napalm_yieldpoint, wir_builtin_entries,
+    wir_builtin_keys, wir_builtin_size, wir_builtin_values, wir_field_register_name, wir_is_map,
+    wir_is_nullish, wir_is_proxy, wir_is_set, wir_is_str, wir_map_clear, wir_map_delete,
+    wir_map_get, wir_map_has, wir_map_new, wir_map_set, wir_map_size, wir_memo_get, wir_memo_put,
+    wir_obj_assign, wir_obj_clone, wir_obj_del_str, wir_obj_get_field_deep, wir_obj_get_method,
+    wir_obj_get_proto, wir_obj_get_str, wir_obj_get_str_deep, wir_obj_has_str, wir_obj_new,
+    wir_obj_set_proto, wir_obj_set_str, wir_proxy_new, wir_set_add, wir_set_clear, wir_set_delete,
+    wir_set_has, wir_set_new, wir_set_size, wir_string_equals, wir_super_get_method,
 };
 #[allow(unused_imports)]
 use crate::value::{
@@ -817,6 +817,15 @@ impl Default for JIT {
                 "napalm_rt_try_leave",
                 napalm_rt_try_leave as *const extern "C" fn(i64, i64, i32, *const i64, usize) -> i64
                     as *const u8,
+            );
+            jb.symbol(
+                "napalm_rt_try_finally_enter",
+                napalm_rt_try_finally_enter as *const extern "C" fn(i64, i64, i64, i32) -> i64
+                    as *const u8,
+            );
+            jb.symbol(
+                "napalm_rt_try_finally_exit",
+                napalm_rt_try_finally_exit as *const extern "C" fn(i64, i64) -> i64 as *const u8,
             );
             jb.symbol(
                 "napalm_rt_schedule_defer",
@@ -5018,6 +5027,32 @@ impl JIT {
                                     s.returns.push(AbiParam::new(types::I64)); // result (ignored)
                                 },
                                 &[fid, rid, exit_val, locals_ptr, locals_len],
+                            )?;
+                        }
+
+                        Inst::TryFinallyEnter { region, error, .. } => {
+                            use cranelift::prelude::{AbiParam, types};
+                            let fid = fb.ins().iconst(types::I64, fun_ir.id.0 as i64);
+                            let rid = fb.ins().iconst(types::I64, region.0 as i64);
+                            let err_val = if let Some(err_vid) = error {
+                                vmap.get_or_emit(*err_vid, &mut fb, fun_ir)
+                            } else {
+                                fb.ins().iconst(types::I64, 0)
+                            };
+                            let has_error = fb
+                                .ins()
+                                .iconst(types::I64, if error.is_some() { 1 } else { 0 });
+                            let _ = self.call_import(
+                                &mut fb,
+                                "napalm_rt_try_finally_enter",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64)); // func id
+                                    s.params.push(AbiParam::new(types::I64)); // region id
+                                    s.params.push(AbiParam::new(types::I64)); // error value
+                                    s.params.push(AbiParam::new(types::I64)); // has error flag
+                                    s.returns.push(AbiParam::new(types::I64)); // ignored
+                                },
+                                &[fid, rid, err_val, has_error],
                             )?;
                         }
 
