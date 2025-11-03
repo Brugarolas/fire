@@ -77,6 +77,10 @@ struct TryFrame {
     locals: Vec<i64>,
     defers: Vec<DeferredAction>,
     defers_run: bool,
+    pending_exit: Option<TryExitKind>,
+    pending_error: Option<i64>,
+    in_finally: bool,
+    has_finally: bool,
 }
 
 thread_local! {
@@ -205,6 +209,9 @@ pub extern "C" fn napalm_rt_try_enter(
     };
     TRY_STACK.with(|stack| {
         let mut stack = stack.borrow_mut();
+        let has_finally = descriptor(resolved_ptr)
+            .map(|d| d.finally_stub.is_some())
+            .unwrap_or(false);
         stack.push(TryFrame {
             func_id: func_id_u,
             region_id: region_id_u,
@@ -212,6 +219,10 @@ pub extern "C" fn napalm_rt_try_enter(
             locals: Vec::new(),
             defers: Vec::new(),
             defers_run: false,
+            pending_exit: None,
+            pending_error: None,
+            in_finally: false,
+            has_finally,
         });
     });
     0
@@ -237,13 +248,75 @@ pub extern "C" fn napalm_rt_try_leave(
             debug_assert_eq!(frame.func_id, func_id as u32);
             debug_assert_eq!(frame.region_id, region_id as u32);
             store_locals(frame, args_ptr, argc);
-            run_deferred(frame, exit);
-            if matches!(exit, TryExitKind::Normal | TryExitKind::Rethrow) {
+            frame.pending_exit = Some(exit);
+            if matches!(exit, TryExitKind::Normal) && frame.has_finally {
+                run_deferred(frame, exit);
+                frame.defers_run = false; // allow new defers inside finally
+            } else {
+                run_deferred(frame, exit);
+            }
+            if matches!(exit, TryExitKind::Normal | TryExitKind::Rethrow) && !frame.has_finally {
                 stack.pop();
             }
         } else {
             panic!("napalm_rt_try_leave called with empty try stack");
         }
+    });
+    0
+}
+
+fn locate_frame_mut<'a>(
+    stack: &'a mut Vec<TryFrame>,
+    func_id: u32,
+    region_id: u32,
+) -> &'a mut TryFrame {
+    match stack.last_mut() {
+        Some(frame) if frame.func_id == func_id && frame.region_id == region_id => frame,
+        _ => panic!(
+            "try finalizer mismatch (func_id={} region_id={})",
+            func_id, region_id
+        ),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn napalm_rt_try_finally_enter(
+    func_id: i64,
+    region_id: i64,
+    error: i64,
+    has_error: i32,
+) -> i64 {
+    TRY_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        let frame = locate_frame_mut(&mut stack, func_id as u32, region_id as u32);
+        frame.in_finally = true;
+        if has_error != 0 {
+            frame.pending_exit = Some(TryExitKind::Exception);
+            frame.pending_error = Some(error);
+        }
+        // Allow defers scheduled inside finally to run at exit.
+        frame.defers_run = false;
+    });
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn napalm_rt_try_finally_exit(func_id: i64, region_id: i64) -> i64 {
+    TRY_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        let func_id_u = func_id as u32;
+        let region_id_u = region_id as u32;
+        {
+            let frame = locate_frame_mut(&mut stack, func_id_u, region_id_u);
+            let exit = frame.pending_exit.unwrap_or(TryExitKind::Normal);
+            if !frame.defers_run {
+                run_deferred(frame, exit);
+            }
+            frame.in_finally = false;
+            frame.pending_exit = None;
+            frame.pending_error = None;
+        }
+        stack.pop();
     });
     0
 }
