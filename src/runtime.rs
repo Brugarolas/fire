@@ -83,6 +83,19 @@ struct TryFrame {
     has_finally: bool,
 }
 
+enum ThrowAction {
+    Catch {
+        stub: StubPtr,
+        args: SmallVec<[i64; 8]>,
+    },
+    Finally {
+        stub: StubPtr,
+        args: SmallVec<[i64; 8]>,
+    },
+    PopFrame,
+    Unhandled,
+}
+
 thread_local! {
     static TRY_STACK: RefCell<Vec<TryFrame>> = RefCell::new(Vec::new());
     static RESUME_INFO: RefCell<Option<RuntimeResumeInfo>> = RefCell::new(None);
@@ -93,6 +106,17 @@ static TRY_DESCRIPTOR_REGISTRY: OnceLock<Mutex<HashMap<(u32, u32), usize>>> = On
 
 fn descriptor(ptr: *const RuntimeTryDescriptor) -> Option<&'static RuntimeTryDescriptor> {
     unsafe { ptr.as_ref() }
+}
+
+fn resolve_descriptor_for(frame: &TryFrame) -> Option<&'static RuntimeTryDescriptor> {
+    descriptor(frame.descriptor).or_else(|| {
+        TRY_DESCRIPTOR_REGISTRY
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .get(&(frame.func_id, frame.region_id))
+            .copied()
+            .and_then(|addr| descriptor(addr as *const RuntimeTryDescriptor))
+    })
 }
 
 fn run_deferred(frame: &mut TryFrame, exit: TryExitKind) {
@@ -349,53 +373,82 @@ pub extern "C" fn napalm_rt_throw(func_id: i64, error: i64) -> i64 {
     RETURN_SLOT.with(|slot| {
         slot.borrow_mut().take();
     });
-    TRY_STACK.with(|stack| {
-        let mut stack = stack.borrow_mut();
-        while let Some(mut frame) = stack.pop() {
-            run_deferred(&mut frame, TryExitKind::Exception);
-            let desc = match descriptor(frame.descriptor).or_else(|| {
-                TRY_DESCRIPTOR_REGISTRY
-                    .get_or_init(|| Mutex::new(HashMap::new()))
-                    .lock()
-                    .get(&(frame.func_id, frame.region_id))
-                    .copied()
-                    .and_then(|addr| descriptor(addr as *const RuntimeTryDescriptor))
-            }) {
-                Some(d) => d,
-                None => continue,
+    TRY_STACK.with(|stack_cell| {
+        loop {
+            let action = {
+                let mut stack = stack_cell.borrow_mut();
+                if stack.is_empty() {
+                    ThrowAction::Unhandled
+                } else {
+                    let frame = stack.last_mut().unwrap();
+                    run_deferred(frame, TryExitKind::Exception);
+                    frame.pending_exit = Some(TryExitKind::Exception);
+                    frame.pending_error = Some(error);
+
+                    if let Some(desc) = resolve_descriptor_for(frame) {
+                        let mut catch_action = None;
+                        for idx in 0..(desc.catch_len as usize) {
+                            let entry = unsafe { desc.catch_stubs.add(idx).as_ref().unwrap() };
+                            let mut args = SmallVec::<[i64; 8]>::new();
+                            if entry.binds_exception {
+                                args.push(error);
+                            }
+                            args.extend_from_slice(&frame.locals);
+                            catch_action = Some(ThrowAction::Catch {
+                                stub: entry.stub,
+                                args,
+                            });
+                            break;
+                        }
+
+                        if let Some(action) = catch_action {
+                            action
+                        } else if let Some(finally_stub) = desc.finally_stub {
+                            frame.in_finally = true;
+                            frame.defers_run = false;
+                            let mut args = SmallVec::<[i64; 8]>::new();
+                            args.extend_from_slice(&frame.locals);
+                            ThrowAction::Finally {
+                                stub: finally_stub,
+                                args,
+                            }
+                        } else {
+                            stack.pop();
+                            ThrowAction::PopFrame
+                        }
+                    } else {
+                        stack.pop();
+                        ThrowAction::PopFrame
+                    }
+                }
             };
 
-            // Attempt catch handlers in order.
-            for idx in 0..(desc.catch_len as usize) {
-                let entry = unsafe { desc.catch_stubs.add(idx).as_ref().unwrap() };
-                let mut args = SmallVec::<[i64; 8]>::new();
-                if entry.binds_exception {
-                    args.push(error);
+            match action {
+                ThrowAction::Catch { stub, args } => {
+                    let result = unsafe { stub(args.as_ptr(), args.len()) };
+                    if let Some(ret) = take_pending_return() {
+                        return ret;
+                    }
+                    return result;
                 }
-                args.extend_from_slice(&frame.locals);
-                let result = unsafe { (entry.stub)(args.as_ptr(), args.len()) };
-                if let Some(ret) = take_pending_return() {
-                    return ret;
+                ThrowAction::Finally { stub, args } => {
+                    unsafe {
+                        let _ = stub(args.as_ptr(), args.len());
+                    }
+                    if let Some(ret) = take_pending_return() {
+                        return ret;
+                    }
+                    continue;
                 }
-                return result;
-            }
-
-            // Run finally if present before propagating further.
-            if let Some(finally_stub) = desc.finally_stub {
-                unsafe {
-                    let _ = finally_stub(frame.locals.as_ptr(), frame.locals.len());
+                ThrowAction::PopFrame => continue,
+                ThrowAction::Unhandled => {
+                    panic!(
+                        "uncaught exception thrown from func={} error={:#x}",
+                        func_id, error
+                    );
                 }
-                if let Some(ret) = take_pending_return() {
-                    return ret;
-                }
-                // no override: continue propagating original error
-                continue;
             }
         }
-        panic!(
-            "uncaught exception thrown from func={} error={:#x}",
-            func_id, error
-        );
     })
 }
 
