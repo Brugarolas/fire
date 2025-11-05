@@ -5056,6 +5056,22 @@ impl JIT {
                             )?;
                         }
 
+                        Inst::TryFinallyExit { region } => {
+                            use cranelift::prelude::{AbiParam, types};
+                            let fid = fb.ins().iconst(types::I64, fun_ir.id.0 as i64);
+                            let rid = fb.ins().iconst(types::I64, region.0 as i64);
+                            let _ = self.call_import(
+                                &mut fb,
+                                "napalm_rt_try_finally_exit",
+                                |s| {
+                                    s.params.push(AbiParam::new(types::I64));
+                                    s.params.push(AbiParam::new(types::I64));
+                                    s.returns.push(AbiParam::new(types::I64));
+                                },
+                                &[fid, rid],
+                            )?;
+                        }
+
                         Inst::Throw(val) => {
                             use cranelift::prelude::{AbiParam, TrapCode, types};
                             let fid = fb.ins().iconst(types::I64, fun_ir.id.0 as i64);

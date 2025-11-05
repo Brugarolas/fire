@@ -360,6 +360,7 @@ where
                 locals_finally.keys().collect::<Vec<_>>()
             );
             let args = gather_args(&locals_finally);
+            let _ = b.push_node(Inst::TryFinallyExit { region: region_id }, None, 0, true);
             b.jump(continuation, &args);
             cont_has_path = true;
         }

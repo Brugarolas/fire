@@ -372,6 +372,9 @@ pub enum Inst {
         locals: Vec<ValueId>,
         error: Option<ValueId>,
     },
+    TryFinallyExit {
+        region: TryRegionId,
+    },
 
     // ---- Effect / bookkeeping ----
     EffectEntry, // E0 entry token
@@ -1496,7 +1499,8 @@ impl EffectKind {
             | crate::wir::Inst::LoadSuperMethod { .. }
             | crate::wir::Inst::InstanceOf { .. }
             | crate::wir::Inst::TryLeave { .. }
-            | crate::wir::Inst::TryFinallyEnter { .. } => EffectKind::Entry,
+            | crate::wir::Inst::TryFinallyEnter { .. }
+            | crate::wir::Inst::TryFinallyExit { .. } => EffectKind::Entry,
 
             crate::wir::Inst::Safepoint => EffectKind::Safepoint,
 
