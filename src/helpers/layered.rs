@@ -1,6 +1,7 @@
 use crate::helpers::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
+use parking_lot::Mutex;
 
 /////////////////////////////////////////////////////////////////////////////////////
 /// Layered Hash Map
@@ -18,7 +19,7 @@ type Matrix<T> = Vec<Vec<T>>;
 
 // We'll store a small stack of `Vec<usize>` for re-use
 thread_local! {
-    static VEC_POOL_12: std::sync::Mutex<Matrix<usize>> = std::sync::Mutex::new({
+    static VEC_POOL_12: Mutex<Matrix<usize>> = Mutex::new({
         let mut init = Vec::with_capacity(50);
         for _ in 0..50 {
             init.push(Vec::with_capacity(12));
@@ -284,7 +285,7 @@ where
         panic!("No layer to get last layer id");
     }
 
-    /// Obtain the shared cell for `key`, creating an `Arc<Mutex<V::default()>>`
+    /// Obtain the shared cell for `key`, creating an `Trc<Mutex<V::default()>>`
     /// if the variable does not yet exist in the current scope.
     pub fn capture_cell(&mut self, key: &K) -> V {
         if let Some(existing) = self.get(key) {
@@ -297,7 +298,7 @@ where
         cell
     }
 
-    /// Directly insert an **existing** `Arc<Mutex<V>>` into the map
+    /// Directly insert an **existing** `Trc<Mutex<V>>` into the map
     /// (used when a closure wants to share an outer cell).
     pub fn insert_cell(&mut self, key: K, cell: V) {
         let current_layer = self
@@ -329,7 +330,7 @@ where
 
     /// Return the *currently-visible* Rc cell for `key`, if any.
     pub fn find_cell(&self, key: &K) -> Option<V> {
-        // `get()` probably returns Option<&Arc<…>>
+        // `get()` probably returns Option<&Trc<…>>
         self.get(key).map(|cell| cell.clone())
     }
 
@@ -350,7 +351,7 @@ where
         self.key_index.keys().cloned().collect()
     }
 
-    /// Iterate over the *currently‑visible* `Arc<Mutex<V>>` cells.
+    /// Iterate over the *currently‑visible* `Trc<Mutex<V>>` cells.
     ///
     /// Each key keeps a stack of versions; the last entry is the one that is
     /// visible in the current lexical layer.

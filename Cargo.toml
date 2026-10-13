@@ -66,11 +66,12 @@ likely_stable = "0.1.3" # Branch prediction hints
 
 #job-pool = "0.6.0" # Job pool for parallelism
 
-mmtk = { git = "https://github.com/mmtk/mmtk-core.git", default-features = true } #git = "https://github.com/mmtk/mmtk-core.git", #version = "0.31"
+#mmtk = { git = "https://github.com/mmtk/mmtk-core.git", default-features = true } #git = "https://github.com/mmtk/mmtk-core.git", #version = "0.31"
+mmtk = "0.33.0"
 bumpalo = "3.19.0"
 mimalloc = "0.1.48"
 
-libc = "0.2.176"
+libc = "0.2.190"
 windows-sys = { version = "0.61.2", features = ["Win32_System_Threading"] }
 
 tokio = { version = "1.48.0", features = ["full", "rt-multi-thread", "macros"] }

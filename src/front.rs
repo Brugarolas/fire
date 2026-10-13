@@ -5,7 +5,7 @@
 use crate::helpers::collections::{HashMap, HashSet};
 use crate::helpers::layered::LayeredMap;
 use ariadne::Source;
-use hybrid_rc::Arc;
+use trc::Trc;
 use logos::Logos;
 use smallbox::SmallBox;
 use std::collections::hash_map::Entry;
@@ -282,9 +282,9 @@ pub struct Program {
 #[derive(Debug, Clone)]
 pub struct ModuleAST<'a> {
     pub id: ModuleId,
-    pub path: Arc<PathBuf>,
+    pub path: Trc<PathBuf>,
     pub exports: HashMap<&'a str, ExportItem<'a>>,
-    pub imports: HashMap<Arc<PathBuf>, ImportRequest<'a>>,
+    pub imports: HashMap<Trc<PathBuf>, ImportRequest<'a>>,
 }
 
 #[derive(Debug, Clone)]
@@ -297,7 +297,7 @@ pub struct ExportItem<'a> {
 
 #[derive(Debug, Clone)]
 pub struct ImportRequest<'a> {
-    pub from_path: Arc<PathBuf>,
+    pub from_path: Trc<PathBuf>,
     pub names: Vec<&'a str>,
     pub resolved: Vec<(&'a str, BindingId)>,
     // Diagnostic info
@@ -841,7 +841,7 @@ pub struct Parser<'src> {
     module_ptr: Option<*mut ModuleAST<'static>>,
     ctx: Option<*const ModulesCTX>,
     resolver: Option<*const ProgramBuilder>,
-    referrer: Option<Arc<PathBuf>>,
+    referrer: Option<Trc<PathBuf>>,
     file_id: FileId,
     file_name: CompactString,
 }
@@ -923,7 +923,7 @@ impl<'src> Parser<'src> {
         ctx: &'a ModulesCTX,
         resolver: &'a ProgramBuilder,
         module_ptr: *mut ModuleAST<'a>,
-        referrer: Arc<PathBuf>,
+        referrer: Trc<PathBuf>,
     ) -> Self {
         let display_name = referrer.to_string_lossy();
         let mut p = Self::with_name(src, display_name.as_ref());
@@ -1240,7 +1240,7 @@ impl<'src> Parser<'src> {
                     names_bumped.push(std::mem::transmute::<&str, &'static str>(s));
                 }
 
-                let abs_arc = Arc::new(abs.clone());
+                let abs_arc = Trc::new(abs.clone());
                 let req = m
                     .imports
                     .entry(abs_arc.clone())

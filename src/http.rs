@@ -16,7 +16,7 @@ use core::ptr::read_unaligned;
 use futures_util::stream::StreamExt;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-use rclite::Arc;
+use trc::Trc;
 use reqwest;
 use serde_json;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -94,7 +94,7 @@ struct ServerEntry {
     routes: Vec<Route>,
 }
 
-static SERVERS: Lazy<Mutex<HashMap<u64, Arc<ServerEntry>>>> =
+static SERVERS: Lazy<Mutex<HashMap<u64, Trc<ServerEntry>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Map (server_id, req_id) -> response sender (no VM values inside)
@@ -403,7 +403,7 @@ pub extern "C" fn wir_server_create(addr_ptr: i64) -> i64 {
     let server_id = rand_id();
 
     let dispatch_closure = crate::value::closure_new(dispatch_tramp as usize, 0);
-    let entry = Arc::new(ServerEntry {
+    let entry = Trc::new(ServerEntry {
         addr,
         dispatch_closure,
         routes: Vec::new(),
@@ -480,9 +480,9 @@ pub extern "C" fn wir_server_add_route(
         .get_mut(&(server_id as u64))
         .expect("server not found during add_route");
 
-    // `Arc::get_mut` is correct for ensuring we have exclusive access to modify the routes.
+    // `Trc::get_mut` is correct for ensuring we have exclusive access to modify the routes.
     let server_entry =
-        Arc::get_mut(entry).expect("Cannot modify server routes while it is actively being used");
+        Trc::get_mut(entry).expect("Cannot modify server routes while it is actively being used");
 
     server_entry.routes.push(Route {
         method,
@@ -509,7 +509,7 @@ pub extern "C" fn wir_server_listen(server_id: i64) -> i64 {
                 // --- THIS IS THE FINAL FIX ---
                 // We define an Axum handler as a closure that can be used for both routes.
                 let handler = move |method: Method, uri: axum::http::Uri, headers: HeaderMap, body: Bytes| {
-                    let entry = entry.clone(); // Clone the Arc for this specific request
+                    let entry = entry.clone(); // Clone the Trc for this specific request
                     async move {
                         #[cfg(debug_assertions)]
                         eprintln!("[http::axum_handler] Received request: {} {}", method, uri.path());

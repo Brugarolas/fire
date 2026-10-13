@@ -3,7 +3,7 @@
 #![allow(unused_variables)]
 
 use bumpalo::Bump;
-use hybrid_rc::Arc;
+use trc::Trc;
 use may::coroutine;
 use std::num::NonZeroUsize;
 use std::thread;
@@ -35,7 +35,7 @@ pub struct ModulesCTX {
     /// Bump arena used by the parser to intern &'static str for import/export names.
     pub arena: Bump,
     /// Registry of parsed modules (by absolute path) → Box<ModuleAST>.
-    pub registry: HashMap<Arc<PathBuf>, Box<ModuleAST<'static>>>,
+    pub registry: HashMap<Trc<PathBuf>, Box<ModuleAST<'static>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,17 +87,17 @@ pub struct ProgramBuilder {
     loader: FSLoader,
 
     /// LIFO queue of absolute paths to parse (pop/push).
-    pending: RefCell<Vec<Arc<PathBuf>>>,
+    pending: RefCell<Vec<Trc<PathBuf>>>,
     /// Set of absolute paths already enqueued/visited to avoid duplicates.
-    visited: RefCell<HashSet<Arc<PathBuf>>>,
+    visited: RefCell<HashSet<Trc<PathBuf>>>,
     /// Per-module full AST (what `Lowerer` needs).
-    programs: HashMap<Arc<PathBuf>, Program>,
-    sources: HashMap<Arc<PathBuf>, String>,
+    programs: HashMap<Trc<PathBuf>, Program>,
+    sources: HashMap<Trc<PathBuf>, String>,
 }
 
 pub struct BuiltBundle {
-    pub shards: HashMap<Arc<PathBuf>, crate::wir::Module>,
-    pub init_order: Vec<Arc<PathBuf>>,
+    pub shards: HashMap<Trc<PathBuf>, crate::wir::Module>,
+    pub init_order: Vec<Trc<PathBuf>>,
 }
 
 impl ProgramBuilder {
@@ -116,7 +116,7 @@ impl ProgramBuilder {
         // 1) parse + bind
         let entry_abs =
             std::fs::canonicalize(entry).map_err(|e| format!("canonicalize({entry}): {e}"))?;
-        let entry_arc = Arc::new(entry_abs);
+        let entry_arc = Trc::new(entry_abs);
 
         self.build_from_entry(entry)?;
 
@@ -133,7 +133,7 @@ impl ProgramBuilder {
     }
 
     fn resolve_all_modules(&self) -> Result<(), String> {
-        let mut paths: Vec<&Arc<PathBuf>> = self.programs.keys().collect();
+        let mut paths: Vec<&Trc<PathBuf>> = self.programs.keys().collect();
         paths.sort();
 
         for path in paths {
@@ -160,15 +160,15 @@ impl ProgramBuilder {
 
     fn merge_wir_shards(
         &self,
-        mut shards: HashMap<Arc<PathBuf>, crate::wir::Module>,
-        order: &[Arc<PathBuf>],
-        entry: &Arc<PathBuf>,
+        mut shards: HashMap<Trc<PathBuf>, crate::wir::Module>,
+        order: &[Trc<PathBuf>],
+        entry: &Trc<PathBuf>,
     ) -> Result<crate::wir::Module, String> {
         use crate::wir::Module as WirModule;
 
         let mut dst = WirModule::new();
-        let mut modinit_funcs: HashMap<Arc<PathBuf>, FuncId> = HashMap::default();
-        let mut toplevel_funcs: HashMap<Arc<PathBuf>, FuncId> = HashMap::default();
+        let mut modinit_funcs: HashMap<Trc<PathBuf>, FuncId> = HashMap::default();
+        let mut toplevel_funcs: HashMap<Trc<PathBuf>, FuncId> = HashMap::default();
 
         for path in order {
             let mut src = match shards.remove(path) {
@@ -273,10 +273,10 @@ impl ProgramBuilder {
 
     fn build_link_info_for_module(
         &self,
-        path: &Arc<PathBuf>,
+        path: &Trc<PathBuf>,
         prog: &Program,
         // This cache is important to avoid re-analyzing the AST of modules that are imported multiple times.
-        export_kind_cache: &mut HashMap<Arc<PathBuf>, HashMap<String, ExportSymbolKind>>,
+        export_kind_cache: &mut HashMap<Trc<PathBuf>, HashMap<String, ExportSymbolKind>>,
     ) -> Result<LinkInfo, String> {
         // 1. Start with a fresh LinkInfo for the current module.
         let mut links = LinkInfo::default();
@@ -309,7 +309,7 @@ impl ProgramBuilder {
                         imp.specifier, path, e
                     )
                 })?;
-            let resolved_provider_arc = Arc::new(resolved_provider_path);
+            let resolved_provider_arc = Trc::new(resolved_provider_path);
 
             // Get the ModuleAST of the module we are importing FROM.
             let provider_ast = self
@@ -422,7 +422,7 @@ impl ProgramBuilder {
     pub fn build_from_entry(&mut self, entry: &str) -> Result<crate::wir::Module, String> {
         let abs =
             std::fs::canonicalize(entry).map_err(|e| format!("canonicalize({entry}): {e}"))?;
-        let abs = Arc::new(abs);
+        let abs = Trc::new(abs);
 
         self.enqueue_if_new(abs.clone());
 
@@ -454,7 +454,7 @@ impl ProgramBuilder {
     ///  - The `Lowerer` inside the fiber only mutates its own fresh `wir::Module`.
     pub fn lower_all_modules_parallel_sharded(
         &self,
-    ) -> Result<HashMap<Arc<PathBuf>, crate::wir::Module>, String> {
+    ) -> Result<HashMap<Trc<PathBuf>, crate::wir::Module>, String> {
         use may::coroutine::Builder as CoBuilder;
         let num_cpus: usize = thread::available_parallelism()
             .unwrap_or(NonZeroUsize::new(1).unwrap())
@@ -466,7 +466,7 @@ impl ProgramBuilder {
         //    (path, program, links)
         #[derive(Clone)]
         struct Job {
-            path: Arc<PathBuf>,
+            path: Trc<PathBuf>,
             prog: Program,
             links: LinkInfo,
         }
@@ -474,11 +474,11 @@ impl ProgramBuilder {
         let build_start = std::time::Instant::now();
 
         let mut jobs: Vec<Job> = Vec::new();
-        let mut export_kind_cache: HashMap<Arc<PathBuf>, HashMap<String, ExportSymbolKind>> =
+        let mut export_kind_cache: HashMap<Trc<PathBuf>, HashMap<String, ExportSymbolKind>> =
             HashMap::default();
 
         // Stable order for determinism
-        let mut paths: Vec<Arc<PathBuf>> = self.ctx.registry.keys().cloned().collect();
+        let mut paths: Vec<Trc<PathBuf>> = self.ctx.registry.keys().cloned().collect();
         paths.sort_by(|a, b| a.as_path().cmp(b.as_path()));
 
         for path in paths {
@@ -501,7 +501,7 @@ impl ProgramBuilder {
             let name = format!("lower#{}", i);
             let h = unsafe {
                 CoBuilder::new().name(name).spawn(
-                    move || -> Result<(Arc<PathBuf>, crate::wir::Module), String> {
+                    move || -> Result<(Trc<PathBuf>, crate::wir::Module), String> {
                         // Lower into a fresh module
                         let mut m = crate::wir::Module::new();
 
@@ -523,7 +523,7 @@ impl ProgramBuilder {
         }
 
         // 3) Join all and gather results.
-        let mut out: HashMap<Arc<PathBuf>, crate::wir::Module> = HashMap::default();
+        let mut out: HashMap<Trc<PathBuf>, crate::wir::Module> = HashMap::default();
         let mut coroutine_counter = 1;
         for h in handles {
             let (p, m) = h
@@ -544,10 +544,10 @@ impl ProgramBuilder {
         Ok(out)
     }
 
-    fn topo_order(&self) -> Result<Vec<Arc<PathBuf>>, String> {
+    fn topo_order(&self) -> Result<Vec<Trc<PathBuf>>, String> {
         // 1) provider -> {importers}
-        let mut incoming: HashMap<Arc<PathBuf>, usize> = HashMap::default(); // indegree
-        let mut outgoing: HashMap<Arc<PathBuf>, Vec<Arc<PathBuf>>> = HashMap::default();
+        let mut incoming: HashMap<Trc<PathBuf>, usize> = HashMap::default(); // indegree
+        let mut outgoing: HashMap<Trc<PathBuf>, Vec<Trc<PathBuf>>> = HashMap::default();
 
         for k in self.ctx.registry.keys() {
             incoming.entry(k.clone()).or_insert(0);
@@ -571,7 +571,7 @@ impl ProgramBuilder {
 
         // 2) Kahn
         use std::collections::VecDeque;
-        let mut q: VecDeque<Arc<PathBuf>> = incoming
+        let mut q: VecDeque<Trc<PathBuf>> = incoming
             .iter()
             .filter_map(|(k, &deg)| if deg == 0 { Some(k.clone()) } else { None })
             .collect();
@@ -608,7 +608,7 @@ impl ProgramBuilder {
     // ------------------------
 
     /// The parser calls this when it encounters an `import` (absolute path already resolved).
-    pub fn note_pending(&self, abs: Arc<PathBuf>) {
+    pub fn note_pending(&self, abs: Trc<PathBuf>) {
         self.enqueue_if_new(abs);
     }
 
@@ -623,7 +623,7 @@ impl ProgramBuilder {
     // Internals
     // ------------------------
 
-    fn enqueue_if_new(&self, abs: Arc<PathBuf>) {
+    fn enqueue_if_new(&self, abs: Trc<PathBuf>) {
         let mut v = self.visited.borrow_mut();
         if v.insert(abs.clone()) {
             self.pending.borrow_mut().push(abs);
@@ -632,7 +632,7 @@ impl ProgramBuilder {
 
     /// Parse a single module at absolute path `abs`, producing and registering a fresh ModuleAST,
     /// and keeping the full `Program` AST aside (for lowerer).
-    fn parse_one(&mut self, abs: Arc<PathBuf>) -> Result<(), String> {
+    fn parse_one(&mut self, abs: Trc<PathBuf>) -> Result<(), String> {
         // 1) Read source
         let src = self
             .loader
@@ -732,7 +732,7 @@ impl ProgramBuilder {
     /// `ImportRequest.resolved`. Namespace imports and re-exports are left for later.
     fn bind_imports(&mut self) -> Result<(), String> {
         // Snapshot all jobs to avoid borrow conflicts.
-        let mut jobs: Vec<(Arc<PathBuf>, Arc<PathBuf>, Vec<&'static str>)> = Vec::new();
+        let mut jobs: Vec<(Trc<PathBuf>, Trc<PathBuf>, Vec<&'static str>)> = Vec::new();
 
         for (tgt_path, tgt_box) in self.ctx.registry.get_internals() {
             let tgt: &ModuleAST<'static> = &**tgt_box;

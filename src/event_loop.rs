@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, VecDeque},
-    sync::{Condvar, Mutex},
     time::{Duration, Instant},
 };
+use parking_lot::{Condvar, Mutex};
 
 #[derive(Clone, Copy)]
 pub struct MicroTask {
