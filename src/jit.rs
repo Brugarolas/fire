@@ -122,7 +122,7 @@ fn ic_from_ptr(ptr: *mut FieldInlineCache) -> Option<&'static FieldInlineCache> 
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn jit_obj_get_field_slow(ic_ptr: *mut FieldInlineCache, obj: i64, fid: i64) -> i64 {
+extern "C" fn jit_obj_get_field_slow(ic_ptr: *mut FieldInlineCache, obj: i64, fid: i64) -> i64 {
     if obj == 0 {
         if let Some(ic) = ic_from_ptr(ic_ptr) {
             ic.invalidate();
@@ -160,7 +160,7 @@ pub extern "C" fn jit_obj_get_field_slow(ic_ptr: *mut FieldInlineCache, obj: i64
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn jit_obj_set_field_slow(
+extern "C" fn jit_obj_set_field_slow(
     ic_ptr: *mut FieldInlineCache,
     obj: i64,
     fid: i64,
@@ -198,7 +198,7 @@ pub extern "C" fn jit_obj_set_field_slow(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn jit_obj_has_field_slow(ic_ptr: *mut FieldInlineCache, obj: i64, fid: i64) -> i64 {
+extern "C" fn jit_obj_has_field_slow(ic_ptr: *mut FieldInlineCache, obj: i64, fid: i64) -> i64 {
     if obj == 0 {
         if let Some(ic) = ic_from_ptr(ic_ptr) {
             ic.invalidate();
@@ -237,7 +237,7 @@ pub extern "C" fn jit_obj_has_field_slow(ic_ptr: *mut FieldInlineCache, obj: i64
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn jit_obj_del_field_slow(ic_ptr: *mut FieldInlineCache, obj: i64, fid: i64) -> i64 {
+extern "C" fn jit_obj_del_field_slow(ic_ptr: *mut FieldInlineCache, obj: i64, fid: i64) -> i64 {
     if obj == 0 {
         if let Some(ic) = ic_from_ptr(ic_ptr) {
             ic.invalidate();

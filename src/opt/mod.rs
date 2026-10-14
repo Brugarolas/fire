@@ -75,11 +75,11 @@ impl<'f> InstCursor<'f> {
     // ----- explicit materialization helpers (avoid implicit autoref) -----
     #[inline]
     unsafe fn func_ref(&self) -> &Function {
-        &*self.func
+        unsafe { &*self.func }
     }
     #[inline]
     unsafe fn func_mut(&mut self) -> &mut Function {
-        &mut *self.func
+        unsafe { &mut *self.func }
     }
 
     #[inline]
@@ -428,7 +428,7 @@ impl WirEditQueue {
     }
 
     /// Apply to one block; also updates `FuncState` position map.
-    pub fn apply_block(&mut self, f: &mut Function, fs: &mut FuncState, bix: usize) {
+    fn apply_block(&mut self, f: &mut Function, fs: &mut FuncState, bix: usize) {
         self.ensure_blocks(f.blocks.len());
         // Route compat edits for this block (if any).
         self.route_compat_for_block(f, bix);

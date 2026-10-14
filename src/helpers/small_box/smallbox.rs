@@ -155,8 +155,10 @@ impl<T: ?Sized, Space> SmallBox<T, Space> {
     where
         U: Sized,
     {
-        let val = ManuallyDrop::new(val);
-        Self::new_copy(&val, ptr)
+        unsafe {
+            let val = ManuallyDrop::new(val);
+            Self::new_copy(&val, ptr)
+        }
     }
 
     /// Change the capacity of [`SmallBox`].
@@ -215,72 +217,76 @@ impl<T: ?Sized, Space> SmallBox<T, Space> {
     where
         U: ?Sized,
     {
-        let layout = Layout::for_value::<U>(val);
-        let space_layout = Layout::new::<Space>();
+        unsafe {
+            let layout = Layout::for_value::<U>(val);
+            let space_layout = Layout::new::<Space>();
 
-        let mut space = MaybeUninit::<UnsafeCell<Space>>::uninit();
+            let mut space = MaybeUninit::<UnsafeCell<Space>>::uninit();
 
-        let (ptr_this, val_dst): (*mut u8, *mut u8) =
-            if layout.size() <= space_layout.size() && layout.align() <= space_layout.align() {
-                // Stack.
-                (INLINE_SENTINEL, space.as_mut_ptr().cast())
-            } else if layout.size() == 0 {
-                // ZST with alignment greater than Space, which will behave like being stored on
-                // heap but will not actually allocate.
-                (
-                    without_provenance_mut(layout.align()),
-                    without_provenance_mut(layout.align()),
-                )
-            } else {
-                // Heap.
-                let layout = layout
-                    // Safety: MIN_ALIGNMENT is 2, which is a valid power-of-two alignment.
-                    .align_to(MIN_ALIGNMENT)
-                    .unwrap_or_else(|_| unreachable_unchecked());
-                let heap_ptr = alloc::alloc(layout);
+            let (ptr_this, val_dst): (*mut u8, *mut u8) =
+                if layout.size() <= space_layout.size() && layout.align() <= space_layout.align() {
+                    // Stack.
+                    (INLINE_SENTINEL, space.as_mut_ptr().cast())
+                } else if layout.size() == 0 {
+                    // ZST with alignment greater than Space, which will behave like being stored on
+                    // heap but will not actually allocate.
+                    (
+                        without_provenance_mut(layout.align()),
+                        without_provenance_mut(layout.align()),
+                    )
+                } else {
+                    // Heap.
+                    let layout = layout
+                        // Safety: MIN_ALIGNMENT is 2, which is a valid power-of-two alignment.
+                        .align_to(MIN_ALIGNMENT)
+                        .unwrap_or_else(|_| unreachable_unchecked());
+                    let heap_ptr = alloc::alloc(layout);
 
-                if heap_ptr.is_null() {
-                    handle_alloc_error(layout)
-                }
+                    if heap_ptr.is_null() {
+                        handle_alloc_error(layout)
+                    }
 
-                (heap_ptr, heap_ptr)
-            };
+                    (heap_ptr, heap_ptr)
+                };
 
-        // `self.ptr` always holds the metadata, even if stack allocated.
-        let ptr = with_metadata_of_mut(ptr_this, metadata_ptr);
-        // Safety: ptr is either INLINE_SENTINEL or returned from the allocator and checked for
-        // null.
-        let ptr = NonNull::new_unchecked(ptr);
+            // `self.ptr` always holds the metadata, even if stack allocated.
+            let ptr = with_metadata_of_mut(ptr_this, metadata_ptr);
+            // Safety: ptr is either INLINE_SENTINEL or returned from the allocator and checked for
+            // null.
+            let ptr = NonNull::new_unchecked(ptr);
 
-        ptr::copy_nonoverlapping(from_ref(val).cast(), val_dst, layout.size());
+            ptr::copy_nonoverlapping(from_ref(val).cast(), val_dst, layout.size());
 
-        SmallBox {
-            space,
-            ptr,
-            _phantom: PhantomData,
+            SmallBox {
+                space,
+                ptr,
+                _phantom: PhantomData,
+            }
         }
     }
 
     unsafe fn downcast_unchecked<U: Any>(self) -> SmallBox<U, Space> {
-        let this = ManuallyDrop::new(self);
+        unsafe {
+            let this = ManuallyDrop::new(self);
 
-        let size = mem::size_of::<U>();
-        let mut space = MaybeUninit::<UnsafeCell<Space>>::uninit();
+            let size = mem::size_of::<U>();
+            let mut space = MaybeUninit::<UnsafeCell<Space>>::uninit();
 
-        if !this.is_heap() {
-            ptr::copy_nonoverlapping::<u8>(
-                this.space.as_ptr().cast(),
-                space.as_mut_ptr().cast(),
-                size,
-            );
-        };
+            if !this.is_heap() {
+                ptr::copy_nonoverlapping::<u8>(
+                    this.space.as_ptr().cast(),
+                    space.as_mut_ptr().cast(),
+                    size,
+                );
+            };
 
-        let ptr = this.ptr.cast();
+            let ptr = this.ptr.cast();
 
-        SmallBox {
-            space,
-            ptr,
-            _phantom: PhantomData,
+            SmallBox {
+                space,
+                ptr,
+                _phantom: PhantomData,
+            }
         }
     }
 
@@ -599,23 +605,6 @@ impl<F: Future + ?Sized, S> Future for SmallBox<F, S> {
 unsafe impl<T: ?Sized + Send, Space> Send for SmallBox<T, Space> {}
 unsafe impl<T: ?Sized + Sync, Space> Sync for SmallBox<T, Space> {}
 
-#[cfg(feature = "nightly")]
-#[allow(clippy::incompatible_msrv)]
-mod implementation {
-    pub const fn without_provenance_mut<T>(addr: usize) -> *mut T {
-        core::ptr::without_provenance_mut(addr)
-    }
-
-    pub fn with_metadata_of<T: ?Sized, U: ?Sized>(ptr: *const T, meta: *const U) -> *const U {
-        ptr.with_metadata_of(meta)
-    }
-
-    pub fn with_metadata_of_mut<T: ?Sized, U: ?Sized>(ptr: *mut T, meta: *const U) -> *mut U {
-        ptr.with_metadata_of(meta)
-    }
-}
-
-#[cfg(not(feature = "nightly"))]
 #[allow(clippy::as_conversions)]
 mod implementation {
     use core::ptr::addr_of_mut;
@@ -625,10 +614,7 @@ mod implementation {
     }
 
     pub const fn without_provenance_mut<T>(addr: usize) -> *mut T {
-        #[allow(clippy::useless_transmute)]
-        unsafe {
-            core::mem::transmute(addr)
-        }
+        core::ptr::without_provenance_mut(addr)
     }
 
     pub fn with_metadata_of<T: ?Sized, U: ?Sized>(ptr: *const T, meta: *const U) -> *const U {

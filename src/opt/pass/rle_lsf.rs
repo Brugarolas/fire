@@ -260,7 +260,6 @@ impl RedundantLoadElim {
                         | Inst::StrLen(_) | Inst::StrConcat { .. } | Inst::StrSlice { .. }
                         | Inst::StrCompare { .. } | Inst::StrContains { .. }
                         | Inst::ArraySlice { .. }
-                        | Inst::ArrayLen(_) // handled above already
                         | Inst::Return(_) | Inst::Throw(_)
                         | Inst::Branch { .. } | Inst::Jump(_, _) | Inst::Switch { .. } => {
                             // nothing to do

@@ -98,7 +98,7 @@ impl EventLoop {
             fun,
             canceled: false,
         };
-        let mut g = self.m.lock().unwrap();
+        let mut g = self.m.lock();
         g.heap.push(Reverse(t));
         g.active += 1;
         self.cv.notify_all();
@@ -106,7 +106,7 @@ impl EventLoop {
     }
 
     pub fn enqueue_microtask(&self, fun: i64, arg: i64) {
-        let mut g = self.m.lock().unwrap();
+        let mut g = self.m.lock();
         g.micro.push_back(MicroTask { fun, arg });
         self.cv.notify_all();
     }
@@ -118,7 +118,7 @@ impl EventLoop {
                 break;
             }
             let mt = {
-                let mut g = self.m.lock().unwrap();
+                let mut g = self.m.lock();
                 match g.micro.pop_front() {
                     Some(m) => m,
                     None => break,
@@ -132,7 +132,7 @@ impl EventLoop {
 
     // fix clear():
     pub fn clear(&self, id: u64) {
-        let mut g = self.m.lock().unwrap();
+        let mut g = self.m.lock();
 
         // mark ready-queue tasks and count how many we actually canceled
         let mut dec = 0usize;
@@ -154,7 +154,7 @@ impl EventLoop {
 
     // when moving due items out of the heap:
     pub fn poll_due_and_enqueue(&self) {
-        let mut g = self.m.lock().unwrap();
+        let mut g = self.m.lock();
         let now = Instant::now();
         while let Some(Reverse(t)) = g.heap.peek().cloned() {
             if t.when > now {
@@ -179,7 +179,7 @@ impl EventLoop {
                 break;
             }
             let task = {
-                let mut g = self.m.lock().unwrap();
+                let mut g = self.m.lock();
                 match g.ready.pop_front() {
                     Some(t) => t,
                     None => break,
@@ -188,11 +188,11 @@ impl EventLoop {
 
             // skip if canceled (either flagged while ready, or tombstoned)
             let canceled_now = {
-                let mut g = self.m.lock().unwrap();
+                let mut g = self.m.lock();
                 task.canceled || g.canceled.remove(&task.id)
             };
             if canceled_now {
-                let mut g = self.m.lock().unwrap();
+                let mut g = self.m.lock();
                 g.active = g.active.saturating_sub(1);
                 continue;
             }
@@ -201,14 +201,14 @@ impl EventLoop {
             ran += 1;
 
             if task.kind == TimerKind::Interval {
-                let mut g = self.m.lock().unwrap();
+                let mut g = self.m.lock();
                 let p = task.period.unwrap();
                 g.heap.push(Reverse(Task {
                     when: Instant::now() + p,
                     ..task
                 }));
             } else {
-                let mut g = self.m.lock().unwrap();
+                let mut g = self.m.lock();
                 g.active = g.active.saturating_sub(1);
             }
         }
@@ -243,7 +243,7 @@ impl EventLoop {
         }
 
         // 4) Nothing ran; wait until next timer or a short timeout
-        let mut g = self.m.lock().unwrap();
+        let mut g = self.m.lock();
 
         // If something arrived concurrently, loop again immediately (no wait)
         if !g.micro.is_empty() || !g.ready.is_empty() {
@@ -257,9 +257,9 @@ impl EventLoop {
             } else {
                 Duration::from_millis(0)
             };
-            let (_g2, _) = self.cv.wait_timeout(g, dur).unwrap();
+            self.cv.wait_for(&mut g, dur);
         } else {
-            let (_g2, _) = self.cv.wait_timeout(g, Duration::from_millis(1)).unwrap();
+            self.cv.wait_for(&mut g, Duration::from_millis(1));
         }
 
         false
@@ -280,7 +280,7 @@ impl EventLoop {
             let _ran = self.run_ready(usize::MAX, &mut call_timer);
 
             // 3) Quiescence / wait
-            let mut g = self.m.lock().unwrap();
+            let mut g = self.m.lock();
             if g.active == 0 && g.ready.is_empty() && g.micro.is_empty() {
                 break;
             }
@@ -294,18 +294,16 @@ impl EventLoop {
                     continue;
                 }
                 let dur = next.when - now;
-                let (g2, _) = self.cv.wait_timeout(g, dur).unwrap();
-                g = g2;
+                self.cv.wait_for(&mut g, dur);
             } else if g.ready.is_empty() {
-                let (g2, _) = self.cv.wait_timeout(g, Duration::from_millis(1)).unwrap();
-                g = g2;
+                self.cv.wait_for(&mut g, Duration::from_millis(1));
             }
         }
     }
 
     // Root scanning hook for the GC: now also visit microtask closures
     pub fn with_root_slots<F: FnMut(*mut i64)>(&self, mut f: F) {
-        let g = self.m.lock().unwrap();
+        let g = self.m.lock();
         for Reverse(t) in g.heap.iter() {
             let ptr = &t.fun as *const i64 as *mut i64;
             f(ptr);
@@ -324,7 +322,7 @@ impl EventLoop {
     /// becoming quiescent and exiting. This is used by long-running background
     /// services like an HTTP server.
     pub fn add_persistent_task(&self) {
-        let mut g = self.m.lock().unwrap();
+        let mut g = self.m.lock();
         g.active += 1;
     }
 }

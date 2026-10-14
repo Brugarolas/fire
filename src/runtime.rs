@@ -1358,7 +1358,7 @@ pub extern "C" fn wir_super_get_method(home_proto: i64, field_id_smi: i64) -> i6
     }
     let fid = unsafe { obj_get_field_deep(super_proto, decode_field_smi(field_id_smi)) };
     if (fid & 1) == 1 {
-        (unsafe { wir_make_method_closure(fid) })
+        unsafe { wir_make_method_closure(fid) }
     } else {
         fid
     } // same binding rule

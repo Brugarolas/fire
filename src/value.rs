@@ -315,7 +315,7 @@ impl BoxedArray {
 }
 
 #[inline]
-fn alloc_array_from_vec(mut buf: Vec<i64>) -> ValueRepr {
+fn alloc_array_from_vec(buf: Vec<i64>) -> ValueRepr {
     unsafe {
         let size = core::mem::size_of::<BoxedArray>();
         let align = core::mem::align_of::<BoxedArray>();

@@ -111,7 +111,7 @@ impl SimplifyCFG {
                             default_b,
                             table,
                         } => {
-                            let mut nd = resolve_zero_param_trampoline(*default_b, func);
+                            let nd = resolve_zero_param_trampoline(*default_b, func);
                             let mut nt = table.clone();
                             let mut any = nd != *default_b;
                             for it in nt.iter_mut() {
@@ -209,7 +209,6 @@ impl SimplifyCFG {
             // Rebuild preds if we changed edges
             if changed {
                 q.apply(func);
-                changed = false;
                 // rebuild to continue processing below
                 let term_of2 = collect_terminators(func);
                 let (preds2, _succs2) = build_cfg(func, &term_of2);

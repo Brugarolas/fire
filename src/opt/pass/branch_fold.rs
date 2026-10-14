@@ -225,7 +225,7 @@ impl BranchFold {
                                 continue;
                             }
                             // 3) All arms (table + default) are the same → Jump(that)
-                            let mut all_to = default_b;
+                            let all_to = default_b;
                             let mut all_same = true;
                             for &(_, b) in table {
                                 if b != default_b {

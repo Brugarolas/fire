@@ -466,7 +466,7 @@ pub struct LinkInfo {
 pub struct LoweringContext {
     pub funcs: HashMap<String, FuncId>,
     pub lam_captures: HashMap<String, Vec<String>>,
-    pub classes: HashMap<String, ClassInfo>,
+    classes: HashMap<String, ClassInfo>,
     pub links: LinkInfo,
 }
 

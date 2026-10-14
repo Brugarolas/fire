@@ -32,7 +32,7 @@ thread_local! {
 /// otherwise create a new one with capacity 12.
 fn pool_get_vec_12() -> Vec<usize> {
     VEC_POOL_12.with(|pool| {
-        let mut guard = pool.lock().unwrap(); // ← was borrow_mut()
+        let mut guard = pool.lock(); // ← was borrow_mut()
         if let Some(mut v) = guard.pop() {
             v.clear(); // ensure length == 0
             v
@@ -47,7 +47,7 @@ fn pool_put_vec_12(mut v: Vec<usize>) {
     if v.capacity() == 12 {
         v.clear();
         VEC_POOL_12.with(|pool| {
-            pool.lock().unwrap().push(v); // ← was borrow_mut()
+            pool.lock().push(v); // ← was borrow_mut()
         });
     }
     // else: drop and let the allocator reclaim it

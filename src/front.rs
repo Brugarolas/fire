@@ -5,11 +5,11 @@
 use crate::helpers::collections::{HashMap, HashSet};
 use crate::helpers::layered::LayeredMap;
 use ariadne::Source;
-use trc::Trc;
 use logos::Logos;
 use smallbox::SmallBox;
 use std::collections::hash_map::Entry;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::{
     collections::BTreeSet,
     ops::Deref,
@@ -282,9 +282,9 @@ pub struct Program {
 #[derive(Debug, Clone)]
 pub struct ModuleAST<'a> {
     pub id: ModuleId,
-    pub path: Trc<PathBuf>,
+    pub path: Arc<PathBuf>,
     pub exports: HashMap<&'a str, ExportItem<'a>>,
-    pub imports: HashMap<Trc<PathBuf>, ImportRequest<'a>>,
+    pub imports: HashMap<Arc<PathBuf>, ImportRequest<'a>>,
 }
 
 #[derive(Debug, Clone)]
@@ -297,7 +297,7 @@ pub struct ExportItem<'a> {
 
 #[derive(Debug, Clone)]
 pub struct ImportRequest<'a> {
-    pub from_path: Trc<PathBuf>,
+    pub from_path: Arc<PathBuf>,
     pub names: Vec<&'a str>,
     pub resolved: Vec<(&'a str, BindingId)>,
     // Diagnostic info
@@ -614,18 +614,6 @@ fn lvalue_unknown(kind: LValueKind) -> LValue {
     Node::unknown(kind)
 }
 
-macro_rules! stmt {
-    ($variant:ident { $($inner:tt)* }) => {
-        stmt_unknown(StmtKind::$variant { $($inner)* })
-    };
-    ($variant:ident ( $($inner:expr),* $(,)? )) => {
-        stmt_unknown(StmtKind::$variant($($inner),*))
-    };
-    ($variant:ident) => {
-        stmt_unknown(StmtKind::$variant)
-    };
-}
-
 macro_rules! expr {
     ($variant:ident { $($inner:tt)* }) => {
         expr_unknown(ExprKind::$variant { $($inner)* })
@@ -841,7 +829,7 @@ pub struct Parser<'src> {
     module_ptr: Option<*mut ModuleAST<'static>>,
     ctx: Option<*const ModulesCTX>,
     resolver: Option<*const ProgramBuilder>,
-    referrer: Option<Trc<PathBuf>>,
+    referrer: Option<Arc<PathBuf>>,
     file_id: FileId,
     file_name: CompactString,
 }
@@ -923,7 +911,7 @@ impl<'src> Parser<'src> {
         ctx: &'a ModulesCTX,
         resolver: &'a ProgramBuilder,
         module_ptr: *mut ModuleAST<'a>,
-        referrer: Trc<PathBuf>,
+        referrer: Arc<PathBuf>,
     ) -> Self {
         let display_name = referrer.to_string_lossy();
         let mut p = Self::with_name(src, display_name.as_ref());
@@ -1240,7 +1228,7 @@ impl<'src> Parser<'src> {
                     names_bumped.push(std::mem::transmute::<&str, &'static str>(s));
                 }
 
-                let abs_arc = Trc::new(abs.clone());
+                let abs_arc = Arc::new(abs.clone());
                 let req = m
                     .imports
                     .entry(abs_arc.clone())

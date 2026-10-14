@@ -38,8 +38,9 @@ use mmtk::{
     vm::{ObjectTracerContext, RootsWorkFactory},
     // For ObjectModel impl:
     vm::{
-        VMGlobalLogBitSpec, VMLocalForwardingBitsSpec, VMLocalForwardingPointerSpec,
-        VMLocalLOSMarkNurserySpec, VMLocalMarkBitSpec, VMLocalPinningBitSpec,
+        VMGlobalFieldUnlogBitSpec, VMGlobalLogBitSpec, VMLocalForwardingBitsSpec,
+        VMLocalForwardingPointerSpec, VMLocalLOSMarkNurserySpec, VMLocalMarkBitSpec,
+        VMLocalPinningBitSpec,
     },
 };
 
@@ -87,8 +88,10 @@ static ALL_MUTATORS: Lazy<Mutex<Vec<MutatorRaw>>> = Lazy::new(|| Mutex::new(Vec:
 unsafe fn read_len_unaligned(base: *const u8) -> usize {
     // Array len is stored as i64 immediately after the header.
     // We use read_unaligned to be resilient to any future packing.
-    let len_ptr = base.add(ARRAY_LEN_OFFSET as usize) as *const i64;
-    (*len_ptr).max(0) as usize
+    unsafe {
+        let len_ptr = base.add(ARRAY_LEN_OFFSET as usize) as *const i64;
+        len_ptr.read_unaligned().max(0) as usize
+    }
 }
 
 #[inline]
@@ -302,6 +305,8 @@ impl ObjectModel<NapalmVM> for VMObjModel {
     // ---- Where per-object metadata lives ----
     // Keep it simple: everything (except the forwarding *pointer*) goes to side metadata.
     const GLOBAL_LOG_BIT_SPEC: VMGlobalLogBitSpec = VMGlobalLogBitSpec::side_first();
+    const GLOBAL_FIELD_UNLOG_BIT_SPEC: VMGlobalFieldUnlogBitSpec =
+        VMGlobalFieldUnlogBitSpec::side_after(Self::GLOBAL_LOG_BIT_SPEC.as_spec());
 
     // Forwarding pointer MUST be in-header. We place it at the first payload word:
     // offset = header_size_in_bits (so it overwrites the first payload word only while dead).
@@ -395,12 +400,22 @@ impl ObjectModel<NapalmVM> for VMObjModel {
         let bytes = Self::get_size_when_copied(from);
         let align = Self::get_align_when_copied(from);
         let align_off = Self::get_align_offset_when_copied(from);
-        let dst_region = copy_context.alloc_copy(from, align, align_off, bytes, semantics);
+        let dst_region = copy_context.alloc_copy(from, bytes, align, align_off, semantics);
         let to_ref = Self::get_reference_when_copied_to(from, dst_region);
         let end = Self::copy_to(from, to_ref, dst_region);
         debug_assert_eq!(end, dst_region.add(bytes));
         copy_context.post_copy(to_ref, bytes, semantics);
         to_ref
+    }
+
+    #[inline]
+    fn try_copy(
+        from: ObjectReference,
+        semantics: CopySemantics,
+        copy_context: &mut GCWorkerCopyContext<NapalmVM>,
+    ) -> Option<ObjectReference> {
+        // MMTk owns the forwarding claim during stop-the-world copying.
+        Some(Self::copy(from, semantics, copy_context))
     }
 
     #[inline]
@@ -531,10 +546,10 @@ impl ObjectModel<NapalmVM> for VMObjModel {
 
 impl Scanning<NapalmVM> for VMScanning {
     #[inline]
-    fn scan_object<SV: mmtk::vm::SlotVisitor<SlotItem>>(
+    fn scan_object(
         _tls: VMWorkerThread,
         object: ObjectReference,
-        slot_visitor: &mut SV,
+        slot_visitor: &mut impl mmtk::vm::SlotVisitor<SlotItem>,
     ) {
         use crate::value::{
             BoxedArray, BoxedF64, BoxedObj, BoxedProxy, BoxedStr, NULL, ObjHeader, TAG_ARRAY,
@@ -1020,6 +1035,7 @@ impl NapalmGc {
         handle_user_collection_request::<NapalmVM>(
             self.gc,
             VMMutatorThread(VMThread::UNINITIALIZED),
+            false,
         )
     }
 
@@ -1045,7 +1061,7 @@ impl NapalmGc {
     /// If you meant 'push a range of locals' for a frame, expose that explicitly:
     #[inline]
     pub unsafe fn push_any_visitor(&self, base: *mut ValueRepr, slots: usize) {
-        ShadowStack::push_range(base as *mut i64, slots);
+        unsafe { ShadowStack::push_range(base as *mut i64, slots) };
     }
 
     #[inline]
@@ -1147,16 +1163,11 @@ impl NapalmGc {
         unimplemented!();
     }
 
-    #[inline]
-    fn stack_anchor(&self) -> *const u8 {
-        let x = 0u8;
-        &x as *const u8
-    }
-
     /// Downward–growing stack assumption: high == current anchor; low == anchor - guess.
     #[inline]
     fn stack_bounds_guess(&self) -> (Address, Address) {
-        let anchor = self.stack_anchor() as usize;
+        let stack_marker = 0u8;
+        let anchor = &stack_marker as *const u8 as usize;
         let hi = anchor;
         let lo = anchor.saturating_sub(self.stack_guess);
         unsafe { (Address::from_usize(lo), Address::from_usize(hi)) }
@@ -1281,9 +1292,14 @@ impl NapalmGc {
         }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "windows"
+    )))]
     #[inline]
-    fn stack_bounds_os() -> Option<(&self, Address, Address)> {
+    fn stack_bounds_os(&self) -> Option<(Address, Address)> {
         None
     }
 

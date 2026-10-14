@@ -44,7 +44,7 @@ mod tls_prng {
     fn addr_noise() -> u64 {
         let stack_addr = {
             let local = 0u8;
-            (&local as *const u8 as usize as u64)
+            &local as *const u8 as usize as u64
         };
         let code_addr = fast_two_u64 as usize as u64;
         stack_addr.rotate_left(17) ^ code_addr.rotate_left(31)
@@ -357,7 +357,7 @@ mod hasher_impl {
     impl AesHasher {
         #[inline]
         pub fn with_keys(k0: u64, k1: u64) -> Self {
-            Self(AHasher::new_with_keys(k0, k1))
+            Self(ahash::RandomState::with_seeds(k0, k1, 0, 0).build_hasher())
         }
     }
 

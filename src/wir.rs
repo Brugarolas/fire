@@ -797,7 +797,6 @@ impl Inst {
                 | ArrayFind { .. }
                 | ArrayFindIndex { .. }
                 | ArrayFilter { .. }
-                | ArrayReduce { .. }
                 | StrToNumber(_)
                 | CallDirect { .. }
                 | CallDirectMemoized { .. }

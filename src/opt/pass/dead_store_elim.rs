@@ -225,7 +225,6 @@ impl DeadStoreElim {
                         | Inst::StrCompare { .. }
                         | Inst::StrContains { .. }
                         | Inst::StrToNumber(_)
-                        | Inst::ArrayLen(_)
                         | Inst::ArraySlice { .. } => {
                             // Pure or modeled loads handled above; nothing to do.
                         }

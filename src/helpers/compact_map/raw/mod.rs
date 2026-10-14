@@ -90,15 +90,17 @@ impl<T> RawIterInner<T> {
 
     #[inline]
     unsafe fn next_impl(&mut self, group_base: NonNull<u8>, base: Bucket<T>) -> Bucket<T> {
-        loop {
-            if let Some(index) = self.current_group.next() {
-                return base.next_n(index + self.group_offset);
-            }
+        unsafe {
+            loop {
+                if let Some(index) = self.current_group.next() {
+                    return base.next_n(index + self.group_offset);
+                }
 
-            self.group_offset += Group::WIDTH;
-            self.current_group = Group::load_aligned(group_base.as_ptr().add(self.group_offset))
-                .match_full()
-                .into_iter();
+                self.group_offset += Group::WIDTH;
+                self.current_group = Group::load_aligned(group_base.as_ptr().add(self.group_offset))
+                    .match_full()
+                    .into_iter();
+            }
         }
     }
 
@@ -124,9 +126,11 @@ impl<T> RawIterInner<T> {
 
 impl<T> RawIterInner<T> {
     pub(crate) unsafe fn drop_elements(&mut self, group_base: NonNull<u8>, base: Bucket<T>) {
-        if T::NEEDS_DROP && self.len != 0 {
-            while let Some(item) = self.next(group_base, base.clone()) {
-                item.drop();
+        unsafe {
+            if T::NEEDS_DROP && self.len != 0 {
+                while let Some(item) = self.next(group_base, base.clone()) {
+                    item.drop();
+                }
             }
         }
     }

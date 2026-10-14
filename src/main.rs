@@ -140,7 +140,7 @@ fn main() {
         return;
     }
 
-    let mut compile_order: Vec<&wir::Function> = module.funcs.iter().collect();
+    let compile_order: Vec<&wir::Function> = module.funcs.iter().collect();
 
     for f in compile_order {
         if let Err(e) = jit.compile(f) {
