@@ -5,7 +5,7 @@
 #![allow(unused_unsafe)]
 
 use cranelift::codegen::ir::instructions::BlockArg;
-use cranelift::codegen::ir::{StackSlotData, StackSlotKind};
+use cranelift::codegen::ir::{MemFlagsData, StackSlotData, StackSlotKind};
 use cranelift::prelude::*;
 use cranelift::prelude::{InstBuilder, types};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -1645,7 +1645,7 @@ impl JIT {
         descriptor_ptr: Option<*const RuntimeTryDescriptor>,
         region_id: TryRegionId,
     ) -> Result<cranelift_module::FuncId, String> {
-        use cranelift::prelude::{AbiParam, FunctionBuilder, MemFlags, types};
+        use cranelift::prelude::{AbiParam, FunctionBuilder, MemFlagsData, types};
 
         let ptr_ty = self.ptr_ty();
         let mut ctx = self.module.make_context();
@@ -1712,7 +1712,7 @@ impl JIT {
             let res = fb.inst_results(call)[0];
             fb.ins().return_(&[res]);
             fb.seal_all_blocks();
-            fb.finalize();
+            fb.finalize(self.module.isa().frontend_config());
         }
 
         let name = format!("wir_try_stub_{}_{}_{}", fun.id.0, target_block.0, label);
@@ -1801,12 +1801,12 @@ impl JIT {
         // Small helpers for SMI encode/decode (do NOT capture &mut self)
         let dec_smi = |fb: &mut FunctionBuilder, v: Value| -> Value {
             // raw = v >> 1 (arithmetic)
-            fb.ins().sshr_imm(v, 1)
+            fb.ins().sshr_imm_s(v, 1)
         };
         let enc_smi = |fb: &mut FunctionBuilder, raw: Value| -> Value {
             // (raw << 1) | 1
-            let sh = fb.ins().ishl_imm(raw, 1);
-            fb.ins().iadd_imm(sh, 1)
+            let sh = fb.ins().ishl_imm_s(raw, 1);
+            fb.ins().iadd_imm_s(sh, 1)
         };
 
         // ---- build cranelift function context/signature: (param0, param1, ...) -> i64
@@ -1956,7 +1956,7 @@ impl JIT {
                     .brif(has_resume, resume_block, &[], normal_entry_block, &[]);
                 fb.switch_to_block(resume_block);
 
-                let mem_flags = MemFlags::trusted();
+                let mem_flags = MemFlagsData::trusted();
                 let block_raw =
                     fb.ins()
                         .load(types::I32, mem_flags, resume_ptr, RESUME_INFO_BLOCK_OFFSET);
@@ -1976,7 +1976,7 @@ impl JIT {
 
                     let mut args: Vec<BlockArg> = Vec::new();
                     for idx in 0..*param_count {
-                        let addr = fb.ins().iadd_imm(argv_ptr, (idx as i64) * 8);
+                        let addr = fb.ins().iadd_imm_s(argv_ptr, (idx as i64) * 8);
                         let val = fb.ins().load(types::I64, mem_flags, addr, 0);
                         args.push(BlockArg::from(val));
                     }
@@ -2096,8 +2096,8 @@ impl JIT {
                             let b = vmap.get_or_emit(*b, &mut fb, fun_ir);
 
                             // decode SMIs -> raw i64
-                            let ra = fb.ins().sshr_imm(a, 1);
-                            let rb = fb.ins().sshr_imm(b, 1);
+                            let ra = fb.ins().sshr_imm_s(a, 1);
+                            let rb = fb.ins().sshr_imm_s(b, 1);
 
                             // arithmetic/bitwise on raw
                             let raw = match op {
@@ -2116,8 +2116,8 @@ impl JIT {
                             };
 
                             // re-encode to SMI: (raw << 1) | 1
-                            let sh = fb.ins().ishl_imm(raw, 1);
-                            let smi = fb.ins().iadd_imm(sh, 1);
+                            let sh = fb.ins().ishl_imm_s(raw, 1);
+                            let smi = fb.ins().iadd_imm_s(sh, 1);
 
                             if res_count == 1 {
                                 vmap.bind(node.results[0], smi);
@@ -2138,14 +2138,14 @@ impl JIT {
                             let a_is_false = fb.ins().icmp(IntCC::Equal, a, bool_false_val);
                             let a_bool_raw = fb.ins().select(a_is_true, int_one, int_zero);
                             let a_any_bool = fb.ins().bor(a_is_true, a_is_false);
-                            let a_smi = fb.ins().sshr_imm(a, 1);
+                            let a_smi = fb.ins().sshr_imm_s(a, 1);
                             let ra = fb.ins().select(a_any_bool, a_bool_raw, a_smi);
 
                             let b_is_true = fb.ins().icmp(IntCC::Equal, b, bool_true_val);
                             let b_is_false = fb.ins().icmp(IntCC::Equal, b, bool_false_val);
                             let b_bool_raw = fb.ins().select(b_is_true, int_one, int_zero);
                             let b_any_bool = fb.ins().bor(b_is_true, b_is_false);
-                            let b_smi = fb.ins().sshr_imm(b, 1);
+                            let b_smi = fb.ins().sshr_imm_s(b, 1);
                             let rb = fb.ins().select(b_any_bool, b_bool_raw, b_smi);
 
                             // raw compare → 0/1 (NOT SMI)
@@ -2185,7 +2185,7 @@ impl JIT {
 
                         Inst::ArrayLen(arr) => {
                             use cranelift::codegen::ir::instructions::BlockArg;
-                            use cranelift::prelude::{AbiParam, IntCC, MemFlags, types};
+                            use cranelift::prelude::{AbiParam, IntCC, types};
 
                             let ptr_ty = self.ptr_ty();
                             let arr_val = vmap.get_or_emit(*arr, &mut fb, fun_ir);
@@ -2210,7 +2210,7 @@ impl JIT {
                             let arr_ptr = self.value_as_ptr(&mut fb, arr_val);
                             let tag_u32 = fb.ins().load(
                                 types::I32,
-                                MemFlags::trusted(),
+                                MemFlagsData::new().with_notrap().with_aligned(),
                                 arr_ptr,
                                 OBJ_TAG_OFFSET,
                             );
@@ -2229,7 +2229,7 @@ impl JIT {
                             let len_offset = ARRAY_BUF_OFFSET + VEC_LEN_OFFSET;
                             let len_raw =
                                 fb.ins()
-                                    .load(ptr_ty, MemFlags::trusted(), arr_ptr, len_offset);
+                                    .load(ptr_ty, MemFlagsData::new().with_notrap().with_aligned(), arr_ptr, len_offset);
                             let len_i64 = self.ptr_to_i64(&mut fb, len_raw);
                             let len_smi = enc_smi(&mut fb, len_i64);
                             fb.ins().jump(bb_exit, &[BlockArg::from(len_smi)]);
@@ -2254,7 +2254,7 @@ impl JIT {
 
                         Inst::LoadElem { arr, idx } => {
                             use cranelift::codegen::ir::instructions::BlockArg;
-                            use cranelift::prelude::{AbiParam, IntCC, MemFlags, types};
+                            use cranelift::prelude::{AbiParam, IntCC, types};
 
                             let ptr_ty = self.ptr_ty();
                             let zero = fb.ins().iconst(types::I64, 0);
@@ -2283,7 +2283,7 @@ impl JIT {
                             let arr_ptr = self.value_as_ptr(&mut fb, arr_val);
                             let tag_u32 = fb.ins().load(
                                 types::I32,
-                                MemFlags::trusted(),
+                                MemFlagsData::new().with_notrap().with_aligned(),
                                 arr_ptr,
                                 OBJ_TAG_OFFSET,
                             );
@@ -2312,7 +2312,7 @@ impl JIT {
                             let len_offset = ARRAY_BUF_OFFSET + VEC_LEN_OFFSET;
                             let len_raw =
                                 fb.ins()
-                                    .load(ptr_ty, MemFlags::trusted(), arr_ptr, len_offset);
+                                    .load(ptr_ty, MemFlagsData::new().with_notrap().with_aligned(), arr_ptr, len_offset);
                             let len_i64 = self.ptr_to_i64(&mut fb, len_raw);
                             let out_of_bounds =
                                 fb.ins()
@@ -2328,14 +2328,14 @@ impl JIT {
                             fb.switch_to_block(bb_load);
                             let data_ptr = fb.ins().load(
                                 ptr_ty,
-                                MemFlags::trusted(),
+                                MemFlagsData::new().with_notrap().with_aligned(),
                                 arr_ptr,
                                 ARRAY_BUF_OFFSET,
                             );
-                            let idx_bytes = fb.ins().imul_imm(idx_raw, 8);
+                            let idx_bytes = fb.ins().imul_imm_s(idx_raw, 8);
                             let idx_ptr = self.value_as_ptr(&mut fb, idx_bytes);
                             let addr = fb.ins().iadd(data_ptr, idx_ptr);
-                            let val = fb.ins().load(types::I64, MemFlags::trusted(), addr, 0);
+                            let val = fb.ins().load(types::I64, MemFlagsData::new().with_notrap().with_aligned(), addr, 0);
                             fb.ins().jump(bb_exit, &[BlockArg::from(val)]);
 
                             fb.switch_to_block(bb_slow);
@@ -2359,7 +2359,7 @@ impl JIT {
 
                         Inst::StoreElem { arr, idx, val } => {
                             use cranelift::codegen::ir::instructions::BlockArg;
-                            use cranelift::prelude::{AbiParam, IntCC, MemFlags, types};
+                            use cranelift::prelude::{AbiParam, IntCC, types};
 
                             let ptr_ty = self.ptr_ty();
                             let zero = fb.ins().iconst(types::I64, 0);
@@ -2389,7 +2389,7 @@ impl JIT {
                             let arr_ptr = self.value_as_ptr(&mut fb, arr_val);
                             let tag_u32 = fb.ins().load(
                                 types::I32,
-                                MemFlags::trusted(),
+                                MemFlagsData::new().with_notrap().with_aligned(),
                                 arr_ptr,
                                 OBJ_TAG_OFFSET,
                             );
@@ -2418,7 +2418,7 @@ impl JIT {
                             let len_offset = ARRAY_BUF_OFFSET + VEC_LEN_OFFSET;
                             let len_raw =
                                 fb.ins()
-                                    .load(ptr_ty, MemFlags::trusted(), arr_ptr, len_offset);
+                                    .load(ptr_ty, MemFlagsData::new().with_notrap().with_aligned(), arr_ptr, len_offset);
                             let len_i64 = self.ptr_to_i64(&mut fb, len_raw);
                             let out_of_bounds =
                                 fb.ins()
@@ -2878,7 +2878,7 @@ impl JIT {
                         Inst::CallClosure {
                             fun: fun_val, args, ..
                         } => {
-                            use cranelift::prelude::{AbiParam, MemFlags, types};
+                            use cranelift::prelude::{AbiParam, types};
 
                             let ptr_ty = self.ptr_ty();
 
@@ -2897,8 +2897,8 @@ impl JIT {
                             // 2) Store each argument at argv + i*8
                             for (i, a) in args.iter().enumerate() {
                                 let v = vmap.get_or_emit(*a, &mut fb, fun_ir);
-                                let addr = fb.ins().iadd_imm(argv, (i as i64) * 8);
-                                fb.ins().store(MemFlags::trusted(), v, addr, 0);
+                                let addr = fb.ins().iadd_imm_s(argv, (i as i64) * 8);
+                                fb.ins().store(MemFlagsData::new().with_notrap().with_aligned(), v, addr, 0);
                             }
 
                             // 3) Call the runtime trampoline (it will prepend env internally)
@@ -2941,7 +2941,7 @@ impl JIT {
                             match name.as_str() {
                                 "wir_string_get_char" => {
                                     use cranelift::codegen::ir::instructions::BlockArg;
-                                    use cranelift::prelude::{AbiParam, IntCC, MemFlags, types};
+                                    use cranelift::prelude::{AbiParam, IntCC, types};
 
                                     let s_val = vmap.get_or_emit(args[0], &mut fb, fun_ir);
                                     let idx_val = vmap.get_or_emit(args[1], &mut fb, fun_ir);
@@ -2972,7 +2972,7 @@ impl JIT {
                                     let s_ptr = self.value_as_ptr(&mut fb, s_val);
                                     let tag_u32 = fb.ins().load(
                                         types::I32,
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         s_ptr,
                                         OBJ_TAG_OFFSET,
                                     );
@@ -3000,7 +3000,7 @@ impl JIT {
                                     );
 
                                     fb.switch_to_block(bb_decode_idx);
-                                    let idx_i64 = fb.ins().sshr_imm(idx_val, 1);
+                                    let idx_i64 = fb.ins().sshr_imm_s(idx_val, 1);
                                     let idx_negative =
                                         fb.ins().icmp(IntCC::SignedLessThan, idx_i64, zero);
                                     let bb_check_bounds = fb.create_block();
@@ -3015,7 +3015,7 @@ impl JIT {
                                     fb.switch_to_block(bb_check_bounds);
                                     let len_raw = fb.ins().load(
                                         self.ptr_ty(),
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         s_ptr,
                                         STR_LEN_OFFSET,
                                     );
@@ -3037,7 +3037,7 @@ impl JIT {
                                     fb.switch_to_block(bb_fast);
                                     let data_ptr = fb.ins().load(
                                         self.ptr_ty(),
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         s_ptr,
                                         STR_DATA_OFFSET,
                                     );
@@ -3045,13 +3045,13 @@ impl JIT {
                                     let char_addr = fb.ins().iadd(data_i64, idx_i64);
                                     let char_ptr = self.value_as_ptr(&mut fb, char_addr);
                                     let ch =
-                                        fb.ins().load(types::I8, MemFlags::trusted(), char_ptr, 0);
+                                        fb.ins().load(types::I8, MemFlagsData::new().with_notrap().with_aligned(), char_ptr, 0);
 
                                     let char_slot = fb.func.create_sized_stack_slot(
                                         StackSlotData::new(StackSlotKind::ExplicitSlot, 1u32, 0),
                                     );
                                     let buf_ptr = fb.ins().stack_addr(self.ptr_ty(), char_slot, 0);
-                                    fb.ins().store(MemFlags::trusted(), ch, buf_ptr, 0);
+                                    fb.ins().store(MemFlagsData::new().with_notrap().with_aligned(), ch, buf_ptr, 0);
                                     let len_one = fb.ins().iconst(types::I64, 1);
                                     let interned =
                                         self.call_jit_intern_bytes(&mut fb, buf_ptr, len_one)?;
@@ -3077,7 +3077,7 @@ impl JIT {
                                 }
                                 "wir_string_len" => {
                                     use cranelift::codegen::ir::instructions::BlockArg;
-                                    use cranelift::prelude::{IntCC, MemFlags};
+                                    use cranelift::prelude::{IntCC};
 
                                     let str_val = vmap.get_or_emit(args[0], &mut fb, fun_ir);
                                     let zero = fb.ins().iconst(types::I64, 0);
@@ -3115,7 +3115,7 @@ impl JIT {
                                     let str_ptr = self.value_as_ptr(&mut fb, str_val);
                                     let tag_u32 = fb.ins().load(
                                         types::I32,
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         str_ptr,
                                         OBJ_TAG_OFFSET,
                                     );
@@ -3132,13 +3132,13 @@ impl JIT {
                                     fb.switch_to_block(bb_fast);
                                     let len_raw = fb.ins().load(
                                         self.ptr_ty(),
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         str_ptr,
                                         STR_LEN_OFFSET,
                                     );
                                     let len_i64 = self.ptr_to_i64(&mut fb, len_raw);
-                                    let len_shift = fb.ins().ishl_imm(len_i64, 1);
-                                    let len_smi = fb.ins().iadd_imm(len_shift, 1);
+                                    let len_shift = fb.ins().ishl_imm_s(len_i64, 1);
+                                    let len_smi = fb.ins().iadd_imm_s(len_shift, 1);
                                     fb.ins().jump(bb_exit, &[BlockArg::from(len_smi)]);
 
                                     fb.switch_to_block(bb_exit);
@@ -3148,7 +3148,7 @@ impl JIT {
                                 }
                                 "wir_string_concat" => {
                                     use cranelift::codegen::ir::instructions::BlockArg;
-                                    use cranelift::prelude::{AbiParam, IntCC, MemFlags, types};
+                                    use cranelift::prelude::{AbiParam, IntCC, types};
 
                                     let a_val = vmap.get_or_emit(args[0], &mut fb, fun_ir);
                                     let b_val = vmap.get_or_emit(args[1], &mut fb, fun_ir);
@@ -3178,7 +3178,7 @@ impl JIT {
                                     let a_ptr = self.value_as_ptr(&mut fb, a_val);
                                     let a_tag_u32 = fb.ins().load(
                                         types::I32,
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         a_ptr,
                                         OBJ_TAG_OFFSET,
                                     );
@@ -3211,7 +3211,7 @@ impl JIT {
                                     let b_ptr = self.value_as_ptr(&mut fb, b_val);
                                     let b_tag_u32 = fb.ins().load(
                                         types::I32,
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         b_ptr,
                                         OBJ_TAG_OFFSET,
                                     );
@@ -3229,13 +3229,13 @@ impl JIT {
                                     fb.switch_to_block(bb_fast);
                                     let len_a_raw = fb.ins().load(
                                         self.ptr_ty(),
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         a_ptr,
                                         STR_LEN_OFFSET,
                                     );
                                     let len_b_raw = fb.ins().load(
                                         self.ptr_ty(),
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         b_ptr,
                                         STR_LEN_OFFSET,
                                     );
@@ -3273,8 +3273,8 @@ impl JIT {
                                     fb.ins().jump(exit_block, &[BlockArg::from(empty_res)]);
 
                                     fb.switch_to_block(bb_copy);
-                                    let len_plus7 = fb.ins().iadd_imm(total_len, 7);
-                                    let words = fb.ins().ushr_imm(len_plus7, 3);
+                                    let len_plus7 = fb.ins().iadd_imm_s(total_len, 7);
+                                    let words = fb.ins().ushr_imm_s(len_plus7, 3);
                                     let ptr_ty_cached = self.ptr_ty();
                                     let buf_words = self.call_import(
                                         &mut fb,
@@ -3301,7 +3301,7 @@ impl JIT {
                                     fb.switch_to_block(bb_copy_a);
                                     let data_a = fb.ins().load(
                                         self.ptr_ty(),
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         a_ptr,
                                         STR_DATA_OFFSET,
                                     );
@@ -3325,7 +3325,7 @@ impl JIT {
                                     fb.switch_to_block(bb_copy_b);
                                     let data_b = fb.ins().load(
                                         self.ptr_ty(),
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         b_ptr,
                                         STR_DATA_OFFSET,
                                     );
@@ -3373,7 +3373,7 @@ impl JIT {
                                 }
                                 "wir_string_concat_coerce" => {
                                     use cranelift::codegen::ir::instructions::BlockArg;
-                                    use cranelift::prelude::{AbiParam, IntCC, MemFlags, types};
+                                    use cranelift::prelude::{AbiParam, IntCC, types};
 
                                     let a_val = vmap.get_or_emit(args[0], &mut fb, fun_ir);
                                     let b_val = vmap.get_or_emit(args[1], &mut fb, fun_ir);
@@ -3403,7 +3403,7 @@ impl JIT {
                                     let a_ptr = self.value_as_ptr(&mut fb, a_val);
                                     let a_tag_u32 = fb.ins().load(
                                         types::I32,
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         a_ptr,
                                         OBJ_TAG_OFFSET,
                                     );
@@ -3436,7 +3436,7 @@ impl JIT {
                                     let b_ptr = self.value_as_ptr(&mut fb, b_val);
                                     let b_tag_u32 = fb.ins().load(
                                         types::I32,
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         b_ptr,
                                         OBJ_TAG_OFFSET,
                                     );
@@ -3454,13 +3454,13 @@ impl JIT {
                                     fb.switch_to_block(bb_fast);
                                     let len_a_raw = fb.ins().load(
                                         self.ptr_ty(),
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         a_ptr,
                                         STR_LEN_OFFSET,
                                     );
                                     let len_b_raw = fb.ins().load(
                                         self.ptr_ty(),
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         b_ptr,
                                         STR_LEN_OFFSET,
                                     );
@@ -3498,8 +3498,8 @@ impl JIT {
                                     fb.ins().jump(exit_block, &[BlockArg::from(empty_res)]);
 
                                     fb.switch_to_block(bb_copy);
-                                    let len_plus7 = fb.ins().iadd_imm(total_len, 7);
-                                    let words = fb.ins().ushr_imm(len_plus7, 3);
+                                    let len_plus7 = fb.ins().iadd_imm_s(total_len, 7);
+                                    let words = fb.ins().ushr_imm_s(len_plus7, 3);
                                     let ptr_ty_cached = self.ptr_ty();
                                     let buf_words = self.call_import(
                                         &mut fb,
@@ -3526,7 +3526,7 @@ impl JIT {
                                     fb.switch_to_block(bb_copy_a);
                                     let data_a = fb.ins().load(
                                         self.ptr_ty(),
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         a_ptr,
                                         STR_DATA_OFFSET,
                                     );
@@ -3550,7 +3550,7 @@ impl JIT {
                                     fb.switch_to_block(bb_copy_b);
                                     let data_b = fb.ins().load(
                                         self.ptr_ty(),
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         b_ptr,
                                         STR_DATA_OFFSET,
                                     );
@@ -3598,7 +3598,7 @@ impl JIT {
                                 }
                                 "wir_string_equals" => {
                                     use cranelift::codegen::ir::instructions::BlockArg;
-                                    use cranelift::prelude::{IntCC, MemFlags};
+                                    use cranelift::prelude::{IntCC};
 
                                     let lhs = vmap.get_or_emit(args[0], &mut fb, fun_ir);
                                     let rhs = vmap.get_or_emit(args[1], &mut fb, fun_ir);
@@ -3663,13 +3663,13 @@ impl JIT {
                                     let rhs_ptr = self.value_as_ptr(&mut fb, rhs);
                                     let lhs_tag_u32 = fb.ins().load(
                                         types::I32,
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         lhs_ptr,
                                         OBJ_TAG_OFFSET,
                                     );
                                     let rhs_tag_u32 = fb.ins().load(
                                         types::I32,
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         rhs_ptr,
                                         OBJ_TAG_OFFSET,
                                     );
@@ -3689,13 +3689,13 @@ impl JIT {
                                     fb.switch_to_block(bb_len);
                                     let len_a_raw = fb.ins().load(
                                         self.ptr_ty(),
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         lhs_ptr,
                                         STR_LEN_OFFSET,
                                     );
                                     let len_b_raw = fb.ins().load(
                                         self.ptr_ty(),
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         rhs_ptr,
                                         STR_LEN_OFFSET,
                                     );
@@ -3723,22 +3723,22 @@ impl JIT {
                                     fb.switch_to_block(bb_cmp_bytes);
                                     let aux_a = fb.ins().load(
                                         types::I32,
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         lhs_ptr,
                                         STR_AUX_OFFSET,
                                     );
                                     let aux_b = fb.ins().load(
                                         types::I32,
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         rhs_ptr,
                                         STR_AUX_OFFSET,
                                     );
                                     let aux_a_flag = fb.ins().band(aux_a, intern_flag);
                                     let aux_b_flag = fb.ins().band(aux_b, intern_flag);
                                     let a_interned =
-                                        fb.ins().icmp_imm(IntCC::NotEqual, aux_a_flag, 0);
+                                        fb.ins().icmp_imm_s(IntCC::NotEqual, aux_a_flag, 0);
                                     let b_interned =
-                                        fb.ins().icmp_imm(IntCC::NotEqual, aux_b_flag, 0);
+                                        fb.ins().icmp_imm_s(IntCC::NotEqual, aux_b_flag, 0);
                                     let both_interned = fb.ins().band(a_interned, b_interned);
                                     fb.ins().brif(
                                         both_interned,
@@ -3751,19 +3751,19 @@ impl JIT {
                                     fb.switch_to_block(bb_after_intern);
                                     let data_a = fb.ins().load(
                                         self.ptr_ty(),
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         lhs_ptr,
                                         STR_DATA_OFFSET,
                                     );
                                     let data_b = fb.ins().load(
                                         self.ptr_ty(),
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         rhs_ptr,
                                         STR_DATA_OFFSET,
                                     );
                                     let cmp_res =
                                         self.call_memcmp(&mut fb, data_a, data_b, len_a_raw)?;
-                                    let equal_bytes = fb.ins().icmp_imm(IntCC::Equal, cmp_res, 0);
+                                    let equal_bytes = fb.ins().icmp_imm_s(IntCC::Equal, cmp_res, 0);
                                     let final_res =
                                         fb.ins().select(equal_bytes, bool_true, bool_false);
                                     fb.ins().jump(bb_exit, &[BlockArg::from(final_res)]);
@@ -3775,7 +3775,7 @@ impl JIT {
                                 }
                                 "wir_string_includes" => {
                                     use cranelift::codegen::ir::instructions::BlockArg;
-                                    use cranelift::prelude::{AbiParam, IntCC, MemFlags, types};
+                                    use cranelift::prelude::{AbiParam, IntCC, types};
 
                                     let hay_val = vmap.get_or_emit(args[0], &mut fb, fun_ir);
                                     let needle_val = vmap.get_or_emit(args[1], &mut fb, fun_ir);
@@ -3810,7 +3810,7 @@ impl JIT {
                                     let hay_ptr = self.value_as_ptr(&mut fb, hay_val);
                                     let hay_tag_u32 = fb.ins().load(
                                         types::I32,
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         hay_ptr,
                                         OBJ_TAG_OFFSET,
                                     );
@@ -3845,7 +3845,7 @@ impl JIT {
                                     let need_ptr = self.value_as_ptr(&mut fb, needle_val);
                                     let need_tag_u32 = fb.ins().load(
                                         types::I32,
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         need_ptr,
                                         OBJ_TAG_OFFSET,
                                     );
@@ -3864,13 +3864,13 @@ impl JIT {
                                     fb.switch_to_block(bb_lengths);
                                     let hay_len_raw = fb.ins().load(
                                         self.ptr_ty(),
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         hay_ptr,
                                         STR_LEN_OFFSET,
                                     );
                                     let need_len_raw = fb.ins().load(
                                         self.ptr_ty(),
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         need_ptr,
                                         STR_LEN_OFFSET,
                                     );
@@ -3902,13 +3902,13 @@ impl JIT {
                                     let limit = fb.ins().isub(hay_len, need_len);
                                     let hay_data = fb.ins().load(
                                         self.ptr_ty(),
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         hay_ptr,
                                         STR_DATA_OFFSET,
                                     );
                                     let need_data = fb.ins().load(
                                         self.ptr_ty(),
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         need_ptr,
                                         STR_DATA_OFFSET,
                                     );
@@ -3941,7 +3941,7 @@ impl JIT {
                                         need_data,
                                         need_len_raw,
                                     )?;
-                                    let equals = fb.ins().icmp_imm(IntCC::Equal, cmp_res, 0);
+                                    let equals = fb.ins().icmp_imm_s(IntCC::Equal, cmp_res, 0);
                                     let next_block = fb.create_block();
                                     fb.ins().brif(
                                         equals,
@@ -3975,7 +3975,7 @@ impl JIT {
                                 }
                                 "wir_obj_has_field" => {
                                     use cranelift::codegen::ir::instructions::BlockArg;
-                                    use cranelift::prelude::{IntCC, MemFlags};
+                                    use cranelift::prelude::{IntCC};
 
                                     let ptr_ty = self.ptr_ty();
                                     let ic_raw = self.alloc_field_ic();
@@ -3983,7 +3983,7 @@ impl JIT {
 
                                     let recv = vmap.get_or_emit(args[0], &mut fb, fun_ir);
                                     let fid_smi = vmap.get_or_emit(args[1], &mut fb, fun_ir);
-                                    let fid = fb.ins().ushr_imm(fid_smi, 1);
+                                    let fid = fb.ins().ushr_imm_s(fid_smi, 1);
 
                                     let zero = fb.ins().iconst(types::I64, 0);
                                     let bool_true = fb.ins().iconst(types::I64, BOOL_TRUE);
@@ -4010,7 +4010,7 @@ impl JIT {
                                     let recv_ptr = self.value_as_ptr(&mut fb, recv);
                                     let tag_u32 = fb.ins().load(
                                         types::I32,
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         recv_ptr,
                                         OBJ_TAG_OFFSET,
                                     );
@@ -4034,7 +4034,7 @@ impl JIT {
                                     fb.switch_to_block(bb_cache);
                                     let shape_u32 = fb.ins().load(
                                         types::I32,
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         recv_ptr,
                                         OBJ_SHAPE_OFFSET,
                                     );
@@ -4053,7 +4053,7 @@ impl JIT {
                                             + (idx as i32) * FIELD_IC_ENTRY_STRIDE;
                                         let cached_shape_u32 = fb.ins().load(
                                             types::I32,
-                                            MemFlags::trusted(),
+                                            MemFlagsData::new().with_notrap().with_aligned(),
                                             ic_ptr,
                                             shape_off,
                                         );
@@ -4072,14 +4072,14 @@ impl JIT {
                                         fb.switch_to_block(hit_blocks[idx]);
                                         let slot_off = FIELD_IC_SLOT_OFFSET
                                             + (idx as i32) * FIELD_IC_ENTRY_STRIDE;
-                                        let slot_ptr = fb.ins().iadd_imm(ic_ptr, slot_off as i64);
+                                        let slot_ptr = fb.ins().iadd_imm_s(ic_ptr, slot_off as i64);
                                         fb.ins().jump(bb_slot_state, &[BlockArg::from(slot_ptr)]);
                                     }
 
                                     fb.switch_to_block(bb_slot_state);
                                     let slot_ptr_val = slot_param;
                                     let cached_slot =
-                                        fb.ins().load(ptr_ty, MemFlags::trusted(), slot_ptr_val, 0);
+                                        fb.ins().load(ptr_ty, MemFlagsData::new().with_notrap().with_aligned(), slot_ptr_val, 0);
                                     let absent = fb.ins().iconst(ptr_ty, -1);
                                     let has_slot =
                                         fb.ins().icmp(IntCC::NotEqual, cached_slot, absent);
@@ -4112,7 +4112,7 @@ impl JIT {
                                 }
                                 "wir_obj_del_field" => {
                                     use cranelift::codegen::ir::instructions::BlockArg;
-                                    use cranelift::prelude::{IntCC, MemFlags};
+                                    use cranelift::prelude::{IntCC};
 
                                     let ptr_ty = self.ptr_ty();
                                     let ic_raw = self.alloc_field_ic();
@@ -4120,7 +4120,7 @@ impl JIT {
 
                                     let recv = vmap.get_or_emit(args[0], &mut fb, fun_ir);
                                     let fid_smi = vmap.get_or_emit(args[1], &mut fb, fun_ir);
-                                    let fid = fb.ins().ushr_imm(fid_smi, 1);
+                                    let fid = fb.ins().ushr_imm_s(fid_smi, 1);
 
                                     let zero = fb.ins().iconst(types::I64, 0);
                                     let bool_false = fb.ins().iconst(types::I64, BOOL_FALSE);
@@ -4146,7 +4146,7 @@ impl JIT {
                                     let recv_ptr = self.value_as_ptr(&mut fb, recv);
                                     let tag_u32 = fb.ins().load(
                                         types::I32,
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         recv_ptr,
                                         OBJ_TAG_OFFSET,
                                     );
@@ -4170,7 +4170,7 @@ impl JIT {
                                     fb.switch_to_block(bb_cache);
                                     let shape_u32 = fb.ins().load(
                                         types::I32,
-                                        MemFlags::trusted(),
+                                        MemFlagsData::new().with_notrap().with_aligned(),
                                         recv_ptr,
                                         OBJ_SHAPE_OFFSET,
                                     );
@@ -4189,7 +4189,7 @@ impl JIT {
                                             + (idx as i32) * FIELD_IC_ENTRY_STRIDE;
                                         let cached_shape_u32 = fb.ins().load(
                                             types::I32,
-                                            MemFlags::trusted(),
+                                            MemFlagsData::new().with_notrap().with_aligned(),
                                             ic_ptr,
                                             shape_off,
                                         );
@@ -4208,14 +4208,14 @@ impl JIT {
                                         fb.switch_to_block(hit_blocks[idx]);
                                         let slot_off = FIELD_IC_SLOT_OFFSET
                                             + (idx as i32) * FIELD_IC_ENTRY_STRIDE;
-                                        let slot_ptr = fb.ins().iadd_imm(ic_ptr, slot_off as i64);
+                                        let slot_ptr = fb.ins().iadd_imm_s(ic_ptr, slot_off as i64);
                                         fb.ins().jump(bb_slot_state, &[BlockArg::from(slot_ptr)]);
                                     }
 
                                     fb.switch_to_block(bb_slot_state);
                                     let slot_ptr_val = slot_param;
                                     let cached_slot =
-                                        fb.ins().load(ptr_ty, MemFlags::trusted(), slot_ptr_val, 0);
+                                        fb.ins().load(ptr_ty, MemFlagsData::new().with_notrap().with_aligned(), slot_ptr_val, 0);
                                     let absent = fb.ins().iconst(ptr_ty, -1);
                                     let has_slot =
                                         fb.ins().icmp(IntCC::NotEqual, cached_slot, absent);
@@ -4299,7 +4299,7 @@ impl JIT {
 
                         // Engine has the ability to memoize functions, it is implemented natively
                         Inst::CallDirectMemoized { callee, args } => {
-                            use cranelift::prelude::{AbiParam, IntCC, MemFlags, types};
+                            use cranelift::prelude::{AbiParam, IntCC, types};
 
                             let arity = args.len();
                             let ptr_ty = self.ptr_ty();
@@ -4407,7 +4407,7 @@ impl JIT {
 
                             // HIT: load cached, free temp buffer, jump join
                             fb.switch_to_block(bb_hit);
-                            let cached = fb.ins().load(types::I64, MemFlags::trusted(), out_ptr, 0);
+                            let cached = fb.ins().load(types::I64, MemFlagsData::new().with_notrap().with_aligned(), out_ptr, 0);
                             let _ = self.call_import(
                                 &mut fb,
                                 "wir_free_words",
@@ -4546,7 +4546,7 @@ impl JIT {
 
                         Inst::LoadField { obj, field, .. } => {
                             use cranelift::codegen::ir::instructions::BlockArg;
-                            use cranelift::prelude::{AbiParam, IntCC, MemFlags, types};
+                            use cranelift::prelude::{AbiParam, IntCC, types};
 
                             let ptr_ty = self.ptr_ty();
                             let ic_raw = self.alloc_field_ic();
@@ -4579,7 +4579,7 @@ impl JIT {
                             let recv_ptr = self.value_as_ptr(&mut fb, recv);
                             let tag_u32 = fb.ins().load(
                                 types::I32,
-                                MemFlags::trusted(),
+                                MemFlagsData::new().with_notrap().with_aligned(),
                                 recv_ptr,
                                 OBJ_TAG_OFFSET,
                             );
@@ -4603,7 +4603,7 @@ impl JIT {
                             fb.switch_to_block(bb_cache);
                             let shape_u32 = fb.ins().load(
                                 types::I32,
-                                MemFlags::trusted(),
+                                MemFlagsData::new().with_notrap().with_aligned(),
                                 recv_ptr,
                                 OBJ_SHAPE_OFFSET,
                             );
@@ -4622,7 +4622,7 @@ impl JIT {
                                     FIELD_IC_SHAPE_OFFSET + (idx as i32) * FIELD_IC_ENTRY_STRIDE;
                                 let cached_shape_u32 = fb.ins().load(
                                     types::I32,
-                                    MemFlags::trusted(),
+                                    MemFlagsData::new().with_notrap().with_aligned(),
                                     ic_ptr,
                                     shape_off,
                                 );
@@ -4639,14 +4639,14 @@ impl JIT {
                                 fb.switch_to_block(hit_blocks[idx]);
                                 let slot_off =
                                     FIELD_IC_SLOT_OFFSET + (idx as i32) * FIELD_IC_ENTRY_STRIDE;
-                                let slot_ptr = fb.ins().iadd_imm(ic_ptr, slot_off as i64);
+                                let slot_ptr = fb.ins().iadd_imm_s(ic_ptr, slot_off as i64);
                                 fb.ins().jump(bb_slot_state, &[BlockArg::from(slot_ptr)]);
                             }
 
                             fb.switch_to_block(bb_slot_state);
                             let slot_ptr_val = slot_param;
                             let cached_slot =
-                                fb.ins().load(ptr_ty, MemFlags::trusted(), slot_ptr_val, 0);
+                                fb.ins().load(ptr_ty, MemFlagsData::new().with_notrap().with_aligned(), slot_ptr_val, 0);
                             let absent = fb.ins().iconst(ptr_ty, -1);
                             let slot_index = self.ptr_to_i64(&mut fb, cached_slot);
                             let has_slot = fb.ins().icmp(IntCC::NotEqual, cached_slot, absent);
@@ -4662,14 +4662,14 @@ impl JIT {
                             let slot_index = load_slot_idx;
                             let slots_ptr = fb.ins().load(
                                 ptr_ty,
-                                MemFlags::trusted(),
+                                MemFlagsData::new().with_notrap().with_aligned(),
                                 recv_ptr,
                                 OBJ_SLOTS_OFFSET,
                             );
-                            let byte_off = fb.ins().imul_imm(slot_index, 8);
+                            let byte_off = fb.ins().imul_imm_s(slot_index, 8);
                             let off_ptr = self.value_as_ptr(&mut fb, byte_off);
                             let addr = fb.ins().iadd(slots_ptr, off_ptr);
-                            let val = fb.ins().load(types::I64, MemFlags::trusted(), addr, 0);
+                            let val = fb.ins().load(types::I64, MemFlagsData::new().with_notrap().with_aligned(), addr, 0);
                             fb.ins().jump(bb_exit, &[BlockArg::from(val)]);
 
                             fb.switch_to_block(bb_absent);
@@ -4700,7 +4700,7 @@ impl JIT {
                             obj, field, val, ..
                         } => {
                             use cranelift::codegen::ir::instructions::BlockArg;
-                            use cranelift::prelude::{AbiParam, IntCC, MemFlags, types};
+                            use cranelift::prelude::{AbiParam, IntCC, types};
 
                             let ptr_ty = self.ptr_ty();
                             let ic_raw = self.alloc_field_ic();
@@ -4733,7 +4733,7 @@ impl JIT {
                             let recv_ptr = self.value_as_ptr(&mut fb, recv);
                             let tag_u32 = fb.ins().load(
                                 types::I32,
-                                MemFlags::trusted(),
+                                MemFlagsData::new().with_notrap().with_aligned(),
                                 recv_ptr,
                                 OBJ_TAG_OFFSET,
                             );
@@ -4757,7 +4757,7 @@ impl JIT {
                             fb.switch_to_block(bb_cache);
                             let shape_u32 = fb.ins().load(
                                 types::I32,
-                                MemFlags::trusted(),
+                                MemFlagsData::new().with_notrap().with_aligned(),
                                 recv_ptr,
                                 OBJ_SHAPE_OFFSET,
                             );
@@ -4776,7 +4776,7 @@ impl JIT {
                                     FIELD_IC_SHAPE_OFFSET + (idx as i32) * FIELD_IC_ENTRY_STRIDE;
                                 let cached_shape_u32 = fb.ins().load(
                                     types::I32,
-                                    MemFlags::trusted(),
+                                    MemFlagsData::new().with_notrap().with_aligned(),
                                     ic_ptr,
                                     shape_off,
                                 );
@@ -4793,14 +4793,14 @@ impl JIT {
                                 fb.switch_to_block(hit_blocks[idx]);
                                 let slot_off =
                                     FIELD_IC_SLOT_OFFSET + (idx as i32) * FIELD_IC_ENTRY_STRIDE;
-                                let slot_ptr = fb.ins().iadd_imm(ic_ptr, slot_off as i64);
+                                let slot_ptr = fb.ins().iadd_imm_s(ic_ptr, slot_off as i64);
                                 fb.ins().jump(bb_slot_state, &[BlockArg::from(slot_ptr)]);
                             }
 
                             fb.switch_to_block(bb_slot_state);
                             let slot_ptr_val = slot_param;
                             let cached_slot =
-                                fb.ins().load(ptr_ty, MemFlags::trusted(), slot_ptr_val, 0);
+                                fb.ins().load(ptr_ty, MemFlagsData::new().with_notrap().with_aligned(), slot_ptr_val, 0);
                             let absent = fb.ins().iconst(ptr_ty, -1);
                             let slot_index = self.ptr_to_i64(&mut fb, cached_slot);
                             let has_slot = fb.ins().icmp(IntCC::NotEqual, cached_slot, absent);
@@ -4905,7 +4905,7 @@ impl JIT {
                         }
 
                         Inst::MakeNamespace { exports } => {
-                            use cranelift::prelude::{AbiParam, MemFlags, types};
+                            use cranelift::prelude::{AbiParam, types};
 
                             // MVP: construye un objeto normal y copia *snapshot* de los valores actuales
                             // de cada binding como campos por nombre (string). Más adelante podemos
@@ -4988,7 +4988,7 @@ impl JIT {
                                 "[jit-debug] fun{} TryLeave region {:?} exit {:?} locals {:?}",
                                 fun_ir.id.0, region, exit, locals
                             );
-                            use cranelift::prelude::{AbiParam, MemFlags, types};
+                            use cranelift::prelude::{AbiParam, types};
                             let fid = fb.ins().iconst(types::I64, fun_ir.id.0 as i64);
                             let rid = fb.ins().iconst(types::I64, region.0 as i64);
                             let exit_code = match exit {
@@ -5007,7 +5007,7 @@ impl JIT {
                                     0,
                                 ));
                                 let base = fb.ins().stack_addr(ptr_ty, slot, 0);
-                                let flags = MemFlags::trusted();
+                                let flags = MemFlagsData::new().with_notrap().with_aligned();
                                 for (idx, vid) in locals.iter().enumerate() {
                                     let val = vmap.get_or_emit(*vid, &mut fb, fun_ir);
                                     let offset = (idx as i32) * 8;
@@ -5125,8 +5125,8 @@ impl JIT {
                             let i_smi = vmap.get_or_emit(*idx, &mut fb, fun_ir);
                             let n_smi = vmap.get_or_emit(*len, &mut fb, fun_ir);
 
-                            let i = fb.ins().sshr_imm(i_smi, 1); // raw idx
-                            let n = fb.ins().sshr_imm(n_smi, 1); // raw len
+                            let i = fb.ins().sshr_imm_s(i_smi, 1); // raw idx
+                            let n = fb.ins().sshr_imm_s(n_smi, 1); // raw len
 
                             let zero = fb.ins().iconst(types::I64, 0);
                             let ge0 = fb.ins().icmp(IntCC::SignedGreaterThanOrEqual, i, zero);
@@ -5178,7 +5178,7 @@ impl JIT {
             }
 
             fb.seal_all_blocks();
-            fb.finalize();
+            fb.finalize(self.module.isa().frontend_config());
 
             // Materialize fast (register ABI) body.
             if let Err(err) = self.module.define_function(fast_func_id, &mut fast_ctx) {
@@ -5213,7 +5213,7 @@ impl JIT {
                 .push(AbiParam::new(types::I64));
 
             {
-                use cranelift::prelude::MemFlags;
+                
                 let mut sb = FunctionBuilder::new(&mut stub_ctx.func, &mut fctx_local);
                 let entry = sb.create_block();
                 sb.append_block_params_for_function_params(entry);
@@ -5224,8 +5224,8 @@ impl JIT {
 
                 let mut call_args = Vec::with_capacity(fun.sig.params.len());
                 for i in 0..fun.sig.params.len() {
-                    let addr = sb.ins().iadd_imm(argv_ptr, (i as i64) * 8);
-                    let v = sb.ins().load(types::I64, MemFlags::trusted(), addr, 0);
+                    let addr = sb.ins().iadd_imm_s(argv_ptr, (i as i64) * 8);
+                    let v = sb.ins().load(types::I64, MemFlagsData::new().with_notrap().with_aligned(), addr, 0);
                     call_args.push(v);
                 }
 
@@ -5235,7 +5235,7 @@ impl JIT {
                 sb.ins().return_(&[res]);
 
                 sb.seal_all_blocks();
-                sb.finalize();
+                sb.finalize(self.module.isa().frontend_config());
             }
 
             self.module
@@ -5402,8 +5402,8 @@ fn synth_const(values: &Vec<WirValue>, id: ValueId, fb: &mut FunctionBuilder) ->
         ValueDef::Const(c) => match c {
             Constant::Int32(x) => {
                 let raw = fb.ins().iconst(types::I64, *x as i64);
-                let sh = fb.ins().ishl_imm(raw, 1);
-                let smi = fb.ins().iadd_imm(sh, 1);
+                let sh = fb.ins().ishl_imm_s(raw, 1);
+                let smi = fb.ins().iadd_imm_s(sh, 1);
                 Some(smi)
             }
             Constant::F64(f) => {
@@ -5521,7 +5521,7 @@ pub extern "C" fn wir_make_method_closure(fid_smi: i64) -> i64 {
     unsafe extern "C" {
         fn wir_method_trampoline(argv: *const i64, argc: usize) -> i64;
     }
-    let clo_val = closure_new(wir_method_trampoline as usize, 1);
+    let clo_val = closure_new(wir_method_trampoline as *const() as usize, 1);
     unsafe {
         closure_set_env_slot(clo_val, 0, fid_smi);
     }

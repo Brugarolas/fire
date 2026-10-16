@@ -198,10 +198,10 @@ pub extern "C" fn wir_promise_new(executor: i64) -> i64 {
             }
         }
 
-        let res = closure_new(resolve_tramp as usize, 1);
+        let res = closure_new(resolve_tramp as *const() as usize, 1);
         closure_set_env_slot(res, 0, priv_p);
 
-        let rej = closure_new(reject_tramp as usize, 1);
+        let rej = closure_new(reject_tramp as *const() as usize, 1);
         closure_set_env_slot(rej, 0, priv_p);
 
         // 3) call executor(resolve, reject)
@@ -330,9 +330,9 @@ pub extern "C" fn wir_await(val: i64) -> i64 {
     }));
 
     unsafe {
-        let onf = closure_new(on_f as usize, 1);
+        let onf = closure_new(on_f as *const() as usize, 1);
         closure_set_env_slot(onf, 0, cell as i64);
-        let onr = closure_new(on_r as usize, 1);
+        let onr = closure_new(on_r as *const() as usize, 1);
         closure_set_env_slot(onr, 0, cell as i64);
 
         // IMPORTANT: do NOT call wir_obj_get_str here.

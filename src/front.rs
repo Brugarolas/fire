@@ -40,7 +40,7 @@ pub enum Tok {
     // --- Skips (must come before '/' token) ---
     #[regex(r"[ \t\r\n\f]+", logos::skip)]
     _Ws,
-    #[regex(r"//[^\n]*", logos::skip)]
+    #[regex(r"//[^\n]*", logos::skip, allow_greedy = true)]
     _LineComment,
     #[regex(r"/\*([^*]|\*[^/])*\*/", logos::skip)]
     _BlockComment,
@@ -3439,5 +3439,33 @@ fn lvalue_to_expr(lv: &LValue) -> Expr {
             recv: SmallBox::new(recv.clone()),
             index: SmallBox::new(index.clone()),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Parser;
+
+    #[test]
+    fn parses_index_on_one_megabyte_stack() {
+        // Match the Windows main thread's stack instead of the test harness's
+        // larger default. Nested expressions used to overflow during parsing.
+        std::thread::Builder::new()
+            .name("parser-stack-regression".into())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let mut parser = Parser::with_name(
+                    include_str!("../scripts/index.napalm"),
+                    "scripts/index.napalm",
+                );
+                let program = parser.program().expect("index.napalm must parse");
+                assert!(program.functions.iter().any(|f| f.name == "levenshtein"));
+                assert!(program.functions.iter().any(|f| f.name == "__toplevel__"));
+                assert!(!program.classes.is_empty());
+                // Drop the AST on the same limited stack as well.
+            })
+            .expect("spawn parser thread")
+            .join()
+            .expect("parser thread must finish");
     }
 }

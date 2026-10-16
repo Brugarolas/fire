@@ -46,7 +46,7 @@ mod tls_prng {
             let local = 0u8;
             &local as *const u8 as usize as u64
         };
-        let code_addr = fast_two_u64 as usize as u64;
+        let code_addr = fast_two_u64 as *const() as usize as u64;
         stack_addr.rotate_left(17) ^ code_addr.rotate_left(31)
     }
 

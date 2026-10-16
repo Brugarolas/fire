@@ -371,8 +371,8 @@ fn attach_then_catch(promise: i64, sid: u64, rid: u64) {
         0
     }
 
-    let f = crate::value::closure_new(on_f as usize, 2);
-    let r = crate::value::closure_new(on_r as usize, 2);
+    let f = crate::value::closure_new(on_f as *const() as usize, 2);
+    let r = crate::value::closure_new(on_r as *const() as usize, 2);
     unsafe {
         crate::value::closure_set_env_slot(f, 0, sid as i64);
         crate::value::closure_set_env_slot(f, 1, rid as i64);
@@ -402,7 +402,7 @@ pub extern "C" fn wir_server_create(addr_ptr: i64) -> i64 {
     let addr = unsafe { boxedstr_to_string(addr_ptr) };
     let server_id = rand_id();
 
-    let dispatch_closure = crate::value::closure_new(dispatch_tramp as usize, 0);
+    let dispatch_closure = crate::value::closure_new(dispatch_tramp as *const() as usize, 0);
     let entry = Arc::new(ServerEntry {
         addr,
         dispatch_closure,
@@ -854,7 +854,7 @@ static HTTP_RESOLVE_CLO: Lazy<i64> = Lazy::new(|| {
         }
         0
     }
-    crate::value::closure_new(http_resolve_tramp as usize, 0)
+    crate::value::closure_new(http_resolve_tramp as *const() as usize, 0)
 });
 
 #[inline]

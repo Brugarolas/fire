@@ -60,7 +60,8 @@ pub struct Meta {
     pub stack_span: Vec<FrontErrorLabel>, // for the stack of calls
     pub escape: EscapeInfo,               // future: escape analysis
     pub purity: Purity,                   // future: purity analysis
-    pub front_error: Option<FrontError>,
+    // Diagnostics are rare; keep their payload off every AST node's stack frame.
+    pub front_error: Option<Box<FrontError>>,
 }
 
 #[derive(Clone, Debug)]

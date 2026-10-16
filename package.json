@@ -5,7 +5,7 @@
     "main": "index.js",
     "type": "module",
     "scripts": {
-        "cargo::run": "RUSTFLAGS=\" -Awarnings\" cargo run -- scripts/index.napalm",
+        "cargo::run": "cargo run -- scripts/index.napalm",
         "cargo::run::file": "RUSTFLAGS=\" -Awarnings\" cargo run > log.txt 2>&1 -- scripts/index.napalm",
         "cargo::run::server": "RUSTFLAGS=\" -Awarnings\" cargo run > log.txt 2>&1 -- scripts/server.napalm",
         "cargo::run::no_debug": "RUSTFLAGS=\"-C debug-assertions=no -Awarnings\" cargo run -- scripts/index.napalm",
