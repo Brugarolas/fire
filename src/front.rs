@@ -20,6 +20,8 @@ use compact_str::CompactString;
 
 use smallvec::SmallVec;
 
+mod enums;
+
 // Bring in the WIR types from your other file/module.
 use crate::diag::{
     ErrorCode, FileId, FrontError, FrontErrorLabel, FrontErrorMessage, Meta, Node,
@@ -56,6 +58,8 @@ pub enum Tok {
     Let,
     #[token("const")]
     Const,
+    #[token("enum")]
+    Enum,
     #[token("if")]
     If,
     #[token("unless")]
@@ -446,6 +450,11 @@ pub enum BuiltinCommonMethod {
 
 #[derive(Debug, Clone)]
 pub enum StmtKind {
+    Enum {
+        name: String,
+        binding: BindingId,
+        init: Expr,
+    },
     Var {
         name: String,
         init: Option<Expr>,
@@ -1673,6 +1682,17 @@ impl<'src> Parser<'src> {
             return Ok(());
         }
 
+        if self.check(&Tok::Enum) {
+            let declaration = self.enum_decl()?;
+            let StmtKind::Enum { name, binding, .. } = declaration.kind() else {
+                unreachable!()
+            };
+            self.record_export_with_binding(name, Some(*binding));
+            exports.push(ExportDecl::Var(name.clone()));
+            toplevel.push(declaration);
+            return Ok(());
+        }
+
         // export var/let X = ... ;
         if self.check(&Tok::Var) || self.check(&Tok::Let) || self.check(&Tok::Const) {
             let _ = self.next()?; // consume keyword
@@ -1802,7 +1822,7 @@ impl<'src> Parser<'src> {
             return Ok(());
         }
 
-        Err(self.err_here("invalid export syntax; expected 'async', 'fn', 'function', 'class', 'var', 'let', 'const', '*', or '{'"))
+        Err(self.err_here("invalid export syntax; expected 'async', 'fn', 'function', 'class', 'enum', 'var', 'let', 'const', '*', or '{'"))
     }
 
     fn parse_fn_param_names(&mut self) -> PResult<Vec<String>> {
@@ -1924,6 +1944,9 @@ impl<'src> Parser<'src> {
     }
 
     fn stmt(&mut self) -> PResult<Stmt> {
+        if self.check(&Tok::Enum) {
+            return self.enum_decl();
+        }
         // Allow empty statements (`;`) anywhere a statement is expected
         // (including top level). Treat as a no-op expression stmt.
         if self.matches(&Tok::Semi) {

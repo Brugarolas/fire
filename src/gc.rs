@@ -728,6 +728,21 @@ impl Scanning<NapalmVM> for VMScanning {
                 factory.create_process_roots_work(edges.to_vec());
             }
         }
+
+        // 7) Module bindings retain private and exported enum objects.
+        {
+            let mut edges: SmallVec<[SlotItem; 64]> = SmallVec::new();
+            crate::jit::bindings_with_root_slots(|slot| {
+                edges.push(SlotItem(Address::from_ptr(slot.cast::<u8>())));
+                if edges.len() == 64 {
+                    factory.create_process_roots_work(edges.to_vec());
+                    edges.clear();
+                }
+            });
+            if !edges.is_empty() {
+                factory.create_process_roots_work(edges.to_vec());
+            }
+        }
     }
 
     // ===== extra items your MMTk requires =====

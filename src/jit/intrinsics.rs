@@ -1,5 +1,5 @@
 use super::*;
-use crate::value::{TAG_MAP, TAG_PROXY, TAG_SET};
+use crate::value::{TAG_MAP, TAG_OBJECT, TAG_PROXY, TAG_SET};
 use cranelift::codegen::ir::Block;
 
 #[derive(Clone, Copy, Debug)]
@@ -84,6 +84,7 @@ impl JIT {
         args: &[Value],
     ) -> Result<Option<Value>, String> {
         let tag = match name {
+            "wir_is_obj" => Some(TAG_OBJECT),
             "wir_is_str" => Some(TAG_STRING),
             "wir_is_map" => Some(TAG_MAP),
             "wir_is_set" => Some(TAG_SET),
@@ -871,6 +872,42 @@ mod tests {
                     if operation == "length" { SMI_ZERO } else { 0 }
                 );
             }
+        }
+    }
+
+    #[test]
+    fn module_binding_ids_do_not_alias_and_values_are_gc_roots() {
+        let first = value::obj_new();
+        let second = value::obj_new();
+        wir_binding_store(1_000_000, first);
+        wir_binding_store(2_000_001, second);
+        assert_eq!(wir_binding_load(1_000_000), first);
+        assert_eq!(wir_binding_load(2_000_001), second);
+        let mut roots = Vec::new();
+        bindings_with_root_slots(|slot| roots.push(unsafe { *slot }));
+        assert!(roots.contains(&first));
+        assert!(roots.contains(&second));
+        wir_binding_store(1_000_000, 0);
+        wir_binding_store(2_000_001, 0);
+    }
+
+    #[test]
+    fn object_predicate_is_compiled_without_host_calls() {
+        let compiled = Compiled::new("wir_is_obj", 1);
+        assert!(!compiled.ir.contains(" = call "));
+        let object = value::obj_new();
+        assert_eq!(compiled.call(&[object]), BOOL_TRUE);
+        for value in [
+            0,
+            BOOL_FALSE,
+            BOOL_TRUE,
+            value::make_smi(1),
+            value::intern_string("x"),
+            value::array_new(0),
+            value::map_new(),
+            value::proxy_new(object, value::obj_new()),
+        ] {
+            assert_eq!(compiled.call(&[value]), BOOL_FALSE);
         }
     }
 

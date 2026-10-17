@@ -29,7 +29,7 @@ Language features (Done/Planned):
 - Array functional methods. [x]
 - Operator conditional/nullish, optional chaining, pipeline operator. [x]
 - A small, concise, powerful eDSL for creating server services. [x]
-- Enums. [ ]
+- Enums. [x]
 - Try/Catch/Finally. [x]
 - Defer/Errdefer. [ ]
 - Dates and dates methods. [ ]
@@ -41,6 +41,30 @@ Language features (Done/Planned):
 - Operator overloading for classes. [ ]
 - An optional type system a là TypeScript, with optional static typing, interfaces and generics. [ ]
 - TODO (add more, functional programming, reactive programming, UI bindings, standard library, etc). [ ]
+
+Enums:
+```text
+enum Color { Red, Green, Blue }             // 0, 1, 2
+enum Status { Pending = 10, Running, Done = 20 }
+enum Direction { Up = "up", Down = "down" }
+enum Alias { First = 4, Same = First, Next = Alias.First + 1 }
+
+print(Color.Green);                         // 1
+print(Color[Color.Green]);                  // "Green"
+print(Direction.Up);                        // "up"
+```
+- Declarations accept an optional trailing comma and an optional semicolon after `}`. Empty enums are supported.
+- Numeric members start at zero and increment from the previous numeric member. Explicit negative and fractional values are supported. A member after a string value must have an explicit initializer.
+- Initializers are compile-time constants: numeric/string literals, previous members of the same enum (`First`, `Alias.First`, or `Alias["First"]`), parentheses, unary `+`/`-`, numeric `+`, `-`, `*`, `/`, `%`, and string concatenation with `+`. Forward references, function calls, non-finite results, and auto-increments that exceed numeric precision are rejected.
+- Numeric members get reverse mappings; the last member with a duplicated numeric value wins. String members do not get reverse mappings. Duplicate member names and numeric member names are rejected.
+- Enums work at module level and in local declaration scopes, including async functions, class methods, and captured closures. Module enums are shared objects accessible to functions in that module, not recreated on each access.
+- Use `export enum Color { ... }` or `export { Color };`, then named imports (including aliases) or namespace imports. Private enums are not exposed in module namespaces.
+- Enum values are ordinary numbers or strings, and enum namespaces use ordinary Napalm object semantics. This is not a nominal type system or a read-only property checker. Payload variants, declaration merging, `const enum` erasure, and arbitrary runtime initializers are not supported.
+- Constants are resolved by the frontend; object construction and member access use the existing Cranelift/JIT paths. No enum-specific unsafe C runtime helpers are needed. Numeric indexing on ordinary objects also reads string-keyed properties, enabling reverse lookup. An object's own `size` property takes precedence over the builtin size operation.
+
+Run the example with `cargo run -- scripts/enums.napalm` and the language/module regressions with `cargo test --test enums -- --test-threads=1`.
+Use `--no-default-features` for the same tests without GC if MMTk cannot reserve its heap address range on Windows.
+Compilation errors now exit with a nonzero status rather than reporting success.
 
 Exception handling:
 - `throw` accepts any value; `catch (error)` receives that same value. `catch { ... }` is also supported.

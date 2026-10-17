@@ -91,6 +91,10 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
     }
     fn collect_defs_uses_stmt(s: &Stmt, defs: &mut BTreeSet<String>, uses: &mut BTreeSet<String>) {
         match &s.kind {
+            StmtKind::Enum { name, init, .. } => {
+                defs.insert(name.clone());
+                collect_uses_expr(init, uses);
+            }
             StmtKind::Var { name, init } => {
                 defs.insert(name.clone());
                 if let Some(e) = init {
@@ -287,6 +291,22 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
 
         for s in &b.stmts {
             match &s.kind {
+                StmtKind::Enum {
+                    name,
+                    binding,
+                    init,
+                } => {
+                    let init = rw_expr(init, used, counter, &scope, out_funcs, lam_caps_out);
+                    out_stmts.push(stmt_with_meta(
+                        s,
+                        StmtKind::Enum {
+                            name: name.clone(),
+                            binding: *binding,
+                            init,
+                        },
+                    ));
+                    scope.insert(name.clone());
+                }
                 // `var` introduces a name *after* its initializer; rewrite init with current scope,
                 // then add the binding to the scope for following statements.
                 StmtKind::Var { name, init } => {
@@ -390,6 +410,18 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
         lam_caps_out: &mut HashMap<String, Vec<String>>,
     ) -> Stmt {
         match &s.kind {
+            StmtKind::Enum {
+                name,
+                binding,
+                init,
+            } => stmt_with_meta(
+                s,
+                StmtKind::Enum {
+                    name: name.clone(),
+                    binding: *binding,
+                    init: rw_expr(init, used, counter, enclosing_locals, out_funcs, lam_caps_out),
+                },
+            ),
             StmtKind::Var { name, init } => {
                 let init_rw = init.as_ref().map(|expr| {
                     rw_expr(

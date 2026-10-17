@@ -504,28 +504,24 @@ fn bindings() -> &'static Mutex<HashMap<u32, i64>> {
     WIR_BINDINGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+pub(crate) fn bindings_with_root_slots(mut visit: impl FnMut(*mut i64)) {
+    let mut bindings = bindings().lock();
+    for value in bindings.values_mut() {
+        visit(value as *mut i64);
+    }
+}
+
 #[unsafe(no_mangle)]
-pub extern "C" fn wir_binding_load(binding_id_smi: i64) -> i64 {
-    // binding_id viene como SMI o raw? Aquí esperamos RAW (como en Store/MakeNamespace).
-    // Para máxima compatibilidad, acepta ambos: si es impar, decodifica SMI.
-    let raw = if (binding_id_smi & 1) == 1 {
-        binding_id_smi >> 1
-    } else {
-        binding_id_smi
-    };
-    let id = raw as u32;
+pub extern "C" fn wir_binding_load(binding_id: i64) -> i64 {
+    // LoadBinding, StoreBinding and MakeNamespace pass untagged IDs.
+    let id = binding_id as u32;
     let m = bindings().lock();
     *m.get(&id).unwrap_or(&0)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn wir_binding_store(binding_id_smi: i64, val: i64) -> i64 {
-    let raw = if (binding_id_smi & 1) == 1 {
-        binding_id_smi >> 1
-    } else {
-        binding_id_smi
-    };
-    let id = raw as u32;
+pub extern "C" fn wir_binding_store(binding_id: i64, val: i64) -> i64 {
+    let id = binding_id as u32;
     #[cfg(debug_assertions)]
     eprintln!("[binding-store] id={} val={:#x}", id, val as u64);
     let mut m = bindings().lock();
@@ -717,8 +713,8 @@ impl Default for JIT {
         }
 
         unsafe extern "C" {
-            fn wir_binding_load(binding_id_smi: i64) -> i64;
-            fn wir_binding_store(binding_id_smi: i64, val: i64) -> i64;
+            fn wir_binding_load(binding_id: i64) -> i64;
+            fn wir_binding_store(binding_id: i64, val: i64) -> i64;
         }
 
         unsafe extern "C" {

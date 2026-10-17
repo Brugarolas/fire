@@ -86,7 +86,7 @@ fn main() {
             Ok(m) => (m, input_path.clone()),
             Err(e) => {
                 eprintln!("Error building whole program: {}", e);
-                return;
+                std::process::exit(1);
             }
         }
     } else {
@@ -96,7 +96,7 @@ fn main() {
             Ok(m) => (m, "<default>".to_string()),
             Err(e) => {
                 eprintln!("Error building default script: {}", e);
-                return;
+                std::process::exit(1);
             }
         }
     };

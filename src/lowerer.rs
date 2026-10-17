@@ -509,8 +509,17 @@ fn await_allowed() -> bool {
     AWAIT_SCOPE_DEPTH.with(|depth| depth.get() > 0)
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct EnumBinding {
+    /// Distinguishes a module declaration from a same-named local enum.
+    pub declaration: BindingId,
+    pub cell: BindingId,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LinkInfo {
+    /// Module-level enum bindings, including private declarations.
+    pub enum_bindings: HashMap<String, EnumBinding>,
     /// import { a as x } from "m"   →   "x" -> binding(m,a)
     pub import_bindings: HashMap<String, BindingId>,
     /// import * as ns from "m"      →   "ns" -> [ ("a", binding(m,a)), ... ]
@@ -576,6 +585,34 @@ impl<'m> Lowerer<'m> {
     }
 
     pub fn lower_program(&mut self, prog: &Program) -> LResult<Vec<FuncId>> {
+        self.lowering_ctx.links.enum_bindings.clear();
+        if let Some(toplevel) = prog.functions.iter().find(|f| f.name == "__toplevel__") {
+            for statement in &toplevel.body.stmts {
+                if let StmtKind::Enum { name, binding, .. } = statement.kind() {
+                    let cell = self
+                        .lowering_ctx
+                        .links
+                        .export_bindings
+                        .get(name)
+                        .copied()
+                        .unwrap_or(*binding);
+                    let enum_binding = EnumBinding {
+                        declaration: *binding,
+                        cell,
+                    };
+                    if self
+                        .lowering_ctx
+                        .links
+                        .enum_bindings
+                        .insert(name.clone(), enum_binding)
+                        .is_some()
+                    {
+                        return Err(LowerError::NotLowerable("duplicate enum declaration"));
+                    }
+                }
+            }
+        }
+
         // -------- Stage 1: collect classes & their metadata --------
         self.lowering_ctx.classes.clear();
 
@@ -920,6 +957,19 @@ fn lower_stmt_free<'m>(
 ) -> LResult<()> {
     snapshot_try_locals(b, locals);
     match s.kind() {
+        StmtKind::Enum {
+            name,
+            binding,
+            init,
+        } => {
+            let value = lower_expr_free(b, locals, fields, next_field, init, lowering_ctx)?;
+            locals.insert(name.clone(), value);
+            if let Some(module_binding) = lowering_ctx.links.enum_bindings.get(name) {
+                if module_binding.declaration == *binding {
+                    b.store_binding(module_binding.cell, value);
+                }
+            }
+        }
         StmtKind::Var { name, init } => {
             let val = if let Some(e) = init {
                 lower_expr_free(b, locals, fields, next_field, e, lowering_ctx)? // <-- pass
@@ -1649,6 +1699,7 @@ fn collect_mut_locals_in_expr(e: &Expr, out: &mut BTreeSet<String>) {
 fn collect_mut_locals_in_stmt(s: &Stmt, out: &mut BTreeSet<String>) {
     match s.kind() {
         StmtKind::Expr(e) => collect_mut_locals_in_expr(e, out),
+        StmtKind::Enum { .. } => {}
         StmtKind::Var { .. } => {} // vars declared inside the loop are not loop-carried
         StmtKind::VarDestruct { .. } => {}
         StmtKind::If {
@@ -1931,6 +1982,9 @@ fn lower_stmt_free_async<'m>(
                         true,
                     );
                     Ok(())
+                }
+                StmtKind::Enum { .. } => {
+                    lower_stmt_free(b, locals, fields, next_field, s, lowering_ctx, active_try)
                 }
                 StmtKind::Var { name, init } => {
                     let val = if let Some(e) = init {
@@ -3392,6 +3446,10 @@ fn lower_expr_free_impl<'m>(
                 return Ok(v);
             }
 
+            if let Some(binding) = lowering_ctx.links.enum_bindings.get(name) {
+                return Ok(b.load_binding(binding.cell, None));
+            }
+
             // 3) Known global function name → make a closure with null env
             if let Some(&fid) = lowering_ctx.funcs.get(name) {
                 let (_nid, env_null) =
@@ -3431,16 +3489,11 @@ fn lower_expr_free_impl<'m>(
             // 7) Compatibility path: declared namespace import but not cached yet.
             //    If the namespace alias is known, we can synthesize/return a namespace
             //    object lazily and memoize it into `locals` to avoid rebuilding it.
-            if lowering_ctx.links.namespace_imports.contains_key(name) {
+            if let Some(exports) = lowering_ctx.links.namespace_imports.get(name) {
                 if let Some(&cached) = locals.get(name) {
                     return Ok(cached);
                 }
-                // NOTE: We only have the alias here (no member BindingIds).
-                //       `make_namespace` should create an object that reads provider
-                //       bindings on demand (implementation-specific). If your current
-                //       `make_namespace` needs the (name, BindingId) list, you'll want
-                //       to run a linking pass that populates `namespace_imports[alias]`.
-                let ns_obj = b.make_namespace(Vec::new());
+                let ns_obj = b.make_namespace(exports.clone());
                 locals.insert(name.clone(), ns_obj);
                 return Ok(ns_obj);
             }
@@ -5663,6 +5716,49 @@ fn lower_expr_free_impl<'m>(
             b.jump(numeric_cont, &[char_res[0]]);
 
             b.position_at(array_recv_path);
+            let (_nid_object, object) = b.push_node(
+                Inst::CallNative {
+                    name: "wir_is_obj".into(),
+                    args: vec![recv_v],
+                    pure: true,
+                    can_throw: false,
+                },
+                Some(Type::Bool),
+                1,
+                false,
+            );
+            let object_recv_path = b.block();
+            let indexed_array_path = b.block();
+            b.branch(object[0], object_recv_path, indexed_array_path);
+
+            // Numeric enum reverse mappings are ordinary string-keyed properties.
+            b.position_at(object_recv_path);
+            let empty = b.const_str("");
+            let (_nid_key, key) = b.push_node(
+                Inst::CallNative {
+                    name: "wir_string_concat_coerce".into(),
+                    args: vec![empty, idx_v],
+                    pure: false,
+                    can_throw: false,
+                },
+                Some(Type::Str),
+                1,
+                true,
+            );
+            let (_nid_value, value) = b.push_node(
+                Inst::CallNative {
+                    name: "wir_obj_get_str".into(),
+                    args: vec![recv_v, key[0]],
+                    pure: false,
+                    can_throw: false,
+                },
+                None,
+                1,
+                true,
+            );
+            b.jump(numeric_cont, &[value[0]]);
+
+            b.position_at(indexed_array_path);
             let (_nid_arr, arr_res) = b.push_node(
                 Inst::CallNative {
                     name: "wir_array_get".into(),
@@ -6261,6 +6357,43 @@ fn lower_expr_free_impl<'m>(
 
         ExprKind::GetBuiltinSize(recv) => {
             let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
+            let (_nid_object, object) = b.push_node(
+                Inst::CallNative {
+                    name: "wir_is_obj".into(),
+                    args: vec![recv_v],
+                    pure: true,
+                    can_throw: false,
+                },
+                Some(Type::Bool),
+                1,
+                false,
+            );
+            let check_property = b.block();
+            let property = b.block();
+            let builtin = b.block();
+            let done = b.block();
+            let result = b.add_block_param(done, Type::Top);
+            b.branch(object[0], check_property, builtin);
+
+            b.position_at(check_property);
+            let key = b.const_str("size");
+            let (_nid_has, has) = b.push_node(
+                Inst::CallNative {
+                    name: "wir_obj_has_str".into(),
+                    args: vec![recv_v, key],
+                    pure: false,
+                    can_throw: false,
+                },
+                Some(Type::Bool),
+                1,
+                true,
+            );
+            b.branch(has[0], property, builtin);
+            b.position_at(property);
+            let value = lower_general_getprop(b, recv_v, "size", fields, next_field);
+            b.jump(done, &[value]);
+
+            b.position_at(builtin);
             let (_nid, res) = b.push_node(
                 Inst::CallNative {
                     name: "wir_builtin_size".into(),
@@ -6272,7 +6405,9 @@ fn lower_expr_free_impl<'m>(
                 1,
                 false,
             );
-            Ok(res[0])
+            b.jump(done, &[res[0]]);
+            b.position_at(done);
+            Ok(result)
         }
 
         _ => Err(LowerError::NotLowerable("expression type not supported")),
@@ -6352,6 +6487,12 @@ impl<'m> Lowerer<'m> {
             let undef = b.const_undef();
             for &bid in links.export_bindings.values() {
                 b.store_binding(bid, undef);
+            }
+            for binding in links.enum_bindings.values() {
+                let bid = binding.cell;
+                if !links.export_bindings.values().any(|export| *export == bid) {
+                    b.store_binding(bid, undef);
+                }
             }
 
             // null env para closures
@@ -6680,6 +6821,18 @@ impl<'m> Lowerer<'m> {
         }
         fn rw_stmt<F: Fn(&Expr) -> Expr + Copy>(s: &Stmt, f: F) -> Stmt {
             match s.kind() {
+                StmtKind::Enum {
+                    name,
+                    binding,
+                    init,
+                } => stmt_with_meta(
+                    s,
+                    StmtKind::Enum {
+                        name: name.clone(),
+                        binding: *binding,
+                        init: rw_expr(init, f),
+                    },
+                ),
                 StmtKind::Var { name, init } => stmt_with_meta(
                     s,
                     StmtKind::Var {

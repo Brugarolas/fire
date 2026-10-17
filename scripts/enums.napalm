@@ -1,0 +1,36 @@
+enum Color {
+    Red,
+    Green,
+    Blue,
+}
+
+enum Status {
+    Pending = 10,
+    Running,
+    Failed = -1,
+    Done = 20,
+}
+
+enum Direction {
+    Up = "up",
+    Down = "down",
+}
+
+fn describe(color) {
+    if (color == Color.Green) { return "green"; }
+    return Color[color];
+}
+
+print([Color.Red, Color.Green, Color.Blue]);
+print([Status.Pending, Status.Running, Status.Failed, Status.Done]);
+print([Direction.Up, Direction.Down]);
+print([Color[Color.Red], Color[2], Status[-1]]);
+print(describe(Color.Green));
+print(describe(Color.Blue));
+
+fn local_enum() {
+    enum State { Start = 3, Next, End = Next + 5 }
+    return fn () { return [State.Start, State.Next, State.End]; };
+}
+var read_state = local_enum();
+print(read_state());

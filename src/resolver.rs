@@ -182,6 +182,10 @@ impl Resolver {
     /// Resolves a single statement.
     fn resolve_stmt(&mut self, stmt: &Stmt) -> Result<(), FrontError> {
         match &stmt.kind {
+            StmtKind::Enum { name, init, .. } => {
+                self.resolve_expr(init)?;
+                self.declare(name.clone(), stmt.meta.span.clone())?;
+            }
             StmtKind::Var { name, init } => {
                 // Resolve the initializer expression *before* declaring the variable.
                 // This correctly catches `var x = x;`.
