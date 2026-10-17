@@ -22,6 +22,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 mod exceptions;
+mod intrinsics;
 use exceptions::CompletionKind;
 
 thread_local! {
@@ -140,8 +141,6 @@ const FIELD_IC_ENTRY_SLOT_OFFSET: i32 = offset_of!(FieldCacheEntry, slot) as i32
 const FIELD_IC_SHAPE_OFFSET: i32 = FIELD_IC_ENTRIES_OFFSET + FIELD_IC_ENTRY_SHAPE_OFFSET;
 const FIELD_IC_SLOT_OFFSET: i32 = FIELD_IC_ENTRIES_OFFSET + FIELD_IC_ENTRY_SLOT_OFFSET;
 const ARRAY_BUF_OFFSET: i32 = offset_of!(BoxedArray, buf) as i32;
-const VEC_PTR_OFFSET: i32 = 0;
-const VEC_LEN_OFFSET: i32 = core::mem::size_of::<usize>() as i32;
 const STR_LEN_OFFSET: i32 = offset_of!(BoxedStr, len) as i32;
 const STR_DATA_OFFSET: i32 = offset_of!(BoxedStr, data) as i32;
 const STR_AUX_OFFSET: i32 = offset_of!(BoxedStr, hdr) as i32 + offset_of!(ObjHeader, aux) as i32;
@@ -314,30 +313,6 @@ pub extern "C" fn jit_obj_store_slot(obj: i64, slot: i64, val: i64) -> i64 {
     }
     0
 }
-
-#[unsafe(no_mangle)]
-pub extern "C" fn jit_array_store_inbounds(arr: i64, idx: i64, val: i64) -> i64 {
-    if arr == 0 {
-        return 0;
-    }
-
-    let idx_u = idx as usize;
-    unsafe {
-        let arr_ref = &mut *(arr as *mut BoxedArray);
-        debug_assert!(idx_u < arr_ref.buf.len());
-        let slot = arr_ref.buf.as_mut_ptr().add(idx_u);
-        *slot = val;
-
-        #[cfg(feature = "gc")]
-        {
-            NAPALM_GC.post_write_barrier(arr as *mut u8, slot, val);
-        }
-    }
-    0
-}
-
-#[allow(unused_imports)]
-use crate::gc::NAPALM_GC;
 
 
 use crate::wir::{
@@ -665,7 +640,6 @@ impl Default for JIT {
             fn jit_obj_has_field_slow(ic: *mut FieldInlineCache, obj: i64, field_id: i64) -> i64;
             fn jit_obj_del_field_slow(ic: *mut FieldInlineCache, obj: i64, field_id: i64) -> i64;
             fn jit_obj_store_slot(obj: i64, slot: i64, val: i64) -> i64;
-            fn jit_array_store_inbounds(arr: i64, idx: i64, val: i64) -> i64;
 
             fn wir_obj_get_str(obj: i64, key: i64) -> i64;
             fn wir_obj_set_str(obj: i64, key: i64, val: i64) -> i64;
@@ -1052,10 +1026,6 @@ impl Default for JIT {
             jb.symbol(
                 "jit_obj_store_slot",
                 jit_obj_store_slot as *const extern "C" fn(i64, i64, i64) -> i64 as *const u8,
-            );
-            jb.symbol(
-                "jit_array_store_inbounds",
-                jit_array_store_inbounds as *const extern "C" fn(i64, i64, i64) -> i64 as *const u8,
             );
 
             jb.symbol(
@@ -1487,6 +1457,19 @@ impl JIT {
         build_sig: impl FnOnce(&mut cranelift::prelude::Signature),
         args: &[cranelift::prelude::Value],
     ) -> Result<cranelift::prelude::Value, String> {
+        if let Some(value) = self.emit_core_intrinsic(fb, name, args)? {
+            return Ok(value);
+        }
+        self.call_host(fb, name, build_sig, args)
+    }
+
+    fn call_host<'a>(
+        &mut self,
+        fb: &mut FunctionBuilder<'a>,
+        name: &str,
+        build_sig: impl FnOnce(&mut Signature),
+        args: &[Value],
+    ) -> Result<Value, String> {
         use cranelift::prelude::*;
         use cranelift_module::Linkage;
 
@@ -1629,17 +1612,6 @@ impl JIT {
 
         let fast_func_id = self.ensure_fast_decl(fun)?;
         let stub_func_id = self.ensure_stub_decl(fun)?;
-
-        // Small helpers for SMI encode/decode (do NOT capture &mut self)
-        let dec_smi = |fb: &mut FunctionBuilder, v: Value| -> Value {
-            // raw = v >> 1 (arithmetic)
-            fb.ins().sshr_imm_s(v, 1)
-        };
-        let enc_smi = |fb: &mut FunctionBuilder, raw: Value| -> Value {
-            // (raw << 1) | 1
-            let sh = fb.ins().ishl_imm_s(raw, 1);
-            fb.ins().iadd_imm_s(sh, 1)
-        };
 
         // ---- build cranelift function context/signature: (param0, param1, ...) -> i64
         let mut fast_ctx = self.module.make_context();
@@ -1913,57 +1885,7 @@ impl JIT {
                         }
 
                         Inst::ArrayLen(arr) => {
-                            use cranelift::codegen::ir::instructions::BlockArg;
-                            use cranelift::prelude::{AbiParam, IntCC, types};
-
-                            let ptr_ty = self.ptr_ty();
                             let arr_val = vmap.get_or_emit(*arr, &mut fb, fun_ir);
-                            let zero = fb.ins().iconst(types::I64, 0);
-
-                            let bb_type = fb.create_block();
-                            let bb_fast = fb.create_block();
-                            let bb_slow = fb.create_block();
-                            let bb_exit = fb.create_block();
-                            let res_phi = fb.append_block_param(bb_exit, types::I64);
-
-                            let is_null = fb.ins().icmp(IntCC::Equal, arr_val, zero);
-                            fb.ins().brif(
-                                is_null,
-                                bb_exit,
-                                &[BlockArg::from(zero)],
-                                bb_type,
-                                &[] as &[BlockArg],
-                            );
-
-                            fb.switch_to_block(bb_type);
-                            let arr_ptr = self.value_as_ptr(&mut fb, arr_val);
-                            let tag_u32 = fb.ins().load(
-                                types::I32,
-                                MemFlagsData::new().with_notrap().with_aligned(),
-                                arr_ptr,
-                                OBJ_TAG_OFFSET,
-                            );
-                            let tag = fb.ins().uextend(types::I64, tag_u32);
-                            let array_tag = fb.ins().iconst(types::I64, TAG_ARRAY as i64);
-                            let is_array = fb.ins().icmp(IntCC::Equal, tag, array_tag);
-                            fb.ins().brif(
-                                is_array,
-                                bb_fast,
-                                &[] as &[BlockArg],
-                                bb_slow,
-                                &[] as &[BlockArg],
-                            );
-
-                            fb.switch_to_block(bb_fast);
-                            let len_offset = ARRAY_BUF_OFFSET + VEC_LEN_OFFSET;
-                            let len_raw =
-                                fb.ins()
-                                    .load(ptr_ty, MemFlagsData::new().with_notrap().with_aligned(), arr_ptr, len_offset);
-                            let len_i64 = self.ptr_to_i64(&mut fb, len_raw);
-                            let len_smi = enc_smi(&mut fb, len_i64);
-                            fb.ins().jump(bb_exit, &[BlockArg::from(len_smi)]);
-
-                            fb.switch_to_block(bb_slow);
                             let out = self.call_import(
                                 &mut fb,
                                 "wir_array_len",
@@ -1973,101 +1895,14 @@ impl JIT {
                                 },
                                 &[arr_val],
                             )?;
-                            fb.ins().jump(bb_exit, &[BlockArg::from(out)]);
-
-                            fb.switch_to_block(bb_exit);
                             if res_count == 1 {
-                                vmap.bind(node.results[0], res_phi);
+                                vmap.bind(node.results[0], out);
                             }
                         }
 
                         Inst::LoadElem { arr, idx } => {
-                            use cranelift::codegen::ir::instructions::BlockArg;
-                            use cranelift::prelude::{AbiParam, IntCC, types};
-
-                            let ptr_ty = self.ptr_ty();
-                            let zero = fb.ins().iconst(types::I64, 0);
                             let arr_val = vmap.get_or_emit(*arr, &mut fb, fun_ir);
                             let idx_smi = vmap.get_or_emit(*idx, &mut fb, fun_ir);
-                            let idx_raw = dec_smi(&mut fb, idx_smi);
-
-                            let bb_type = fb.create_block();
-                            let bb_index = fb.create_block();
-                            let bb_len = fb.create_block();
-                            let bb_load = fb.create_block();
-                            let bb_slow = fb.create_block();
-                            let bb_exit = fb.create_block();
-                            let res_phi = fb.append_block_param(bb_exit, types::I64);
-
-                            let is_null = fb.ins().icmp(IntCC::Equal, arr_val, zero);
-                            fb.ins().brif(
-                                is_null,
-                                bb_exit,
-                                &[BlockArg::from(zero)],
-                                bb_type,
-                                &[] as &[BlockArg],
-                            );
-
-                            fb.switch_to_block(bb_type);
-                            let arr_ptr = self.value_as_ptr(&mut fb, arr_val);
-                            let tag_u32 = fb.ins().load(
-                                types::I32,
-                                MemFlagsData::new().with_notrap().with_aligned(),
-                                arr_ptr,
-                                OBJ_TAG_OFFSET,
-                            );
-                            let tag = fb.ins().uextend(types::I64, tag_u32);
-                            let array_tag = fb.ins().iconst(types::I64, TAG_ARRAY as i64);
-                            let is_array = fb.ins().icmp(IntCC::Equal, tag, array_tag);
-                            fb.ins().brif(
-                                is_array,
-                                bb_index,
-                                &[] as &[BlockArg],
-                                bb_slow,
-                                &[] as &[BlockArg],
-                            );
-
-                            fb.switch_to_block(bb_index);
-                            let idx_negative = fb.ins().icmp(IntCC::SignedLessThan, idx_raw, zero);
-                            fb.ins().brif(
-                                idx_negative,
-                                bb_exit,
-                                &[BlockArg::from(zero)],
-                                bb_len,
-                                &[] as &[BlockArg],
-                            );
-
-                            fb.switch_to_block(bb_len);
-                            let len_offset = ARRAY_BUF_OFFSET + VEC_LEN_OFFSET;
-                            let len_raw =
-                                fb.ins()
-                                    .load(ptr_ty, MemFlagsData::new().with_notrap().with_aligned(), arr_ptr, len_offset);
-                            let len_i64 = self.ptr_to_i64(&mut fb, len_raw);
-                            let out_of_bounds =
-                                fb.ins()
-                                    .icmp(IntCC::UnsignedGreaterThanOrEqual, idx_raw, len_i64);
-                            fb.ins().brif(
-                                out_of_bounds,
-                                bb_exit,
-                                &[BlockArg::from(zero)],
-                                bb_load,
-                                &[] as &[BlockArg],
-                            );
-
-                            fb.switch_to_block(bb_load);
-                            let data_ptr = fb.ins().load(
-                                ptr_ty,
-                                MemFlagsData::new().with_notrap().with_aligned(),
-                                arr_ptr,
-                                ARRAY_BUF_OFFSET,
-                            );
-                            let idx_bytes = fb.ins().imul_imm_s(idx_raw, 8);
-                            let idx_ptr = self.value_as_ptr(&mut fb, idx_bytes);
-                            let addr = fb.ins().iadd(data_ptr, idx_ptr);
-                            let val = fb.ins().load(types::I64, MemFlagsData::new().with_notrap().with_aligned(), addr, 0);
-                            fb.ins().jump(bb_exit, &[BlockArg::from(val)]);
-
-                            fb.switch_to_block(bb_slow);
                             let out = self.call_import(
                                 &mut fb,
                                 "wir_array_get",
@@ -2078,104 +1913,16 @@ impl JIT {
                                 },
                                 &[arr_val, idx_smi],
                             )?;
-                            fb.ins().jump(bb_exit, &[BlockArg::from(out)]);
-
-                            fb.switch_to_block(bb_exit);
                             if res_count == 1 {
-                                vmap.bind(node.results[0], res_phi);
+                                vmap.bind(node.results[0], out);
                             }
                         }
 
                         Inst::StoreElem { arr, idx, val } => {
-                            use cranelift::codegen::ir::instructions::BlockArg;
-                            use cranelift::prelude::{AbiParam, IntCC, types};
-
-                            let ptr_ty = self.ptr_ty();
-                            let zero = fb.ins().iconst(types::I64, 0);
                             let arr_val = vmap.get_or_emit(*arr, &mut fb, fun_ir);
                             let idx_smi = vmap.get_or_emit(*idx, &mut fb, fun_ir);
                             let val_v = vmap.get_or_emit(*val, &mut fb, fun_ir);
-                            let idx_raw = dec_smi(&mut fb, idx_smi);
-
-                            let bb_type = fb.create_block();
-                            let bb_index = fb.create_block();
-                            let bb_len = fb.create_block();
-                            let bb_inline = fb.create_block();
-                            let bb_slow = fb.create_block();
-                            let bb_exit = fb.create_block();
-                            let res_phi = fb.append_block_param(bb_exit, types::I64);
-
-                            let is_null = fb.ins().icmp(IntCC::Equal, arr_val, zero);
-                            fb.ins().brif(
-                                is_null,
-                                bb_exit,
-                                &[BlockArg::from(zero)],
-                                bb_type,
-                                &[] as &[BlockArg],
-                            );
-
-                            fb.switch_to_block(bb_type);
-                            let arr_ptr = self.value_as_ptr(&mut fb, arr_val);
-                            let tag_u32 = fb.ins().load(
-                                types::I32,
-                                MemFlagsData::new().with_notrap().with_aligned(),
-                                arr_ptr,
-                                OBJ_TAG_OFFSET,
-                            );
-                            let tag = fb.ins().uextend(types::I64, tag_u32);
-                            let array_tag = fb.ins().iconst(types::I64, TAG_ARRAY as i64);
-                            let is_array = fb.ins().icmp(IntCC::Equal, tag, array_tag);
-                            fb.ins().brif(
-                                is_array,
-                                bb_index,
-                                &[] as &[BlockArg],
-                                bb_slow,
-                                &[] as &[BlockArg],
-                            );
-
-                            fb.switch_to_block(bb_index);
-                            let idx_negative = fb.ins().icmp(IntCC::SignedLessThan, idx_raw, zero);
-                            fb.ins().brif(
-                                idx_negative,
-                                bb_exit,
-                                &[BlockArg::from(zero)],
-                                bb_len,
-                                &[] as &[BlockArg],
-                            );
-
-                            fb.switch_to_block(bb_len);
-                            let len_offset = ARRAY_BUF_OFFSET + VEC_LEN_OFFSET;
-                            let len_raw =
-                                fb.ins()
-                                    .load(ptr_ty, MemFlagsData::new().with_notrap().with_aligned(), arr_ptr, len_offset);
-                            let len_i64 = self.ptr_to_i64(&mut fb, len_raw);
-                            let out_of_bounds =
-                                fb.ins()
-                                    .icmp(IntCC::UnsignedGreaterThanOrEqual, idx_raw, len_i64);
-                            fb.ins().brif(
-                                out_of_bounds,
-                                bb_slow,
-                                &[] as &[BlockArg],
-                                bb_inline,
-                                &[] as &[BlockArg],
-                            );
-
-                            fb.switch_to_block(bb_inline);
-                            let _ = self.call_import(
-                                &mut fb,
-                                "jit_array_store_inbounds",
-                                |s| {
-                                    s.params.push(AbiParam::new(types::I64)); // arr
-                                    s.params.push(AbiParam::new(types::I64)); // idx (raw)
-                                    s.params.push(AbiParam::new(types::I64)); // val
-                                    s.returns.push(AbiParam::new(types::I64)); // status / 0
-                                },
-                                &[arr_val, idx_raw, val_v],
-                            )?;
-                            fb.ins().jump(bb_exit, &[BlockArg::from(zero)]);
-
-                            fb.switch_to_block(bb_slow);
-                            let _ = self.call_import(
+                            let out = self.call_import(
                                 &mut fb,
                                 "wir_array_set",
                                 |s| {
@@ -2186,11 +1933,8 @@ impl JIT {
                                 },
                                 &[arr_val, idx_smi, val_v],
                             )?;
-                            fb.ins().jump(bb_exit, &[BlockArg::from(zero)]);
-
-                            fb.switch_to_block(bb_exit);
                             if res_count == 1 {
-                                vmap.bind(node.results[0], res_phi);
+                                vmap.bind(node.results[0], out);
                             }
                         }
 
@@ -2805,74 +2549,13 @@ impl JIT {
                                     }
                                 }
                                 "wir_string_len" => {
-                                    use cranelift::codegen::ir::instructions::BlockArg;
-                                    use cranelift::prelude::{IntCC};
-
                                     let str_val = vmap.get_or_emit(args[0], &mut fb, fun_ir);
-                                    let zero = fb.ins().iconst(types::I64, 0);
-                                    let smi_zero = fb.ins().iconst(types::I64, SMI_ZERO);
-                                    let mask = fb.ins().iconst(types::I64, PTR_TAG_MASK);
-                                    let str_tag = fb.ins().iconst(types::I64, TAG_STRING as i64);
-
-                                    let bb_check_ptr = fb.create_block();
-                                    let bb_check_tag = fb.create_block();
-                                    let bb_fast = fb.create_block();
-                                    let bb_exit = fb.create_block();
-                                    let res_phi = fb.append_block_param(bb_exit, types::I64);
-
-                                    let is_null = fb.ins().icmp(IntCC::Equal, str_val, zero);
-                                    fb.ins().brif(
-                                        is_null,
-                                        bb_exit,
-                                        &[BlockArg::from(smi_zero)],
-                                        bb_check_ptr,
-                                        &[] as &[BlockArg],
-                                    );
-
-                                    fb.switch_to_block(bb_check_ptr);
-                                    let masked = fb.ins().band(str_val, mask);
-                                    let not_ptr = fb.ins().icmp(IntCC::NotEqual, masked, zero);
-                                    fb.ins().brif(
-                                        not_ptr,
-                                        bb_exit,
-                                        &[BlockArg::from(smi_zero)],
-                                        bb_check_tag,
-                                        &[] as &[BlockArg],
-                                    );
-
-                                    fb.switch_to_block(bb_check_tag);
-                                    let str_ptr = self.value_as_ptr(&mut fb, str_val);
-                                    let tag_u32 = fb.ins().load(
-                                        types::I32,
-                                        MemFlagsData::new().with_notrap().with_aligned(),
-                                        str_ptr,
-                                        OBJ_TAG_OFFSET,
-                                    );
-                                    let tag = fb.ins().uextend(types::I64, tag_u32);
-                                    let is_string = fb.ins().icmp(IntCC::Equal, tag, str_tag);
-                                    fb.ins().brif(
-                                        is_string,
-                                        bb_fast,
-                                        &[] as &[BlockArg],
-                                        bb_exit,
-                                        &[BlockArg::from(smi_zero)],
-                                    );
-
-                                    fb.switch_to_block(bb_fast);
-                                    let len_raw = fb.ins().load(
-                                        self.ptr_ty(),
-                                        MemFlagsData::new().with_notrap().with_aligned(),
-                                        str_ptr,
-                                        STR_LEN_OFFSET,
-                                    );
-                                    let len_i64 = self.ptr_to_i64(&mut fb, len_raw);
-                                    let len_shift = fb.ins().ishl_imm_s(len_i64, 1);
-                                    let len_smi = fb.ins().iadd_imm_s(len_shift, 1);
-                                    fb.ins().jump(bb_exit, &[BlockArg::from(len_smi)]);
-
-                                    fb.switch_to_block(bb_exit);
+                                    let out = self.call_import(&mut fb, "wir_string_len", |sig| {
+                                        sig.params.push(AbiParam::new(types::I64));
+                                        sig.returns.push(AbiParam::new(types::I64));
+                                    }, &[str_val])?;
                                     if res_count == 1 {
-                                        vmap.bind(node.results[0], res_phi);
+                                        vmap.bind(node.results[0], out);
                                     }
                                 }
                                 "wir_string_concat" => {

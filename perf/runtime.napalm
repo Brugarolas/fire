@@ -1,0 +1,22 @@
+fn array_work(n) {
+    var a = [1, 2, 3, 4];
+    var total = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        a.push(i);
+        total = total + a.pop() + a.length();
+    }
+    return total;
+}
+
+fn string_work(n, text, prefix, suffix) {
+    var total = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        if (text.startsWith(prefix)) { total = total + 1; }
+        if (text.endsWith(suffix)) { total = total + 1; }
+        total = total + text.indexOf(suffix);
+    }
+    return total;
+}
+
+print(array_work(200000));
+print(string_work(200000, "napalm-runtime-intrinsics", "napalm", "intrinsics"));

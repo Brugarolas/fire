@@ -1,0 +1,49 @@
+fn arrays() {
+    var a = [];
+    print([a.length(), a.pop(), a.shift()]);
+    print([a.push(1), a.push(2), a.push(3)]);
+    print([a[0], a[2], a[-1], a[3]]);
+    a[1] = 20;
+    a[5] = 60;
+    print(a);
+    a.setLength(2);
+    a.setLength(5);
+    print(a);
+    print([a.unshift(9), a.shift(), a.pop(), a.length()]);
+    print(a);
+
+    var object = { answer: 42 };
+    a[0] = object;
+    a.push(object);
+    a.unshift(object);
+    print([a[0].answer, a.pop().answer, a.shift().answer]);
+    print(a[0].answer);
+    a.fill(7);
+    print(a);
+    a.fill(object);
+    print([a[0].answer, a[3].answer]);
+
+    print([1, 2, 3].map(|x| x + 1));
+    print([1, 2, 3, 4].filter(|x| x > 2));
+    print([1, 2, 3].reduce(|sum, x| sum + x, 0));
+}
+
+fn strings(text) {
+    print([text.length, text.startsWith("nap"), text.endsWith("alm")]);
+    print([text.startsWith(""), text.endsWith(""), text.startsWith("napalm!")]);
+    print([text.indexOf("a"), text.indexOf("a", 2), text.indexOf("missing")]);
+    print([text.lastIndexOf("a"), text.lastIndexOf("a", 2), text.indexOf("", 999)]);
+    print([text.slice(1, 4), text.slice(-3), text.slice(4, 1)]);
+    print([text.substring(4, 1), text.substring(-10, 3), text.substring(3)]);
+}
+
+arrays();
+strings("napalm");
+print([" \tNapalm\n ".trim(), " Napalm ".trimStart(), " Napalm ".trimEnd()]);
+print(["Napalm!".toUpperCase(), "Napalm!".toLowerCase()]);
+print(["straße".toUpperCase(), " É ".trim().toLowerCase()]);
+var text = "café";
+print([text.length, text.slice(3), text.substring(0, 3), text.indexOf("é")]);
+print([null ?? 7, false ?? 7, 0 ?? 7]);
+var optional = null;
+print(optional?.answer);

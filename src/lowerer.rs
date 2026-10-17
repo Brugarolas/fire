@@ -2422,6 +2422,13 @@ fn lower_array_method_call<'m>(
             let v = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
             return cn!("wir_array_unshift", [arr, v], Some(Type::Int32));
         }
+        "fill" => {
+            if args.len() != 1 {
+                return Err(LowerError::NotLowerable("fill expects 1 arg"));
+            }
+            let v = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            return cn!("wir_array_fill", [arr, v], None);
+        }
 
         // ---- map: build loop in WIR, call the closure for each element
         "map" => {

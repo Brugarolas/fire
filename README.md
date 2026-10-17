@@ -53,6 +53,20 @@ Exception handling:
 Run the exception example with `cargo run -- scripts/trycatch.napalm` and the regression suite with `cargo test --test trycatch`.
 If MMTk cannot reserve its heap address range on Windows, the same suite can be run without GC using `cargo test --no-default-features --test trycatch`.
 
+JIT core intrinsics:
+- 26 runtime helpers now have shared Cranelift fast paths, used by native calls and the corresponding WIR array instructions.
+- Type checks: string, map, set, proxy, and nullish.
+- Arrays: length, indexed get/set, push/pop, shift/unshift, setLength, and fill. Reads, removals, primitive stores, and capacity-preserving resizes execute directly in generated code. Allocation, capacity growth, and GC pointer-store barriers use existing runtime helpers.
+- `array.fill(value)` is now exposed as a method; it fills existing elements and returns null, matching the existing runtime helper.
+- Strings: byte length, startsWith/endsWith, slice/substring, indexOf/lastIndexOf, trim/trimStart/trimEnd, and toUpperCase/toLowerCase. Existing byte-index and sentinel semantics are preserved. String results use the existing interner; prefix/suffix comparisons use the existing `memcmp` import.
+- Short searches (up to 64 remaining bytes) run a generated search loop; larger searches retain Rust's optimized runtime search. ASCII trimming is compiled directly; non-ASCII boundaries use the Unicode-aware runtime. Case conversion handles ASCII strings up to 64 bytes in generated code and falls back for Unicode or longer inputs.
+- Array layout offsets are discovered from the host compiler's actual `Vec<i64>` representation rather than assuming a Rust field order.
+
+Run the language regression with `cargo run -- scripts/runtime_intrinsics.napalm`.
+Run differential tests plus language/exception regressions with `cargo test --no-default-features --bin Napalm --test runtime_intrinsics --test trycatch -- --test-threads=1`.
+Use `cargo test --test runtime_intrinsics` to exercise the GC-enabled pointer-store fallbacks.
+The focused benchmark is `cargo run --no-default-features -- perf/runtime.napalm`; compare the program-execution timer rather than total build/JIT startup time.
+
 Known bugs:
 - When a function is natively memoized, it can cause use-after-free errors if memoized values are not primitives (like an object), since complex values allocate on the GC that can free them in any moment while the native memoization thinks they are still there.
 

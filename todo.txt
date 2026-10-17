@@ -15,7 +15,7 @@ Features I still have not implemented:
 - Add reactive programming (pure reactive programming - and patterns like Stream, Sinks (a là Carboxyl), Event/Emitter/Pipe/Listener)
 
 Optimizations:
-- Implement a lot of core runtime functions inside the JIT (big perf wins)
+- Continue moving core runtime functions into the JIT (26 array/string/type-check helpers have fast paths; allocation, Unicode transforms, long searches and GC barriers retain runtime fallbacks)
 - Implement CompactStr (inlined strings) - in the entire engine maybe?
 - Implement SmallVec where it makes sense
 - Implement SmallMap where it makes sense
