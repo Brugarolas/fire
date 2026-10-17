@@ -299,6 +299,8 @@ pub enum WirDeferKind {
 /// Distinguishes how a try-region completed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TryExitKind {
+    /// Save live locals without leaving the protected scope.
+    Snapshot,
     /// The try block finished normally (fallthrough/return).
     Normal,
     /// Control left the try via an exception.
@@ -328,6 +330,9 @@ pub struct TryRegion {
     pub catches: Vec<TryHandler>,
     /// Optional finally block that always executes before continuing.
     pub finally_entry: Option<BlockId>,
+    /// Lexical membership, including nested regions, before JIT exception dispatch.
+    pub body_blocks: Vec<BlockId>,
+    pub catch_blocks: Vec<BlockId>,
 }
 
 /// A deferred action scheduled within a scope.
@@ -764,13 +769,14 @@ pub struct AccessorInfo {
 }
 
 impl Inst {
-    /// Whether the instruction *requires* an incoming effect token.
+    /// Whether this instruction must be ordered after the current effect token.
     pub fn needs_effect_in(&self) -> bool {
         use Inst::*;
+
         matches!(
             self,
-            EffectEntry
-                | Safepoint
+            // Safepoints / speculative checks
+            Safepoint
                 | GuardType { .. }
                 | GuardShape { .. }
                 | GuardBounds { .. }
@@ -778,53 +784,109 @@ impl Inst {
                 | GuardIsInt { .. }
                 | GuardIsF64 { .. }
                 | Bailout { .. }
+
+                // Objects
                 | AllocObj { .. }
+                | LoadField { .. }
                 | StoreField { .. }
                 | TransitionShape { .. }
+
+                // Arrays
                 | AllocArray { .. }
+                | ArrayLen(_)
+                | ArraySetLen { .. }
+                | LoadElem { .. }
                 | StoreElem { .. }
+                | ArraySlice { .. }
+                | ArrayPush { .. }
+                | ArrayPop(_)
+                | ArrayShift(_)
+                | ArrayUnshift { .. }
                 | ArrayFill { .. }
                 | ArrayCopy { .. }
-                // mutating array ops
-                | ArrayPush { .. }
-                | ArrayPop ( .. )
-                | ArrayShift ( .. )
-                | ArrayUnshift { .. }
-                // higher-order ops (call user code / runtime)
+
+                // Higher-order array operations may invoke user code.
                 | ArrayMap { .. }
                 | ArrayReduce { .. }
                 | ArrayForEach { .. }
                 | ArrayFind { .. }
                 | ArrayFindIndex { .. }
                 | ArrayFilter { .. }
+
+                // Conversion may call runtime code / deopt.
                 | StrToNumber(_)
+
+                // Calls
                 | CallDirect { .. }
                 | CallDirectMemoized { .. }
                 | CallIC { .. }
                 | CallClosure { .. }
-                | AllocClosure { .. }
-                | StoreEnv { .. }
                 | CallNative { .. }
-                | PostWriteBarrier { .. }
-                | ReadBarrier { .. }
-                | RegisterClass { .. }  // mutates global class registry
+
+                // Closures / environments
+                | AllocClosure { .. }
+                | MakeClosure { .. }
+                | LoadEnv { .. }
+                | StoreEnv { .. }
+
+                // Classes / method lookup
+                | RegisterClass { .. }
                 | AllocInstance { .. }
+                | MethodLookup { .. }
+                | LoadMethod { .. }
+                | LoadSuperMethod { .. }
                 | CallMethodIC { .. }
                 | CallSuper { .. }
-                // Modules / ESM
-                | LoadBinding { .. }     // may throw TDZ → model as effectful guard
-                | StoreBinding { .. }    // writes a live cell
-                | MakeNamespace { .. }   // allocates a namespace object
-                | ImportDynamic { .. } // schedules async load/eval (calls runtime)
+                | InstanceOf { .. }
+
+                // Event loop / timers
+                | SetTimeout { .. }
+                | SetInterval { .. }
+                | ClearTimeout { .. }
+                | ClearInterval { .. }
+                | EventLoopPump { .. }
+
+                // GC
+                | PostWriteBarrier { .. }
+                | ReadBarrier { .. }
+
+                // OSR acts as an ordering boundary.
+                | OSRPoint
+
+                // ESM
+                | LoadBinding { .. }
+                | StoreBinding { .. }
+                | MakeNamespace { .. }
+                | ImportDynamic { .. }
+
+                // Exception/defer bookkeeping
                 | TryEnter { .. }
                 | TryLeave { .. }
+                | TryFinallyEnter { .. }
+                | TryFinallyExit { .. }
                 | ScheduleDefer { .. }
         )
     }
 
-    /// Whether the instruction *produces* a new effect token.
+    /// Whether the instruction produces a new effect token.
+    ///
+    /// EffectEntry is special: it creates the root token without consuming one.
     pub fn produces_effect_out(&self) -> bool {
-        self.needs_effect_in()
+        matches!(self, Inst::EffectEntry) || self.needs_effect_in()
+    }
+
+    /// Whether this instruction ends the current basic block.
+    #[inline]
+    pub fn is_terminator(&self) -> bool {
+        matches!(
+            self,
+            Inst::Return(_)
+                | Inst::Throw(_)
+                | Inst::Jump(_, _)
+                | Inst::Branch { .. }
+                | Inst::Switch { .. }
+                | Inst::Bailout { .. }
+        )
     }
 }
 
@@ -860,6 +922,7 @@ pub struct Signature {
 #[derive(Clone, Debug)]
 pub struct Function {
     pub id: FuncId,
+    pub is_async: bool,
     pub sig: Signature,
     pub blocks: Vec<Block>,
     pub nodes: Vec<Node>,
@@ -957,11 +1020,14 @@ impl Module {
         }
     }
     pub fn push_function(&mut self, mut f: Function) -> FuncId {
-        self.next_func = next_id();
-        let id = FuncId(self.next_func);
-        if f.id.0 == 0 {
-            f.id = id;
-        }
+        let id = if f.id.0 == 0 {
+            self.next_func = next_id();
+            f.id = FuncId(self.next_func);
+            f.id
+        } else {
+            f.id
+        };
+
         self.funcs.push(f);
         id
     }
@@ -994,6 +1060,7 @@ pub struct Builder<'m> {
     pub module: &'m mut Module,
     func: Function,
     cur_block: BlockId,
+    pub try_local_scopes: Vec<(TryRegionId, Vec<String>)>,
 }
 
 impl<'m> Builder<'m> {
@@ -1001,6 +1068,7 @@ impl<'m> Builder<'m> {
         let entry_block = BlockId(0);
         let mut func = Function {
             id: FuncId(0),
+            is_async: false,
             sig: Signature {
                 params: params.clone(),
                 returns,
@@ -1037,7 +1105,12 @@ impl<'m> Builder<'m> {
             module,
             func,
             cur_block: entry_block,
+            try_local_scopes: Vec::new(),
         }
+    }
+
+    pub fn set_async(&mut self, is_async: bool) {
+        self.func.is_async = is_async;
     }
 
     pub fn finish(mut self) -> Function {
@@ -1064,23 +1137,42 @@ impl<'m> Builder<'m> {
         res_count: u8,
         effect_in: bool,
     ) -> (InstId, Vec<ValueId>) {
-        let effect_in_val = if effect_in {
+        // Preserve the old explicit `effect_in` flag for compatibility, but
+        // also trust the instruction's own effect classification.
+        let requires_effect_in = effect_in || kind.needs_effect_in();
+
+        let effect_in_val = if requires_effect_in {
             Some(self.ensure_effect_in())
         } else {
             None
         };
-        let effect_out_val = if kind.produces_effect_out() {
+
+        // EffectEntry is the root of an effect chain and therefore produces an
+        // effect without consuming one. Explicitly effectful legacy callers
+        // must also keep producing a new token.
+        let produces_effect_out = effect_in || kind.produces_effect_out();
+
+        let effect_out_val = if produces_effect_out {
             Some(self.new_effect_value(EffectKind::from_inst(&kind)))
         } else {
             None
         };
 
-        // Now it’s safe to allocate this node’s ID
+        // Keep Node::ty semantics consistent:
+        //   None       => no SSA result
+        //   Some(type) => one or more SSA results
+        //
+        // Unknown result types are represented by Top, not None.
+        let ty = if res_count == 0 {
+            None
+        } else {
+            Some(ty.unwrap_or(Type::Top))
+        };
+
+        // Allocate the instruction ID only after effect-token creation.
         let id = InstId(self.func.nodes.len() as u32);
 
-        // Reserve result ValueIds *after* any effect_out was created,
-        // so numbering lines up with `self.func.values.len()`.
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity(res_count as usize);
         for r in 0..res_count {
             let vid = ValueId(self.func.values.len() as u32 + r as u32);
             results.push(vid);
@@ -1094,7 +1186,9 @@ impl<'m> Builder<'m> {
             effect_out: effect_out_val,
             results: results.clone(),
         };
+
         self.func.nodes.push(node);
+
         self.func
             .blocks
             .iter_mut()
@@ -1103,26 +1197,27 @@ impl<'m> Builder<'m> {
             .insts
             .push(id);
 
-        for (i, _) in results.iter().enumerate() {
+        for (i, &vid) in results.iter().enumerate() {
             self.func.values.push(Value {
-                id: ValueId(self.func.values.len() as u32),
+                id: vid,
                 ty: ty.clone(),
                 def: ValueDef::InstResult(id, i as u8),
             });
         }
+
         (id, results)
     }
 
     fn ensure_effect_in(&mut self) -> ValueId {
-        // Convention: the first param of entry block is not effect; we create an effect token node when needed.
-        // We add an EffectEntry once per block at the top if none exists yet.
-        // Simplified: we emit EffectEntry on first effectful instruction in the function and reuse the last effect.
-        // A more robust builder would thread effect SSA explicitly.
         if let Some(last_effect) = self.last_effect_value_in_block(self.cur_block) {
             return last_effect;
         }
-        let (_nid, results) = self.push_node(Inst::EffectEntry, Some(Type::Top), 1, false);
-        results[0]
+
+        let (nid, _) = self.push_node(Inst::EffectEntry, None, 0, false);
+
+        self.func.nodes[nid.0 as usize]
+            .effect_out
+            .expect("EffectEntry must produce an effect token")
     }
 
     fn last_effect_value_in_block(&self, b: BlockId) -> Option<ValueId> {
@@ -1143,19 +1238,26 @@ impl<'m> Builder<'m> {
             .iter()
             .find(|b| b.id == self.cur_block)
             .unwrap();
-        if let Some(&last) = blk.insts.last() {
-            use crate::wir::Inst;
-            matches!(
-                self.func.nodes[last.0 as usize].kind,
-                Inst::Return(_)
-                    | Inst::Branch { .. }
-                    | Inst::Jump(_, _)
-                    | Inst::Throw(_)
-                    | Inst::TryEnter { .. }
-            )
-        } else {
-            false
-        }
+
+        blk.insts
+            .last()
+            .map(|&inst_id| self.func.nodes[inst_id.0 as usize].kind.is_terminator())
+            .unwrap_or(false)
+    }
+
+    pub fn block_count(&self) -> usize {
+        self.func.blocks.len()
+    }
+
+    pub fn set_try_blocks(
+        &mut self,
+        region: TryRegionId,
+        body_blocks: Vec<BlockId>,
+        catch_blocks: Vec<BlockId>,
+    ) {
+        let region = &mut self.func.try_regions[region.0 as usize];
+        region.body_blocks = body_blocks;
+        region.catch_blocks = catch_blocks;
     }
 
     fn new_effect_value(&mut self, kind: EffectKind) -> ValueId {
@@ -1184,19 +1286,11 @@ impl<'m> Builder<'m> {
             Some(b) => b,
             None => return false,
         };
-        if let Some(&inst_id) = blk.insts.last() {
-            use crate::wir::Inst;
-            matches!(
-                self.func.nodes[inst_id.0 as usize].kind,
-                Inst::Return(_)
-                    | Inst::Throw(_)
-                    | Inst::Jump(_, _)
-                    | Inst::Branch { .. }
-                    | Inst::Switch { .. }
-            )
-        } else {
-            false
-        }
+
+        blk.insts
+            .last()
+            .map(|&inst_id| self.func.nodes[inst_id.0 as usize].kind.is_terminator())
+            .unwrap_or(false)
     }
 
     pub fn add_try_region(&mut self, mut region: TryRegion) -> TryRegionId {
@@ -1260,8 +1354,8 @@ impl<'m> Builder<'m> {
     pub fn guard_bounds(&mut self, idx: ValueId, len: ValueId, deopt: DeoptId) {
         let _ = self.push_node(
             Inst::GuardBounds { idx, len, deopt },
-            Some(Type::Top),
-            1,
+            None,
+            0,
             true,
         );
     }
@@ -1407,7 +1501,7 @@ impl<'m> Builder<'m> {
                 args,
                 seed_pic,
             },
-            Some(Type::Int32), // adjust per language return typing; keep Top/Union if unknown
+            Some(Type::Top),
             1,
             true,
         );
@@ -1428,7 +1522,7 @@ impl<'m> Builder<'m> {
                 method,
                 args,
             },
-            Some(Type::Int32),
+            Some(Type::Top),
             1,
             true,
         );
@@ -1491,77 +1585,98 @@ impl<'m> Builder<'m> {
 
 impl EffectKind {
     fn from_inst(i: &Inst) -> EffectKind {
+        use crate::wir::Inst;
+
         match i {
-            // treated as structural; group with Entry for ordering
-            crate::wir::Inst::EffectEntry
-            | crate::wir::Inst::LoadMethod { .. }
-            | crate::wir::Inst::LoadSuperMethod { .. }
-            | crate::wir::Inst::InstanceOf { .. }
-            | crate::wir::Inst::TryLeave { .. }
-            | crate::wir::Inst::TryFinallyEnter { .. }
-            | crate::wir::Inst::TryFinallyExit { .. } => EffectKind::Entry,
+            // Entry / ordered reads / structural operations.
+            //
+            // We currently use Entry for ordered reads because adding a
+            // dedicated EffectKind::Load would ripple into external matches.
+            // The important property here is ordering, not the diagnostic kind.
+            Inst::EffectEntry
+            | Inst::LoadField { .. }
+            | Inst::ArrayLen(_)
+            | Inst::LoadElem { .. }
+            | Inst::LoadEnv { .. }
+            | Inst::MethodLookup { .. }
+            | Inst::LoadMethod { .. }
+            | Inst::LoadSuperMethod { .. }
+            | Inst::InstanceOf { .. }
+            | Inst::TryLeave { .. }
+            | Inst::TryFinallyEnter { .. }
+            | Inst::TryFinallyExit { .. } => EffectKind::Entry,
 
-            crate::wir::Inst::Safepoint => EffectKind::Safepoint,
+            // Explicit safepoints and OSR boundaries.
+            Inst::Safepoint | Inst::OSRPoint => EffectKind::Safepoint,
 
-            // Guards / checks
-            crate::wir::Inst::GuardType { .. }
-            | crate::wir::Inst::GuardShape { .. }
-            | crate::wir::Inst::GuardBounds { .. }
-            | crate::wir::Inst::GuardNotNull { .. }
-            | crate::wir::Inst::GuardIsInt { .. }
-            | crate::wir::Inst::GuardIsF64 { .. }
-            | crate::wir::Inst::Bailout { .. }
-            // ESM: reading a binding may throw TDZ → clasifícalo como guard
-            | crate::wir::Inst::LoadBinding { .. } => EffectKind::Guard,
+            // Guards / speculative checks.
+            Inst::GuardType { .. }
+            | Inst::GuardShape { .. }
+            | Inst::GuardBounds { .. }
+            | Inst::GuardNotNull { .. }
+            | Inst::GuardIsInt { .. }
+            | Inst::GuardIsF64 { .. }
+            | Inst::Bailout { .. }
+            | Inst::LoadBinding { .. } => EffectKind::Guard,
 
-            // Allocations
-            crate::wir::Inst::AllocObj { .. }
-            | crate::wir::Inst::AllocArray { .. }
-            | crate::wir::Inst::RegisterClass { .. }
-            | crate::wir::Inst::AllocInstance { .. }
-            | crate::wir::Inst::MakeNamespace { .. } => EffectKind::Alloc,
+            // Allocations.
+            Inst::AllocObj { .. }
+            | Inst::AllocArray { .. }
+            | Inst::ArraySlice { .. }
+            | Inst::AllocClosure { .. }
+            | Inst::MakeClosure { .. }
+            | Inst::RegisterClass { .. }
+            | Inst::AllocInstance { .. }
+            | Inst::MakeNamespace { .. } => EffectKind::Alloc,
 
-            // Stores / mutations
-            crate::wir::Inst::StoreField { .. }
-            | crate::wir::Inst::StoreElem { .. }
-            | crate::wir::Inst::TransitionShape { .. }
-            | crate::wir::Inst::ArrayPush { .. }
-            | crate::wir::Inst::ArrayPop ( .. )
-            | crate::wir::Inst::ArrayShift ( .. )
-            | crate::wir::Inst::ArrayUnshift { .. }
-            | crate::wir::Inst::ArrayFill { .. }
-            | crate::wir::Inst::ArrayCopy { .. }
-            // ESM: write to an export cell
-            | crate::wir::Inst::StoreBinding { .. } => EffectKind::Store,
+            // Stores / mutations.
+            Inst::StoreField { .. }
+            | Inst::TransitionShape { .. }
+            | Inst::ArraySetLen { .. }
+            | Inst::StoreElem { .. }
+            | Inst::ArrayPush { .. }
+            | Inst::ArrayPop(_)
+            | Inst::ArrayShift(_)
+            | Inst::ArrayUnshift { .. }
+            | Inst::ArrayFill { .. }
+            | Inst::ArrayCopy { .. }
+            | Inst::StoreEnv { .. }
+            | Inst::StoreBinding { .. } => EffectKind::Store,
 
-            // Calls (user/runtime)
-            crate::wir::Inst::CallDirect { .. }
-            | crate::wir::Inst::CallDirectMemoized { .. }
-            | crate::wir::Inst::CallIC { .. }
-            | crate::wir::Inst::CallClosure { .. }
-            | crate::wir::Inst::CallNative { .. }
-            | crate::wir::Inst::AllocClosure { .. }
-            | crate::wir::Inst::StoreEnv { .. }
-            | crate::wir::Inst::ArrayMap { .. }
-            | crate::wir::Inst::ArrayReduce { .. }
-            | crate::wir::Inst::ArrayForEach { .. }
-            | crate::wir::Inst::ArrayFind { .. }
-            | crate::wir::Inst::ArrayFindIndex { .. }
-            | crate::wir::Inst::ArrayFilter { .. }
-            | crate::wir::Inst::StrToNumber(_)
-            | crate::wir::Inst::CallMethodIC { .. }
-            | crate::wir::Inst::CallSuper { .. }
-            // ESM: dynamic import calls into the loader/runtime
-            | crate::wir::Inst::ImportDynamic { .. } => EffectKind::Call,
+            // Calls into user code or the runtime.
+            Inst::CallDirect { .. }
+            | Inst::CallDirectMemoized { .. }
+            | Inst::CallIC { .. }
+            | Inst::CallClosure { .. }
+            | Inst::CallNative { .. }
+            | Inst::ArrayMap { .. }
+            | Inst::ArrayReduce { .. }
+            | Inst::ArrayForEach { .. }
+            | Inst::ArrayFind { .. }
+            | Inst::ArrayFindIndex { .. }
+            | Inst::ArrayFilter { .. }
+            | Inst::StrToNumber(_)
+            | Inst::CallMethodIC { .. }
+            | Inst::CallSuper { .. }
+            | Inst::ImportDynamic { .. }
+            | Inst::TryEnter { .. }
+            | Inst::ScheduleDefer { .. } => EffectKind::Call,
 
-            // Barriers
-            crate::wir::Inst::PostWriteBarrier { .. }
-            | crate::wir::Inst::ReadBarrier { .. } => EffectKind::Barrier,
+            // Event loop interaction is externally observable.
+            Inst::SetTimeout { .. }
+            | Inst::SetInterval { .. }
+            | Inst::ClearTimeout { .. }
+            | Inst::ClearInterval { .. }
+            | Inst::EventLoopPump { .. } => EffectKind::IO,
 
-            crate::wir::Inst::TryEnter { .. }
-            | crate::wir::Inst::ScheduleDefer { .. } => EffectKind::Call,
+            // GC barriers.
+            Inst::PostWriteBarrier { .. }
+            | Inst::ReadBarrier { .. } => EffectKind::Barrier,
 
-            _ => EffectKind::from_inst_default(i),
+            // This function can still be called for an instruction explicitly
+            // forced into the effect chain by Builder::push_node(..., true).
+            // Keep that backwards-compatible behavior conservative.
+            _ => EffectKind::Entry,
         }
     }
 }
@@ -1629,7 +1744,7 @@ impl<'m> Builder<'m> {
                 fun,
                 args,
             },
-            Some(Type::Int32),
+            Some(Type::Top),
             1,
             true,
         );
@@ -1738,7 +1853,7 @@ impl<'m> Builder<'m> {
     pub fn array_reduce(&mut self, func: FuncId, init: ValueId, arr: ValueId) -> ValueId {
         let (_nid, res) = self.push_node(
             Inst::ArrayReduce { func, init, arr },
-            Some(Type::Int32),
+            Some(Type::Top),
             1,
             true,
         );

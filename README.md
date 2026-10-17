@@ -30,7 +30,7 @@ Language features (Done/Planned):
 - Operator conditional/nullish, optional chaining, pipeline operator. [x]
 - A small, concise, powerful eDSL for creating server services. [x]
 - Enums. [ ]
-- Try/Catch/Finally. [ ]
+- Try/Catch/Finally. [x]
 - Defer/Errdefer. [ ]
 - Dates and dates methods. [ ]
 - Proxies a là JavaScript. [ ]
@@ -41,6 +41,17 @@ Language features (Done/Planned):
 - Operator overloading for classes. [ ]
 - An optional type system a là TypeScript, with optional static typing, interfaces and generics. [ ]
 - TODO (add more, functional programming, reactive programming, UI bindings, standard library, etc). [ ]
+
+Exception handling:
+- `throw` accepts any value; `catch (error)` receives that same value. `catch { ... }` is also supported.
+- `finally` runs on normal completion, return, and exception propagation. A return or throw in `finally` replaces the pending result.
+- Handlers, finalizers, saved locals, and completion dispatch are compiled directly with Cranelift. A small thread-local state accessor carries exceptions across the existing single-result calling convention; no runtime unwinder or function re-entry is used.
+- Async functions settle their promises only after finalizers finish. Rejected `await` expressions can be caught.
+- Uncaught top-level exceptions print a diagnostic and exit with a nonzero status.
+- WIR optimization passes currently bypass functions containing try regions because those passes do not yet model exceptional CFG edges. Cranelift still compiles these functions normally.
+
+Run the exception example with `cargo run -- scripts/trycatch.napalm` and the regression suite with `cargo test --test trycatch`.
+If MMTk cannot reserve its heap address range on Windows, the same suite can be run without GC using `cargo test --no-default-features --test trycatch`.
 
 Known bugs:
 - When a function is natively memoized, it can cause use-after-free errors if memoized values are not primitives (like an object), since complex values allocate on the GC that can free them in any moment while the native memoization thinks they are still there.

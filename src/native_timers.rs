@@ -48,10 +48,12 @@ pub fn drain_event_loop_to_quiescence() {
         |f, a| {
             let arg = [a];
             let _ = wir_call_closure(f, arg.as_ptr(), 1);
+            report_uncaught_exception();
         },
         // timer: zero args
         |fun| {
             let _ = wir_call_closure(fun, core::ptr::null(), 0);
+            report_uncaught_exception();
         },
     );
 }
@@ -65,8 +67,17 @@ pub extern "C" fn napalm_pump_to_quiescence() -> i64 {
 
 pub fn invoke_and_pump(entry: JitFnPtr, args: &[i64]) -> i64 {
     let ret = unsafe { (entry)(args.as_ptr(), args.len()) };
+    report_uncaught_exception();
     drain_event_loop_to_quiescence();
+    report_uncaught_exception();
     ret
+}
+
+fn report_uncaught_exception() {
+    if let Some(error) = crate::jit::take_exception() {
+        eprintln!("Uncaught exception: {}", crate::runtime::fmt_value(error));
+        std::process::exit(1);
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -80,6 +91,7 @@ pub extern "C" fn event_loop_yieldpoint() -> i64 {
         let _ = EVENT_LOOP.run_microtasks(32, |f, a| {
             let arg = [a];
             let _ = wir_call_closure(f, arg.as_ptr(), 1);
+            report_uncaught_exception();
         });
 
         // Then poll timers and run a few macrotasks
@@ -87,6 +99,7 @@ pub extern "C" fn event_loop_yieldpoint() -> i64 {
         // Run just a few ready closures; avoid full drain while inside JIT.
         let _ = EVENT_LOOP.run_ready(4, |fun| {
             let _ = wir_call_closure(fun, std::ptr::null(), 0);
+            report_uncaught_exception();
         });
     }
     0

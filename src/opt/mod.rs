@@ -854,6 +854,11 @@ impl Optimize {
 
     /// Run over a single function.
     pub fn optimize_function(&mut self, func: &mut Function) {
+        // These passes only model ordinary CFG edges. Handler entries and live
+        // local snapshots must survive until exceptional edges are emitted.
+        if !func.try_regions.is_empty() {
+            return;
+        }
         for pass in self.passes.iter_mut() {
             pass.pass_optimizations(func, 1);
         }

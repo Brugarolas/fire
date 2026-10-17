@@ -250,9 +250,20 @@ impl ProgramBuilder {
                     1,
                     true,
                 );
-                last_ret = Some(res[0]);
+                let (_nid, awaited) = builder.push_node(
+                    Inst::CallNative {
+                        name: "wir_await".into(),
+                        args: vec![res[0]],
+                        pure: false,
+                        can_throw: true,
+                    },
+                    Some(Type::Int32),
+                    1,
+                    true,
+                );
+                last_ret = Some(awaited[0]);
                 if path.as_ref() == entry.as_ref() {
-                    entry_ret = Some(res[0]);
+                    entry_ret = Some(awaited[0]);
                 }
             }
         }

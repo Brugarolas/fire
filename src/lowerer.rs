@@ -84,6 +84,7 @@ fn emit_try_leave_chain<'m>(
                 .unwrap_or_else(|| panic!("missing local '{}' for try scope", name));
             captured.push(val);
         }
+
         let locals_vec = captured.clone();
         let _ = b.push_node(
             Inst::TryLeave {
@@ -103,6 +104,25 @@ fn emit_try_leave_chain<'m>(
         });
     }
     out
+}
+
+fn snapshot_try_locals(b: &mut Builder<'_>, locals: &HashMap<String, ValueId>) {
+    if b.current_block_terminated() {
+        return;
+    }
+    for (region, names) in b.try_local_scopes.clone() {
+        let values = names.iter().map(|name| locals[name]).collect();
+        b.push_node(
+            Inst::TryLeave {
+                region,
+                exit: TryExitKind::Snapshot,
+                locals: values,
+            },
+            None,
+            0,
+            true,
+        );
+    }
 }
 
 fn lower_try_stmt_generic<'m, F>(
@@ -194,6 +214,8 @@ where
         continuation,
         catches: catches_meta,
         finally_entry,
+        body_blocks: Vec::new(),
+        catch_blocks: Vec::new(),
     });
 
     let _ = b.push_node(Inst::TryEnter { region: region_id }, None, 0, true);
@@ -205,6 +227,7 @@ where
         finally: finally_entry,
         locals: mutated_names.clone(),
     });
+    b.try_local_scopes.push((region_id, mutated_names.clone()));
     let mut region_popped = false;
 
     let incoming_locals = locals.clone();
@@ -223,7 +246,9 @@ where
 
     // Lower try body
     b.position_at(try_entry);
+    let body_start = b.block_count();
     let mut locals_try = incoming_locals.clone();
+    snapshot_try_locals(b, &locals_try);
     lower_block(
         b,
         &mut locals_try,
@@ -233,7 +258,9 @@ where
         lowering_ctx,
         active_try,
     )?;
-    if !b.block_has_terminator(try_entry) {
+    let mut body_blocks = vec![try_entry];
+    body_blocks.extend((body_start..b.block_count()).map(|i| BlockId(i as u32)));
+    if !b.current_block_terminated() {
         #[cfg(debug_assertions)]
         eprintln!(
             "[lower_try] after try-body mutated={:?} keys={:?}",
@@ -271,17 +298,43 @@ where
     }
 
     // Lower catch, if present
+    let mut catch_blocks = Vec::new();
     if let (Some(catch_clause), Some(catch_id)) = (catch, catch_entry) {
         b.position_at(catch_id);
+        let catch_start = b.block_count();
         let mut locals_catch = incoming_locals.clone();
-        if let Some(binding) = &catch_clause.binding {
-            let err_val = b.add_block_param(catch_id, Type::AnyRef);
-            locals_catch.insert(binding.clone(), err_val);
-        }
+        let exception = catch_clause.binding.as_ref()
+            .map(|_| b.add_block_param(catch_id, Type::Top));
         for name in &mutated_names {
             let ty = mutated_types.get(name).cloned().unwrap_or(Type::Top);
             let param = b.add_block_param(catch_id, ty);
             locals_catch.insert(name.clone(), param);
+        }
+        let saved_snapshot_scopes = b.try_local_scopes.clone();
+        let saved_try_scopes = active_try.clone();
+        let shadow = catch_clause.binding.as_ref().and_then(|binding| {
+            locals_catch.get(binding).copied().map(|value| {
+                let saved = format!("\0catch_{}_{}", region_id.0, binding);
+                locals_catch.insert(saved.clone(), value);
+                for (_, names) in &mut b.try_local_scopes {
+                    for name in names {
+                        if name == binding {
+                            *name = saved.clone();
+                        }
+                    }
+                }
+                for scope in active_try.iter_mut() {
+                    for name in &mut scope.locals {
+                        if name == binding {
+                            *name = saved.clone();
+                        }
+                    }
+                }
+                (binding.clone(), saved)
+            })
+        });
+        if let (Some(binding), Some(exception)) = (&catch_clause.binding, exception) {
+            locals_catch.insert(binding.clone(), exception);
         }
         lower_block(
             b,
@@ -292,7 +345,15 @@ where
             lowering_ctx,
             active_try,
         )?;
-        if !b.block_has_terminator(catch_id) {
+        b.try_local_scopes = saved_snapshot_scopes;
+        *active_try = saved_try_scopes;
+        if let Some((binding, saved)) = shadow {
+            let value = locals_catch[&saved];
+            locals_catch.insert(binding, value);
+        }
+        catch_blocks.push(catch_id);
+        catch_blocks.extend((catch_start..b.block_count()).map(|i| BlockId(i as u32)));
+        if !b.current_block_terminated() {
             #[cfg(debug_assertions)]
             eprintln!(
                 "[lower_try] catch path mutated={:?} keys={:?}",
@@ -331,6 +392,7 @@ where
     }
 
     // Lower finally, if present
+    b.try_local_scopes.pop();
     if let Some(fin_id) = finally_entry {
         let popped = active_try
             .pop()
@@ -352,7 +414,7 @@ where
             lowering_ctx,
             active_try,
         )?;
-        if !b.block_has_terminator(fin_id) {
+        if !b.current_block_terminated() {
             #[cfg(debug_assertions)]
             eprintln!(
                 "[lower_try] finally path mutated={:?} keys={:?}",
@@ -371,6 +433,7 @@ where
         debug_assert_eq!(popped.region, region_id);
     }
     debug_assert_eq!(active_try.len(), stack_depth_before);
+    b.set_try_blocks(region_id, body_blocks, catch_blocks);
 
     b.position_at(continuation);
     if cont_has_path {
@@ -762,6 +825,7 @@ impl<'m> Lowerer<'m> {
             let mut active_try: Vec<TryScope> = Vec::new();
 
             if is_async {
+                b.set_async(true);
                 // --- Async prologue: d = Deferred()
                 let (_nid, d_res) = b.push_node(
                     Inst::CallNative {
@@ -789,22 +853,10 @@ impl<'m> Lowerer<'m> {
                     &mut active_try,
                 )?;
 
-                // Fallthrough: if the body didn’t explicitly return, resolve with 0 and return d.
+                // Promise settlement happens after all finalizers in the JIT epilogue.
                 if !b.current_block_terminated() {
                     let zero = b.const_i32(0);
-                    let dloc = *locals.get("__deferred").expect("__deferred present");
-                    let (_nid, _) = b.push_node(
-                        Inst::CallNative {
-                            name: "wir_deferred_resolve".into(),
-                            args: vec![dloc, zero],
-                            pure: false,
-                            can_throw: false,
-                        },
-                        None,
-                        1,
-                        true,
-                    );
-                    b.ret(&[dloc]);
+                    b.ret(&[zero]);
                 }
             } else {
                 // --- Sync function: old path
@@ -849,6 +901,9 @@ fn lower_block_free<'m>(
     active_try: &mut Vec<TryScope>,
 ) -> LResult<()> {
     for s in &blk.stmts {
+        if b.current_block_terminated() {
+            break;
+        }
         lower_stmt_free(b, locals, fields, next_field, s, lowering_ctx, active_try)?; // <-- pass
     }
     Ok(())
@@ -863,6 +918,7 @@ fn lower_stmt_free<'m>(
     lowering_ctx: &LoweringContext,
     active_try: &mut Vec<TryScope>,
 ) -> LResult<()> {
+    snapshot_try_locals(b, locals);
     match s.kind() {
         StmtKind::Var { name, init } => {
             let val = if let Some(e) = init {
@@ -1232,20 +1288,8 @@ fn lower_stmt_free<'m>(
         }
         StmtKind::Throw(expr) => {
             let val = lower_expr_free(b, locals, fields, next_field, expr, lowering_ctx)?;
-            let (_nid, err_res) = b.push_node(
-                Inst::CallNative {
-                    name: "wir_error_from_value".into(),
-                    args: vec![val],
-                    pure: false,
-                    can_throw: false,
-                },
-                Some(Type::AnyRef),
-                1,
-                true,
-            );
-            let err = err_res[0];
             let _ = emit_try_leave_chain(b, active_try, locals, TryExitKind::Exception);
-            let _ = b.push_node(Inst::Throw(err), None, 0, true);
+            let _ = b.push_node(Inst::Throw(val), None, 0, true);
         }
         StmtKind::Defer { kind, expr } => {
             let action = lower_expr_free(b, locals, fields, next_field, expr, lowering_ctx)?;
@@ -1268,32 +1312,10 @@ fn lower_stmt_free<'m>(
         StmtKind::Return(e) => {
             if let Some(e) = e {
                 let v = lower_expr_free(b, locals, fields, next_field, e, lowering_ctx)?;
-                let _ = b.push_node(
-                    Inst::CallNative {
-                        name: "napalm_rt_mark_return".into(),
-                        args: vec![v],
-                        pure: false,
-                        can_throw: false,
-                    },
-                    Some(Type::Top),
-                    1,
-                    true,
-                );
                 let _ = emit_try_leave_chain(b, active_try, locals, TryExitKind::Normal);
                 b.ret(&[v]);
             } else {
                 let z = b.const_i32(0);
-                let _ = b.push_node(
-                    Inst::CallNative {
-                        name: "napalm_rt_mark_return".into(),
-                        args: vec![z],
-                        pure: false,
-                        can_throw: false,
-                    },
-                    Some(Type::Top),
-                    1,
-                    true,
-                );
                 let _ = emit_try_leave_chain(b, active_try, locals, TryExitKind::Normal);
                 b.ret(&[z]);
             }
@@ -1723,6 +1745,9 @@ fn lower_block_free_async<'m>(
     active_try: &mut Vec<TryScope>,
 ) -> LResult<()> {
     for s in &blk.stmts {
+        if b.current_block_terminated() {
+            break;
+        }
         lower_stmt_free_async(
             b,
             locals,
@@ -1749,36 +1774,13 @@ fn lower_stmt_free_async<'m>(
 ) -> LResult<()> {
     match s.kind() {
         StmtKind::Return(eopt) if in_async => {
-            let d = *locals.get("__deferred").expect("__deferred present");
             let ret_val = if let Some(e) = eopt {
                 lower_expr_free_async(b, locals, fields, next_field, e, lowering_ctx, in_async)?
             } else {
                 b.const_i32(0)
             };
-            let _ = b.push_node(
-                Inst::CallNative {
-                    name: "napalm_rt_mark_return".into(),
-                    args: vec![ret_val],
-                    pure: false,
-                    can_throw: false,
-                },
-                Some(Type::Top),
-                1,
-                true,
-            );
             let _ = emit_try_leave_chain(b, active_try, locals, TryExitKind::Normal);
-            let (_nid, _r) = b.push_node(
-                Inst::CallNative {
-                    name: "wir_deferred_resolve".into(),
-                    args: vec![d, ret_val],
-                    pure: false,
-                    can_throw: false,
-                },
-                None,
-                1,
-                true,
-            );
-            b.ret(&[d]);
+            b.ret(&[ret_val]);
             Ok(())
         }
         StmtKind::Listen(ld) => {
@@ -1899,20 +1901,8 @@ fn lower_stmt_free_async<'m>(
                         lowering_ctx,
                         in_async,
                     )?;
-                    let (_nid, err_res) = b.push_node(
-                        Inst::CallNative {
-                            name: "wir_error_from_value".into(),
-                            args: vec![val],
-                            pure: false,
-                            can_throw: false,
-                        },
-                        Some(Type::AnyRef),
-                        1,
-                        true,
-                    );
-                    let err = err_res[0];
                     let _ = emit_try_leave_chain(b, active_try, locals, TryExitKind::Exception);
-                    let _ = b.push_node(Inst::Throw(err), None, 0, true);
+                    let _ = b.push_node(Inst::Throw(val), None, 0, true);
                     Ok(())
                 }
                 StmtKind::Defer { kind, expr } => {
@@ -3272,6 +3262,20 @@ fn lower_string_method_call<'m>(
 }
 
 fn lower_expr_free<'m>(
+    b: &mut Builder<'m>,
+    locals: &mut HashMap<String, ValueId>,
+    fields: &mut HashMap<String, FieldId>,
+    next_field: &mut u32,
+    e: &Expr,
+    lowering_ctx: &LoweringContext,
+) -> LResult<ValueId> {
+    snapshot_try_locals(b, locals);
+    let value = lower_expr_free_impl(b, locals, fields, next_field, e, lowering_ctx)?;
+    snapshot_try_locals(b, locals);
+    Ok(value)
+}
+
+fn lower_expr_free_impl<'m>(
     b: &mut Builder<'m>,
     locals: &mut HashMap<String, ValueId>,
     fields: &mut HashMap<String, FieldId>,
@@ -6593,6 +6597,7 @@ impl<'m> Lowerer<'m> {
             let mut active_try: Vec<TryScope> = Vec::new();
 
             if is_async {
+                b.set_async(true);
                 // Deferred prologue
                 let (_nid, d_res) = b.push_node(
                     Inst::CallNative {
@@ -6621,18 +6626,7 @@ impl<'m> Lowerer<'m> {
 
                 if !b.current_block_terminated() {
                     let zero = b.const_i32(0);
-                    let (_nid, _) = b.push_node(
-                        Inst::CallNative {
-                            name: "wir_deferred_resolve".into(),
-                            args: vec![d, zero],
-                            pure: false,
-                            can_throw: false,
-                        },
-                        None,
-                        1,
-                        true,
-                    );
-                    b.ret(&[d]);
+                    b.ret(&[zero]);
                 }
             } else {
                 lower_block_free(
@@ -6988,6 +6982,7 @@ impl<'m> Lowerer<'m> {
             let mut active_try: Vec<TryScope> = Vec::new();
 
             if is_async {
+                b.set_async(true);
                 // --- Async prologue: d = Deferred()
                 let (_nid, d_res) = b.push_node(
                     Inst::CallNative {
@@ -7015,21 +7010,10 @@ impl<'m> Lowerer<'m> {
                     &mut active_try,
                 )?;
 
-                // Fallthrough: if the body didn’t explicitly return, resolve with 0 and return d.
+                // Promise settlement happens after all finalizers in the JIT epilogue.
                 if !b.current_block_terminated() {
                     let zero = b.const_i32(0);
-                    let (_nid, _) = b.push_node(
-                        Inst::CallNative {
-                            name: "wir_deferred_resolve".into(),
-                            args: vec![d, zero],
-                            pure: false,
-                            can_throw: false,
-                        },
-                        None,
-                        1,
-                        true,
-                    );
-                    b.ret(&[d]);
+                    b.ret(&[zero]);
                 }
             } else {
                 // --- Sync path (what you already had), but sharing the CLASS field-id map

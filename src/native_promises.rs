@@ -278,7 +278,7 @@ pub extern "C" fn wir_event_loop_pump_once() -> i32 {
     ran as i32
 }
 
-// Blocking await: returns fulfillment value; rejection returns 0 for now
+// Blocking await: rejection is propagated through the compiled exception path.
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_await(val: i64) -> i64 {
     #[cfg(debug_assertions)]
@@ -354,8 +354,12 @@ pub extern "C" fn wir_await(val: i64) -> i64 {
     }
 
     let out = unsafe { (*cell).v };
+    let rejected = unsafe { !(*cell).ok };
     unsafe {
         drop(Box::from_raw(cell));
+    }
+    if rejected {
+        crate::jit::raise_exception(out);
     }
     out
 }
