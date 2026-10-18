@@ -1952,6 +1952,35 @@ impl<'src> Parser<'src> {
             meta: Meta::new(self.file_id, Span::with_range(self.get_current_span())),
         })
     }
+    /// Parses an optional `else` clause; `else if`/`else unless` chains of any
+    /// length desugar into nested `else { if ? }` blocks.
+    fn else_clause(&mut self) -> PResult<Option<Block>> {
+        if !self.matches(&Tok::Else) {
+            return Ok(None);
+        }
+        if !(self.matches(&Tok::If) || self.matches(&Tok::Unless)) {
+            return Ok(Some(self.block()?));
+        }
+        let negated = matches!(
+            self.toks.get(self.i.saturating_sub(1)).map(|tt| &tt.tok),
+            Some(Tok::Unless)
+        );
+        self.expect(Tok::LParen, "expected '(' after 'else if'/'else unless'")?;
+        let mut cond = self.expr()?;
+        self.expect(Tok::RParen, "expected ')' after condition")?;
+        if negated {
+            cond = expr_unknown(ExprKind::Unary {
+                op: UnOp::Not,
+                e: SmallBox::new(cond),
+            });
+        }
+        let then_b = self.block()?;
+        let else_b = self.else_clause()?;
+        Ok(Some(Block {
+            stmts: vec![stmt_unknown(StmtKind::If { cond, then_b, else_b })],
+        }))
+    }
+
     fn block(&mut self) -> PResult<Block> {
         self.expect(Tok::LBrace, "expected opening brace for block")?;
         let mut stmts = Vec::new();
@@ -2072,54 +2101,7 @@ impl<'src> Parser<'src> {
             let then_b = self.block()?;
 
             // else { … } | else if (…) { … } | else unless (…) { … }
-            let else_b = if self.matches(&Tok::Else) {
-                if self.matches(&Tok::If) || self.matches(&Tok::Unless) {
-                    // Was it "else unless"?
-                    let negated = if self
-                        .toks
-                        .get(self.i.saturating_sub(1))
-                        .map(|tt| tt.tok == Tok::Unless)
-                        .unwrap_or(false)
-                    {
-                        true
-                    } else {
-                        false
-                    };
-
-                    self.expect(Tok::LParen, "expected '(' after 'else if'/'else unless'")?;
-                    let mut cond2 = self.expr()?;
-                    self.expect(Tok::RParen, "expected ')' after condition")?;
-                    if negated {
-                        let prev = cond2;
-                        cond2 = expr_unknown(ExprKind::Unary {
-                            op: UnOp::Not,
-                            e: SmallBox::new(prev),
-                        });
-                    }
-                    let then2 = self.block()?;
-
-                    // Optional trailing else after the else-if/unless chain
-                    let tail_else = if self.matches(&Tok::Else) {
-                        Some(self.block()?)
-                    } else {
-                        None
-                    };
-
-                    // Desugar into: else { if (cond2) then2 else tail_else }
-                    Some(Block {
-                        stmts: vec![stmt_unknown(StmtKind::If {
-                            cond: cond2,
-                            then_b: then2,
-                            else_b: tail_else,
-                        })],
-                    })
-                } else {
-                    // Plain "else { … }"
-                    Some(self.block()?)
-                }
-            } else {
-                None
-            };
+            let else_b = self.else_clause()?;
 
             Ok(stmt_unknown(StmtKind::If {
                 cond,
@@ -2138,47 +2120,7 @@ impl<'src> Parser<'src> {
             let then_b = self.block()?;
 
             // else { … } | else if (…) { … } | else unless (…) { … }
-            let else_b = if self.matches(&Tok::Else) {
-                // “else if …” or “else unless …”
-                if self.matches(&Tok::If) || self.matches(&Tok::Unless) {
-                    let was_unless = matches!(
-                        self.toks.get(self.i.saturating_sub(1)).map(|tt| &tt.tok),
-                        Some(Tok::Unless)
-                    );
-                    self.expect(Tok::LParen, "expected '(' after 'else if'/'else unless'")?;
-                    let mut cond2 = self.expr()?;
-                    self.expect(Tok::RParen, "expected ')' after condition")?;
-                    if was_unless {
-                        let prev = cond2;
-                        cond2 = expr_unknown(ExprKind::Unary {
-                            op: UnOp::Not,
-                            e: SmallBox::new(prev),
-                        });
-                    }
-                    let then2 = self.block()?;
-
-                    // Optional trailing else after the else-if/unless
-                    let tail_else = if self.matches(&Tok::Else) {
-                        Some(self.block()?)
-                    } else {
-                        None
-                    };
-
-                    // Desugar into: else { if (cond2) then2 else tail_else }
-                    Some(Block {
-                        stmts: vec![stmt_unknown(StmtKind::If {
-                            cond: cond2,
-                            then_b: then2,
-                            else_b: tail_else,
-                        })],
-                    })
-                } else {
-                    // Plain "else { … }"
-                    Some(self.block()?)
-                }
-            } else {
-                None
-            };
+            let else_b = self.else_clause()?;
 
             Ok(stmt_unknown(StmtKind::If {
                 cond,

@@ -369,6 +369,7 @@ impl JIT {
 
         for fun in funs {
             let fid_raw = fun.id.0 as u32;
+            self.fn_arity.insert(fid_raw, fun.sig.params.len());
             if self.fast_decls.contains_key(&fid_raw) {
                 continue;
             }
@@ -392,6 +393,7 @@ impl JIT {
     }
 
     fn ensure_fast_decl(&mut self, fun: &WirFunction) -> Result<cranelift_module::FuncId, String> {
+        self.fn_arity.insert(fun.id.0 as u32, fun.sig.params.len());
         if let Some(&id) = self.fast_decls.get(&(fun.id.0 as u32)) {
             return Ok(id);
         }
@@ -442,6 +444,21 @@ impl JIT {
         self.fast_decls.get(&fid.0).copied()
     }
 
+    /// Adapts direct-call arguments to the callee's declared arity: missing
+    /// arguments are `null` and extra ones (already evaluated) are dropped.
+    fn direct_call_args(&self, fb: &mut FunctionBuilder, fid: FuncId, mut args: Vec<Value>) -> Vec<Value> {
+        use cranelift::prelude::types;
+        if let Some(&arity) = self.fn_arity.get(&fid.0) {
+            if args.len() > arity {
+                args.truncate(arity);
+            }
+            while args.len() < arity {
+                args.push(fb.ins().iconst(types::I64, 0));
+            }
+        }
+        args
+    }
+
     fn ensure_fast_decl_for_call(
         &mut self,
         fid: FuncId,
@@ -450,6 +467,7 @@ impl JIT {
         if let Some(&id) = self.fast_decls.get(&fid.0) {
             return Ok(id);
         }
+        let arity = self.fn_arity.get(&fid.0).copied().unwrap_or(arity);
 
         use cranelift::prelude::{AbiParam, types};
         use cranelift_module::Linkage;
@@ -536,6 +554,8 @@ pub struct JIT {
     keep_alive: Vec<std::ffi::CString>, // keep CString storage alive for compiled code
     heap_keep_alive: Vec<*mut u8>,
     fast_decls: HashMap<u32, cranelift_module::FuncId>,
+    /// Declared parameter count of each function, used to pad/truncate direct calls.
+    fn_arity: HashMap<u32, usize>,
     stub_decls: HashMap<u32, cranelift_module::FuncId>,
     field_inline_caches: Vec<Box<FieldInlineCache>>,
     num_helpers: HashMap<numbers::NumHelper, cranelift_module::FuncId>,
@@ -1124,6 +1144,14 @@ impl Default for JIT {
             );
 
             jb.symbol(
+                "wir_date_now",
+                crate::native_date::wir_date_now as *const extern "C" fn() -> i64 as *const u8,
+            );
+            jb.symbol(
+                "wir_date_local_offset",
+                crate::native_date::wir_date_local_offset as *const extern "C" fn(i64) -> i64 as *const u8,
+            );
+            jb.symbol(
                 "wir_set_timeout",
                 wir_set_timeout as *const extern "C" fn(i64, i64) -> i64 as *const u8,
             );
@@ -1346,6 +1374,7 @@ impl Default for JIT {
             keep_alive: Vec::new(),
             heap_keep_alive: Vec::new(),
             fast_decls: HashMap::new(),
+            fn_arity: HashMap::new(),
             stub_decls: HashMap::new(),
             field_inline_caches: Vec::new(),
             num_helpers: HashMap::new(),
@@ -1735,8 +1764,14 @@ impl JIT {
                 }
             }
 
-            // ---- linear pass
-            for (bid, block) in fun.blocks.iter().enumerate() {
+            // ---- linear pass, in reverse post-order so that every definition is
+            // emitted before its uses even when the lowerer numbered a dominating
+            // block after the blocks it dominates. Blocks not reachable through
+            // WIR edges (e.g. catch handlers entered via exception flow) follow
+            // in id order.
+            let block_order = wir_block_emission_order(fun);
+            for &bid in &block_order {
+                let block = &fun.blocks[bid];
                 #[cfg(debug_assertions)]
                 {
                     eprintln!(
@@ -3646,6 +3681,7 @@ impl JIT {
                             for &a in args {
                                 call_args.push(vmap.get_or_emit(a, &mut fb, fun_ir));
                             }
+                            let call_args = self.direct_call_args(&mut fb, *callee, call_args);
 
                             let call = fb.ins().call(func_ref, &call_args);
                             let outs = fb.inst_results(call).to_vec();
@@ -3784,7 +3820,8 @@ impl JIT {
 
                             let func_id = self.ensure_fast_decl_for_call(*callee, arity)?;
                             let func_ref = self.module.declare_func_in_func(func_id, &mut fb.func);
-                            let call = fb.ins().call(func_ref, &keys[..]);
+                            let call_args = self.direct_call_args(&mut fb, *callee, keys.clone());
+                            let call = fb.ins().call(func_ref, &call_args);
                             let retv = fb.inst_results(call)[0];
 
                             // memo put
@@ -3878,8 +3915,7 @@ impl JIT {
                         } => {
                             use cranelift::prelude::{IntCC, types};
                             let ci64 = vmap.get_or_emit(*cond, &mut fb, fun);
-                            let tval = fb.ins().iconst(types::I64, BOOL_TRUE);
-                            let cb1 = fb.ins().icmp(IntCC::Equal, ci64, tval);
+                            let cb1 = self.emit_truthy(&mut fb, ci64);
                             use cranelift::codegen::ir::instructions::BlockArg;
                             fb.ins().brif(
                                 cb1,
@@ -4504,10 +4540,17 @@ impl JIT {
 
                 let params = sb.block_params(entry);
                 let argv_ptr = params[0];
+                let argc = params[1];
 
+                // Parameters beyond `argc` read a static null word instead of argv,
+                // so callers may pass fewer arguments than declared (JS semantics).
+                static NULL_WORD: i64 = 0;
+                let null_addr = sb.ins().iconst(ptr_ty, &NULL_WORD as *const i64 as i64);
                 let mut call_args = Vec::with_capacity(fun.sig.params.len());
                 for i in 0..fun.sig.params.len() {
                     let addr = sb.ins().iadd_imm_s(argv_ptr, (i as i64) * 8);
+                    let present = sb.ins().icmp_imm_u(IntCC::UnsignedGreaterThan, argc, i as i64);
+                    let addr = sb.ins().select(present, addr, null_addr);
                     let v = sb.ins().load(types::I64, MemFlagsData::new().with_notrap().with_aligned(), addr, 0);
                     call_args.push(v);
                 }
@@ -4704,6 +4747,59 @@ fn trap_unsupported(fb: &mut FunctionBuilder, _what: &str) {
     // 'trap' is a terminator. Do NOT emit any further instructions in this block.
     let code = TrapCode::unwrap_user(0xE0);
     fb.ins().trap(code);
+}
+
+/// Block indices in reverse post-order from the entry, followed by the blocks
+/// not reachable through Jump/Branch/Switch edges, in id order.
+fn wir_block_emission_order(fun: &WirFunction) -> Vec<usize> {
+    let n = fun.blocks.len();
+    let succs = |bid: usize| -> Vec<usize> {
+        let Some(&last) = fun.blocks[bid].insts.last() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        match &fun.nodes[last.0 as usize].kind {
+            Inst::Jump(t, _) => out.push(t.0 as usize),
+            Inst::Branch { then_b, else_b, .. } => {
+                out.push(then_b.0 as usize);
+                out.push(else_b.0 as usize);
+            }
+            Inst::Switch {
+                default_b, table, ..
+            } => {
+                out.push(default_b.0 as usize);
+                out.extend(table.iter().map(|&(_, b)| b.0 as usize));
+            }
+            _ => {}
+        }
+        out.retain(|&b| b < n);
+        out
+    };
+
+    let entry = fun.entry.0 as usize;
+    let mut seen = vec![false; n];
+    let mut post = Vec::with_capacity(n);
+    if entry < n {
+        let mut stack: Vec<(usize, Vec<usize>, usize)> = vec![(entry, succs(entry), 0)];
+        seen[entry] = true;
+        while let Some((bid, ss, i)) = stack.last_mut() {
+            if *i < ss.len() {
+                let s = ss[*i];
+                *i += 1;
+                if !seen[s] {
+                    seen[s] = true;
+                    let next = succs(s);
+                    stack.push((s, next, 0));
+                }
+            } else {
+                post.push(*bid);
+                stack.pop();
+            }
+        }
+    }
+    post.reverse();
+    post.extend((0..n).filter(|&b| !seen[b]));
+    post
 }
 
 #[unsafe(no_mangle)]

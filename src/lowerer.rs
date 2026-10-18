@@ -4254,25 +4254,7 @@ fn lower_expr_free_impl<'m>(
                     let neg_one = b.const_i32(-1);
                     Ok(b.int_bin(IntBinOp::Xor, v, neg_one))
                 }
-                UnOp::Not => {
-                    let (_nid, falsev) = b.push_node(
-                        Inst::Const(Constant::Bool(false)),
-                        Some(Type::Bool),
-                        1,
-                        false,
-                    );
-                    let (_nid, res) = b.push_node(
-                        Inst::CmpInt {
-                            kind: crate::wir::CmpKind::Eq,
-                            a: v,
-                            b: falsev[0],
-                        },
-                        Some(Type::Bool),
-                        1,
-                        false,
-                    );
-                    Ok(res[0])
-                }
+                UnOp::Not => Ok(bool_select(b, v, false)),
             }
         }
 
@@ -4454,40 +4436,26 @@ fn lower_expr_free_impl<'m>(
                     }
                 }
                 And | Or => {
+                    // JS semantics: `a && b` is `a` when falsy else `b`;
+                    // `a || b` is `a` when truthy else `b`.
                     let then_b = b.block();
                     let else_b = b.block();
                     let cont = b.block();
-                    let res_param = b.add_block_param(cont, Type::Bool);
+                    let res_param = b.add_block_param(cont, Type::Top);
 
-                    if *op == And {
-                        b.branch(va, then_b, else_b);
-                    } else {
-                        b.branch(va, else_b, then_b);
-                    }
+                    b.branch(va, then_b, else_b);
 
                     b.position_at(then_b);
                     let tval = if *op == And {
                         lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?
                     } else {
-                        let (_nid, res) = b.push_node(
-                            Inst::Const(Constant::Bool(true)),
-                            Some(Type::Bool),
-                            1,
-                            false,
-                        );
-                        res[0]
+                        va
                     };
                     b.jump(cont, &[tval]);
 
                     b.position_at(else_b);
                     let fval = if *op == And {
-                        let (_nid, res) = b.push_node(
-                            Inst::Const(Constant::Bool(false)),
-                            Some(Type::Bool),
-                            1,
-                            false,
-                        );
-                        res[0]
+                        va
                     } else {
                         lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?
                     };
@@ -5756,6 +5724,25 @@ fn lower_expr_free_impl<'m>(
 
             // --- Bare identifier callee & other cases ---
             if let ExprKind::Ident(name) = callee.kind() {
+                // Hidden intrinsics used by the embedded standard library (std/date.napalm).
+                let std_intrinsic = match name.as_str() {
+                    "__date_now" => Some(("wir_date_now", 0, Type::Top, false)),
+                    "__date_local_offset" => Some(("wir_date_local_offset", 1, Type::Top, true)),
+                    "__is_number" => Some(("wir_is_number", 1, Type::Bool, true)),
+                    "__is_string" => Some(("wir_is_str", 1, Type::Bool, true)),
+                    "__is_object" => Some(("wir_is_obj", 1, Type::Bool, true)),
+                    _ => None,
+                };
+                if let Some((native, arity, ty, pure)) = std_intrinsic {
+                    if args.len() != arity {
+                        return Err(LowerError::NotLowerable("std intrinsic arity"));
+                    }
+                    let mut argvals = Vec::with_capacity(arity);
+                    for arg in args.iter() {
+                        argvals.push(lower_expr_free(b, locals, fields, next_field, arg, lowering_ctx)?);
+                    }
+                    return Ok(typed_native(b, native, argvals, ty, pure));
+                }
                 // Timers
                 if name == "setTimeout" {
                     if args.len() != 2 {

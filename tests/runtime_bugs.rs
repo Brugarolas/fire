@@ -621,3 +621,74 @@ fn out_of_scope_variables_report_a_located_error() {
     );
     assert_build_error(run("print(nothere);\n"), &["`nothere` is not defined in this scope"]);
 }
+#[test]
+fn missing_arguments_are_null() {
+    assert_output(
+        r#"
+fn f(a, b, c) { return [a, b == null, c == null]; }
+print(f(1));
+class P { constructor(x, y) { this.x = x; this.y = y; } }
+let p = new P(3);
+print([p.x, p.y == null]);
+"#,
+        "[1, true, true]\n[3, true]\n",
+    );
+}
+
+#[test]
+fn else_if_chains_of_any_length() {
+    assert_output(
+        r#"
+fn grade(n) {
+    if (n > 90) { return "A"; }
+    else if (n > 80) { return "B"; }
+    else if (n > 70) { return "C"; }
+    else if (n > 60) { return "D"; }
+    else { return "F"; }
+}
+print([grade(95), grade(85), grade(75), grade(65), grade(5)]);
+"#,
+        "[\"A\", \"B\", \"C\", \"D\", \"F\"]\n",
+    );
+}
+
+#[test]
+fn null_equality_and_logical_operator_values() {
+    assert_output(
+        r#"
+print([0 == null, null == 0, null == null, 0 != null, "" == null]);
+print([0 || 5, 3 || 5, null || "x", 0 && 5, 3 && 5, "" || "fallback"]);
+"#,
+        "[false, false, true, true, false]\n[5, 3, \"x\", 0, 5, \"fallback\"]\n",
+    );
+}
+
+#[test]
+fn conditions_use_js_truthiness() {
+    assert_output(
+        r#"
+fn t(v) { if (v) { return 1; } return 0; }
+print([t(0), t(1), t(2), t(-1), t(""), t("a"), t(null), t(false), t(true), t(0.0), t(0.5), t([])]);
+print([!0, !2, !"", !"a", !null]);
+let n = 3;
+let c = 0;
+while (n) { n = n - 1; c = c + 1; }
+print(c);
+"#,
+        "[0, 1, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1]\n[true, false, true, false, true]\n3\n",
+    );
+}
+
+#[test]
+fn values_defined_in_later_numbered_blocks_reach_their_uses() {
+    // The nested `if` with an early return makes the lowerer number the block
+    // defining `i = 4` after the join block that consumes it.
+    assert_output(
+        r#"
+fn a(f, g) { let i = 0; if (f) { i = 7; } else { if (g) { return 5; } i = 4; } return i; }
+fn b(f, g) { let i = 0; if (f) { i = 7; } else { if (g) { return 5; } i = 4; } return i; }
+print([a(false, false), b(false, false), b(true, false), b(false, true)]);
+"#,
+        "[4, 4, 7, 5]\n",
+    );
+}

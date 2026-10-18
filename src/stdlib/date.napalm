@@ -1,0 +1,831 @@
+// Napalm standard library: Date (JavaScript-compatible semantics).
+//
+// Imported implicitly by any module that uses `Date`; it can also be imported
+// explicitly with `import { Date } from "napalm:date";`.
+//
+// A Date holds a time value: milliseconds since 1970-01-01T00:00:00Z
+// (NaN for an invalid date). Only the clock (`__date_now`) and the local
+// time-zone offset (`__date_local_offset`) come from the host; every calendar
+// computation below is compiled by the JIT.
+
+const NAN = 0 / 0;
+const MS_PER_DAY = 86400000;
+const MAX_TIME = 8640000000000000;
+const DIGITS = "0123456789";
+const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+// ---------------------------------------------------------------- arithmetic
+
+fn floorDiv(a, b) {
+  let r = a % b;
+  if (r < 0) {
+    r = r + b;
+  }
+  return (a - r) / b;
+}
+
+fn posMod(a, b) {
+  let r = a % b;
+  if (r < 0) {
+    r = r + b;
+  }
+  return r;
+}
+
+fn trunc(x) {
+  return x - x % 1;
+}
+
+fn isFiniteNum(x) {
+  return x == x && x != 1 / 0 && x != -1 / 0;
+}
+
+// ToNumber for date components: non-numbers (and missing values) are NaN.
+fn num(x) {
+  if (__is_number(x)) {
+    return x;
+  }
+  return NAN;
+}
+
+// Optional component: missing keeps `fallback`, anything else is converted.
+fn pick(x, fallback) {
+  if (x == null) {
+    return fallback;
+  }
+  return num(x);
+}
+
+// ------------------------------------------------------------------ calendar
+
+fn isLeapYear(y) {
+  return posMod(y, 4) == 0 && (posMod(y, 100) != 0 || posMod(y, 400) == 0);
+}
+
+fn daysInMonth(y, m) {
+  if (m == 2) {
+    if (isLeapYear(y)) {
+      return 29;
+    }
+    return 28;
+  }
+  if (m == 4 || m == 6 || m == 9 || m == 11) {
+    return 30;
+  }
+  return 31;
+}
+
+// Days since 1970-01-01 of the proleptic Gregorian date (month 1..12).
+fn daysFromCivil(y, m, d) {
+  let yy = y;
+  if (m <= 2) {
+    yy = y - 1;
+  }
+  let era = floorDiv(yy, 400);
+  let yoe = yy - era * 400;
+  let doy = floorDiv(153 * ((m + 9) % 12) + 2, 5) + d - 1;
+  let doe = yoe * 365 + floorDiv(yoe, 4) - floorDiv(yoe, 100) + doy;
+  return era * 146097 + doe - 719468;
+}
+
+// [year, month 1..12, day] of a day count since 1970-01-01.
+fn civilFromDays(days) {
+  let z = days + 719468;
+  let era = floorDiv(z, 146097);
+  let doe = z - era * 146097;
+  let yoe = floorDiv(doe - floorDiv(doe, 1460) + floorDiv(doe, 36524) - floorDiv(doe, 146096), 365);
+  let doy = doe - (365 * yoe + floorDiv(yoe, 4) - floorDiv(yoe, 100));
+  let mp = floorDiv(5 * doy + 2, 153);
+  let d = doy - floorDiv(153 * mp + 2, 5) + 1;
+  let m = mp + 3;
+  if (mp >= 10) {
+    m = mp - 9;
+  }
+  let y = yoe + era * 400;
+  if (m <= 2) {
+    y = y + 1;
+  }
+  return [y, m, d];
+}
+
+// ECMAScript MakeDay: month may overflow in either direction.
+fn makeDay(year, month, date) {
+  if (!isFiniteNum(year) || !isFiniteNum(month) || !isFiniteNum(date)) {
+    return NAN;
+  }
+  let m = trunc(month);
+  let y = trunc(year) + floorDiv(m, 12);
+  let mn = posMod(m, 12);
+  if (y < -400000 || y > 400000) {
+    return NAN;
+  }
+  return daysFromCivil(y, mn + 1, 1) + trunc(date) - 1;
+}
+
+fn makeTime(h, m, s, ms) {
+  if (!isFiniteNum(h) || !isFiniteNum(m) || !isFiniteNum(s) || !isFiniteNum(ms)) {
+    return NAN;
+  }
+  return trunc(h) * 3600000 + trunc(m) * 60000 + trunc(s) * 1000 + trunc(ms);
+}
+
+fn makeDate(day, time) {
+  if (!isFiniteNum(day) || !isFiniteNum(time)) {
+    return NAN;
+  }
+  return day * MS_PER_DAY + time;
+}
+
+fn timeClip(t) {
+  if (!isFiniteNum(t) || t > MAX_TIME || t < -MAX_TIME) {
+    return NAN;
+  }
+  return trunc(t) + 0;
+}
+
+// Two-digit years in constructor/UTC() arguments mean 1900..1999.
+fn fullYear(y) {
+  if (y == y) {
+    let iy = trunc(y);
+    if (iy >= 0 && iy <= 99) {
+      return 1900 + iy;
+    }
+  }
+  return y;
+}
+
+// ------------------------------------------------------------- local time
+
+// Local offset in milliseconds at the UTC instant `t`.
+fn offsetAt(t) {
+  return __date_local_offset(t) * 60000;
+}
+
+fn localTime(t) {
+  return t + offsetAt(t);
+}
+
+fn utcFromLocal(t) {
+  if (t != t) {
+    return t;
+  }
+  let guess = t - offsetAt(t);
+  return t - offsetAt(guess);
+}
+
+// ------------------------------------------------------------ decomposition
+
+fn dayOf(t) {
+  return floorDiv(t, MS_PER_DAY);
+}
+
+fn timeInDay(t) {
+  return posMod(t, MS_PER_DAY);
+}
+
+fn yearOf(t) {
+  if (t != t) {
+    return NAN;
+  }
+  return civilFromDays(dayOf(t))[0];
+}
+
+fn monthOf(t) {
+  if (t != t) {
+    return NAN;
+  }
+  return civilFromDays(dayOf(t))[1] - 1;
+}
+
+fn dateOf(t) {
+  if (t != t) {
+    return NAN;
+  }
+  return civilFromDays(dayOf(t))[2];
+}
+
+fn weekDayOf(t) {
+  if (t != t) {
+    return NAN;
+  }
+  return posMod(dayOf(t) + 4, 7);
+}
+
+fn hoursOf(t) {
+  if (t != t) {
+    return NAN;
+  }
+  return floorDiv(timeInDay(t), 3600000);
+}
+
+fn minutesOf(t) {
+  if (t != t) {
+    return NAN;
+  }
+  return posMod(floorDiv(t, 60000), 60);
+}
+
+fn secondsOf(t) {
+  if (t != t) {
+    return NAN;
+  }
+  return posMod(floorDiv(t, 1000), 60);
+}
+
+fn msOf(t) {
+  if (t != t) {
+    return NAN;
+  }
+  return posMod(t, 1000);
+}
+
+// Replaces the given components (null keeps the current one) of time value
+// `t`, all in the same frame (UTC or local).
+fn compose(t, y, mo, d, h, mi, s, ms) {
+  if (t != t) {
+    return NAN;
+  }
+  let ymd = civilFromDays(dayOf(t));
+  let day = makeDay(pick(y, ymd[0]), pick(mo, ymd[1] - 1), pick(d, ymd[2]));
+  let time = makeTime(
+    pick(h, hoursOf(t)),
+    pick(mi, minutesOf(t)),
+    pick(s, secondsOf(t)),
+    pick(ms, msOf(t))
+  );
+  return makeDate(day, time);
+}
+
+// ---------------------------------------------------------------- formatting
+
+fn pad(n, width) {
+  return ("" + n).padStart(width, "0");
+}
+
+fn yearString(y) {
+  if (y < 0) {
+    return "-" + pad(-y, 6);
+  }
+  return pad(y, 4);
+}
+
+fn isoYear(y) {
+  if (y >= 0 && y <= 9999) {
+    return pad(y, 4);
+  }
+  if (y < 0) {
+    return "-" + pad(-y, 6);
+  }
+  return "+" + pad(y, 6);
+}
+
+fn offsetString(t, separator) {
+  let off = __date_local_offset(t);
+  let sign = "+";
+  if (off < 0) {
+    sign = "-";
+    off = -off;
+  }
+  return sign + pad(floorDiv(off, 60), 2) + separator + pad(off % 60, 2);
+}
+
+fn timeString(t) {
+  return pad(hoursOf(t), 2) + ":" + pad(minutesOf(t), 2) + ":" + pad(secondsOf(t), 2);
+}
+
+fn dateString(t) {
+  return DAY_NAMES[weekDayOf(t)] + " " + MONTH_NAMES[monthOf(t)] + " " + pad(dateOf(t), 2) + " " + yearString(yearOf(t));
+}
+
+fn hour12(t) {
+  let h = hoursOf(t) % 12;
+  if (h == 0) {
+    h = 12;
+  }
+  let suffix = " AM";
+  if (hoursOf(t) >= 12) {
+    suffix = " PM";
+  }
+  return h + ":" + pad(minutesOf(t), 2) + ":" + pad(secondsOf(t), 2) + suffix;
+}
+
+fn usDate(t) {
+  return (monthOf(t) + 1) + "/" + dateOf(t) + "/" + yearOf(t);
+}
+
+// ------------------------------------------------------------------- parsing
+
+fn digitAt(s, i) {
+  let ch = s[i];
+  if (ch == null) {
+    return -1;
+  }
+  return DIGITS.indexOf(ch);
+}
+
+// Exactly `n` decimal digits at `i`, or -1.
+fn readDigits(s, i, n) {
+  let v = 0;
+  let k = 0;
+  while (k < n) {
+    let dg = digitAt(s, i + k);
+    if (dg < 0) {
+      return -1;
+    }
+    v = v * 10 + dg;
+    k = k + 1;
+  }
+  return v;
+}
+
+// All-digit string as a number, or -1.
+fn parseUint(s) {
+  if (s.length == 0) {
+    return -1;
+  }
+  return readDigits(s, 0, s.length);
+}
+
+// ECMAScript date-time string format:
+// [+-YYYYYY|YYYY][-MM[-DD]][THH:mm[:ss[.sss]]][Z|+HH:mm|-HH:mm]
+// Date-only forms are UTC; date-time forms without an offset are local time.
+fn parseIso(s) {
+  let n = s.length;
+  let i = 0;
+  let y = 0;
+  let c = s[0];
+  if (c == "+" || c == "-") {
+    y = readDigits(s, 1, 6);
+    if (y < 0 || (c == "-" && y == 0)) {
+      return NAN;
+    }
+    if (c == "-") {
+      y = -y;
+    }
+    i = 7;
+  } else {
+    y = readDigits(s, 0, 4);
+    if (y < 0) {
+      return NAN;
+    }
+    i = 4;
+  }
+  let mo = 1;
+  let d = 1;
+  if (i < n && s[i] == "-") {
+    mo = readDigits(s, i + 1, 2);
+    if (mo < 1 || mo > 12) {
+      return NAN;
+    }
+    i = i + 3;
+    if (i < n && s[i] == "-") {
+      d = readDigits(s, i + 1, 2);
+      if (d < 1 || d > daysInMonth(y, mo)) {
+        return NAN;
+      }
+      i = i + 3;
+    }
+  }
+  let hasTime = false;
+  let h = 0;
+  let mi = 0;
+  let sec = 0;
+  let ms = 0;
+  if (i < n && (s[i] == "T" || s[i] == "t" || s[i] == " ")) {
+    hasTime = true;
+    h = readDigits(s, i + 1, 2);
+    if (s[i + 3] != ":") {
+      return NAN;
+    }
+    mi = readDigits(s, i + 4, 2);
+    if (h < 0 || mi < 0) {
+      return NAN;
+    }
+    i = i + 6;
+    if (i < n && s[i] == ":") {
+      sec = readDigits(s, i + 1, 2);
+      if (sec < 0) {
+        return NAN;
+      }
+      i = i + 3;
+      if (i < n && (s[i] == "." || s[i] == ",")) {
+        i = i + 1;
+        let count = 0;
+        while (digitAt(s, i) >= 0) {
+          if (count < 3) {
+            ms = ms * 10 + digitAt(s, i);
+            count = count + 1;
+          }
+          i = i + 1;
+        }
+        if (count == 0) {
+          return NAN;
+        }
+        while (count < 3) {
+          ms = ms * 10;
+          count = count + 1;
+        }
+      }
+    }
+    if (h > 24 || mi > 59 || sec > 59 || (h == 24 && (mi != 0 || sec != 0 || ms != 0))) {
+      return NAN;
+    }
+  }
+  let hasOffset = false;
+  let offset = 0;
+  if (i < n) {
+    c = s[i];
+    if (c == "Z" || c == "z") {
+      hasOffset = true;
+      i = i + 1;
+    } else if (c == "+" || c == "-") {
+      let oh = readDigits(s, i + 1, 2);
+      let om = 0;
+      if (s[i + 3] == ":") {
+        om = readDigits(s, i + 4, 2);
+        i = i + 6;
+      } else {
+        om = readDigits(s, i + 3, 2);
+        i = i + 5;
+      }
+      if (oh < 0 || om < 0 || oh > 23 || om > 59) {
+        return NAN;
+      }
+      offset = oh * 60 + om;
+      if (c == "-") {
+        offset = -offset;
+      }
+      hasOffset = true;
+    }
+  }
+  if (i != n) {
+    return NAN;
+  }
+  let t = makeDate(makeDay(y, mo - 1, d), makeTime(h, mi, sec, ms));
+  if (hasOffset) {
+    t = t - offset * 60000;
+  } else if (hasTime) {
+    t = utcFromLocal(t);
+  }
+  return timeClip(t);
+}
+
+// "+hhmm" / "-hh:mm" / "+hh" as minutes, or NaN.
+fn parseOffset(s) {
+  if (s.length == 0) {
+    return 0;
+  }
+  let sign = 1;
+  if (s[0] == "-") {
+    sign = -1;
+  } else if (s[0] != "+") {
+    return NAN;
+  }
+  let body = s.slice(1).replaceAll(":", "");
+  let v = parseUint(body);
+  if (v < 0) {
+    return NAN;
+  }
+  if (body.length <= 2) {
+    return sign * v * 60;
+  }
+  if (body.length != 4) {
+    return NAN;
+  }
+  return sign * (floorDiv(v, 100) * 60 + v % 100);
+}
+
+fn nameIndex(names, word) {
+  let j = 0;
+  while (j < names.length) {
+    if (names[j].toLowerCase() == word) {
+      return j;
+    }
+    j = j + 1;
+  }
+  return -1;
+}
+
+// Lenient fallback for the formats produced by toString(), toUTCString(),
+// toDateString() and "M/D/YYYY [h:mm[:ss] [AM|PM]]".
+fn parseLoose(input) {
+  let s = input;
+  let paren = s.indexOf("(");
+  if (paren >= 0) {
+    s = s.slice(0, paren);
+  }
+  let parts = s.replaceAll(",", " ").split(" ");
+  let y = NAN;
+  let mo = -1;
+  let d = -1;
+  let h = 0;
+  let mi = 0;
+  let sec = 0;
+  let ms = 0;
+  let pm = -1;
+  let hasOffset = false;
+  let offset = 0;
+  let k = 0;
+  while (k < parts.length) {
+    let tk = parts[k];
+    k = k + 1;
+    let lower = tk.toLowerCase();
+    let v = parseUint(tk);
+    if (tk.length == 0) {
+      // Skip separators.
+    } else if (lower == "am" || lower == "pm") {
+      pm = 0;
+      if (lower == "pm") {
+        pm = 1;
+      }
+    } else if (lower == "z" || lower.startsWith("gmt") || lower.startsWith("utc")) {
+      let rest = "";
+      if (lower != "z") {
+        rest = tk.slice(3);
+      }
+      offset = parseOffset(rest);
+      if (offset != offset) {
+        return NAN;
+      }
+      hasOffset = true;
+    } else if ((tk[0] == "+" || tk[0] == "-") && tk.length >= 3 && digitAt(tk, 1) >= 0 && d >= 0) {
+      offset = parseOffset(tk);
+      if (offset != offset) {
+        return NAN;
+      }
+      hasOffset = true;
+    } else if (tk.indexOf(":") > 0) {
+      let hms = tk.split(":");
+      h = parseUint(hms[0]);
+      mi = parseUint(hms[1]);
+      if (hms.length > 2) {
+        let secParts = hms[2].split(".");
+        sec = parseUint(secParts[0]);
+        if (secParts.length > 1) {
+          ms = parseUint(secParts[1].padEnd(3, "0").slice(0, 3));
+        }
+      }
+      if (h < 0 || mi < 0 || sec < 0 || ms < 0 || hms.length > 3) {
+        return NAN;
+      }
+    } else if (tk.indexOf("/") > 0) {
+      let mdy = tk.split("/");
+      if (mdy.length != 3) {
+        return NAN;
+      }
+      mo = parseUint(mdy[0]) - 1;
+      d = parseUint(mdy[1]);
+      y = parseUint(mdy[2]);
+      if (mo < 0 || d < 0 || y < 0) {
+        return NAN;
+      }
+    } else if (v >= 0) {
+      if (d < 0 && tk.length <= 2) {
+        d = v;
+      } else {
+        y = v;
+      }
+    } else if (tk[0] == "-" && parseUint(tk.slice(1)) >= 0) {
+      y = -parseUint(tk.slice(1));
+    } else if (tk.length >= 3) {
+      let word = lower.slice(0, 3);
+      let found = nameIndex(MONTH_NAMES, word);
+      if (found >= 0) {
+        mo = found;
+      } else if (nameIndex(DAY_NAMES, word) < 0) {
+        return NAN;
+      }
+    } else {
+      return NAN;
+    }
+  }
+  if (y != y || mo < 0) {
+    return NAN;
+  }
+  if (d < 0) {
+    d = 1;
+  }
+  if (pm >= 0) {
+    if (h < 1 || h > 12) {
+      return NAN;
+    }
+    h = h % 12 + pm * 12;
+  }
+  if (mo > 11 || d < 1 || d > daysInMonth(y, mo + 1) || h > 24 || mi > 59 || sec > 59) {
+    return NAN;
+  }
+  let t = makeDate(makeDay(fullYear(y), mo, d), makeTime(h, mi, sec, ms));
+  if (hasOffset) {
+    return timeClip(t - offset * 60000);
+  }
+  return timeClip(utcFromLocal(t));
+}
+
+fn parseDate(s) {
+  let str = s.trim();
+  let t = parseIso(str);
+  if (t == t) {
+    return t;
+  }
+  return parseLoose(str);
+}
+
+// ---------------------------------------------------------------------- Date
+
+export class Date {
+  constructor(a, b, c, d, e, f, g) {
+    if (a == null) {
+      this._t = __date_now();
+    } else if (b == null) {
+      if (__is_number(a)) {
+        this._t = timeClip(a);
+      } else if (__is_string(a)) {
+        this._t = parseDate(a);
+      } else if (__is_object(a) && __is_number(a._t)) {
+        this._t = a._t;
+      } else {
+        this._t = NAN;
+      }
+    } else {
+      let day = makeDay(fullYear(num(a)), num(b), pick(c, 1));
+      let time = makeTime(pick(d, 0), pick(e, 0), pick(f, 0), pick(g, 0));
+      this._t = timeClip(utcFromLocal(makeDate(day, time)));
+    }
+  }
+
+  // ------------------------------------------------------------ statics
+
+  static now(): number {
+    return __date_now();
+  }
+
+  static parse(s): number {
+    if (!__is_string(s)) {
+      return NAN;
+    }
+    return parseDate(s);
+  }
+
+  static UTC(y, mo, d, h, mi, s, ms): number {
+    let day = makeDay(fullYear(num(y)), pick(mo, 0), pick(d, 1));
+    return timeClip(makeDate(day, makeTime(pick(h, 0), pick(mi, 0), pick(s, 0), pick(ms, 0))));
+  }
+
+  // ------------------------------------------------------------ getters
+
+  getTime(): number { return this._t; }
+  valueOf(): number { return this._t; }
+
+  getFullYear(): number { return yearOf(localTime(this._t)); }
+  getMonth(): number { return monthOf(localTime(this._t)); }
+  getDate(): number { return dateOf(localTime(this._t)); }
+  getDay(): number { return weekDayOf(localTime(this._t)); }
+  getHours(): number { return hoursOf(localTime(this._t)); }
+  getMinutes(): number { return minutesOf(localTime(this._t)); }
+  getSeconds(): number { return secondsOf(localTime(this._t)); }
+  getMilliseconds(): number { return msOf(this._t); }
+
+  getUTCFullYear(): number { return yearOf(this._t); }
+  getUTCMonth(): number { return monthOf(this._t); }
+  getUTCDate(): number { return dateOf(this._t); }
+  getUTCDay(): number { return weekDayOf(this._t); }
+  getUTCHours(): number { return hoursOf(this._t); }
+  getUTCMinutes(): number { return minutesOf(this._t); }
+  getUTCSeconds(): number { return secondsOf(this._t); }
+  getUTCMilliseconds(): number { return msOf(this._t); }
+
+  // Minutes to add to local time to get UTC (positive west of Greenwich).
+  getTimezoneOffset(): number {
+    let t = this._t;
+    if (t != t) {
+      return NAN;
+    }
+    return 0 - __date_local_offset(t);
+  }
+
+  // ------------------------------------------------------------ setters
+
+  setTime(t): number {
+    this._t = timeClip(num(t));
+    return this._t;
+  }
+
+  setMilliseconds(ms): number { return this._setLocal(null, null, null, null, null, null, num(ms)); }
+  setSeconds(s, ms): number { return this._setLocal(null, null, null, null, null, num(s), ms); }
+  setMinutes(mi, s, ms): number { return this._setLocal(null, null, null, null, num(mi), s, ms); }
+  setHours(h, mi, s, ms): number { return this._setLocal(null, null, null, num(h), mi, s, ms); }
+  setDate(d): number { return this._setLocal(null, null, num(d), null, null, null, null); }
+  setMonth(mo, d): number { return this._setLocal(null, num(mo), d, null, null, null, null); }
+
+  setFullYear(y, mo, d): number {
+    let t = this._t;
+    if (t != t) {
+      t = 0;
+    } else {
+      t = localTime(t);
+    }
+    this._t = timeClip(utcFromLocal(compose(t, num(y), mo, d, null, null, null, null)));
+    return this._t;
+  }
+
+  setUTCMilliseconds(ms): number { return this._setUtc(null, null, null, null, null, null, num(ms)); }
+  setUTCSeconds(s, ms): number { return this._setUtc(null, null, null, null, null, num(s), ms); }
+  setUTCMinutes(mi, s, ms): number { return this._setUtc(null, null, null, null, num(mi), s, ms); }
+  setUTCHours(h, mi, s, ms): number { return this._setUtc(null, null, null, num(h), mi, s, ms); }
+  setUTCDate(d): number { return this._setUtc(null, null, num(d), null, null, null, null); }
+  setUTCMonth(mo, d): number { return this._setUtc(null, num(mo), d, null, null, null, null); }
+
+  setUTCFullYear(y, mo, d): number {
+    let t = this._t;
+    if (t != t) {
+      t = 0;
+    }
+    this._t = timeClip(compose(t, num(y), mo, d, null, null, null, null));
+    return this._t;
+  }
+
+  _setLocal(y, mo, d, h, mi, s, ms): number {
+    this._t = timeClip(utcFromLocal(compose(localTime(this._t), y, mo, d, h, mi, s, ms)));
+    return this._t;
+  }
+
+  _setUtc(y, mo, d, h, mi, s, ms): number {
+    this._t = timeClip(compose(this._t, y, mo, d, h, mi, s, ms));
+    return this._t;
+  }
+
+  // --------------------------------------------------------- formatting
+
+  toISOString(): string {
+    let t = this._t;
+    if (t != t) {
+      throw "RangeError: Invalid time value";
+    }
+    return isoYear(yearOf(t)) + "-" + pad(monthOf(t) + 1, 2) + "-" + pad(dateOf(t), 2) + "T" + timeString(t) + "." + pad(msOf(t), 3) + "Z";
+  }
+
+  toJSON() {
+    if (this._t != this._t) {
+      return null;
+    }
+    return this.toISOString();
+  }
+
+  toString(): string {
+    let t = this._t;
+    if (t != t) {
+      return "Invalid Date";
+    }
+    let local = localTime(t);
+    return dateString(local) + " " + timeString(local) + " GMT" + offsetString(t, "");
+  }
+
+  toDateString(): string {
+    if (this._t != this._t) {
+      return "Invalid Date";
+    }
+    return dateString(localTime(this._t));
+  }
+
+  toTimeString(): string {
+    let t = this._t;
+    if (t != t) {
+      return "Invalid Date";
+    }
+    return timeString(localTime(t)) + " GMT" + offsetString(t, "");
+  }
+
+  toUTCString(): string {
+    let t = this._t;
+    if (t != t) {
+      return "Invalid Date";
+    }
+    return DAY_NAMES[weekDayOf(t)] + ", " + pad(dateOf(t), 2) + " " + MONTH_NAMES[monthOf(t)] + " " + yearString(yearOf(t)) + " " + timeString(t) + " GMT";
+  }
+
+  toGMTString(): string { return this.toUTCString(); }
+
+  // en-US style, in local time.
+  toLocaleDateString(): string {
+    if (this._t != this._t) {
+      return "Invalid Date";
+    }
+    return usDate(localTime(this._t));
+  }
+
+  toLocaleTimeString(): string {
+    if (this._t != this._t) {
+      return "Invalid Date";
+    }
+    return hour12(localTime(this._t));
+  }
+
+  toLocaleString(): string {
+    if (this._t != this._t) {
+      return "Invalid Date";
+    }
+    let local = localTime(this._t);
+    return usDate(local) + ", " + hour12(local);
+  }
+}

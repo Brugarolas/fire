@@ -39,6 +39,15 @@ impl Resolver {
                 used: true,
             },
         ); // Built-in function
+        for intrinsic in ["__date_now", "__date_local_offset", "__is_number", "__is_string", "__is_object"] {
+            layered_map.insert_cell(
+                intrinsic.into(),
+                SymbolInfo {
+                    declared_at: Span::new(0, 0),
+                    used: true,
+                },
+            );
+        }
         layered_map.insert_cell(
             "setTimeout".into(),
             SymbolInfo {

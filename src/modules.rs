@@ -46,12 +46,80 @@ pub trait ModuleLoader {
 
 pub struct FSLoader;
 
+/// Embedded standard-library modules, importable as `napalm:<name>`.
+const STD_MODULES: &[(&str, &str)] = &[("napalm:date", include_str!("stdlib/date.napalm"))];
+
+/// Global names provided by std modules and imported implicitly when a module uses them.
+const STD_GLOBALS: &[(&str, &str)] = &[("Date", "napalm:date")];
+
+fn std_module_source(path: &Path) -> Option<&'static str> {
+    let path = path.to_str()?;
+    STD_MODULES.iter().find(|(name, _)| *name == path).map(|(_, src)| *src)
+}
+
+/// Appends `import { X } from "napalm:..."` for every std global `src` uses
+/// without declaring or importing it. Appending keeps existing spans valid.
+pub fn with_implicit_std_imports(path: &Path, src: &str) -> Option<String> {
+    use crate::front::Tok;
+    use logos::Logos;
+
+    if std_module_source(path).is_some() {
+        return None;
+    }
+    let toks: Vec<Tok> = Tok::lexer(src).filter_map(Result::ok).collect();
+    let mut imports = String::new();
+    for (global, spec) in STD_GLOBALS {
+        let mut used = false;
+        let mut declared = false;
+        let mut in_import = false;
+        for (i, tok) in toks.iter().enumerate() {
+            match tok {
+                Tok::Import => in_import = true,
+                Tok::From => in_import = false,
+                Tok::Ident(name) if name == global => {
+                    let prev = i.checked_sub(1).map(|j| &toks[j]);
+                    if in_import
+                        || matches!(
+                            prev,
+                            Some(
+                                Tok::Class
+                                    | Tok::Fn
+                                    | Tok::Function
+                                    | Tok::Var
+                                    | Tok::Let
+                                    | Tok::Const
+                                    | Tok::Enum
+                                    | Tok::As
+                            )
+                        )
+                    {
+                        declared = true;
+                    } else if !matches!(prev, Some(Tok::Dot)) {
+                        used = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if used && !declared {
+            imports.push_str(&format!("\nimport {{ {global} }} from \"{spec}\";\n"));
+        }
+    }
+    (!imports.is_empty()).then(|| format!("{src}{imports}"))
+}
+
 impl ModuleLoader for FSLoader {
     fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+        if let Some(src) = std_module_source(path) {
+            return Ok(src.to_string());
+        }
         std::fs::read_to_string(path)
     }
 
     fn resolve(&self, referrer: &Path, spec: &str) -> std::io::Result<PathBuf> {
+        if STD_MODULES.iter().any(|(name, _)| *name == spec) {
+            return Ok(PathBuf::from(spec));
+        }
         // Simple resolution relative to the referrer's directory.
         let base = if referrer.is_dir() {
             referrer.to_path_buf()
@@ -705,6 +773,7 @@ impl ProgramBuilder {
             .loader
             .read_to_string(&abs)
             .map_err(|e| format!("read_to_string({:?}): {e}", abs))?;
+        let src = with_implicit_std_imports(&abs, &src).unwrap_or(src);
 
         self.sources.insert(abs.clone(), src.clone());
 

@@ -12,6 +12,7 @@ mod http;
 mod jit;
 mod lowerer;
 mod modules;
+mod native_date;
 mod native_promises;
 mod native_timers;
 mod opt;

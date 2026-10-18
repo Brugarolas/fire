@@ -4,7 +4,7 @@
 //! else (floats, overflow, inexact division, string `+`) goes to a slow path that is itself
 //! compiled with Cranelift once per operator and shared by every call site.
 use super::*;
-use crate::value::{BoxedF64, TAG_BOXED_F64};
+use crate::value::{BoxedF64, BoxedStr, TAG_BOXED_F64, TAG_STRING};
 use crate::wir::CmpKind;
 use cranelift::codegen::ir::Block;
 
@@ -197,7 +197,74 @@ impl JIT {
         fb.ins().jump(done, &[slow_result.into()]);
 
         fb.switch_to_block(done);
+        if matches!(kind, CmpKind::Eq | CmpKind::Ne) {
+            // Loose equality: null equals only null (never 0, 0.0 or false).
+            let a_null = fb.ins().icmp_imm_s(IntCC::Equal, a, 0);
+            let b_null = fb.ins().icmp_imm_s(IntCC::Equal, b, 0);
+            let either_null = fb.ins().bor(a_null, b_null);
+            let cc = if kind == CmpKind::Eq { IntCC::Equal } else { IntCC::NotEqual };
+            let same = fb.ins().icmp(cc, a, b);
+            let identity = Self::tagged_bool(fb, same);
+            return Ok(fb.ins().select(either_null, identity, result));
+        }
         Ok(result)
+    }
+
+    /// JS truthiness as a branch condition: `null`, `false`, `0`, `NaN`, `0.0`
+    /// and `""` are falsy, every other value is truthy.
+    pub(super) fn emit_truthy(&mut self, fb: &mut FunctionBuilder, v: Value) -> Value {
+        let rest = fb.create_block();
+        let imm = fb.create_block();
+        let ptr = fb.create_block();
+        let boxed = fb.create_block();
+        let not_boxed = fb.create_block();
+        let string = fb.create_block();
+        let truthy = fb.create_block();
+        let done = fb.create_block();
+        let result = fb.append_block_param(done, types::I8);
+
+        let is_true = fb.ins().icmp_imm_s(IntCC::Equal, v, BOOL_TRUE);
+        let one = fb.ins().iconst(types::I8, 1);
+        fb.ins().brif(is_true, done, &[one.into()], rest, &[]);
+
+        fb.switch_to_block(rest);
+        let is_ptr = Self::emit_is_ptr(fb, v);
+        fb.ins().brif(is_ptr, ptr, &[], imm, &[]);
+
+        fb.switch_to_block(imm);
+        let is_null = fb.ins().icmp_imm_s(IntCC::Equal, v, 0);
+        let is_false = fb.ins().icmp_imm_s(IntCC::Equal, v, BOOL_FALSE);
+        let is_zero = fb.ins().icmp_imm_s(IntCC::Equal, v, 1);
+        let falsy = fb.ins().bor(is_null, is_false);
+        let falsy = fb.ins().bor(falsy, is_zero);
+        let value = fb.ins().icmp_imm_s(IntCC::Equal, falsy, 0);
+        fb.ins().jump(done, &[value.into()]);
+
+        fb.switch_to_block(ptr);
+        self.tag_guard(fb, v, TAG_BOXED_F64, boxed, not_boxed);
+
+        fb.switch_to_block(boxed);
+        let p = self.value_as_ptr(fb, v);
+        let x = fb.ins().load(types::F64, MemFlagsData::trusted(), p, offset_of!(BoxedF64, val) as i32);
+        let zero = fb.ins().f64const(0.0);
+        let value = fb.ins().fcmp(FloatCC::OrderedNotEqual, x, zero);
+        fb.ins().jump(done, &[value.into()]);
+
+        fb.switch_to_block(not_boxed);
+        self.tag_guard(fb, v, TAG_STRING, string, truthy);
+
+        fb.switch_to_block(string);
+        let p = self.value_as_ptr(fb, v);
+        let len = fb.ins().load(types::I64, MemFlagsData::trusted(), p, offset_of!(BoxedStr, len) as i32);
+        let value = fb.ins().icmp_imm_s(IntCC::NotEqual, len, 0);
+        fb.ins().jump(done, &[value.into()]);
+
+        fb.switch_to_block(truthy);
+        let one = fb.ins().iconst(types::I8, 1);
+        fb.ins().jump(done, &[one.into()]);
+
+        fb.switch_to_block(done);
+        result
     }
 
     fn emit_is_ptr(fb: &mut FunctionBuilder, v: Value) -> Value {

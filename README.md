@@ -32,7 +32,7 @@ Language features (Done/Planned):
 - Enums. [x]
 - Try/Catch/Finally. [x]
 - Defer/Errdefer. [x]
-- Dates and dates methods. [ ]
+- Dates and dates methods. [x]
 - Proxies a là JavaScript. [ ]
 - Generators. [ ]
 - Fibers a là Wren. [ ]
@@ -140,6 +140,27 @@ var n = untypedValue() as number;          // checked at runtime
 
 Run `cargo run -- scripts/types.napalm` for the example and `cargo test --test types -- --test-threads=1` for the regressions. The checker unit tests run with `cargo test --no-default-features --bin Napalm typeck`. Add `--no-default-features` to test without GC when MMTk cannot reserve its Windows heap range.
 
+Dates:
+```text
+let d: Date = new Date(Date.UTC(2024, 1, 29, 13, 45, 30, 250)); // months are 0-based
+print(d.toISOString());                     // "2024-02-29T13:45:30.250Z"
+print(d.toUTCString());                     // "Thu, 29 Feb 2024 13:45:30 GMT"
+print(new Date(2024, 0, 31).toString());    // "Wed Jan 31 2024 00:00:00 GMT+0100" (local time)
+print(Date.parse("2024-03-05T12:20:30+02:00")); // 1709634030000
+d.setUTCDate(d.getUTCDate() + 10);           // fields overflow like in JavaScript
+```
+- `Date` follows JavaScript semantics. Values are millisecond time values from the epoch, limited to ±8.64e15 ms. Out-of-range or unparsable inputs produce an invalid date (`getTime()` is `NaN`).
+- Constructors: `new Date()` (now), `new Date(ms)`, `new Date(string)`, `new Date(otherDate)`, and `new Date(year, month[, day, hours, minutes, seconds, ms])` in local time. Two-digit years 0–99 map to 1900–1999.
+- Static methods: `Date.now()`, `Date.parse(string)`, and `Date.UTC(year[, month, ...])`.
+- Getters: `getTime`/`valueOf`, `getFullYear`, `getMonth`, `getDate`, `getDay`, `getHours`, `getMinutes`, `getSeconds`, `getMilliseconds`, their `getUTC*` counterparts, and `getTimezoneOffset`.
+- Setters: `setTime`, `setFullYear`, `setMonth`, `setDate`, `setHours`, `setMinutes`, `setSeconds`, `setMilliseconds`, and their `setUTC*` counterparts. Optional trailing arguments work as in JavaScript, and setters return the new time value.
+- Formatting: `toISOString` (throws `"RangeError: Invalid time value"` for invalid dates), `toJSON` (`null` for invalid dates), `toString`, `toDateString`, `toTimeString`, `toUTCString`/`toGMTString`, and `toLocaleString`/`toLocaleDateString`/`toLocaleTimeString`.
+- `Date.parse` accepts the ISO 8601 formats of the ECMAScript spec, including extended `±YYYYYY` years and offsets. Date-only forms are UTC and date-time forms without an offset are local. It also parses the output of `toString()` and `toUTCString()`, plus similar `Mon DD YYYY HH:MM:SS GMT+HHMM` strings.
+- `Date` is implemented in Napalm itself (`src/stdlib/date.napalm`) and compiled by the JIT like user code. Only the system clock and the local timezone offset (DST included) come from the OS. Any module that uses `Date` without declaring or importing it imports it from the built-in `napalm:date` module automatically. You can also write `import { Date } from "napalm:date"` (or a namespace import) explicitly. A user-defined `Date` shadows the built-in one, and `Date` works as a type annotation.
+- Limitations: there is no operator overloading or implicit `valueOf`, so compare and subtract dates with `getTime()`, and string concatenation does not call `toString()`. Locale methods always use the en-US format. `toString()` omits the timezone name. Exponent literals such as `8.64e15` are not supported by the lexer.
+
+Run `cargo run -- scripts/date.napalm` for the example and `cargo test --test date -- --test-threads=1` for the regressions.
+
 JIT core intrinsics:
 - 26 runtime helpers now have shared Cranelift fast paths, used by native calls and the corresponding WIR array instructions.
 - Type checks: string, map, set, proxy, and nullish.
@@ -165,6 +186,11 @@ Runtime semantics:
 - Method calls on objects and class instances dispatch dynamically. User methods named like builtins (`push`, `map`, `replace`, `get`, `set`, `add`, `has`, `delete`, `keys`, ...) are called instead of the builtin. Arrays, strings, Maps, and Sets still use the builtins. Class methods may be named `get`, `set`, `delete`, `catch`, or `finally`.
 - `length` and `size` are ordinary readable and assignable properties on objects (`this.size = 3`). On arrays, assigning `length` resizes the array.
 - `key in obj` evaluates `key` when it is a variable or an expression; otherwise the bare identifier is used as the property name.
+- Calls may pass fewer arguments than a function declares; missing parameters are `null` (direct calls, closures, methods, and constructors).
+- Conditions (`if`, `while`, `for`, `!`, `&&`, `||`) use JavaScript truthiness: `null`, `false`, `0`, `0.0`, `NaN`, and `""` are falsy, and everything else is truthy. `a && b` and `a || b` return one of their operands (`0 || 5` is `5`, `"x" && 3` is `3`), not a boolean.
+- `x == null` is true only when `x` is `null` (`0 == null` is false). Ordering comparisons still treat `null` as `0`.
+- `if` statements accept chains of any number of `else if`/`else unless` clauses.
+- The JIT emits blocks in reverse post-order, so a value is always defined before it is used, even when a nested branch with an early `return` numbers its defining block after its uses. Previously such values could read as `null`.
 
 Run `cargo test --test runtime_bugs -- --test-threads=1` for these regressions.
 
