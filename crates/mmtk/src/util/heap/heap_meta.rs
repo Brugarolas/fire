@@ -41,10 +41,14 @@ impl HeapMeta {
             }
         };
 
-        // TODO: The following call do an fixed mmap. We should try to allow the OS to choose the address if the fixed mmap fails.
-        mmapper.quarantine_address_range(
+        let start = Self::quarantine_first_free(
             start,
-            crate::util::conversions::bytes_to_pages_up(extent),
+            extent,
+            align,
+            top,
+            self.heap_cursor,
+            self.heap_limit,
+            mmapper,
             huge_page_option,
             anno,
         )?;
@@ -63,6 +67,61 @@ impl HeapMeta {
         );
 
         Ok(start)
+    }
+
+    /// Quarantines `extent` bytes at `start`. The fixed mmap fails when another mapping
+    /// already occupies part of the range: on Windows, high-entropy ASLR can place the
+    /// process's bottom-up allocations (thread stacks, heaps, mapped NLS files) inside the
+    /// first space slot. Aligned (slot-sized) requests then move to the next free slot in
+    /// the allocation direction, staying within `[cursor, limit]`; space indices are derived
+    /// from addresses, so any free slot works. Each attempt targets a range that MMTk has
+    /// not mapped yet, which the OS reserves atomically, so failed attempts leave no state.
+    #[allow(clippy::too_many_arguments)]
+    fn quarantine_first_free(
+        start: Address,
+        extent: usize,
+        align: Option<usize>,
+        top: bool,
+        cursor: Address,
+        limit: Address,
+        mmapper: &dyn Mmapper,
+        huge_page_option: HugePageSupport,
+        anno: &MmapAnnotation,
+    ) -> MmapResult<Address> {
+        let pages = crate::util::conversions::bytes_to_pages_up(extent);
+        let first_error = match mmapper.quarantine_address_range(start, pages, huge_page_option, anno)
+        {
+            Ok(()) => return Ok(start),
+            Err(error) => error,
+        };
+        let Some(step) = align.filter(|&a| a >= extent) else {
+            return Err(first_error);
+        };
+        let mut candidate = start;
+        loop {
+            candidate = if top {
+                if candidate.as_usize() < cursor.as_usize() + step {
+                    break;
+                }
+                candidate - step
+            } else {
+                if candidate.as_usize() + step + extent > limit.as_usize() {
+                    break;
+                }
+                candidate + step
+            };
+            if mmapper
+                .quarantine_address_range(candidate, pages, huge_page_option, anno)
+                .is_ok()
+            {
+                warn!(
+                    "Address range at {} is in use ({}); quarantined {} instead",
+                    start, first_error, candidate
+                );
+                return Ok(candidate);
+            }
+        }
+        Err(first_error)
     }
 
     pub fn get_discontig_start(&self) -> Address {

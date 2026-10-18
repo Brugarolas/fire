@@ -1,4 +1,4 @@
-// src/lowerer.rs
+﻿// src/lowerer.rs
 #![allow(unused_variables)]
 
 use crate::helpers::collections::{HashMap, HashSet};
@@ -453,7 +453,7 @@ where
     Ok(())
 }
 // -------------------------
-/// LOWERING (AST → WIR)
+/// LOWERING (AST â†’ WIR)
 /// -------------------------
 
 #[derive(Debug, Clone)]
@@ -472,6 +472,11 @@ struct ClassInfo {
 #[derive(Debug)]
 pub enum LowerError {
     UnknownVar(String),
+    /// Identifier that is not in scope, with the source location of the use.
+    Undefined {
+        name: String,
+        meta: crate::diag::Meta,
+    },
     UnknownFunc(String),
     NotLowerable(&'static str),
 }
@@ -522,15 +527,15 @@ pub struct LinkInfo {
     pub module_bindings: HashMap<String, (Vec<crate::diag::Span>, BindingId)>,
     /// Module-level enum bindings, including private declarations.
     pub enum_bindings: HashMap<String, EnumBinding>,
-    /// import { a as x } from "m"   →   "x" -> binding(m,a)
+    /// import { a as x } from "m"   â†’   "x" -> binding(m,a)
     pub import_bindings: HashMap<String, BindingId>,
-    /// import * as ns from "m"      →   "ns" -> [ ("a", binding(m,a)), ... ]
+    /// import * as ns from "m"      â†’   "ns" -> [ ("a", binding(m,a)), ... ]
     pub namespace_imports: HashMap<String, Vec<(String, BindingId)>>,
     /// export { local as name } / export function f / export const x ...
-    /// nombre local en este módulo → binding(this,name)
+    /// nombre local en este mÃ³dulo â†’ binding(this,name)
     pub export_bindings: HashMap<String, BindingId>,
     /// celda local (live binding) donde cachearemos el objeto namespace en __modinit__
-    /// Si no está, caemos al camino “MVP por uso” para compat.
+    /// Si no estÃ¡, caemos al camino â€œMVP por usoâ€ para compat.
     pub namespace_cells: HashMap<String, BindingId>,
     /// nombres locales que corresponden a `export class` del proveedor (para saber que son clase)
     pub imported_class_bindings: HashSet<BindingId>,
@@ -824,7 +829,7 @@ impl<'m> Lowerer<'m> {
         // -------- Stage 5: lower ALL CLASSES (emiten en el mismo orden predeclarado) --------
         self.lower_all_classes(&prog)?;
 
-        // -------- Stage 6: ahora SÍ, __modinit__ AL FINAL --------
+        // -------- Stage 6: ahora SÃ, __modinit__ AL FINAL --------
         let modinit = self.lower_modinit(&prog, &self.lowering_ctx.links.clone())?;
         out.push(modinit);
 
@@ -1082,6 +1087,48 @@ where
     Ok(())
 }
 
+/// Whether `recv` names a namespace import (`import * as ns`) not shadowed by a local.
+fn is_namespace_ident(recv: &Expr, locals: &HashMap<String, ValueId>, ctx: &LoweringContext) -> bool {
+    let ExprKind::Ident(ns) = recv.kind() else {
+        return false;
+    };
+    let links = &ctx.links;
+    if links.namespace_cells.contains_key(ns) {
+        !locals.contains_key(ns)
+    } else {
+        // Path 7 of identifier lowering memoizes the namespace into `locals`.
+        links.namespace_imports.contains_key(ns)
+    }
+}
+
+/// Whether `recv` is a namespace import that exports `name`.
+fn namespace_exports(
+    recv: &Expr,
+    name: &str,
+    locals: &HashMap<String, ValueId>,
+    ctx: &LoweringContext,
+) -> bool {
+    let ExprKind::Ident(ns) = recv.kind() else {
+        return false;
+    };
+    is_namespace_ident(recv, locals, ctx)
+        && ctx
+            .links
+            .namespace_imports
+            .get(ns)
+            .is_some_and(|members| members.iter().any(|(n, _)| n == name))
+}
+
+/// `ns.name(args)` as a plain call; the parser turns calls of builtin collection
+/// method names (`add`, `get`, `keys`, ...) into builtin nodes regardless of receiver.
+fn namespace_member_call(e: &Expr, recv: &Expr, name: &str, args: Vec<Expr>) -> Expr {
+    let callee = expr_with_meta(e, ExprKind::GetProp {
+        recv: SmallBox::new(recv.clone()),
+        name: name.to_string(),
+    });
+    expr_with_meta(e, ExprKind::Call { callee: SmallBox::new(callee), args })
+}
+
 fn initialize_variable(
     b: &mut Builder<'_>,
     locals: &mut HashMap<String, ValueId>,
@@ -1093,6 +1140,10 @@ fn initialize_variable(
     if let Some((declarations, cell)) = ctx.links.module_bindings.get(name) {
         if declarations.contains(&statement.meta.span) {
             b.store_binding(*cell, value);
+            // A block-scoped local of the same name (e.g. a `for (var i ...)` init)
+            // would otherwise keep shadowing the module binding on later reads.
+            locals.remove(name);
+            locals.remove(&boxed_key(name));
             return;
         }
     }
@@ -1108,6 +1159,7 @@ fn lower_stmt_free<'m>(
     lowering_ctx: &LoweringContext,
     active_try: &mut Vec<TryScope>,
 ) -> LResult<()> {
+    prebox_captures_for_stmt(b, locals, s, lowering_ctx);
     snapshot_try_locals(b, locals);
     match s.kind() {
         StmtKind::Enum {
@@ -1388,7 +1440,9 @@ fn lower_stmt_free<'m>(
         } => {
             if let Some(i) = init.as_deref() {
                 lower_stmt_free(b, locals, fields, next_field, i, lowering_ctx, active_try)?;
-            } // <-- pass
+                // The init may have declared a captured loop variable.
+                prebox_captures_for_stmt(b, locals, s, lowering_ctx);
+            }
 
             let head = b.block();
             let body_b = b.block();
@@ -1938,6 +1992,233 @@ fn collect_mut_locals_in_stmt(s: &Stmt, out: &mut BTreeSet<String>) {
     }
 }
 
+/// Box a local into a one-element array so closures can share and mutate it.
+fn box_local(b: &mut Builder<'_>, locals: &mut HashMap<String, ValueId>, name: &str) -> bool {
+    if locals.contains_key(&boxed_key(name)) {
+        return true;
+    }
+    let Some(&cur) = locals.get(name) else {
+        return false;
+    };
+    let one = b.const_i32(1);
+    let (_nid, box_res) = b.push_node(
+        Inst::CallNative {
+            name: "wir_array_new".into(),
+            args: vec![one],
+            pure: false,
+            can_throw: false,
+        },
+        Some(Type::Array(Box::new(None))),
+        1,
+        true,
+    );
+    let box_arr = box_res[0];
+    let zero = b.const_i32(0);
+    let _ = b.push_node(
+        Inst::CallNative {
+            name: "wir_array_set".into(),
+            args: vec![box_arr, zero, cur],
+            pure: false,
+            can_throw: false,
+        },
+        Some(Type::Int32),
+        1,
+        true,
+    );
+    locals.insert(name.to_string(), box_arr);
+    locals.insert(boxed_key(name), box_arr);
+    true
+}
+
+/// Box every in-scope local that a closure created inside `s` captures *before*
+/// lowering `s`. Boxing lazily at the closure site would rebind the local only
+/// on that control-flow path, so loop back-edges and branch merges would mix
+/// the box with the raw value.
+fn prebox_captures_for_stmt(
+    b: &mut Builder<'_>,
+    locals: &mut HashMap<String, ValueId>,
+    s: &Stmt,
+    ctx: &LoweringContext,
+) {
+    if ctx.lam_captures.is_empty() {
+        return;
+    }
+    let mut caps = BTreeSet::new();
+    collect_captures_in_stmt(s, ctx, &mut caps);
+    for cap in caps {
+        box_local(b, locals, &cap);
+    }
+}
+
+fn collect_captures_in_block(blk: &Block, ctx: &LoweringContext, out: &mut BTreeSet<String>) {
+    for s in &blk.stmts {
+        collect_captures_in_stmt(s, ctx, out);
+    }
+}
+
+fn collect_captures_in_stmt(s: &Stmt, ctx: &LoweringContext, out: &mut BTreeSet<String>) {
+    match s.kind() {
+        StmtKind::Enum { init, .. } => collect_captures_in_expr(init, ctx, out),
+        StmtKind::Var { init, .. } => {
+            if let Some(e) = init {
+                collect_captures_in_expr(e, ctx, out);
+            }
+        }
+        StmtKind::VarDestruct { init, .. } => collect_captures_in_expr(init, ctx, out),
+        StmtKind::If {
+            cond,
+            then_b,
+            else_b,
+        } => {
+            collect_captures_in_expr(cond, ctx, out);
+            collect_captures_in_block(then_b, ctx, out);
+            if let Some(eb) = else_b {
+                collect_captures_in_block(eb, ctx, out);
+            }
+        }
+        StmtKind::While { cond, body } => {
+            collect_captures_in_expr(cond, ctx, out);
+            collect_captures_in_block(body, ctx, out);
+        }
+        StmtKind::For {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            if let Some(i) = init.as_deref() {
+                collect_captures_in_stmt(i, ctx, out);
+            }
+            if let Some(c) = cond {
+                collect_captures_in_expr(c, ctx, out);
+            }
+            if let Some(st) = step {
+                collect_captures_in_expr(st, ctx, out);
+            }
+            collect_captures_in_block(body, ctx, out);
+        }
+        StmtKind::Try {
+            try_block,
+            catch,
+            finally_block,
+        } => {
+            collect_captures_in_block(try_block, ctx, out);
+            if let Some(c) = catch {
+                collect_captures_in_block(&c.body, ctx, out);
+            }
+            if let Some(fin) = finally_block {
+                collect_captures_in_block(fin, ctx, out);
+            }
+        }
+        StmtKind::Throw(e) | StmtKind::Expr(e) => collect_captures_in_expr(e, ctx, out),
+        StmtKind::Return(e) => {
+            if let Some(e) = e {
+                collect_captures_in_expr(e, ctx, out);
+            }
+        }
+        StmtKind::Defer { body, .. } => collect_captures_in_block(body, ctx, out),
+        StmtKind::Listen(ld) => {
+            for r in &ld.routes {
+                collect_captures_in_expr(&r.pattern, ctx, out);
+                collect_captures_in_expr(&r.handler, ctx, out);
+            }
+        }
+    }
+}
+
+fn collect_captures_in_exprs(es: &[Expr], ctx: &LoweringContext, out: &mut BTreeSet<String>) {
+    for e in es {
+        collect_captures_in_expr(e, ctx, out);
+    }
+}
+
+fn collect_captures_in_expr(e: &Expr, ctx: &LoweringContext, out: &mut BTreeSet<String>) {
+    match e.kind() {
+        ExprKind::FnRef { name } => {
+            if let Some(caps) = ctx.lam_captures.get(name) {
+                out.extend(caps.iter().cloned());
+            }
+        }
+        ExprKind::FnLit { body, .. } => collect_captures_in_block(body, ctx, out),
+        ExprKind::LitInt(_)
+        | ExprKind::LitF64(_)
+        | ExprKind::LitBool(_)
+        | ExprKind::LitNull
+        | ExprKind::Str(_)
+        | ExprKind::Ident(_)
+        | ExprKind::This
+        | ExprKind::SuperProp(_) => {}
+        ExprKind::Assign(lv, rhs) => {
+            match lv.kind() {
+                LValueKind::Ident(_) => {}
+                LValueKind::GetProp { recv, .. } => collect_captures_in_expr(recv, ctx, out),
+                LValueKind::Index { recv, index } => {
+                    collect_captures_in_expr(recv, ctx, out);
+                    collect_captures_in_expr(index, ctx, out);
+                }
+            }
+            collect_captures_in_expr(rhs, ctx, out);
+        }
+        ExprKind::Conditional {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            collect_captures_in_expr(cond, ctx, out);
+            collect_captures_in_expr(then_branch, ctx, out);
+            collect_captures_in_expr(else_branch, ctx, out);
+        }
+        ExprKind::Binary { a, b, .. } => {
+            collect_captures_in_expr(a, ctx, out);
+            collect_captures_in_expr(b, ctx, out);
+        }
+        ExprKind::Unary { e: inner, .. }
+        | ExprKind::Group(inner)
+        | ExprKind::Await(inner)
+        | ExprKind::GetProp { recv: inner, .. }
+        | ExprKind::GetPropObj { obj: inner, .. }
+        | ExprKind::DeleteProp { obj: inner, .. }
+        | ExprKind::CallBuiltinCommonMethod { recv: inner, .. }
+        | ExprKind::GetBuiltinSize(inner) => collect_captures_in_expr(inner, ctx, out),
+        ExprKind::Call { callee, args } => {
+            collect_captures_in_expr(callee, ctx, out);
+            collect_captures_in_exprs(args, ctx, out);
+        }
+        ExprKind::Index { recv: x, index: y }
+        | ExprKind::In { key: x, obj: y }
+        | ExprKind::DeleteIndex { obj: x, index: y }
+        | ExprKind::SetPropObj { obj: x, value: y, .. } => {
+            collect_captures_in_expr(x, ctx, out);
+            collect_captures_in_expr(y, ctx, out);
+        }
+        ExprKind::ArrayLit(args)
+        | ExprKind::SuperCall(args)
+        | ExprKind::New { args, .. }
+        | ExprKind::CreateBuiltin { args, .. }
+        | ExprKind::Typed { args, .. } => collect_captures_in_exprs(args, ctx, out),
+        ExprKind::ObjLit(items) => {
+            for item in items {
+                match item {
+                    ObjItem::Prop(_, v) | ObjItem::Spread(v) => collect_captures_in_expr(v, ctx, out),
+                }
+            }
+        }
+        ExprKind::OptionalChain { base, access } => {
+            collect_captures_in_expr(base, ctx, out);
+            match access {
+                OptionalAccess::Prop(_) => {}
+                OptionalAccess::Index(i) => collect_captures_in_expr(i, ctx, out),
+                OptionalAccess::Call(args) => collect_captures_in_exprs(args, ctx, out),
+            }
+        }
+        ExprKind::CallBuiltinMapMethod { recv, args, .. }
+        | ExprKind::CallBuiltinSetMethod { recv, args, .. } => {
+            collect_captures_in_expr(recv, ctx, out);
+            collect_captures_in_exprs(args, ctx, out);
+        }
+    }
+}
+
 fn collect_mut_locals_in_block(b: &Block) -> Vec<String> {
     let mut set = BTreeSet::new();
     for s in &b.stmts {
@@ -1982,6 +2263,7 @@ fn lower_stmt_free_async<'m>(
     in_async: bool,
     active_try: &mut Vec<TryScope>,
 ) -> LResult<()> {
+    prebox_captures_for_stmt(b, locals, s, lowering_ctx);
     match s.kind() {
         StmtKind::Return(eopt) if in_async => {
             let ret_val = if let Some(e) = eopt {
@@ -2332,7 +2614,7 @@ fn lower_stmt_free_async<'m>(
 
                     Ok(())
                 }
-                // While / For / Expr … call lower_*_async respectively
+                // While / For / Expr â€¦ call lower_*_async respectively
                 StmtKind::While { cond, body } => {
                     // same as your While, but using lower_expr_free_async / lower_block_free_async
                     let head = b.block();
@@ -2408,6 +2690,8 @@ fn lower_stmt_free_async<'m>(
                             in_async,
                             active_try,
                         )?;
+                        // The init may have declared a captured loop variable.
+                        prebox_captures_for_stmt(b, locals, s, lowering_ctx);
                     }
 
                     let head = b.block();
@@ -3764,7 +4048,7 @@ fn lower_expr_free_impl<'m>(
                 return Ok(b.load_binding(binding.cell, None));
             }
 
-            // 3) Known global function name → make a closure with null env
+            // 3) Known global function name â†’ make a closure with null env
             if let Some(&fid) = lowering_ctx.funcs.get(name) {
                 let (_nid, env_null) =
                     b.push_node(Inst::Const(Constant::Null), Some(Type::Null), 1, false);
@@ -3813,7 +4097,10 @@ fn lower_expr_free_impl<'m>(
             }
 
             // Miss: unresolved identifier
-            Err(LowerError::UnknownVar(name.clone()))
+            Err(LowerError::Undefined {
+                name: name.clone(),
+                meta: e.meta.clone(),
+            })
         }
 
         ExprKind::OptionalChain { base, access } => {
@@ -4486,14 +4773,14 @@ fn lower_expr_free_impl<'m>(
                         }
                     }
 
-                    // import x from "m";  x = ...  → error de compilación
+                    // import x from "m";  x = ...  â†’ error de compilaciÃ³n
                     if lowering_ctx.links.import_bindings.contains_key(name) {
                         return Err(LowerError::NotLowerable(
                             "cannot assign to imported binding",
                         ));
                     }
 
-                    // export let x;  x = rv  → StoreBinding(binding(this,x), rv)
+                    // export let x;  x = rv  â†’ StoreBinding(binding(this,x), rv)
                     if !locals.contains_key(name) {
                         if let Some(&bid) = lowering_ctx.links.export_bindings.get(name) {
                             b.store_binding(bid, rv);
@@ -4501,7 +4788,7 @@ fn lower_expr_free_impl<'m>(
                         }
                     }
 
-                    // resto: igual que tenías (boxed locals / locals normales / error)
+                    // resto: igual que tenÃ­as (boxed locals / locals normales / error)
                     if locals.get(&boxed_key(name)).is_some() {
                         let box_arr = *locals
                             .get(name)
@@ -4524,7 +4811,10 @@ fn lower_expr_free_impl<'m>(
                             locals.insert(name.clone(), rv);
                             Ok(rv)
                         } else {
-                            Err(LowerError::UnknownVar(name.clone()))
+                            Err(LowerError::Undefined {
+                                name: name.clone(),
+                                meta: e.meta.clone(),
+                            })
                         }
                     }
                 }
@@ -4535,7 +4825,22 @@ fn lower_expr_free_impl<'m>(
 
         // obj.<propKey>  where propKey is an identifier or string
         ExprKind::GetProp { recv, name } => {
-            // Static class method read: Class.static → closure with null env
+            // `ns.member` of a namespace import reads the exporter's live binding cell.
+            if let ExprKind::Ident(ns) = recv.kind() {
+                if is_namespace_ident(recv, locals, lowering_ctx) {
+                    let binding = lowering_ctx
+                        .links
+                        .namespace_imports
+                        .get(ns)
+                        .and_then(|members| members.iter().find(|(n, _)| n == name))
+                        .map(|(_, bid)| *bid);
+                    if let Some(bid) = binding {
+                        return Ok(b.load_binding(bid, None));
+                    }
+                }
+            }
+
+            // Static class method read: Class.static â†’ closure with null env
             if let ExprKind::Ident(cn) = recv.kind() {
                 if let Some(&mfid) = lowering_ctx.funcs.get(&format!("__static_{}_{}", cn, name)) {
                     let (_nid, env_null) =
@@ -4578,7 +4883,7 @@ fn lower_expr_free_impl<'m>(
 
                 b.branch(is_proxy_res[0], proxy_b, normal_b);
 
-                // Proxy path → generic (may be trapped/overridden)
+                // Proxy path â†’ generic (may be trapped/overridden)
                 b.position_at(proxy_b);
                 let pv = lower_general_getprop(b, recv_v, name, fields, next_field);
                 b.jump(cont, &[pv]);
@@ -4601,7 +4906,7 @@ fn lower_expr_free_impl<'m>(
                 let not_string_b = b.block();
                 b.branch(is_s[0], string_b, not_string_b);
 
-                // String path → builtin length
+                // String path â†’ builtin length
                 b.position_at(string_b);
                 let (_nid_len, len_res) = b.push_node(
                     Inst::CallNative {
@@ -4658,7 +4963,7 @@ fn lower_expr_free_impl<'m>(
 
             // --- Special case: "size" (Map/Set) ---
             if name == "size" {
-                // Proxies → generic
+                // Proxies â†’ generic
                 let (_nid_is_proxy, is_proxy_res) = b.push_node(
                     Inst::CallNative {
                         name: "wir_is_proxy".into(),
@@ -4920,6 +5225,39 @@ fn lower_expr_free_impl<'m>(
 
             // --- Property-call fast paths ---
             if let ExprKind::GetProp { recv, name } = callee.kind() {
+                // 0-) Namespace import member: `ns.f(args)` calls the exported value as a
+                //     plain function; a namespace object is never passed as `this`.
+                if let ExprKind::Ident(ns) = recv.kind() {
+                    if is_namespace_ident(recv, locals, lowering_ctx) {
+                        let funv =
+                            lower_expr_free(b, locals, fields, next_field, callee, lowering_ctx)?;
+                        let mut argv = Vec::with_capacity(args.len());
+                        for a in args {
+                            argv.push(lower_expr_free(
+                                b,
+                                locals,
+                                fields,
+                                next_field,
+                                a,
+                                lowering_ctx,
+                            )?);
+                        }
+                        let message = format!("TypeError: {ns}.{name} is not a function");
+                        require_callable(b, funv, &message);
+                        let (_nid, res) = b.push_node(
+                            Inst::CallClosure {
+                                conv: crate::wir::CallConv::Fast,
+                                fun: funv,
+                                args: argv,
+                            },
+                            Some(Type::Int32),
+                            1,
+                            true,
+                        );
+                        return Ok(res[0]);
+                    }
+                }
+
                 // 0a) Promise-style instance methods
                 if name == "then" {
                     let p = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
@@ -5015,7 +5353,7 @@ fn lower_expr_free_impl<'m>(
                     return Ok(res[0]);
                 }
 
-                // 0b) http.* helpers — IMPORTANT: this branch does NOT lower `recv`
+                // 0b) http.* helpers â€” IMPORTANT: this branch does NOT lower `recv`
                 if let ExprKind::Ident(obj) = recv.kind() {
                     if obj == "http" {
                         match name.as_str() {
@@ -5145,7 +5483,7 @@ fn lower_expr_free_impl<'m>(
                     }
                 }
 
-                // 0c) STATIC CLASS METHODS — check BEFORE anything that would lower `recv`
+                // 0c) STATIC CLASS METHODS â€” check BEFORE anything that would lower `recv`
                 if let ExprKind::Ident(cn) = recv.kind() {
                     if let Some(&fid) = lowering_ctx.funcs.get(&format!("__static_{}_{}", cn, name))
                     {
@@ -5829,6 +6167,45 @@ fn lower_expr_free_impl<'m>(
                 );
             }
 
+            // `new ns.Class(args)`: the namespace member is a class object exposing `new`.
+            if let Some((ns, member)) = class.split_once('.') {
+                let recv = expr_with_meta(e, ExprKind::Ident(ns.to_string()));
+                let class_ref = expr_with_meta(e, ExprKind::GetProp {
+                    recv: SmallBox::new(recv),
+                    name: member.to_string(),
+                });
+                let clazz =
+                    lower_expr_free(b, locals, fields, next_field, &class_ref, lowering_ctx)?;
+                let key = b.const_str("new");
+                let (_ng, fun) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_obj_get_str".into(),
+                        args: vec![clazz, key],
+                        pure: false,
+                        can_throw: false,
+                    },
+                    None,
+                    1,
+                    true,
+                );
+                require_callable(b, fun[0], &format!("TypeError: {class} is not a constructor"));
+                let mut argv = Vec::with_capacity(args.len());
+                for a in args {
+                    argv.push(lower_expr_free(b, locals, fields, next_field, a, lowering_ctx)?);
+                }
+                let (_nid, res) = b.push_node(
+                    Inst::CallClosure {
+                        conv: crate::wir::CallConv::Fast,
+                        fun: fun[0],
+                        args: argv,
+                    },
+                    Some(Type::Int32),
+                    1,
+                    true,
+                );
+                return Ok(res[0]);
+            }
+
             // Handle `new Map()` and `new Set()` as special builtins
             let native_ctor = match class.as_str() {
                 "Map" => Some("wir_map_new"),
@@ -6192,37 +6569,8 @@ fn lower_expr_free_impl<'m>(
             // For each capture, if it is not boxed yet in this scope, box it now:
             //   box = Array(1); box[0] = current_value; rebind local to box; mark boxed.
             for cap in &caps {
-                if locals.get(&boxed_key(cap)).is_none() {
-                    let cur = *locals
-                        .get(cap)
-                        .ok_or_else(|| LowerError::UnknownVar(cap.into()))?;
-                    let one = b.const_i32(1);
-                    let (_nid, box_res) = b.push_node(
-                        Inst::CallNative {
-                            name: "wir_array_new".into(),
-                            args: vec![one],
-                            pure: false,
-                            can_throw: false,
-                        },
-                        Some(Type::Array(Box::new(None))),
-                        1,
-                        true,
-                    );
-                    let box_arr = box_res[0];
-                    let zero = b.const_i32(0);
-                    let _ = b.push_node(
-                        Inst::CallNative {
-                            name: "wir_array_set".into(),
-                            args: vec![box_arr, zero, cur],
-                            pure: false,
-                            can_throw: false,
-                        },
-                        Some(Type::Int32),
-                        1,
-                        true,
-                    );
-                    locals.insert(cap.clone(), box_arr);
-                    locals.insert(boxed_key(cap), box_arr);
+                if !box_local(b, locals, cap) {
+                    return Err(LowerError::UnknownVar(cap.into()));
                 }
             }
 
@@ -6352,7 +6700,7 @@ fn lower_expr_free_impl<'m>(
             let o = lower_expr_free(b, locals, fields, next_field, obj, lowering_ctx)?;
 
             match key {
-                // delete o.a  — delete both field and string
+                // delete o.a  â€” delete both field and string
                 PropKey::Ident(name) => {
                     let field = intern_field_local(fields, next_field, name);
                     let fid_smi = b.const_i32(field.0 as i32);
@@ -6404,7 +6752,7 @@ fn lower_expr_free_impl<'m>(
                     Ok(rs[0]) // return last result (truthy if deleted)
                 }
 
-                // delete o["a"] — delete both string and field
+                // delete o["a"] â€” delete both string and field
                 PropKey::Str(s) => {
                     // del string key
                     let (_nid_sc, ks) = b.push_node(
@@ -6455,7 +6803,7 @@ fn lower_expr_free_impl<'m>(
                     match lower_expr_free(b, locals, fields, next_field, key, lowering_ctx) {
                         Ok(kv) => Some(kv),
                         // Unbound identifier: legacy `name in o` meaning the literal name.
-                        Err(LowerError::UnknownVar(_)) => None,
+                        Err(LowerError::UnknownVar(_) | LowerError::Undefined { .. }) => None,
                         Err(e) => return Err(e),
                     }
                 }
@@ -6636,8 +6984,6 @@ fn lower_expr_free_impl<'m>(
         },
 
         ExprKind::CallBuiltinMapMethod { recv, method, args } => {
-            let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
-
             let (native_name, method_name, is_chainable) = match method {
                 crate::front::BuiltinMapMethod::Get => ("wir_map_get", "get", false),
                 crate::front::BuiltinMapMethod::Set => ("wir_map_set", "set", true),
@@ -6650,6 +6996,11 @@ fn lower_expr_free_impl<'m>(
                     ("wir_builtin_entries", "entries", false)
                 }
             };
+            if namespace_exports(recv, method_name, locals, lowering_ctx) {
+                let call = namespace_member_call(e, recv, method_name, args.clone());
+                return lower_expr_free(b, locals, fields, next_field, &call, lowering_ctx);
+            }
+            let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
 
             let mut arg_vals = Vec::with_capacity(args.len());
             for arg_expr in args {
@@ -6675,8 +7026,6 @@ fn lower_expr_free_impl<'m>(
         }
 
         ExprKind::CallBuiltinSetMethod { recv, method, args } => {
-            let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
-
             let (native_name, method_name, is_chainable) = match method {
                 crate::front::BuiltinSetMethod::Add => ("wir_set_add", "add", true),
                 crate::front::BuiltinSetMethod::Has => ("wir_set_has", "has", false),
@@ -6684,6 +7033,11 @@ fn lower_expr_free_impl<'m>(
                 crate::front::BuiltinSetMethod::Clear => ("wir_set_clear", "clear", false),
                 crate::front::BuiltinSetMethod::Values => ("wir_builtin_values", "values", false),
             };
+            if namespace_exports(recv, method_name, locals, lowering_ctx) {
+                let call = namespace_member_call(e, recv, method_name, args.clone());
+                return lower_expr_free(b, locals, fields, next_field, &call, lowering_ctx);
+            }
+            let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
 
             let mut arg_vals = Vec::with_capacity(args.len());
             for arg_expr in args {
@@ -6709,12 +7063,16 @@ fn lower_expr_free_impl<'m>(
         }
 
         ExprKind::CallBuiltinCommonMethod { recv, method } => {
-            let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
             let (native_name, method_name) = match method {
                 crate::front::BuiltinCommonMethod::Keys => ("wir_builtin_keys", "keys"),
                 crate::front::BuiltinCommonMethod::Values => ("wir_builtin_values", "values"),
                 crate::front::BuiltinCommonMethod::Entries => ("wir_builtin_entries", "entries"),
             };
+            if namespace_exports(recv, method_name, locals, lowering_ctx) {
+                let call = namespace_member_call(e, recv, method_name, Vec::new());
+                return lower_expr_free(b, locals, fields, next_field, &call, lowering_ctx);
+            }
+            let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
             Ok(lower_collection_method_call(
                 b,
                 recv_v,
@@ -7017,11 +7375,11 @@ impl<'m> Lowerer<'m> {
             );
         }
 
-        // ---- Cuerpo de la función (sólo muta self.module) ----
+        // ---- Cuerpo de la funciÃ³n (sÃ³lo muta self.module) ----
         let func = {
             let mut b = Builder::new(self.module, "__modinit__", vec![], vec![Type::Int32]);
 
-            // 0) Inicializa SOLO las celdas de export de este módulo a `undefined` (TDZ-safe).
+            // 0) Inicializa SOLO las celdas de export de este mÃ³dulo a `undefined` (TDZ-safe).
             //    NO tocar import_bindings: son celdas del proveedor.
             let undef = b.const_undef();
             for (_, cell) in links.module_bindings.values() {
@@ -7054,7 +7412,7 @@ impl<'m> Lowerer<'m> {
                 b.store_binding(bid, clos[0]);
             }
 
-            // 2) Materializa clases exportadas: objeto con 'new' + estáticos; luego publícalo
+            // 2) Materializa clases exportadas: objeto con 'new' + estÃ¡ticos; luego publÃ­calo
             for (bid, alloc_opt, statics) in class_exports {
                 let (_nid, obj) = b.push_node(
                     Inst::CallNative {
@@ -7128,7 +7486,7 @@ impl<'m> Lowerer<'m> {
             }
 
             // 3) Cachea namespaces importados (si existen celdas locales para ellos)
-            //    Esto sólo escribe en nuestras celdas de namespace (locales), no en el proveedor.
+            //    Esto sÃ³lo escribe en nuestras celdas de namespace (locales), no en el proveedor.
             for (ns, exports) in links.namespace_imports.get_internals() {
                 if let Some(&cell) = links.namespace_cells.get(ns) {
                     let ns_obj = b.make_namespace(exports.clone());
@@ -7220,7 +7578,7 @@ impl<'m> Lowerer<'m> {
             self.lower_free_like_fun(&fname, params, body, *is_async)?;
         }
 
-        // 4) Ctor (optional) — must share the same field-id map
+        // 4) Ctor (optional) â€” must share the same field-id map
         if let Some((_, ctor_params, ctor_body, _)) =
             ci.methods.iter().find(|(n, _, _, _)| *n == "constructor")
         {
@@ -7254,7 +7612,7 @@ impl<'m> Lowerer<'m> {
             }
         }
 
-        // 6) Allocator — also installs method closures onto the instance
+        // 6) Allocator â€” also installs method closures onto the instance
         self.lower_allocator(&ci, &mut cls_fields, &mut cls_next_field)?;
         Ok(())
     }
@@ -7348,7 +7706,7 @@ impl<'m> Lowerer<'m> {
     }
 
     fn rewrite_privates_in_block(&self, class_name: &str, body: &Block) -> Block {
-        // Resolve base class name once (if any). We’ll still rewrite even if there is none;
+        // Resolve base class name once (if any). Weâ€™ll still rewrite even if there is none;
         // in that case unknown-func errors will be raised later if user wrote `super`.
         let base_opt = self
             .lowering_ctx
@@ -7607,12 +7965,12 @@ impl<'m> Lowerer<'m> {
             }
         }
 
-        // Rewriter: (super(...)) and (super.m)(...) → direct calls with implicit `this`
+        // Rewriter: (super(...)) and (super.m)(...) â†’ direct calls with implicit `this`
         let class_name = class_name.to_string();
 
         let f = |e: &Expr| -> Expr {
             match e.kind() {
-                // super(args...)  →  __ctor_Base(this, args...)  (only if there *is* a base)
+                // super(args...)  â†’  __ctor_Base(this, args...)  (only if there *is* a base)
                 ExprKind::SuperCall(args) => {
                     if let Some(ref base) = base_opt {
                         let mut new_args = Vec::with_capacity(args.len() + 1);
@@ -7630,7 +7988,7 @@ impl<'m> Lowerer<'m> {
                     }
                 }
 
-                // (super.m)(args...)  →  __method_Base_m(this, args...)  (only if base exists)
+                // (super.m)(args...)  â†’  __method_Base_m(this, args...)  (only if base exists)
                 ExprKind::Call { callee, args } => {
                     if let ExprKind::SuperProp(m) = callee.kind() {
                         if let Some(ref base) = base_opt {
@@ -7770,7 +8128,7 @@ impl<'m> Lowerer<'m> {
 
         let fname = format!("__class_new_{}", ci.name);
 
-        // Collect base chain names from root → ... → direct base (so overrides later will win)
+        // Collect base chain names from root â†’ ... â†’ direct base (so overrides later will win)
         let mut base_chain: Vec<String> = Vec::new();
         let mut cur = ci.base.clone();
         while let Some(bn) = cur {

@@ -1,4 +1,4 @@
-// src/modules.rs
+﻿// src/modules.rs
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
@@ -15,7 +15,7 @@ use std::{
 use crate::front::{ExportDecl, ImportItem, ModuleAST, Parser, Program};
 use crate::helpers::collections::{HashMap, HashSet};
 use crate::helpers::layered::LayeredMap;
-use crate::lowerer::{LinkInfo, Lowerer};
+use crate::lowerer::{LinkInfo, LowerError, Lowerer};
 use crate::opt::optimization::optimization_passes;
 use crate::resolver::Resolver;
 use crate::wir::{BindingId, Builder as WirBuilder, CallConv, FuncId, IdRemap, Inst, Type};
@@ -34,16 +34,10 @@ const WORKER_STACK_BYTES: usize = 4 * 1024 * 1024;
 pub struct ModulesCTX {
     /// Bump arena used by the parser to intern &'static str for import/export names.
     pub arena: Bump,
-    /// Registry of parsed modules (by absolute path) → Box<ModuleAST>.
+    /// Registry of parsed modules (by absolute path) â†’ Box<ModuleAST>.
     pub registry: HashMap<Arc<PathBuf>, Box<ModuleAST<'static>>>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ExportSymbolKind {
-    Function,
-    Class,
-    Other,
-}
 
 pub trait ModuleLoader {
     fn read_to_string(&self, path: &Path) -> std::io::Result<String>;
@@ -126,10 +120,10 @@ impl ProgramBuilder {
         // 2) lower + optimize en paralelo
         let shards = self.lower_all_modules_parallel_sharded()?;
 
-        // 3) orden de inicialización (proveedores → consumidores)
+        // 3) orden de inicializaciÃ³n (proveedores â†’ consumidores)
         let order = self.topo_order()?;
 
-        // 4) merge a un único WIR
+        // 4) merge a un Ãºnico WIR
         self.merge_wir_shards(shards, &order, &entry_arc)
     }
 
@@ -154,6 +148,90 @@ impl ProgramBuilder {
 
                 // 2. Return a simple message to stop compilation. The user will see the report above.
                 return Err(format!("Semantic error in {:?}", path));
+            }
+        }
+        Ok(())
+    }
+
+    /// Type-checks every module with the declarations it imports. The parser
+    /// skips checking module programs because imports are unknown until here.
+    fn check_module_types(&mut self) -> Result<(), String> {
+        use crate::front::typeck::check_with_imports;
+        use crate::front::typeck::imports::{type_imports, unresolved_imports, TypeModule};
+
+        let mut paths: Vec<Arc<PathBuf>> = self.programs.keys().cloned().collect();
+        paths.sort();
+
+        let all_imports = {
+            let mut graph = std::collections::HashMap::new();
+            for path in &paths {
+                let program = &self.programs[path];
+                let mut specifiers = std::collections::HashMap::new();
+                let specs = program.imports.iter().map(|i| &i.specifier).chain(
+                    program.exports.iter().filter_map(|e| match e {
+                        ExportDecl::From { specifier, .. } | ExportDecl::AllFrom { specifier } => {
+                            Some(specifier)
+                        }
+                        _ => None,
+                    }),
+                );
+                for spec in specs {
+                    if let Ok(target) = self.loader.resolve(path, spec) {
+                        specifiers.insert(spec.clone(), target);
+                    }
+                }
+                graph.insert((**path).clone(), TypeModule { program, specifiers });
+            }
+            // Broken re-exports (no location) are the root cause of their importers' errors.
+            let unresolved = paths
+                .iter()
+                .flat_map(|path| {
+                    unresolved_imports(&graph, path)
+                        .into_iter()
+                        .map(move |(message, meta)| (path, message, meta))
+                })
+                .min_by_key(|(_, _, meta)| meta.is_some());
+            if let Some((path, message, meta)) = unresolved {
+                let file_name = path.to_string_lossy();
+                if let Some(meta) = meta {
+                    let source = self.sources.get(path).map(String::as_str).unwrap_or("");
+                    crate::front::ParseError::new(message.clone(), meta)
+                        .emit(file_name.as_ref(), source);
+                }
+                return Err(format!("Import error in {:?}: {}", path, message));
+            }
+            paths
+                .iter()
+                .map(|path| type_imports(&graph, path))
+                .collect::<Vec<_>>()
+        };
+
+        for (path, imports) in paths.iter().zip(all_imports) {
+            let program = self.programs.get_mut(path).expect("Program must exist");
+            let imported: Vec<String> = program
+                .imports
+                .iter()
+                .flat_map(|import| import.local_names())
+                .collect();
+            let file_id = program
+                .functions
+                .iter()
+                .find_map(|f| f.meta.file)
+                .or_else(|| program.classes.iter().find_map(|c| c.meta.file))
+                .unwrap_or(crate::diag::FileId(0));
+            let result = check_with_imports(
+                &mut program.functions,
+                &mut program.classes,
+                &program.type_decls,
+                &imported,
+                file_id,
+                &imports,
+            );
+            if let Err(err) = result {
+                let file_name = path.to_string_lossy();
+                let source = self.sources.get(path).map(String::as_str).unwrap_or("");
+                err.emit(file_name.as_ref(), source);
+                return Err(format!("Type error in {:?}: {}", path, err.msg));
             }
         }
         Ok(())
@@ -287,8 +365,8 @@ impl ProgramBuilder {
         &self,
         path: &Arc<PathBuf>,
         prog: &Program,
-        // This cache is important to avoid re-analyzing the AST of modules that are imported multiple times.
-        export_kind_cache: &mut HashMap<Arc<PathBuf>, HashMap<String, ExportSymbolKind>>,
+        // Bindings of exported classes across all modules (re-exports share them).
+        class_bindings: &HashSet<BindingId>,
     ) -> Result<LinkInfo, String> {
         // 1. Start with a fresh LinkInfo for the current module.
         let mut links = LinkInfo::default();
@@ -301,12 +379,10 @@ impl ProgramBuilder {
             )
         })?;
 
-        // 3. Populate this module's OWN exports. The BindingIds were already created correctly by the parser
-        //    and stored in this module's ModuleAST. We just copy them over.
-        for (name, item) in module_ast.exports.get_internals() {
-            links
-                .export_bindings
-                .insert((*name).to_string(), item.binding);
+        // 3. Populate this module's OWN exports, keyed by local name. Re-exported names are
+        //    left out: their cells are owned and initialized by the providing module.
+        for (local, binding) in Self::own_export_bindings(module_ast, prog) {
+            links.export_bindings.insert(local, binding);
         }
 
         // 4. Iterate through all `import` statements in this module to resolve them.
@@ -335,48 +411,7 @@ impl ProgramBuilder {
                     )
                 })?;
 
-            // 5. To know if an import is a class, we need to inspect the provider's full AST.
-            //    We do this once per provider and cache the results.
-            if !export_kind_cache.contains_key(&resolved_provider_arc) {
-                let provider_prog = self.programs.get(&resolved_provider_arc).ok_or_else(|| {
-                    format!(
-                        "[Linker] FATAL: Missing provider Program AST for {:?}",
-                        resolved_provider_arc
-                    )
-                })?;
-
-                let mut kind_map = HashMap::default();
-                for ed in &provider_prog.exports {
-                    match ed {
-                        ExportDecl::Func(name) => {
-                            kind_map.insert(name.clone(), ExportSymbolKind::Function);
-                        }
-                        ExportDecl::Class(name) => {
-                            kind_map.insert(name.clone(), ExportSymbolKind::Class);
-                        }
-                        ExportDecl::Var(name) => {
-                            kind_map.insert(name.clone(), ExportSymbolKind::Other);
-                        }
-                        ExportDecl::Named { items } | ExportDecl::From { items, .. } => {
-                            for (local, alias) in items {
-                                let public_name = alias.clone().unwrap_or_else(|| local.clone());
-                                // We can't know the original type of a re-export without deep analysis,
-                                // so we conservatively mark it as 'Other'.
-                                kind_map
-                                    .entry(public_name)
-                                    .or_insert(ExportSymbolKind::Other);
-                            }
-                        }
-                        ExportDecl::AllFrom { .. } => {
-                            // Re-exporting all is too complex to analyze here, skip for now.
-                        }
-                    }
-                }
-                export_kind_cache.insert(resolved_provider_arc.clone(), kind_map);
-            }
-            let export_kinds = export_kind_cache.get(&resolved_provider_arc).unwrap();
-
-            // 6. Now, process each item in the `import` statement (`{a, b}`, `* as ns`).
+            // 5. Now, process each item in the `import` statement (`{a, b}`, `* as ns`).
             for item in &imp.items {
                 match item {
                     // Case: `import { name as alias } from ...`
@@ -394,7 +429,7 @@ impl ProgramBuilder {
                                 .insert(local_name.clone(), global_binding_id);
 
                             // Check if this binding is for a class and record it.
-                            if matches!(export_kinds.get(name), Some(&ExportSymbolKind::Class)) {
+                            if class_bindings.contains(&global_binding_id) {
                                 links.imported_class_bindings.insert(global_binding_id);
                             }
                         } else {
@@ -424,7 +459,7 @@ impl ProgramBuilder {
             }
         }
 
-        // 7. Return the fully populated LinkInfo for this module.
+        // 6. Return the fully populated LinkInfo for this module.
         Ok(links)
     }
 
@@ -448,6 +483,9 @@ impl ProgramBuilder {
             }
         }
 
+        // Point re-exports at the bindings of the declarations they forward.
+        self.link_reexports()?;
+
         // After parsing every module, bind named imports to export BindingIds.
         self.bind_imports()?;
 
@@ -457,7 +495,7 @@ impl ProgramBuilder {
     }
 
     /// Parallel lower: one May fiber per module. Each fiber produces its own
-    /// `wir::Module` shard. We return a map path→module for the caller to link/merge.
+    /// `wir::Module` shard. We return a map pathâ†’module for the caller to link/merge.
     ///
     /// Safety/ownership:
     ///  - We **precompute** (path, Program, LinkInfo) on the main thread to avoid
@@ -481,13 +519,22 @@ impl ProgramBuilder {
             path: Arc<PathBuf>,
             prog: Program,
             links: LinkInfo,
+            source: String,
         }
 
         let build_start = std::time::Instant::now();
 
         let mut jobs: Vec<Job> = Vec::new();
-        let mut export_kind_cache: HashMap<Arc<PathBuf>, HashMap<String, ExportSymbolKind>> =
-            HashMap::default();
+        let mut class_bindings: HashSet<BindingId> = HashSet::default();
+        for (path, prog) in self.programs.get_internals() {
+            if let Some(module_ast) = self.ctx.registry.get(path) {
+                for (local, binding) in Self::own_export_bindings(module_ast, prog) {
+                    if prog.classes.iter().any(|c| c.name == local) {
+                        class_bindings.insert(binding);
+                    }
+                }
+            }
+        }
 
         // Stable order for determinism
         let mut paths: Vec<Arc<PathBuf>> = self.ctx.registry.keys().cloned().collect();
@@ -502,9 +549,15 @@ impl ProgramBuilder {
                 .clone();
 
             // Build LinkInfo (imports resolved, exports, namespaces, class metadata)
-            let links = self.build_link_info_for_module(&path, &prog, &mut export_kind_cache)?;
+            let links = self.build_link_info_for_module(&path, &prog, &class_bindings)?;
 
-            jobs.push(Job { path, prog, links });
+            let source = self.sources.get(&path).cloned().unwrap_or_default();
+            jobs.push(Job {
+                path,
+                prog,
+                links,
+                source,
+            });
         }
 
         // 2) Spawn one fiber per job. Each returns (path, Module) or error String.
@@ -521,7 +574,9 @@ impl ProgramBuilder {
                         lowerer
                             .set_links(job.links)
                             .lower_program(&job.prog)
-                            .map_err(|e| format!("lower error in {:?}: {:?}", &job.path, e))?;
+                            .map_err(|e| {
+                                report_lower_error(&job.path, &job.prog, &job.source, e)
+                            })?;
 
                         let optimize = optimization_passes();
                         optimize.optimize_module(&mut m);
@@ -653,7 +708,7 @@ impl ProgramBuilder {
 
         self.sources.insert(abs.clone(), src.clone());
 
-        // 2) Create ModuleAST box (non-'static → 'static)
+        // 2) Create ModuleAST box (non-'static â†’ 'static)
         let ast_box_nonstatic: Box<ModuleAST<'_>> = Box::new(ModuleAST {
             id: ModuleId(self.ctx.registry.len() as u32),
             path: abs.clone(),
@@ -731,13 +786,183 @@ impl ProgramBuilder {
                 }
             }
 
-            // <- `p` se destruye aquí, junto con cualquier préstamo a `&self`
+            // <- `p` se destruye aquÃ­, junto con cualquier prÃ©stamo a `&self`
             prog
         };
 
         // 4) Ahora ya podemos mutar `self` con total seguridad
         self.programs.insert(abs.clone(), prog);
         Ok(())
+    }
+
+    /// Makes every exported name share the binding of the declaration it refers to:
+    /// `export { a as b } from`, `export * from`, and a local exported under several
+    /// names (`export { a, a as b }`). Providers are linked before their re-exporters.
+    fn link_reexports(&mut self) -> Result<(), String> {
+        let mut paths: Vec<Arc<PathBuf>> = self.programs.keys().cloned().collect();
+        paths.sort();
+        let mut done: HashSet<Arc<PathBuf>> = HashSet::default();
+        for path in &paths {
+            self.link_module_reexports(path, &mut done, &mut Vec::new())?;
+        }
+        Ok(())
+    }
+
+    fn link_module_reexports(
+        &mut self,
+        path: &Arc<PathBuf>,
+        done: &mut HashSet<Arc<PathBuf>>,
+        stack: &mut Vec<Arc<PathBuf>>,
+    ) -> Result<(), String> {
+        if done.contains(path) {
+            return Ok(());
+        }
+        if stack.contains(path) {
+            return Err(format!("cyclic re-export involving {:?}", path));
+        }
+        let Some(program) = self.programs.get(path) else {
+            return Ok(());
+        };
+        let exports = program.exports.clone();
+        stack.push(path.clone());
+
+        let mut providers = Vec::new();
+        for export in &exports {
+            if let ExportDecl::From { specifier, .. } | ExportDecl::AllFrom { specifier } = export {
+                let target = self
+                    .loader
+                    .resolve(path.as_ref(), specifier)
+                    .map_err(|e| format!("cannot resolve re-export '{}' from {:?}: {}", specifier, path, e))?;
+                let target = Arc::new(target);
+                self.link_module_reexports(&target, done, stack)?;
+                providers.push((export, target));
+            }
+        }
+
+        let module = self
+            .ctx
+            .registry
+            .get(path)
+            .ok_or_else(|| format!("[Linker] FATAL: Missing ModuleAST for {:?}", path))?;
+        let mut updates: Vec<(&'static str, Option<BindingId>, Option<crate::diag::Meta>)> =
+            Vec::new();
+
+        // Several public names for the same local share one binding.
+        let mut local_binding: HashMap<String, BindingId> = HashMap::default();
+        for export in &exports {
+            if let ExportDecl::Func(n) | ExportDecl::Class(n) | ExportDecl::Var(n) = export {
+                if let Some(item) = module.exports.get(n.as_str()) {
+                    local_binding.entry(n.clone()).or_insert(item.binding);
+                }
+            }
+        }
+        for export in &exports {
+            if let ExportDecl::Named { items } = export {
+                for (local, alias) in items {
+                    let public = alias.as_ref().unwrap_or(local);
+                    let Some((&key, item)) = module.exports.get_key_value(public.as_str()) else {
+                        continue;
+                    };
+                    match local_binding.get(local) {
+                        Some(&binding) => updates.push((key, Some(binding), None)),
+                        None => {
+                            local_binding.insert(local.clone(), item.binding);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (export, target) in providers {
+            let provider = self
+                .ctx
+                .registry
+                .get(&target)
+                .ok_or_else(|| format!("[Linker] FATAL: Missing ModuleAST for {:?}", target))?;
+            match export {
+                ExportDecl::From { items, .. } => {
+                    for (source, alias) in items {
+                        let public = alias.as_ref().unwrap_or(source);
+                        let Some((&key, _)) = module.exports.get_key_value(public.as_str()) else {
+                            continue;
+                        };
+                        // Names without a runtime binding are type-only re-exports; the
+                        // type checker reports the ones that are not exported at all.
+                        match provider.exports.get(source.as_str()) {
+                            Some(item) => updates.push((key, Some(item.binding), None)),
+                            None => updates.push((key, None, None)),
+                        }
+                    }
+                }
+                ExportDecl::AllFrom { .. } => {
+                    for (&name, item) in provider.exports.iter() {
+                        // Explicit exports win over `export *`, as do earlier `export *`s.
+                        if module.exports.contains_key(name)
+                            || updates.iter().any(|(n, _, _)| *n == name)
+                        {
+                            continue;
+                        }
+                        updates.push((name, Some(item.binding), Some(item.meta.clone())));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let module = self
+            .ctx
+            .registry
+            .get_mut(path)
+            .ok_or_else(|| format!("[Linker] FATAL: Missing ModuleAST for {:?}", path))?;
+        for (name, binding, meta) in updates {
+            let Some(binding) = binding else {
+                module.exports.remove(name);
+                continue;
+            };
+            match module.exports.get_mut(name) {
+                Some(item) => item.binding = binding,
+                None => {
+                    module.exports.insert(
+                        name,
+                        crate::front::ExportItem {
+                            name,
+                            binding,
+                            meta: meta.unwrap_or_default(),
+                        },
+                    );
+                }
+            }
+        }
+
+        stack.pop();
+        done.insert(path.clone());
+        Ok(())
+    }
+
+    /// Exports declared by `prog` itself, keyed by local name. Re-exported names
+    /// are excluded: their cells belong to (and are initialized by) the provider.
+    fn own_export_bindings(module_ast: &ModuleAST<'static>, prog: &Program) -> Vec<(String, BindingId)> {
+        let mut out: Vec<(String, BindingId)> = Vec::new();
+        let mut push = |local: &str, public: &str| {
+            if out.iter().any(|(n, _)| n == local) {
+                return;
+            }
+            if let Some(item) = module_ast.exports.get(public) {
+                out.push((local.to_string(), item.binding));
+            }
+        };
+        for export in &prog.exports {
+            match export {
+                ExportDecl::Func(n) | ExportDecl::Class(n) | ExportDecl::Var(n) => push(n, n),
+                ExportDecl::Named { items } => {
+                    for (local, alias) in items {
+                        push(local, alias.as_ref().unwrap_or(local));
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
     }
 
     /// Bind named imports to the exporter modules' BindingIds, writing into each
@@ -799,6 +1024,60 @@ pub fn build_whole_program_from_entry(entry: &str) -> Result<crate::wir::Module,
     builder.build_whole_program(entry)
 }
 
+/// Finds a `var`/`enum` declaration of `name` anywhere in the program's statements.
+fn find_block_decl(prog: &Program, name: &str) -> Option<crate::diag::Meta> {
+    use crate::front::{Block, Stmt, StmtKind};
+    fn in_block(block: &Block, name: &str) -> Option<crate::diag::Meta> {
+        block.stmts.iter().find_map(|s| in_stmt(s, name))
+    }
+    fn in_stmt(stmt: &Stmt, name: &str) -> Option<crate::diag::Meta> {
+        match stmt.kind() {
+            StmtKind::Var { name: n, .. } | StmtKind::Enum { name: n, .. } if n == name => {
+                Some(stmt.meta.clone())
+            }
+            StmtKind::If { then_b, else_b, .. } => {
+                in_block(then_b, name).or_else(|| else_b.as_ref().and_then(|b| in_block(b, name)))
+            }
+            StmtKind::While { body, .. } | StmtKind::Defer { body, .. } => in_block(body, name),
+            StmtKind::For { init, body, .. } => init
+                .as_deref()
+                .and_then(|s| in_stmt(s, name))
+                .or_else(|| in_block(body, name)),
+            StmtKind::Try {
+                try_block,
+                catch,
+                finally_block,
+            } => in_block(try_block, name)
+                .or_else(|| catch.as_ref().and_then(|c| in_block(&c.body, name)))
+                .or_else(|| finally_block.as_ref().and_then(|b| in_block(b, name))),
+            _ => None,
+        }
+    }
+    prog.functions.iter().find_map(|f| in_block(&f.body, name))
+}
+
+/// Turns a lowering error into a message, printing a source diagnostic when possible.
+fn report_lower_error(path: &Path, prog: &Program, source: &str, err: LowerError) -> String {
+    let LowerError::Undefined { name, meta } = err else {
+        return format!("lower error in {:?}: {:?}", path, err);
+    };
+    let mut message = format!("`{}` is not defined in this scope", name);
+    if let Some(decl) = find_block_decl(prog, &name) {
+        let line = source
+            .get(..decl.span.range.start)
+            .map_or(0, |s| s.matches('\n').count())
+            + 1;
+        message.push_str(&format!(
+            " (it is declared at line {} inside a block; `var` is block-scoped, \
+             so declare it in an enclosing scope)",
+            line
+        ));
+    }
+    let file_name = path.to_string_lossy();
+    crate::front::ParseError::new(message.clone(), meta).emit(file_name.as_ref(), source);
+    format!("Scope error in {:?}: {}", path, message)
+}
+
 pub fn build_simple_program_from_entry(entry: &str) -> Result<crate::wir::Module, String> {
     let abs = std::fs::canonicalize(entry).map_err(|e| format!("canonicalize({entry}): {e}"))?;
 
@@ -821,7 +1100,7 @@ pub fn build_simple_program_from_entry(entry: &str) -> Result<crate::wir::Module
     let mut lowerer = Lowerer::new(&mut m);
     lowerer
         .lower_program(&prog)
-        .map_err(|e| format!("lower error in {:?}: {:?}", &abs, e))?;
+        .map_err(|e| report_lower_error(&abs, &prog, &src, e))?;
 
     let optimize = optimization_passes();
     optimize.optimize_module(&mut m);

@@ -315,3 +315,104 @@ fn uncaught_guard_failures_terminate_the_program() {
         &["TypeError: cannot cast value to string"],
     );
 }
+
+const GEO_MODULE: &str = r#"
+    interface Inner { v: number; }
+    export interface Point { x: number; y: number; inner?: Inner; }
+    export type Id = number | string;
+    export class Box<T> { value: T; constructor(v: T) { this.value = v; } get(): T { return this.value; } }
+    export enum Color { Red = 1, Green = 2 }
+    export fn norm(p: Point): number { return p.x * p.x + p.y * p.y; }
+    export fn mk(v: number): Inner { return { v: v }; }
+    export var origin: Point = { x: 0, y: 0 };
+"#;
+
+#[test]
+fn cross_module_aliases_namespaces_and_private_types() {
+    assert_output(
+        r#"
+        import { Point as P, Box, Color, mk, norm } from "./geo.napalm";
+        import * as geo from "./geo.napalm";
+        interface Inner { label: string; }
+        var mine: Inner = { label: "local inner" };
+        print(mine.label);
+        var p: P = { x: 3, y: 4 };
+        print(norm(p));
+        print(geo.norm({ x: 1, y: 2 }));
+        var q: geo.Point = geo.origin;
+        print(geo.norm(q));
+        var b: Box<string> = new Box("boxed");
+        print(b.get());
+        var c: Color = Color.Green;
+        print(c);
+        print(mk(5).v);
+        var id: geo.Id = "a";
+        print(id);
+        "#,
+        Some(GEO_MODULE),
+        "\"local inner\"\n25\n5\n0\n\"boxed\"\n2\n5\n\"a\"\n",
+    );
+}
+
+#[test]
+fn namespace_classes_and_enums() {
+    assert_output(
+        r#"
+        import * as geo from "./geo.napalm";
+        var b: geo.Box<string> = new geo.Box("boxed");
+        print(b.get());
+        var c: geo.Color = geo.Color.Green;
+        print(c);
+        "#,
+        Some(GEO_MODULE),
+        "\"boxed\"\n2\n",
+    );
+}
+
+#[test]
+fn cross_module_static_errors() {
+    for (source, expected) in [
+        (
+            "import * as geo from \"./geo.napalm\";\nprint(geo.norm(5));",
+            "type `number` is not assignable to type `Point`",
+        ),
+        (
+            "import * as geo from \"./geo.napalm\";\nprint(geo.missing(1));",
+            "property `missing` does not exist",
+        ),
+        (
+            "import * as geo from \"./geo.napalm\";\nvar q: geo.Point = { x: 1 };",
+            "property `y` is missing",
+        ),
+        (
+            "import { Point as P } from \"./geo.napalm\";\nvar s: string = \"s\";\nvar p: P = s;",
+            "type `string` is not assignable to type `Point`",
+        ),
+        (
+            "import { Inner } from \"./geo.napalm\";\nvar i: Inner = { v: 1 };",
+            "has no exported member `Inner`",
+        ),
+        (
+            "import * as geo from \"./geo.napalm\";\nvar i: geo.Inner = { v: 1 };",
+            "unknown type `geo.Inner`",
+        ),
+        (
+            "import * as geo from \"./geo.napalm\";\nvar s: string = geo.Color.Green;",
+            "type `number` is not assignable to type `string`",
+        ),
+        (
+            "import * as geo from \"./geo.napalm\";\nvar n = new geo.Nope(1);",
+            "unknown class `geo.Nope`",
+        ),
+    ] {
+        let output = run(source, Some(GEO_MODULE));
+        assert!(!output.status.success(), "expected failure for {source}");
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(all.contains(expected), "missing `{expected}` in:\n{all}");
+        assert!(!all.contains("Point@"), "internal type name leaked:\n{all}");
+    }
+}

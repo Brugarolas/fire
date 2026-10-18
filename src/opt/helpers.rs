@@ -72,6 +72,8 @@ pub fn all_same<T: Copy + Eq>(xs: &[T]) -> Option<T> {
 /// divides inexactly produces a float). Returns `None` when the result is not an exact i32.
 pub fn fold_js_int_bin(op: crate::wir::IntBinOp, x: i32, y: i32) -> Option<i32> {
     use crate::wir::IntBinOp::*;
+    // Bitwise operators use JS ToInt32 semantics: shift counts are taken mod 32.
+    let shift = (y as u32) & 31;
     let (x, y) = (x as i64, y as i64);
     let r = match op {
         Add => x + y,
@@ -82,9 +84,9 @@ pub fn fold_js_int_bin(op: crate::wir::IntBinOp, x: i32, y: i32) -> Option<i32> 
         And => x & y,
         Or => x | y,
         Xor => x ^ y,
-        Shl => x.checked_shl((y & 63) as u32)?,
-        Sar => x >> (y & 63),
-        ShrU if x >= 0 => x >> (y & 63),
+        Shl => (x as i32).wrapping_shl(shift) as i64,
+        Sar => (x as i32 >> shift) as i64,
+        ShrU => ((x as i32 as u32) >> shift) as i64,
         _ => return None,
     };
     i32::try_from(r).ok()

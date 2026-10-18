@@ -785,6 +785,9 @@ pub enum ExportDecl {
     Var(String),
     Func(String),
     Class(String),
+
+    // export interface / export type (type-only, no runtime binding)
+    Type(String),
 }
 
 #[derive(Debug, Clone)]
@@ -1749,6 +1752,7 @@ impl<'src> Parser<'src> {
         // Type-only declarations have no runtime binding to export.
         if self.at_type_declaration() {
             let declaration = self.type_declaration()?;
+            exports.push(ExportDecl::Type(declaration.name().to_string()));
             self.type_decls.push(declaration);
             return Ok(());
         }
@@ -1816,6 +1820,8 @@ impl<'src> Parser<'src> {
                 }
             };
             self.expect(Tok::Semi, "expected ';' after export")?;
+            // The source module must be parsed and initialized before this one.
+            self.record_import_and_enqueue(&spec, &[])?;
             exports.push(ExportDecl::AllFrom { specifier: spec });
             return Ok(());
         }
@@ -1859,7 +1865,6 @@ impl<'src> Parser<'src> {
                     None
                 };
                 items.push((name, alias));
-                // TODO Record export with the alias
                 if self.check(&Tok::RBrace) {
                     let _ = self.next()?; // consume RBrace
                     break;
@@ -1878,8 +1883,9 @@ impl<'src> Parser<'src> {
                     }
                 };
                 self.expect(Tok::Semi, "expected ';' after export")?;
-                for (exp_name, _) in &items {
-                    self.record_export(exp_name);
+                self.record_import_and_enqueue(&spec, &[])?;
+                for (name, alias) in &items {
+                    self.record_export(alias.as_ref().unwrap_or(name));
                 }
                 exports.push(ExportDecl::From {
                     specifier: spec,
@@ -1887,8 +1893,8 @@ impl<'src> Parser<'src> {
                 });
             } else {
                 self.expect(Tok::Semi, "expected ';' after export list")?;
-                for (exp_name, _) in &items {
-                    self.record_export(exp_name);
+                for (name, alias) in &items {
+                    self.record_export(alias.as_ref().unwrap_or(name));
                 }
                 exports.push(ExportDecl::Named { items });
             }
@@ -2968,6 +2974,7 @@ impl<'src> Parser<'src> {
         }
 
         let t = self.next()?;
+        let t_span = t.span.clone();
         match t.tok {
             Tok::This => Ok(expr!(This)),
 
@@ -3078,7 +3085,12 @@ impl<'src> Parser<'src> {
                 }
 
                 // --- Fallback to your original, working code for user classes ---
-                let class = self.parse_any_identifier()?;
+                let mut class = self.parse_any_identifier()?;
+                // `new ns.Class()`: a class reached through a namespace import.
+                if self.check(&Tok::Dot) {
+                    self.next()?;
+                    class = format!("{class}.{}", self.parse_any_identifier()?);
+                }
                 let type_args = if self.check(&Tok::Lt) {
                     Some(self.parse_type_args()?)
                 } else {
@@ -3126,7 +3138,7 @@ impl<'src> Parser<'src> {
             Tok::False => Ok(expr!(LitBool(false))),
             Tok::Null => Ok(expr!(LitNull)),
             Tok::Str(s) => Ok(expr!(Str(s))),
-            Tok::Ident(s) => Ok(expr!(Ident(s))),
+            Tok::Ident(s) => Ok(expr!(Ident(s)).with_meta(self.meta_from_range(t_span))),
 
             Tok::ListBuiltin => Ok(expr!(Ident("Array".into()))),
             Tok::PromiseBuiltin => Ok(expr!(Ident("Promise".into()))),

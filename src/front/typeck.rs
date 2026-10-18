@@ -119,7 +119,8 @@ impl fmt::Display for Ty {
                 write!(f, "}}")
             }
             Ty::Named(name, args) => {
-                write!(f, "{name}")?;
+                // Cross-module canonical names (`Point@geo`) display as written.
+                write!(f, "{}", name.split('@').next().unwrap_or(name))?;
                 if !args.is_empty() {
                     write!(f, "<")?;
                     for (i, arg) in args.iter().enumerate() {
@@ -332,6 +333,8 @@ struct Checker {
     funcs: StdMap<String, Rc<Sig>>,
     globals: StdMap<String, Ty>,
     imported: StdSet<String>,
+    /// Imported function declarations; like local ones, they guard their own parameters.
+    imported_funcs: StdSet<String>,
     type_names: StdMap<String, String>,
     scopes: Vec<StdMap<String, Ty>>,
     type_scope: Vec<(String, Option<Ty>)>,
@@ -372,6 +375,7 @@ pub(crate) fn check_with_imports(
         funcs: StdMap::new(),
         globals: StdMap::new(),
         imported: imported.iter().cloned().collect(),
+        imported_funcs: StdSet::new(),
         type_names: imports.names.clone(),
         scopes: Vec::new(),
         type_scope: Vec::new(),
@@ -389,7 +393,15 @@ pub(crate) fn check_with_imports(
         if let Some(class) = checker.classes.get(canonical).cloned() {
             checker.classes.insert(alias.clone(), class);
         }
+        if alias != canonical && !alias.contains('.') {
+            if let Some(info) = checker.enums.get(canonical).cloned() {
+                checker.enums.insert(alias.clone(), info);
+            }
+        }
         if let Some(sig) = checker.funcs.get(canonical).cloned() {
+            if sig.checked {
+                checker.imported_funcs.insert(alias.clone());
+            }
             checker.globals.insert(alias.clone(), Ty::Func(sig));
         }
         if let Some(ty) = imports.variables.get(canonical) {
@@ -693,7 +705,7 @@ impl Checker {
                 return Ty::Param(name.to_string());
             }
         }
-        if let Some(canonical) = self.type_names.get(name).cloned() {
+        if let Some(canonical) = self.type_names.get(name).filter(|c| *c != name).cloned() {
             return self.resolve_name(&canonical, args, map);
         }
         let resolved: Vec<Ty> = args.iter().map(|a| self.resolve_in(a, map)).collect();
@@ -1101,7 +1113,8 @@ impl Checker {
     fn check_assignable(&mut self, src: &Ty, dst: &Ty, what: &str) {
         if let Err(reason) = self.compat(src, dst) {
             self.error(format!(
-                "{what}: type `{src}` is not assignable to type `{dst}`{}",
+                "{what}: type `{}` is not assignable to type `{dst}`{}",
+                shown_source(src, dst),
                 detail(&reason)
             ));
         }
@@ -1809,8 +1822,8 @@ impl Checker {
             }
             ExprKind::Call { callee, args } => self.call(callee, args, None),
             ExprKind::GetProp { recv, name } => {
-                if let ExprKind::Ident(enum_name) = recv.kind() {
-                    if let Some((_, members)) = self.enums.get(enum_name) {
+                if let Some(enum_name) = self.enum_ref(recv) {
+                    if let Some((_, members)) = self.enums.get(&enum_name) {
                         return members.get(name.as_str()).cloned().unwrap_or(Ty::Any);
                     }
                 }
@@ -2041,6 +2054,23 @@ impl Checker {
         ty
     }
 
+    /// The enum named by `Enum` or `ns.Enum` (a namespace-imported enum).
+    fn enum_ref(&self, recv: &Expr) -> Option<String> {
+        match recv.kind() {
+            ExprKind::Ident(name) if self.enums.contains_key(name) => Some(name.clone()),
+            ExprKind::GetProp { recv: ns, name } => {
+                let ExprKind::Ident(ns) = ns.kind() else { return None };
+                // Namespace aliases live in `globals`; only a scoped binding shadows them.
+                if self.scopes.iter().any(|s| s.contains_key(ns.as_str())) {
+                    return None;
+                }
+                let canonical = self.type_names.get(&format!("{ns}.{name}"))?;
+                self.enums.contains_key(canonical).then(|| canonical.clone())
+            }
+            _ => None,
+        }
+    }
+
     fn ident(&mut self, name: &str) -> Ty {
         if let Some(ty) = self.lookup_read(name) {
             return ty;
@@ -2211,7 +2241,7 @@ impl Checker {
         match ty {
             Ty::Unknown => { self.error(format!("cannot access property `{name}` on `unknown`")); return Ty::Any; }
             Ty::Literal(lit) => return self.prop_type(&literal_base(lit), name),
-            Ty::Tuple(items) => return self.prop_type(&Ty::Array(Box::new(union(items.clone()))), name),
+            Ty::Tuple(items) => return self.prop_type(&Ty::Array(Box::new(tuple_element(items.clone(), widen_scalar))), name),
             Ty::Deferred(..) => {
                 let normalized = self.normalize(ty.clone());
                 if &normalized != ty { return self.prop_type(&normalized, name); }
@@ -2271,16 +2301,23 @@ impl Checker {
                     return self.check_call(&sig, args, type_args, &format!("`{name}`"), true);
                 }
             }
+            let shadowed = self.scopes.iter().any(|s| s.contains_key(name));
+            if self.imported_funcs.contains(name) && !shadowed {
+                if let Some(Ty::Func(sig)) = self.globals.get(name).cloned() {
+                    let name = name.clone();
+                    return self.check_call(&sig, args, type_args, &format!("`{name}`"), true);
+                }
+            }
         }
         if let ExprKind::GetProp { recv, name } = &mut callee.kind {
-            let is_enum = matches!(recv.kind(), ExprKind::Ident(n) if self.enums.contains_key(n));
+            let is_enum = self.enum_ref(recv).is_some();
             if !is_enum {
                 let recv_ty = self.expr(recv);
                 let recv_ty = self.normalize(recv_ty);
                 let name = name.clone();
                 return match strip_null(&recv_ty) {
                     Ty::Array(element) => self.array_method(&element, &name, args),
-                    Ty::Tuple(items) => self.array_method(&union(items.into_iter().map(widen_scalar)), &name, args),
+                    Ty::Tuple(items) => self.array_method(&tuple_element(items, widen_scalar), &name, args),
                     Ty::Str | Ty::Literal(TypeLiteral::String(_)) => self.string_method(&name, args),
                     _ => match self.prop_type(&recv_ty, &name) {
                         Ty::Func(sig) => {
@@ -2459,7 +2496,13 @@ impl Checker {
     }
 
     fn new_instance(&mut self, class: &str, args: &mut Vec<Expr>, type_args: Option<Vec<Ty>>) -> Ty {
+        // Imported spellings (`Alias`, `ns.Class`) name the canonical declaration.
+        let canonical = self.type_names.get(class).cloned();
+        let class = canonical.as_deref().unwrap_or(class);
         let Some(info) = self.classes.get(class).cloned() else {
+            if class.contains('.') {
+                self.error(format!("unknown class `{class}`"));
+            }
             if type_args.is_some() && !self.imported.contains(class) {
                 self.error(format!("unknown class `{class}`"));
             }
@@ -2540,9 +2583,25 @@ impl Checker {
             }
             return target;
         }
-        self.error(format!("cannot cast type `{source}` to unrelated type `{target}`"));
+        self.error(format!(
+            "cannot cast type `{}` to unrelated type `{target}`",
+            shown_source(&source, &target)
+        ));
         target
     }
+}
+
+/// Like TypeScript, diagnostics widen a literal source (`"s"` → `string`)
+/// unless the target itself is spelled with literal types.
+fn shown_source(src: &Ty, dst: &Ty) -> Ty {
+    fn has_literal(ty: &Ty) -> bool {
+        match ty {
+            Ty::Literal(_) => true,
+            Ty::Union(members) => members.iter().any(has_literal),
+            _ => false,
+        }
+    }
+    if has_literal(dst) { src.clone() } else { widen_scalar(src.clone()) }
 }
 
 fn zip_args(params: &[TypeParam], args: &[Ty]) -> StdMap<String, Ty> {
@@ -2648,11 +2707,17 @@ fn class_info(class: &ClassDecl) -> ClassInfo {
 fn widen_inferred(ty: Ty) -> Ty {
     match ty {
         Ty::Literal(lit) => literal_base(&lit),
-        Ty::Tuple(items) => Ty::Array(Box::new(union(items.into_iter().map(widen_inferred)))),
+        Ty::Tuple(items) => Ty::Array(Box::new(tuple_element(items, widen_inferred))),
         Ty::Null | Ty::Void | Ty::Never => Ty::Any,
         Ty::Object(members) if members.is_empty() => Ty::Any,
         ty => ty,
     }
+}
+
+/// Element type of an array literal used as an array. An empty literal is an
+/// evolving `any[]` (as in TypeScript), never `never[]`.
+fn tuple_element(items: Vec<Ty>, widen: fn(Ty) -> Ty) -> Ty {
+    if items.is_empty() { Ty::Any } else { union(items.into_iter().map(widen)) }
 }
 
 fn narrow_key(name: &str) -> String {

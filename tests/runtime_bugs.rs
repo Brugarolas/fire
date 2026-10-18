@@ -1,4 +1,4 @@
-use std::process::Command;
+﻿use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -10,6 +10,13 @@ fn run(source: &str) -> std::process::Output {
 }
 
 fn run_with_module(source: &str, provider: Option<&str>) -> std::process::Output {
+    match provider {
+        Some(provider) => run_with_modules(source, &[("provider.napalm", provider)]),
+        None => run_with_modules(source, &[]),
+    }
+}
+
+fn run_with_modules(source: &str, modules: &[(&str, &str)]) -> std::process::Output {
     let _guard = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let directory = std::env::temp_dir().join(format!(
         "napalm-runtime-bugs-{}-{}",
@@ -19,16 +26,15 @@ fn run_with_module(source: &str, provider: Option<&str>) -> std::process::Output
     std::fs::create_dir(&directory).expect("create test directory");
     let entry = directory.join("main.napalm");
     std::fs::write(&entry, source).expect("write test script");
-    let module = directory.join("provider.napalm");
-    if let Some(provider) = provider {
-        std::fs::write(&module, provider).expect("write provider module");
+    for (name, text) in modules {
+        std::fs::write(directory.join(name), text).expect("write provider module");
     }
     let output = Command::new(env!("CARGO_BIN_EXE_Napalm"))
         .arg(&entry)
         .output();
     std::fs::remove_file(&entry).expect("remove test script");
-    if provider.is_some() {
-        std::fs::remove_file(&module).expect("remove provider module");
+    for (name, _) in modules {
+        std::fs::remove_file(directory.join(name)).expect("remove provider module");
     }
     std::fs::remove_dir(&directory).expect("remove test directory");
     output.expect("execute Napalm")
@@ -442,4 +448,176 @@ fn missing_array_methods_raise_catchable_errors() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Uncaught exception:"), "{stderr}");
     assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
+#[test]
+fn closures_capturing_loop_variables_keep_looping() {
+    assert_output(
+        r#"
+        fn inner() {
+            var hs = [];
+            for (var q = 0; q < 3; q = q + 1) { hs.push(fn() { return q; }); }
+            var n = 0;
+            var w = 0;
+            while (w < 3) { var c = fn() { return w; }; n = n + c(); w = w + 1; }
+            return hs.length * 100 + hs[0]() * 10 + n;
+        }
+        print(inner());
+        fn branch(flag) {
+            var x = 1;
+            if (flag) { var read = fn() { return x; }; }
+            x = x + 1;
+            return x;
+        }
+        print(branch(true));
+        print(branch(false));
+        var gs = [];
+        for (var m = 0; m < 3; m = m + 1) { gs.push(fn() { return m; }); }
+        print(gs.length);
+        print(m);
+        print(gs[0]());
+        "#,
+        "333\n2\n2\n3\n3\n3\n",
+    );
+}
+
+#[test]
+fn bitwise_operators_use_int32_semantics() {
+    assert_output(
+        r#"
+        print(4294967295 | 0);
+        print(2147483648 | 0);
+        print(1 << 31);
+        print(-1 >>> 0);
+        print(8 >> 33);
+        print(8 >>> 33);
+        print(5.5 << 1);
+        fn or0(a) { return a | 0; }
+        fn shr(a, b) { return a >> b; }
+        fn shru(a, b) { return a >>> b; }
+        print(or0(4294967296));
+        print(or0(-2147483649));
+        print(or0(100000000000000000000.0));
+        print(or0(0 / 0));
+        print(shr(8, 33));
+        print(shru(-8.5, 1));
+        "#,
+        "-1\n-2147483648\n-2147483648\n4294967295\n4\n4\n10\n0\n2147483647\n1661992960\n0\n4\n2147483644\n",
+    );
+}
+
+#[test]
+fn top_level_redeclaration_after_for_var_is_visible() {
+    assert_output(
+        r#"
+        class C { var z = 7; fn getZ() { return this.z; } }
+        for (var i = 0; i < 2; i += 1) { }
+        var i = new C();
+        print(i.z);
+        print(i.getZ());
+        "#,
+        "7\n7\n",
+    );
+}
+
+#[test]
+fn namespace_member_calls_do_not_receive_this() {
+    let output = run_with_module(
+        r#"
+        import * as lib from "./provider.napalm";
+        print(lib.norm({ x: 1, y: 2 }));
+        print(lib.two(10, 3));
+        print(lib.value);
+        try { lib.value(); } catch (e) { print(e); }
+        "#,
+        Some(
+            r#"
+            export fn norm(p) { return p.x * p.x + p.y * p.y; }
+            export fn two(a, b) { return a - b; }
+            export var value = 7;
+            "#,
+        ),
+    );
+    assert_process_output(output, "5\n7\n7\n\"TypeError: lib.value is not a function\"\n");
+}
+
+const REEXPORT_BASE: &str = r#"
+export var counter = 1;
+export fn inc() { counter = counter + 1; }
+export fn add(a, b) { return a + b; }
+export class Sq { constructor(s) { this.s = s; } fn area() { return this.s * this.s; } }
+export enum Color { Red = 1, Green = 2 }
+"#;
+
+#[test]
+fn reexports_share_live_bindings() {
+    let output = run_with_modules(
+        r#"
+        import { plus, count, local } from "./mid.napalm";
+        import { inc, Sq } from "./hub.napalm";
+        import * as h from "./hub.napalm";
+        print(plus(1, 2));
+        print(count);
+        inc();
+        print(count);
+        print(h.counter);
+        h.inc();
+        print(h.counter);
+        print(h.add(2, 3));
+        print(new Sq(3).area());
+        print(new h.Sq(4).area());
+        print(h.Color.Green);
+        print(local());
+        "#,
+        &[
+            ("base.napalm", REEXPORT_BASE),
+            ("hub.napalm", "export * from \"./base.napalm\";\n"),
+            (
+                "mid.napalm",
+                "export { add as plus, counter as count } from \"./hub.napalm\";\nexport fn local() { return 9; }\n",
+            ),
+        ],
+    );
+    assert_process_output(output, "3\n1\n2\n2\n3\n5\n9\n16\n2\n9\n");
+}
+
+fn assert_build_error(output: std::process::Output, expected: &[&str]) {
+    assert!(
+        !output.status.success(),
+        "expected failure\nstdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for message in expected {
+        assert!(all.contains(message), "missing `{message}` in:\n{all}");
+    }
+}
+
+#[test]
+fn reexporting_a_missing_member_is_an_import_error() {
+    let output = run_with_modules(
+        "import { nope } from \"./mid.napalm\";\nprint(nope);\n",
+        &[
+            ("base.napalm", REEXPORT_BASE),
+            ("mid.napalm", "export { nope } from \"./base.napalm\";\n"),
+        ],
+    );
+    assert_build_error(output, &["cannot re-export `nope`"]);
+}
+
+#[test]
+fn out_of_scope_variables_report_a_located_error() {
+    assert_build_error(
+        run("fn f(c) {\n  if (c) { var z = 1; }\n  return z;\n}\nprint(f(true));\n"),
+        &[
+            "`z` is not defined in this scope",
+            "declared at line 2 inside a block",
+            "main.napalm:3:10",
+        ],
+    );
+    assert_build_error(run("print(nothere);\n"), &["`nothere` is not defined in this scope"]);
 }

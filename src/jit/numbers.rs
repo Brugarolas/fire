@@ -55,6 +55,31 @@ fn raw_int_op(fb: &mut FunctionBuilder, op: IntBinOp, a: Value, b: Value) -> Val
     }
 }
 
+/// JS bitwise operator on two i32 operands, widened back to i64. Cranelift masks shift
+/// amounts by the type width, which matches JS's `count & 31` on i32.
+fn int32_bitwise(fb: &mut FunctionBuilder, op: IntBinOp, a: Value, b: Value) -> Value {
+    let raw = raw_int_op(fb, op, a, b);
+    if op == IntBinOp::ShrU {
+        fb.ins().uextend(types::I64, raw)
+    } else {
+        fb.ins().sextend(types::I64, raw)
+    }
+}
+
+/// JS ToInt32 for an f64: truncate, then wrap modulo 2^32 (NaN/±Infinity become 0).
+/// Every step is exact for finite doubles, so huge values wrap correctly too.
+fn f64_to_int32(fb: &mut FunctionBuilder, x: Value) -> Value {
+    let t = fb.ins().trunc(x);
+    let inv = fb.ins().f64const(1.0 / 4_294_967_296.0);
+    let scaled = fb.ins().fmul(t, inv);
+    let q = fb.ins().floor(scaled);
+    let two32 = fb.ins().f64const(4_294_967_296.0);
+    let whole = fb.ins().fmul(q, two32);
+    let m = fb.ins().fsub(t, whole);
+    let wide = fb.ins().fcvt_to_sint_sat(types::I64, m);
+    fb.ins().ireduce(types::I32, wide)
+}
+
 fn smi_encode(fb: &mut FunctionBuilder, raw: Value) -> Value {
     let shifted = fb.ins().ishl_imm_s(raw, 1);
     fb.ins().bor_imm_s(shifted, 1)
@@ -122,7 +147,9 @@ impl JIT {
                 }
             }
             _ => {
-                let raw = raw_int_op(fb, op, ra, rb);
+                let ia = fb.ins().ireduce(types::I32, ra);
+                let ib = fb.ins().ireduce(types::I32, rb);
+                let raw = int32_bitwise(fb, op, ia, ib);
                 let encoded = smi_encode(fb, raw);
                 fb.ins().jump(done, &[encoded.into()]);
             }
@@ -270,10 +297,9 @@ impl JIT {
         let fa = self.emit_value_to_f64(fb, a);
         let fbv = self.emit_value_to_f64(fb, b);
         let value = if is_bitwise(op) {
-            // Bitwise operators work on the integer part (NaN/±inf saturate; NaN -> 0).
-            let ia = fb.ins().fcvt_to_sint_sat(types::I64, fa);
-            let ib = fb.ins().fcvt_to_sint_sat(types::I64, fbv);
-            let raw = raw_int_op(fb, op, ia, ib);
+            let ia = f64_to_int32(fb, fa);
+            let ib = f64_to_int32(fb, fbv);
+            let raw = int32_bitwise(fb, op, ia, ib);
             smi_encode(fb, raw)
         } else {
             let x = match op {
