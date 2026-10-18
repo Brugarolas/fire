@@ -4,6 +4,8 @@
 #![allow(unused_unsafe)]
 
 use crate::gc::NAPALM_GC;
+mod type_checks;
+pub use type_checks::wir_type_matches;
 use crate::jit::{wir_call_closure, wir_make_method_closure};
 use crate::value as v;
 use crate::value::{
@@ -19,6 +21,7 @@ use crate::helpers::collections::{ConcurrentHashMap, HashMap, HashSet};
 use crate::wir::{TryExitKind, WirDeferKind};
 use core::hash::{BuildHasher, Hasher};
 type FastBuildHasher = crate::helpers::collections::AesBuildHasher;
+
 use core::cmp::min;
 use papaya::HashMap as LockfreeHashMap;
 use parking_lot::{Mutex, RwLock};
@@ -28,6 +31,52 @@ use std::ptr;
 use std::slice;
 use std::sync::OnceLock;
 use tinyvec::TinyVec;
+
+fn search_number(value: i64) -> Option<f64> {
+    if is_imm(value) {
+        Some(v::smi_to_i64(value) as f64)
+    } else if heap_tag(value) == Some(TAG_BOXED_F64) {
+        Some(unsafe { (*(value as *const BoxedF64)).val })
+    } else {
+        None
+    }
+}
+
+fn array_search(array: i64, needle: i64, from: i64, same_value_zero: bool) -> Option<usize> {
+    if heap_tag(array) != Some(TAG_ARRAY) {
+        return None;
+    }
+    let elements = unsafe { &(*(array as *const BoxedArray)).buf };
+    let offset = search_number(from).unwrap_or(0.0).trunc();
+    let start = if offset < 0.0 {
+        (elements.len() as f64 + offset).max(0.0) as usize
+    } else {
+        offset as usize // NaN becomes zero; positive infinity is past the end.
+    };
+    let number = search_number(needle);
+    elements.iter().enumerate().skip(start).find_map(|(index, &element)| {
+        let equal = if is_imm(element) && is_imm(needle) {
+            element == needle
+        } else {
+            match (search_number(element), number) {
+                (Some(a), Some(b)) => a == b || (same_value_zero && a.is_nan() && b.is_nan()),
+                (None, None) => Value(element) == Value(needle),
+                _ => false,
+            }
+        };
+        equal.then_some(index)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_array_index_of(array: i64, needle: i64, from: i64) -> i64 {
+    make_smi(array_search(array, needle, from, false).map_or(-1, |i| i as i64))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wir_array_includes(array: i64, needle: i64, from: i64) -> i64 {
+    bool_to_value(array_search(array, needle, from, true).is_some())
+}
 
 type StubPtr = unsafe extern "C" fn(*const i64, usize) -> i64;
 
@@ -1345,7 +1394,7 @@ pub extern "C" fn wir_super_get_method(home_proto: i64, field_id_smi: i64) -> i6
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_obj_get_str(obj: i64, key_ptr: i64) -> i64 {
-    if obj == 0 {
+    if !matches!(heap_tag(obj), Some(TAG_OBJECT) | Some(TAG_PROXY)) {
         return 0;
     }
     let Some(k) = (unsafe { boxedstr_to_string(key_ptr) }) else {
@@ -1378,7 +1427,10 @@ pub extern "C" fn wir_obj_set_str(obj: i64, key_ptr: i64, val: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_obj_has_str(obj: i64, key_ptr: i64) -> i64 {
-    if obj == 0 {
+    // Only objects/proxies have string-keyed properties; keys must be strings.
+    if !matches!(heap_tag(obj), Some(TAG_OBJECT) | Some(TAG_PROXY))
+        || heap_tag(key_ptr) != Some(TAG_STRING)
+    {
         return bool_to_value(false);
     }
     let Some(k) = (unsafe { boxedstr_to_string(key_ptr) }) else {

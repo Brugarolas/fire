@@ -228,3 +228,14 @@ fn compile_priority(name: &str) -> u8 {
         1
     }
 }
+
+#[cfg(test)]
+#[test]
+fn error_example_compiles_without_starting_http_server() {
+    let module = build_module_from_source(
+        "scripts/error.napalm",
+        include_str!("../scripts/error.napalm"),
+    )
+    .expect("HTTP example must compile without unresolved variables");
+    assert!(pick_entrypoint(&module).is_some());
+}

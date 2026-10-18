@@ -98,197 +98,47 @@ impl OptimizationWIR for PeepholeSimplify {
             }
 
             // ---------------- Int binops ----------------
+            // `IntBin` operands may be floats or strings at runtime, so only rewrites that
+            // hold for every number are applied and `+` is never reordered (string concat).
             IntBin { op, a, b } => {
                 use IntBinOp::*;
                 let (ai, bi) = cur.with_func(|f| (value_as_i32(f, a), value_as_i32(f, b)));
-                let (is0a, is0b, is1a, is1b, isneg1a, isneg1b) = (
-                    ai == Some(0),
-                    bi == Some(0),
-                    ai == Some(1),
-                    bi == Some(1),
-                    ai == Some(-1),
-                    bi == Some(-1),
-                );
-                let same = a == b;
 
-                // Canonicalize commutative ops: stable order & const on RHS
-                match op {
-                    Add | Mul | And | Or | Xor => {
-                        let swap_for_const_rhs = ai.is_some() && bi.is_none();
-                        let (aa, bb) = if swap_for_const_rhs {
-                            (b, a)
-                        } else {
-                            canonical_pair(a, b)
-                        };
-                        if aa != a || bb != b {
-                            cur.with_cur(|n| n.kind = IntBin { op, a: aa, b: bb });
-                            return true;
-                        }
-                    }
-                    _ => {}
-                }
-
-                // Idempotence / neutrals / annihilators / same-operand
-                match op {
-                    Add => {
-                        if is0a {
-                            cur.with_cur(|n| n.kind = Mov(b));
-                            return true;
-                        }
-                        if is0b {
-                            cur.with_cur(|n| n.kind = Mov(a));
-                            return true;
-                        }
-                    }
-                    Sub => {
-                        if is0b {
-                            cur.with_cur(|n| n.kind = Mov(a));
-                            return true;
-                        }
-                        if same {
-                            cur.with_cur(|n| {
-                                n.kind = Const(Constant::Int32(0));
-                                n.ty = Some(Type::Int32);
-                            });
-                            return true;
-                        }
-                    }
-                    Mul => {
-                        if is1a {
-                            cur.with_cur(|n| n.kind = Mov(b));
-                            return true;
-                        }
-                        if is1b {
-                            cur.with_cur(|n| n.kind = Mov(a));
-                            return true;
-                        }
-                        if is0a || is0b {
-                            cur.with_cur(|n| {
-                                n.kind = Const(Constant::Int32(0));
-                                n.ty = Some(Type::Int32);
-                            });
-                            return true;
-                        }
-                    }
-                    DivS => {
-                        if is1b {
-                            cur.with_cur(|n| n.kind = Mov(a));
-                            return true;
-                        }
-                        // keep /-1 untouched due to MIN/-1 overflow corner
-                    }
-                    RemS => {
-                        if is1b || isneg1b {
-                            cur.with_cur(|n| {
-                                n.kind = Const(Constant::Int32(0));
-                                n.ty = Some(Type::Int32);
-                            });
-                            return true;
-                        }
-                    }
-                    And => {
-                        if is0a || is0b {
-                            cur.with_cur(|n| {
-                                n.kind = Const(Constant::Int32(0));
-                                n.ty = Some(Type::Int32);
-                            });
-                            return true;
-                        }
-                        if isneg1a {
-                            cur.with_cur(|n| n.kind = Mov(b));
-                            return true;
-                        }
-                        if isneg1b {
-                            cur.with_cur(|n| n.kind = Mov(a));
-                            return true;
-                        }
-                        if same {
-                            cur.with_cur(|n| n.kind = Mov(a));
-                            return true;
-                        }
-                    }
-                    Or => {
-                        if is0a {
-                            cur.with_cur(|n| n.kind = Mov(b));
-                            return true;
-                        }
-                        if is0b {
-                            cur.with_cur(|n| n.kind = Mov(a));
-                            return true;
-                        }
-                        if isneg1a || isneg1b {
-                            cur.with_cur(|n| {
-                                n.kind = Const(Constant::Int32(-1));
-                                n.ty = Some(Type::Int32);
-                            });
-                            return true;
-                        }
-                        if same {
-                            cur.with_cur(|n| n.kind = Mov(a));
-                            return true;
-                        }
-                    }
-                    Xor => {
-                        if is0a {
-                            cur.with_cur(|n| n.kind = Mov(b));
-                            return true;
-                        }
-                        if is0b {
-                            cur.with_cur(|n| n.kind = Mov(a));
-                            return true;
-                        }
-                        if same {
-                            cur.with_cur(|n| {
-                                n.kind = Const(Constant::Int32(0));
-                                n.ty = Some(Type::Int32);
-                            });
-                            return true;
-                        }
-                    }
-                    Shl | ShrU | Sar => {
-                        if bi == Some(0) {
-                            cur.with_cur(|n| n.kind = Mov(a));
-                            return true;
-                        }
-                    }
-                    _ => { /*Not all ops handled*/ }
-                }
-
-                // Fully constant fold (wrap semantics preserved)
-                if let (Some(x), Some(y)) = (ai, bi) {
-                    let folded = match op {
-                        Add => Some(x.wrapping_add(y)),
-                        Sub => Some(x.wrapping_sub(y)),
-                        Mul => Some(x.wrapping_mul(y)),
-                        DivS => {
-                            if y == 0 || (x == i32::MIN && y == -1) {
-                                None
-                            } else {
-                                Some(x.wrapping_div(y))
-                            }
-                        }
-                        RemS => {
-                            if y == 0 {
-                                None
-                            } else {
-                                Some(x.wrapping_rem(y))
-                            }
-                        }
-                        And => Some(x & y),
-                        Or => Some(x | y),
-                        Xor => Some(x ^ y),
-                        Shl => Some(x.wrapping_shl((y as u32) & 31)),
-                        ShrU => Some(((x as u32) >> ((y as u32) & 31)) as i32),
-                        Sar => Some(x >> ((y as u32) & 31)), // **arithmetic** shift
-                        Not => None,                         // unary
+                if matches!(op, Mul | And | Or | Xor) {
+                    let swap_for_const_rhs = ai.is_some() && bi.is_none();
+                    let (aa, bb) = if swap_for_const_rhs {
+                        (b, a)
+                    } else {
+                        canonical_pair(a, b)
                     };
-                    if let Some(v) = folded {
-                        cur.with_cur(|n| {
-                            n.kind = Const(Constant::Int32(v));
-                            n.ty = Some(Type::Int32);
-                        });
+                    if aa != a || bb != b {
+                        cur.with_cur(|n| n.kind = IntBin { op, a: aa, b: bb });
                         return true;
                     }
+                }
+
+                let replacement = match op {
+                    Sub if bi == Some(0) => Some(Mov(a)),
+                    DivS if bi == Some(1) => Some(Mov(a)),
+                    Mul if bi == Some(1) => Some(Mov(a)),
+                    Mul if ai == Some(1) => Some(Mov(b)),
+                    And if ai == Some(0) || bi == Some(0) => Some(Const(Constant::Int32(0))),
+                    Or if ai == Some(-1) || bi == Some(-1) => Some(Const(Constant::Int32(-1))),
+                    Xor if a == b => Some(Const(Constant::Int32(0))),
+                    _ => match (ai, bi) {
+                        (Some(x), Some(y)) => crate::opt::helpers::fold_js_int_bin(op, x, y)
+                            .map(|v| Const(Constant::Int32(v))),
+                        _ => None,
+                    },
+                };
+                if let Some(kind) = replacement {
+                    cur.with_cur(|n| {
+                        if matches!(kind, Const(_)) {
+                            n.ty = Some(Type::Int32);
+                        }
+                        n.kind = kind;
+                    });
+                    return true;
                 }
             }
 
@@ -371,13 +221,10 @@ impl OptimizationWIR for PeepholeSimplify {
 
             // ---------------- Integer comparisons ----------------
             CmpInt { kind, a, b } => {
-                if a == b {
-                    let val = match kind {
-                        CmpKind::Eq | CmpKind::Le | CmpKind::Ge => true,
-                        CmpKind::Ne | CmpKind::Lt | CmpKind::Gt => false,
-                    };
+                // Operands may be NaN at runtime, so only `x < x` / `x > x` are always false.
+                if a == b && matches!(kind, CmpKind::Lt | CmpKind::Gt) {
                     cur.with_cur(|n| {
-                        n.kind = Const(Constant::Bool(val));
+                        n.kind = Const(Constant::Bool(false));
                         n.ty = Some(Type::Bool);
                     });
                     return true;

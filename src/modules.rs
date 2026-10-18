@@ -121,6 +121,7 @@ impl ProgramBuilder {
         self.build_from_entry(entry)?;
 
         self.resolve_all_modules()?;
+        self.check_module_types()?;
 
         // 2) lower + optimize en paralelo
         let shards = self.lower_all_modules_parallel_sharded()?;

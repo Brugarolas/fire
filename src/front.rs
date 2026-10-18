@@ -22,6 +22,10 @@ use smallvec::SmallVec;
 
 mod defers;
 mod enums;
+pub(crate) mod typeck;
+pub mod types;
+
+pub use types::{FnTypes, RtCheck, TypeDecl, TypeExpr, TypeParam, TypedOp};
 
 // Bring in the WIR types from your other file/module.
 use crate::diag::{
@@ -155,9 +159,9 @@ pub enum Tok {
     // Identifiers & literals
     #[regex(r"[A-Za-z_][A-Za-z0-9_]*", |lex| lex.slice().to_string())]
     Ident(String),
-    #[regex(r"[0-9]+", |lex| lex.slice().parse::<i32>().unwrap())]
-    Int(i32),
-    #[regex(r"[0-9]+\.[0-9]+", |lex| lex.slice().parse::<f64>().unwrap())]
+    #[regex(r"[0-9]+", |lex| lex.slice().to_string())]
+    Int(String),
+    #[regex(r"[0-9]+\.[0-9]+", |lex| lex.slice().parse::<f64>().ok())]
     Float(f64),
     #[regex(r#""([^"\\]|\\.)*""#, |lex| unescape_string(lex.slice()))]
     Str(String),
@@ -277,6 +281,7 @@ fn unescape_string(raw: &str) -> String {
 
 #[derive(Debug, Clone)]
 pub struct Program {
+    pub type_decls: Vec<TypeDecl>,
     pub functions: Vec<FuncDecl>,
     pub classes: Vec<ClassDecl>,
     pub imports: Vec<ImportDecl>,
@@ -314,6 +319,9 @@ pub struct ClassDecl {
     pub name: String,
     pub base: Option<String>, // name after `extends`
     pub members: Vec<ClassMember>,
+    pub type_params: Vec<TypeParam>,
+    pub base_args: Vec<TypeExpr>,
+    pub implements: Vec<TypeExpr>,
     // Diagnostic info
     pub meta: Meta,
 }
@@ -324,7 +332,7 @@ pub enum ClassMember {
     Stored {
         is_static: bool,
         name: String,
-        type_ann: Option<String>, // parsed after ':', kept as raw for now
+        type_ann: Option<TypeExpr>,
         init: Option<Expr>,       // optional initializer
     },
 
@@ -335,6 +343,7 @@ pub enum ClassMember {
         getter: Option<Block>, // body of `get()`
         setter_param: Option<String>,
         setter_body: Option<Block>, // body of `set(param)`
+        type_ann: Option<TypeExpr>,
     },
 
     // `fn name(params) { ... }`     (instance)   or  `static fn name(...) { ... }`
@@ -344,6 +353,7 @@ pub enum ClassMember {
         params: Vec<String>,
         body: Block,
         is_async: bool,
+        types: Option<Box<FnTypes>>,
     },
 
     // `constructor(params) { ... }`
@@ -351,6 +361,7 @@ pub enum ClassMember {
         params: Vec<String>,
         body: Block,
         is_async: bool, // allow `async constructor` now or later
+        types: Option<Box<FnTypes>>,
     },
 
     // `destructor() { ... }`
@@ -366,6 +377,7 @@ pub struct FuncDecl {
     pub params: Vec<String>,
     pub body: Block,
     pub is_async: bool,
+    pub types: Option<Box<FnTypes>>,
     // Diagnostic info
     pub meta: Meta,
 }
@@ -459,6 +471,7 @@ pub enum StmtKind {
     Var {
         name: String,
         init: Option<Expr>,
+        ty: Option<TypeExpr>,
     },
     VarDestruct {
         pattern: ObjPattern,
@@ -538,6 +551,7 @@ pub enum ExprKind {
     FnLit {
         params: Vec<String>,
         body: Block,
+        types: Option<Box<FnTypes>>,
     },
     FnRef {
         name: String,
@@ -606,6 +620,12 @@ pub enum ExprKind {
     },
 
     GetBuiltinSize(SmallBox<Expr, u8>),
+
+    /// Type-system node: parser-only annotations or checker-selected operations.
+    Typed {
+        op: TypedOp,
+        args: Vec<Expr>,
+    },
 }
 
 pub type Expr = Node<ExprKind>;
@@ -693,6 +713,7 @@ pub enum BinOp {
     Ge,
     And,
     Or,
+    BitOr,
     Shl,
     Shr,
     ShrU,
@@ -731,6 +752,15 @@ pub struct ImportDecl {
     pub items: Vec<ImportItem>, // vacío => import "path"; (solo efectos)
     // Diagnostic info
     pub meta: Meta,
+}
+
+impl ImportDecl {
+    pub fn local_names(&self) -> impl Iterator<Item = String> + '_ {
+        self.items.iter().map(|item| match item {
+            ImportItem::Named { name, alias } => alias.clone().unwrap_or_else(|| name.clone()),
+            ImportItem::Namespace { alias } => alias.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -843,6 +873,9 @@ pub struct Parser<'src> {
     referrer: Option<Arc<PathBuf>>,
     file_id: FileId,
     file_name: CompactString,
+
+    type_decls: Vec<TypeDecl>,
+    token_splits: Vec<(usize, Tok)>,
 }
 
 impl<'src> Parser<'src> {
@@ -884,6 +917,8 @@ impl<'src> Parser<'src> {
             referrer: None,
             file_id,
             file_name,
+            type_decls: Vec::new(),
+            token_splits: Vec::new(),
         }
     }
 
@@ -1111,9 +1146,22 @@ impl<'src> Parser<'src> {
                     stmts: toplevel_stmts,
                 },
                 is_async: true, // Allows top-level async
+                types: None,
                 meta: Meta::new(self.file_id, Span::new(0, 0)),
             });
         }
+
+        let imported_names: Vec<String> = imports
+            .iter()
+            .flat_map(|import: &ImportDecl| import.local_names())
+            .collect();
+        if self.module_ptr.is_none() { typeck::check_program(
+            &mut functions,
+            &mut classes,
+            &self.type_decls,
+            &imported_names,
+            self.file_id,
+        )?; }
 
         #[cfg(debug_assertions)]
         {
@@ -1172,6 +1220,7 @@ impl<'src> Parser<'src> {
         }
 
         Ok(Program {
+            type_decls: self.type_decls.clone(),
             functions,
             classes,
             imports,
@@ -1272,10 +1321,17 @@ impl<'src> Parser<'src> {
             }
         };
 
+        let type_params = self.parse_opt_type_params()?;
+        let mut base_args = Vec::new();
         let base = if self.matches(&Tok::Extends) {
             let t = self.next()?;
             match t.tok {
-                Tok::Ident(s) => Some(s),
+                Tok::Ident(s) => {
+                    if self.check(&Tok::Lt) {
+                        base_args = self.parse_type_args()?;
+                    }
+                    Some(s)
+                }
                 ref tok => {
                     return Err(self.make_error(
                         format!("expected base class name after 'extends', found {:?}", tok),
@@ -1286,6 +1342,15 @@ impl<'src> Parser<'src> {
         } else {
             None
         };
+        let mut implements = Vec::new();
+        if self.matches_ident("implements") {
+            loop {
+                implements.push(self.parse_type()?);
+                if !self.matches(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
 
         self.expect(
             Tok::LBrace,
@@ -1308,6 +1373,9 @@ impl<'src> Parser<'src> {
             name,
             base,
             members,
+            type_params,
+            base_args,
+            implements,
             meta: Meta::new(self.file_id, Span::with_range(self.get_current_span())),
         })
     }
@@ -1321,12 +1389,16 @@ impl<'src> Parser<'src> {
 
         // constructor
         if self.matches(&Tok::Constructor) {
-            let params = self.parse_fn_param_names()?;
+            let (params, types) = self.parse_signature(Vec::new())?;
+            if types.as_ref().is_some_and(|t| t.ret.is_some()) {
+                return Err(self.err_here("constructors cannot declare a return type"));
+            }
             let body = self.block()?;
             return Ok(ClassMember::Constructor {
                 params,
                 body,
                 is_async,
+                types,
             });
         }
 
@@ -1339,8 +1411,10 @@ impl<'src> Parser<'src> {
             return Ok(ClassMember::Destructor { body });
         }
 
-        // stored field: var name [: Type]? (= expr)? ;
-        if self.matches(&Tok::Var) {
+        // stored field: var name [: Type]? (= expr)? ;  or TypeScript-style  name: Type (= expr)? ;
+        let typed_field = matches!(self.peek_tok_at(0), Some(Tok::Ident(_)))
+            && matches!(self.peek_tok_at(1), Some(Tok::Colon));
+        if typed_field || self.matches(&Tok::Var) {
             if is_async {
                 return Err(self.err_here("'async' not allowed for stored fields"));
             }
@@ -1355,8 +1429,7 @@ impl<'src> Parser<'src> {
                 }
             };
 
-            // ignore optional type annotation for now
-            let _ = self.maybe_skip_type_annot()?;
+            let type_ann = self.parse_opt_type_annotation()?;
 
             let init = if self.matches(&Tok::Eq) {
                 Some(self.expr()?)
@@ -1367,13 +1440,18 @@ impl<'src> Parser<'src> {
             return Ok(ClassMember::Stored {
                 is_static,
                 name,
-                type_ann: None,
+                type_ann,
                 init,
             });
         }
 
         // accessors: get name() { ... }  |  set name(param) { ... }
-        if self.matches(&Tok::Get) {
+        // `get(...)` / `set(...)` (followed by '(' or type params) are plain methods.
+        let accessor_kw_is_method = matches!(
+            self.toks.get(self.i + 1).map(|t| &t.tok),
+            Some(Tok::LParen) | Some(Tok::Lt)
+        );
+        if !accessor_kw_is_method && self.matches(&Tok::Get) {
             if is_async {
                 return Err(self.err_here("'async' not allowed for getters"));
             }
@@ -1389,6 +1467,7 @@ impl<'src> Parser<'src> {
             };
             self.expect(Tok::LParen, "expected '(' after getter name")?;
             self.expect(Tok::RParen, "expected ')' after getter params")?;
+            let type_ann = self.parse_opt_return_type()?;
             let getter = self.block()?;
             return Ok(ClassMember::Accessor {
                 is_static,
@@ -1396,9 +1475,10 @@ impl<'src> Parser<'src> {
                 getter: Some(getter),
                 setter_param: None,
                 setter_body: None,
+                type_ann,
             });
         }
-        if self.matches(&Tok::Set) {
+        if !accessor_kw_is_method && self.matches(&Tok::Set) {
             if is_async {
                 return Err(self.err_here("'async' not allowed for setters"));
             }
@@ -1423,6 +1503,7 @@ impl<'src> Parser<'src> {
                     ));
                 }
             };
+            let type_ann = self.parse_opt_type_annotation()?;
             self.expect(Tok::RParen, "expected ')' after setter parameter")?;
             let body = self.block()?;
             return Ok(ClassMember::Accessor {
@@ -1431,6 +1512,7 @@ impl<'src> Parser<'src> {
                 getter: None,
                 setter_param: Some(param),
                 setter_body: Some(body),
+                type_ann,
             });
         }
 
@@ -1443,6 +1525,11 @@ impl<'src> Parser<'src> {
         let t = self.next()?;
         let name = match t.tok {
             Tok::Ident(s) => s,
+            Tok::Get => "get".to_string(),
+            Tok::Set => "set".to_string(),
+            Tok::Delete => "delete".to_string(),
+            Tok::Catch => "catch".to_string(),
+            Tok::Finally => "finally".to_string(),
             ref tok => {
                 return Err(self.make_error(
                     format!("expected method name (identifier), found {:?}", tok),
@@ -1451,8 +1538,11 @@ impl<'src> Parser<'src> {
             }
         };
 
-        self.expect(Tok::LParen, "expected '(' after method name")?;
-        let params = self.parse_param_list()?;
+        let type_params = self.parse_opt_type_params()?;
+        if !self.check(&Tok::LParen) {
+            return Err(self.err_here("expected '(' after method name"));
+        }
+        let (params, types) = self.parse_signature(type_params)?;
         let body = self.block()?;
 
         Ok(ClassMember::Method {
@@ -1461,36 +1551,8 @@ impl<'src> Parser<'src> {
             params,
             body,
             is_async,
+            types,
         })
-    }
-
-    fn maybe_skip_type_annot(&mut self) -> PResult<()> {
-        // Allow and ignore: : Ident [.<Ident>]*  (super minimal)
-        if self.matches(&Tok::Colon) {
-            // eat at least one token of the type
-            if let Some(p) = self.peek() {
-                if matches!(&p.tok, Tok::Ident(_)) {
-                    let _ = self.next()?;
-                } else {
-                    return Err(self.err_here("expected type identifier after ':'"));
-                }
-            } else {
-                return Err(self.err_here("unexpected end of file after ':' in type annotation"));
-            }
-            // consume any dotted qualifiers (rough)
-            while self.matches(&Tok::Dot) {
-                if let Some(p) = self.peek() {
-                    if matches!(&p.tok, Tok::Ident(_)) {
-                        let _ = self.next()?;
-                    } else {
-                        return Err(self.err_here("expected identifier after '.' in type"));
-                    }
-                } else {
-                    return Err(self.err_here("unexpected end of file after '.' in type"));
-                }
-            }
-        }
-        Ok(())
     }
 
     fn parse_import_decl(&mut self) -> PResult<ImportDecl> {
@@ -1684,6 +1746,13 @@ impl<'src> Parser<'src> {
             return Ok(());
         }
 
+        // Type-only declarations have no runtime binding to export.
+        if self.at_type_declaration() {
+            let declaration = self.type_declaration()?;
+            self.type_decls.push(declaration);
+            return Ok(());
+        }
+
         if self.check(&Tok::Enum) {
             let declaration = self.enum_decl()?;
             let StmtKind::Enum { name, binding, .. } = declaration.kind() else {
@@ -1716,6 +1785,7 @@ impl<'src> Parser<'src> {
                     ));
                 }
             };
+            let ty = self.parse_opt_type_annotation()?;
             let init = if self.matches(&Tok::Eq) {
                 Some(self.expr()?)
             } else {
@@ -1725,6 +1795,7 @@ impl<'src> Parser<'src> {
             toplevel.push(stmt_unknown(StmtKind::Var {
                 name: name.clone(),
                 init,
+                ty,
             }));
             self.record_export(&name);
             exports.push(ExportDecl::Var(name));
@@ -1859,33 +1930,11 @@ impl<'src> Parser<'src> {
                 ));
             }
         };
-        self.expect(Tok::LParen, "expected '(' after function name")?;
-        let mut params = Vec::new();
-        loop {
-            if self.check(&Tok::RParen) {
-                let _ = self.next()?; // consume RParen
-                break;
-            }
-            if self.is_eof() {
-                return Err(self.err_here("unexpected end of file in parameter list"));
-            }
-            let t = self.next()?;
-            let ident = match t.tok {
-                Tok::Ident(s) => s,
-                ref tok => {
-                    return Err(self.make_error(
-                        format!("expected parameter name (identifier), found {:?}", tok),
-                        t.span,
-                    ));
-                }
-            };
-            params.push(ident);
-            if self.check(&Tok::RParen) {
-                let _ = self.next()?; // consume RParen
-                break;
-            }
-            self.expect(Tok::Comma, "expected ',' between parameters")?;
+        let type_params = self.parse_opt_type_params()?;
+        if !self.check(&Tok::LParen) {
+            return Err(self.err_here("expected '(' after function name"));
         }
+        let (params, types) = self.parse_signature(type_params)?;
         let body = self.block()?;
         Ok(FuncDecl {
             fid: FuncId(next_id()),
@@ -1893,10 +1942,10 @@ impl<'src> Parser<'src> {
             params,
             body,
             is_async,
+            types,
             meta: Meta::new(self.file_id, Span::with_range(self.get_current_span())),
         })
     }
-
     fn block(&mut self) -> PResult<Block> {
         self.expect(Tok::LBrace, "expected opening brace for block")?;
         let mut stmts = Vec::new();
@@ -1946,6 +1995,16 @@ impl<'src> Parser<'src> {
     }
 
     fn stmt(&mut self) -> PResult<Stmt> {
+        let start = self.peek().map(|t| t.span.start);
+        let mut stmt = self.stmt_inner()?;
+        if let (Some(start), None) = (start, stmt.meta.file) {
+            let end = self.get_current_span().end.max(start);
+            stmt.meta = self.meta_from_range(start..end);
+        }
+        Ok(stmt)
+    }
+
+    fn stmt_inner(&mut self) -> PResult<Stmt> {
         if self.check(&Tok::Enum) {
             return self.enum_decl();
         }
@@ -1959,6 +2018,10 @@ impl<'src> Parser<'src> {
 
         if self.check_ident("listen") {
             return self.parse_listen_stmt();
+        }
+
+        if self.at_type_declaration() {
+            return self.type_declaration_stmt();
         }
 
         if self.check(&Tok::Var) || self.check(&Tok::Let) || self.check(&Tok::Const) {
@@ -1988,13 +2051,14 @@ impl<'src> Parser<'src> {
                     ));
                 }
             };
+            let ty = self.parse_opt_type_annotation()?;
             let init = if self.matches(&Tok::Eq) {
                 Some(self.expr()?)
             } else {
                 None
             };
             self.expect(Tok::Semi, "expected ';' after variable declaration")?;
-            Ok(stmt_unknown(StmtKind::Var { name, init }))
+            Ok(stmt_unknown(StmtKind::Var { name, init, ty }))
         } else if self.matches(&Tok::If) {
             self.expect(Tok::LParen, "expected '(' after 'if'")?;
             let cond = self.expr()?;
@@ -2151,6 +2215,7 @@ impl<'src> Parser<'src> {
                             ));
                         }
                     };
+                    let ty = self.parse_opt_type_annotation()?;
                     let init_e = if self.matches(&Tok::Eq) {
                         Some(self.expr()?)
                     } else {
@@ -2160,6 +2225,7 @@ impl<'src> Parser<'src> {
                     Some(SmallBox::new(stmt_unknown(StmtKind::Var {
                         name,
                         init: init_e,
+                        ty,
                     })))
                 }
             } else {
@@ -2323,6 +2389,11 @@ impl<'src> Parser<'src> {
                         name: name.clone(),
                     })
                 }
+                // `x.size` parses as the builtin size read; as a target it is a plain property.
+                ExprKind::GetBuiltinSize(recv) => lvalue!(GetProp {
+                    recv: recv.deref().clone(),
+                    name: "size".to_string(),
+                }),
                 ExprKind::Index { recv, index } => {
                     let recv_expr = recv.deref().clone();
                     let index_expr = index.deref().clone();
@@ -2412,11 +2483,23 @@ impl<'src> Parser<'src> {
         Ok(e)
     }
     fn parse_and(&mut self) -> PResult<Expr> {
-        let mut e = self.parse_eq()?;
+        let mut e = self.parse_bit_or()?;
         while self.matches(&Tok::AndAnd) {
-            let rhs = self.parse_eq()?;
+            let rhs = self.parse_bit_or()?;
             e = expr!(Binary {
                 op: BinOp::And,
+                a: SmallBox::new(e),
+                b: SmallBox::new(rhs),
+            });
+        }
+        Ok(e)
+    }
+    fn parse_bit_or(&mut self) -> PResult<Expr> {
+        let mut e = self.parse_eq()?;
+        while self.matches(&Tok::Pipe) {
+            let rhs = self.parse_eq()?;
+            e = expr!(Binary {
+                op: BinOp::BitOr,
                 a: SmallBox::new(e),
                 b: SmallBox::new(rhs),
             });
@@ -2612,12 +2695,30 @@ impl<'src> Parser<'src> {
                 e: SmallBox::new(e),
             }))
         } else {
-            self.parse_call()
+            let mut e = self.parse_call()?;
+            while self.matches(&Tok::As) {
+                let ty = self.parse_type()?;
+                e = expr!(Typed {
+                    op: TypedOp::Cast(ty),
+                    args: vec![e],
+                });
+            }
+            Ok(e)
         }
     }
     fn parse_call(&mut self) -> PResult<Expr> {
         let mut e = self.parse_primary()?;
+        let mut pending_type_args: Option<Vec<TypeExpr>> = None;
         loop {
+            if pending_type_args.is_none()
+                && self.check(&Tok::Lt)
+                && matches!(e.kind(), ExprKind::Ident(_) | ExprKind::GetProp { .. })
+            {
+                if let Some(args) = self.try_parse_call_type_args() {
+                    pending_type_args = Some(args);
+                    continue;
+                }
+            }
             if self.matches(&Tok::LParen) {
                 let mut args = Vec::new();
                 loop {
@@ -2646,6 +2747,12 @@ impl<'src> Parser<'src> {
                     e = expr!(Call {
                         callee: SmallBox::new(prev),
                         args,
+                    });
+                }
+                if let Some(type_args) = pending_type_args.take() {
+                    e = expr!(Typed {
+                        op: TypedOp::TypeArgs(type_args),
+                        args: vec![e],
                     });
                 }
             } else if self.matches(&Tok::QuestionDot) {
@@ -2720,7 +2827,15 @@ impl<'src> Parser<'src> {
                                 | BuiltinMapMethod::Entries
                         ) && !args.is_empty()
                         {
-                            return Err(self.err_here("builtin method does not take arguments"));
+                            // Not the builtin (it takes no arguments): a user-defined method.
+                            e = expr!(Call {
+                                callee: SmallBox::new(expr!(GetProp {
+                                    recv: SmallBox::new(e),
+                                    name: name_str,
+                                })),
+                                args,
+                            });
+                            continue;
                         }
                         e = expr!(CallBuiltinMapMethod {
                             recv: SmallBox::new(e),
@@ -2741,7 +2856,14 @@ impl<'src> Parser<'src> {
                     if let Some(method) = set_method {
                         let args = self.parse_arg_list()?;
                         if method == BuiltinSetMethod::Values && !args.is_empty() {
-                            return Err(self.err_here("builtin method does not take arguments"));
+                            e = expr!(Call {
+                                callee: SmallBox::new(expr!(GetProp {
+                                    recv: SmallBox::new(e),
+                                    name: name_str,
+                                })),
+                                args,
+                            });
+                            continue;
                         }
                         e = expr!(CallBuiltinSetMethod {
                             recv: SmallBox::new(e),
@@ -2760,7 +2882,14 @@ impl<'src> Parser<'src> {
                     if let Some(method) = common_method {
                         let args = self.parse_arg_list()?;
                         if !args.is_empty() {
-                            return Err(self.err_here("builtin method does not take arguments"));
+                            e = expr!(Call {
+                                callee: SmallBox::new(expr!(GetProp {
+                                    recv: SmallBox::new(e),
+                                    name: name_str,
+                                })),
+                                args,
+                            });
+                            continue;
                         }
                         e = expr!(CallBuiltinCommonMethod {
                             recv: SmallBox::new(e),
@@ -2898,6 +3027,11 @@ impl<'src> Parser<'src> {
 
                 if let Some(kind) = kind {
                     self.next()?; // Consume the builtin token
+                    let type_args = if self.check(&Tok::Lt) {
+                        Some(self.parse_type_args()?)
+                    } else {
+                        None
+                    };
                     self.expect(Tok::LParen, "expected '(' after built-in type name")?;
                     let mut args = Vec::new();
                     if !self.check(&Tok::RParen) {
@@ -2933,11 +3067,23 @@ impl<'src> Parser<'src> {
                         }
                     }
 
-                    return Ok(expr!(CreateBuiltin { kind, args }));
+                    let created = expr!(CreateBuiltin { kind, args });
+                    return Ok(match type_args {
+                        Some(type_args) => expr!(Typed {
+                            op: TypedOp::TypeArgs(type_args),
+                            args: vec![created],
+                        }),
+                        None => created,
+                    });
                 }
 
                 // --- Fallback to your original, working code for user classes ---
                 let class = self.parse_any_identifier()?;
+                let type_args = if self.check(&Tok::Lt) {
+                    Some(self.parse_type_args()?)
+                } else {
+                    None
+                };
                 self.expect(
                     Tok::LParen,
                     "expected '(' after class name in new expression",
@@ -2958,10 +3104,23 @@ impl<'src> Parser<'src> {
                     }
                     self.expect(Tok::Comma, "expected ',' in new arguments")?;
                 }
-                Ok(expr!(New { class, args }))
+                let new_expr = expr!(New { class, args });
+                Ok(match type_args {
+                    Some(type_args) => expr!(Typed {
+                        op: TypedOp::TypeArgs(type_args),
+                        args: vec![new_expr],
+                    }),
+                    None => new_expr,
+                })
             }
 
-            Tok::Int(x) => Ok(expr!(LitInt(x))),
+            Tok::Int(x) => match x.parse::<i32>() {
+                Ok(value) => Ok(expr!(LitInt(value))),
+                Err(_) => x
+                    .parse::<f64>()
+                    .map(|value| expr!(LitF64(value)))
+                    .map_err(|_| self.err_here("invalid numeric literal")),
+            },
             Tok::Float(x) => Ok(expr!(LitF64(x))),
             Tok::True => Ok(expr!(LitBool(true))),
             Tok::False => Ok(expr!(LitBool(false))),
@@ -3007,58 +3166,44 @@ impl<'src> Parser<'src> {
                 Ok(expr!(ArrayLit(elems)))
             }
             Tok::Fn | Tok::Function => {
-                // Stage #1: only the anonymous form inside expressions.
-                // Expect '(' immediately (no name allowed here).
-                self.expect(
-                    Tok::LParen,
-                    "expected '(' after 'fn'/'function' in function literal",
-                )?;
-                let params = self.parse_param_list()?;
+                // Anonymous form only: `fn [<T>](params) [: Ret] { ... }`.
+                let type_params = self.parse_opt_type_params()?;
+                if !self.check(&Tok::LParen) {
+                    return Err(self.err_here(
+                        "expected '(' after 'fn'/'function' in function literal",
+                    ));
+                }
+                let (params, types) = self.parse_signature(type_params)?;
                 let body = self.block()?;
-                Ok(expr!(FnLit { params, body }))
+                Ok(expr!(FnLit {
+                    params,
+                    body,
+                    types
+                }))
             }
             Tok::Pipe => {
-                // parse `|x, y|`
-                let mut params = Vec::new();
-                loop {
-                    if self.check(&Tok::Pipe) {
-                        let _ = self.next()?; // consume closing Pipe
-                        break;
-                    }
-                    if self.is_eof() {
-                        return Err(self.err_here("unexpected end of file in lambda parameters"));
-                    }
-                    let t = self.next()?;
-                    let name = match t.tok {
-                        Tok::Ident(s) => s,
-                        ref tok => {
-                            return Err(self.make_error(
-                                format!(
-                                    "expected parameter name (identifier) in lambda, found {:?}",
-                                    tok
-                                ),
-                                t.span,
-                            ));
-                        }
-                    };
-                    params.push(name);
-                    if self.check(&Tok::Pipe) {
-                        let _ = self.next()?; // consume closing Pipe
-                        break;
-                    }
-                    self.expect(Tok::Comma, "expected ',' in lambda params")?;
-                }
+                // parse `|x, y: number|`
+                let (params, param_types, optional) = self.parse_typed_params(Tok::Pipe)?;
+                let types = Self::lambda_types(param_types, optional);
                 // body: either { block } or a single expression (implicitly returned)
                 if self.check(&Tok::LBrace) {
                     let body = self.block()?;
-                    Ok(expr!(FnLit { params, body }))
+                    Ok(expr!(FnLit {
+                        params,
+                        body,
+                        types
+                    }))
                 } else {
                     // expression-body -> synthesize a block with an implicit return
                     let expr = self.expr()?;
                     let body = Block {
                         stmts: vec![stmt_unknown(StmtKind::Return(Some(expr)))],
                     };
-                    Ok(expr!(FnLit { params, body }))
+                    Ok(expr!(FnLit {
+                        params,
+                        body,
+                        types
+                    }))
                 }
             }
             Tok::LBrace => self.parse_object_literal(),
@@ -3172,6 +3317,7 @@ impl<'src> Parser<'src> {
         self.expect(Tok::Semi, "expected ';' after route declaration")?;
 
         let handler = expr!(FnLit {
+            types: None,
             params,
             body: handler_body,
         });

@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 mod exceptions;
 mod intrinsics;
+mod numbers;
 use exceptions::CompletionKind;
 
 thread_local! {
@@ -537,6 +538,7 @@ pub struct JIT {
     fast_decls: HashMap<u32, cranelift_module::FuncId>,
     stub_decls: HashMap<u32, cranelift_module::FuncId>,
     field_inline_caches: Vec<Box<FieldInlineCache>>,
+    num_helpers: HashMap<numbers::NumHelper, cranelift_module::FuncId>,
 }
 
 impl Default for JIT {
@@ -732,6 +734,9 @@ impl Default for JIT {
             fn wir_string_starts_with(s: i64, search: i64) -> i64;
             fn wir_string_ends_with(s: i64, search: i64) -> i64;
             fn wir_string_includes(s: i64, search: i64) -> i64;
+            fn wir_array_index_of(array: i64, search: i64, from: i64) -> i64;
+            fn wir_array_includes(array: i64, search: i64, from: i64) -> i64;
+            fn wir_type_matches(value: i64, schema: i64) -> i64;
             fn wir_string_to_upper_case(s: i64) -> i64;
             fn wir_string_to_lower_case(s: i64) -> i64;
             fn wir_string_trim(s: i64) -> i64;
@@ -859,6 +864,7 @@ impl Default for JIT {
                 wir_free_words as *const extern "C" fn(*mut i64, i64) -> i64 as *const u8,
             );
 
+            jb.symbol("wir_box_f64_runtime", wir_box_f64_runtime as *const u8);
             jb.symbol(
                 "wir_add_slow",
                 wir_add_slow as *const extern "C" fn(i64, i64) -> i64 as *const u8,
@@ -1297,6 +1303,9 @@ impl Default for JIT {
             );
             jb.symbol("wir_string_ends_with", wir_string_ends_with as *const u8);
             jb.symbol("wir_string_includes", wir_string_includes as *const u8);
+            jb.symbol("wir_array_index_of", crate::runtime::wir_array_index_of as *const u8);
+            jb.symbol("wir_array_includes", crate::runtime::wir_array_includes as *const u8);
+            jb.symbol("wir_type_matches", crate::runtime::wir_type_matches as *const u8);
             jb.symbol(
                 "wir_string_to_upper_case",
                 wir_string_to_upper_case as *const u8,
@@ -1339,6 +1348,7 @@ impl Default for JIT {
             fast_decls: HashMap::new(),
             stub_decls: HashMap::new(),
             field_inline_caches: Vec::new(),
+            num_helpers: HashMap::new(),
         }
     }
 }
@@ -1787,74 +1797,18 @@ impl JIT {
                         Inst::IntBin { op, a, b } => {
                             let a = vmap.get_or_emit(*a, &mut fb, fun_ir);
                             let b = vmap.get_or_emit(*b, &mut fb, fun_ir);
-
-                            // decode SMIs -> raw i64
-                            let ra = fb.ins().sshr_imm_s(a, 1);
-                            let rb = fb.ins().sshr_imm_s(b, 1);
-
-                            // arithmetic/bitwise on raw
-                            let raw = match op {
-                                IntBinOp::Add => fb.ins().iadd(ra, rb),
-                                IntBinOp::Sub => fb.ins().isub(ra, rb),
-                                IntBinOp::Mul => fb.ins().imul(ra, rb),
-                                IntBinOp::DivS => fb.ins().sdiv(ra, rb),
-                                IntBinOp::RemS => fb.ins().srem(ra, rb),
-                                IntBinOp::And => fb.ins().band(ra, rb),
-                                IntBinOp::Or => fb.ins().bor(ra, rb),
-                                IntBinOp::Xor => fb.ins().bxor(ra, rb),
-                                IntBinOp::Shl => fb.ins().ishl(ra, rb),
-                                IntBinOp::ShrU => fb.ins().ushr(ra, rb),
-                                IntBinOp::Sar => fb.ins().sshr(ra, rb),
-                                IntBinOp::Not => fb.ins().bnot(ra),
-                            };
-
-                            // re-encode to SMI: (raw << 1) | 1
-                            let sh = fb.ins().ishl_imm_s(raw, 1);
-                            let smi = fb.ins().iadd_imm_s(sh, 1);
-
+                            let value = self.emit_int_bin(&mut fb, *op, a, b)?;
                             if res_count == 1 {
-                                vmap.bind(node.results[0], smi);
+                                vmap.bind(node.results[0], value);
                             }
                         }
 
                         Inst::CmpInt { kind, a, b } => {
                             let a = vmap.get_or_emit(*a, &mut fb, fun_ir);
                             let b = vmap.get_or_emit(*b, &mut fb, fun_ir);
-
-                            // Decode operands that might be SMIs or boolean immediates.
-                            let bool_true_val = fb.ins().iconst(types::I64, BOOL_TRUE);
-                            let bool_false_val = fb.ins().iconst(types::I64, BOOL_FALSE);
-                            let int_one = fb.ins().iconst(types::I64, 1);
-                            let int_zero = fb.ins().iconst(types::I64, 0);
-
-                            let a_is_true = fb.ins().icmp(IntCC::Equal, a, bool_true_val);
-                            let a_is_false = fb.ins().icmp(IntCC::Equal, a, bool_false_val);
-                            let a_bool_raw = fb.ins().select(a_is_true, int_one, int_zero);
-                            let a_any_bool = fb.ins().bor(a_is_true, a_is_false);
-                            let a_smi = fb.ins().sshr_imm_s(a, 1);
-                            let ra = fb.ins().select(a_any_bool, a_bool_raw, a_smi);
-
-                            let b_is_true = fb.ins().icmp(IntCC::Equal, b, bool_true_val);
-                            let b_is_false = fb.ins().icmp(IntCC::Equal, b, bool_false_val);
-                            let b_bool_raw = fb.ins().select(b_is_true, int_one, int_zero);
-                            let b_any_bool = fb.ins().bor(b_is_true, b_is_false);
-                            let b_smi = fb.ins().sshr_imm_s(b, 1);
-                            let rb = fb.ins().select(b_any_bool, b_bool_raw, b_smi);
-
-                            // raw compare → 0/1 (NOT SMI)
-                            let cc = match kind {
-                                crate::wir::CmpKind::Eq => IntCC::Equal,
-                                crate::wir::CmpKind::Ne => IntCC::NotEqual,
-                                crate::wir::CmpKind::Lt => IntCC::SignedLessThan,
-                                crate::wir::CmpKind::Le => IntCC::SignedLessThanOrEqual,
-                                crate::wir::CmpKind::Gt => IntCC::SignedGreaterThan,
-                                crate::wir::CmpKind::Ge => IntCC::SignedGreaterThanOrEqual,
-                            };
-                            let cond = fb.ins().icmp(cc, ra, rb);
-                            let fast_res = fb.ins().select(cond, bool_true_val, bool_false_val);
-
+                            let value = self.emit_cmp(&mut fb, *kind, a, b)?;
                             if res_count == 1 {
-                                vmap.bind(node.results[0], fast_res);
+                                vmap.bind(node.results[0], value);
                             }
                         }
 
@@ -4968,16 +4922,7 @@ fn smi_encode(x: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wir_box_f64_runtime(bits: u64) -> i64 {
-    use crate::value::{BoxedF64, ObjHeader, TAG_BOXED_F64};
-    let x = f64::from_bits(bits);
-    let obj = Box::new(BoxedF64 {
-        hdr: ObjHeader {
-            tag: TAG_BOXED_F64,
-            aux: 0,
-        },
-        val: x,
-    });
-    Box::into_raw(obj) as i64
+    crate::value::box_f64(f64::from_bits(bits))
 }
 
 #[inline]

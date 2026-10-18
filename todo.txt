@@ -1,9 +1,6 @@
 Features I still have not implemented:
 - When detecting an error, return a beautiful error report ('ariadne'), both in the front and in the lowerer (and modules - "import not found.."?), containing the line of code that failed in number and in code
 - Add Dates (a là JavaScript: get/set of properties .date, .day, .fullYear, .hours, .milliseconds, .seconds, .time; constructors new Date(), Date(), Date.now(), Date.parse())
-- Interfaces (a là TypeScript)
-- Optional static typing, add a type system (a là TypeScript)
-- Generics (a là TypeScript)
 - Generators and Generators inside Generators (a là JavaScript)
 - Fibers (a là Wren)/Coroutines (a là C++)
 - Ranges (a là Wren & custom: 1..100 -> 1, 2, 3, ...; 1..100::5 -> 5, 10, 15, ...; 1..100::-1 -> 100, 99, 98, ...;)

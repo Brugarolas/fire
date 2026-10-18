@@ -186,7 +186,7 @@ impl Resolver {
                 self.resolve_expr(init)?;
                 self.declare(name.clone(), stmt.meta.span.clone())?;
             }
-            StmtKind::Var { name, init } => {
+            StmtKind::Var { name, init, .. } => {
                 // Resolve the initializer expression *before* declaring the variable.
                 // This correctly catches `var x = x;`.
                 if let Some(initializer) = init {
@@ -298,6 +298,11 @@ impl Resolver {
             ExprKind::Unary { e, .. } => self.resolve_expr(e)?,
             ExprKind::Call { callee, args } => {
                 self.resolve_expr(callee)?;
+                for arg in args {
+                    self.resolve_expr(arg)?;
+                }
+            }
+            ExprKind::Typed { args, .. } => {
                 for arg in args {
                     self.resolve_expr(arg)?;
                 }

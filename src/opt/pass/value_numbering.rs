@@ -263,10 +263,8 @@ impl ExprKey {
         use CmpKind::*;
         match &mut self {
             ExprKey::IntBin { op, a, b } => {
-                if matches!(
-                    op,
-                    IntBinOp::Add | IntBinOp::Mul | IntBinOp::And | IntBinOp::Or | IntBinOp::Xor
-                ) {
+                // `+` is not commutative: it may be a string concatenation.
+                if matches!(op, IntBinOp::Mul | IntBinOp::And | IntBinOp::Or | IntBinOp::Xor) {
                     if *a > *b {
                         std::mem::swap(a, b);
                     }

@@ -1,0 +1,75 @@
+// Optional static typing: annotations are checked before execution, and values
+// coming from untyped code are verified by compiled guards at typed boundaries.
+
+interface Shape {
+    name: string;
+    area(): number;
+}
+
+type Pair<A, B> = { first: A; second: B };
+
+class Rect implements Shape {
+    name: string;
+    width: number;
+    height: number;
+    constructor(width: number, height: number) {
+        this.name = "rect";
+        this.width = width;
+        this.height = height;
+    }
+    fn area(): number { return this.width * this.height; }
+}
+
+class Box<T> {
+    value: T;
+    constructor(value: T) { this.value = value; }
+    fn read(): T { return this.value; }
+    fn swap(value: T): T {
+        var old = this.value;
+        this.value = value;
+        return old;
+    }
+}
+
+fn totalArea(shapes: Shape[]): number {
+    var total = 0;
+    for (var i = 0; i < shapes.length; i = i + 1) {
+        total = total + shapes[i].area();
+    }
+    return total;
+}
+
+fn first<T>(items: T[]): T { return items[0]; }
+fn pair<A, B>(first: A, second: B): Pair<A, B> { return { first: first, second: second }; }
+fn label(name: string, suffix?: string): string {
+    if (suffix == null) { return name; }
+    return name + suffix;
+}
+
+var square: Shape = { name: "square", area: fn() { return 9; } };
+print(totalArea([new Rect(2, 3), square]));
+
+var box = new Box<string>("a");
+print(box.swap("b"));
+print(box.read());
+
+var p = pair(first([4, 5]), label("napalm", "!"));
+print([p.first, p.second, label("plain")]);
+
+// Untyped code keeps working; typed boundaries check what it produces.
+fn fromUntyped() { return "not a number"; }
+fn brokenShape() { return { name: "broken" }; }
+fn describe(shape: Shape): string { return shape.name; }
+try {
+    var count: number = fromUntyped();
+    print(count);
+} catch (error) {
+    print(error);
+}
+try {
+    print(describe(brokenShape()));
+} catch (error) {
+    print(error);
+}
+var raw = fromUntyped() as string;
+print(raw.length);

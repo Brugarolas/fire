@@ -1,5 +1,5 @@
 use super::*;
-use crate::value::{TAG_MAP, TAG_OBJECT, TAG_PROXY, TAG_SET};
+use crate::value::{TAG_ARRAY, TAG_BOXED_F64, TAG_CLOSURE, TAG_MAP, TAG_OBJECT, TAG_PROXY, TAG_SET};
 use cranelift::codegen::ir::Block;
 
 #[derive(Clone, Copy, Debug)]
@@ -37,7 +37,7 @@ fn vec_layout() -> VecLayout {
 }
 
 impl JIT {
-    fn intrinsic_host(
+    pub(super) fn intrinsic_host(
         &mut self,
         fb: &mut FunctionBuilder,
         name: &str,
@@ -55,13 +55,20 @@ impl JIT {
         )
     }
 
-    fn tagged_bool(fb: &mut FunctionBuilder, condition: Value) -> Value {
+    pub(super) fn tagged_bool(fb: &mut FunctionBuilder, condition: Value) -> Value {
         let yes = fb.ins().iconst(types::I64, BOOL_TRUE);
         let no = fb.ins().iconst(types::I64, BOOL_FALSE);
         fb.ins().select(condition, yes, no)
     }
 
-    fn tag_guard(&self, fb: &mut FunctionBuilder, value: Value, tag: u32, good: Block, bad: Block) {
+    pub(super) fn tag_guard(
+        &self,
+        fb: &mut FunctionBuilder,
+        value: Value,
+        tag: u32,
+        good: Block,
+        bad: Block,
+    ) {
         let check = fb.create_block();
         let nonnull = fb.ins().icmp_imm(IntCC::NotEqual, value, 0);
         let bits = fb.ins().band_imm(value, PTR_TAG_MASK);
@@ -89,6 +96,8 @@ impl JIT {
             "wir_is_map" => Some(TAG_MAP),
             "wir_is_set" => Some(TAG_SET),
             "wir_is_proxy" => Some(TAG_PROXY),
+            "wir_is_array" => Some(TAG_ARRAY),
+            "wir_is_closure" => Some(TAG_CLOSURE),
             _ => None,
         };
         if let Some(tag) = tag {
@@ -106,9 +115,35 @@ impl JIT {
             fb.switch_to_block(done);
             return Ok(Some(result));
         }
-        if name == "wir_is_nullish" {
+        if matches!(name, "wir_is_nullish" | "wir_is_null") {
             let condition = fb.ins().icmp_imm(IntCC::Equal, args[0], 0);
             return Ok(Some(Self::tagged_bool(fb, condition)));
+        }
+        if name == "wir_is_bool" {
+            let is_false = fb.ins().icmp_imm(IntCC::Equal, args[0], BOOL_FALSE);
+            let is_true = fb.ins().icmp_imm(IntCC::Equal, args[0], BOOL_TRUE);
+            let condition = fb.ins().bor(is_false, is_true);
+            return Ok(Some(Self::tagged_bool(fb, condition)));
+        }
+        if name == "wir_is_number" {
+            // Small integers carry the low tag bit; everything else must be a boxed f64.
+            let yes = fb.create_block();
+            let boxed = fb.create_block();
+            let no = fb.create_block();
+            let done = fb.create_block();
+            let result = fb.append_block_param(done, types::I64);
+            let smi_bit = fb.ins().band_imm(args[0], 1);
+            fb.ins().brif(smi_bit, yes, &[], boxed, &[]);
+            fb.switch_to_block(boxed);
+            self.tag_guard(fb, args[0], TAG_BOXED_F64, yes, no);
+            fb.switch_to_block(yes);
+            let value = fb.ins().iconst(types::I64, BOOL_TRUE);
+            fb.ins().jump(done, &[value.into()]);
+            fb.switch_to_block(no);
+            let value = fb.ins().iconst(types::I64, BOOL_FALSE);
+            fb.ins().jump(done, &[value.into()]);
+            fb.switch_to_block(done);
+            return Ok(Some(result));
         }
         if matches!(
             name,
@@ -947,6 +982,41 @@ mod tests {
                     unsafe { runtime(input) },
                     "{name}({input})"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn type_guard_predicates_are_compiled_without_host_calls() {
+        let object = value::obj_new();
+        let array = value::array_new(0);
+        let string = value::intern_string("test");
+        let boxed = value::box_f64(1.25);
+        let inputs = [
+            0,
+            value::make_smi(0),
+            value::make_smi(-7),
+            BOOL_TRUE,
+            BOOL_FALSE,
+            string,
+            array,
+            object,
+            value::map_new(),
+            value::set_new(),
+            boxed,
+        ];
+        for (name, accepts) in [
+            ("wir_is_null", &[0][..]),
+            ("wir_is_bool", &[BOOL_TRUE, BOOL_FALSE][..]),
+            ("wir_is_number", &[value::make_smi(0), value::make_smi(-7), boxed][..]),
+            ("wir_is_array", &[array][..]),
+            ("wir_is_closure", &[][..]),
+        ] {
+            let compiled = Compiled::new(name, 1);
+            assert!(!compiled.ir.contains(" = call "), "{name}: {}", compiled.ir);
+            for input in inputs {
+                let expected = if accepts.contains(&input) { BOOL_TRUE } else { BOOL_FALSE };
+                assert_eq!(compiled.call(&[input]), expected, "{name}({input})");
             }
         }
     }

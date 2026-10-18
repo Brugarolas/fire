@@ -95,7 +95,7 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                 defs.insert(name.clone());
                 collect_uses_expr(init, uses);
             }
-            StmtKind::Var { name, init } => {
+            StmtKind::Var { name, init, .. } => {
                 defs.insert(name.clone());
                 if let Some(e) = init {
                     collect_uses_expr(e, uses);
@@ -262,7 +262,7 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                 }
             }
 
-            ExprKind::CreateBuiltin { args, .. } => {
+            ExprKind::CreateBuiltin { args, .. } | ExprKind::Typed { args, .. } => {
                 for a in args {
                     collect_uses_expr(a, uses);
                 }
@@ -293,6 +293,20 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
         out_funcs: &mut Vec<FuncDecl>,
         lam_caps_out: &mut HashMap<String, Vec<String>>,
     ) -> Block {
+        rw_block_with_bindings(
+            b, used, counter, enclosing_locals, out_funcs, lam_caps_out, true,
+        )
+    }
+
+    fn rw_block_with_bindings(
+        b: &Block,
+        used: &mut BTreeSet<String>,
+        counter: &mut u32,
+        enclosing_locals: &BTreeSet<String>,
+        out_funcs: &mut Vec<FuncDecl>,
+        lam_caps_out: &mut HashMap<String, Vec<String>>,
+        bind_locals: bool,
+    ) -> Block {
         // Start with the incoming scope, then extend as we see new `var`s.
         let mut scope = enclosing_locals.clone();
         let mut out_stmts = Vec::with_capacity(b.stmts.len());
@@ -313,11 +327,13 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                             init,
                         },
                     ));
-                    scope.insert(name.clone());
+                    if bind_locals {
+                        scope.insert(name.clone());
+                    }
                 }
                 // `var` introduces a name *after* its initializer; rewrite init with current scope,
                 // then add the binding to the scope for following statements.
-                StmtKind::Var { name, init } => {
+                StmtKind::Var { name, init, ty } => {
                     let init_rw = init
                         .as_ref()
                         .map(|e| rw_expr(e, used, counter, &scope, out_funcs, lam_caps_out));
@@ -326,9 +342,12 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                         StmtKind::Var {
                             name: name.clone(),
                             init: init_rw,
+                            ty: ty.clone(),
                         },
                     ));
-                    scope.insert(name.clone());
+                    if bind_locals {
+                        scope.insert(name.clone());
+                    }
                 }
                 StmtKind::VarDestruct { pattern, init } => {
                     let init_rw = rw_expr(init, used, counter, &scope, out_funcs, lam_caps_out);
@@ -339,7 +358,9 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                             init: init_rw,
                         },
                     ));
-                    insert_pattern_bindings(&mut scope, pattern);
+                    if bind_locals {
+                        insert_pattern_bindings(&mut scope, pattern);
+                    }
                 }
 
                 // `for` init can introduce a name that is visible to cond/step/body.
@@ -430,7 +451,7 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                     init: rw_expr(init, used, counter, enclosing_locals, out_funcs, lam_caps_out),
                 },
             ),
-            StmtKind::Var { name, init } => {
+            StmtKind::Var { name, init, ty } => {
                 let init_rw = init.as_ref().map(|expr| {
                     rw_expr(
                         expr,
@@ -446,6 +467,7 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                     StmtKind::Var {
                         name: name.clone(),
                         init: init_rw,
+                        ty: ty.clone(),
                     },
                 )
             }
@@ -905,7 +927,7 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                     lam_caps_out,
                 ))),
             ),
-            ExprKind::FnLit { params, body } => {
+            ExprKind::FnLit { params, body, .. } => {
                 let mut inner_defs: BTreeSet<String> = params.iter().cloned().collect();
                 let mut uses: BTreeSet<String> = BTreeSet::new();
                 collect_defs_uses_block(body, &mut inner_defs, &mut uses);
@@ -939,6 +961,7 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                     body: body_rewritten,
                     is_async: false,
                     meta: e.meta.clone(),
+                    types: None,
                 });
 
                 expr_with_meta(e, ExprKind::FnRef { name: lam_name })
@@ -1108,6 +1131,18 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                         .collect(),
                 },
             ),
+            ExprKind::Typed { op, args } => expr_with_meta(
+                e,
+                ExprKind::Typed {
+                    op: op.clone(),
+                    args: args
+                        .iter()
+                        .map(|a| {
+                            rw_expr(a, used, counter, enclosing_locals, out_funcs, lam_caps_out)
+                        })
+                        .collect(),
+                },
+            ),
             ExprKind::CreateBuiltin { kind, args } => expr_with_meta(
                 e,
                 ExprKind::CreateBuiltin {
@@ -1239,13 +1274,17 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
     for f in &prog.functions {
         // at top-level of a function, enclosing locals = its params (can be captured by nested lambdas)
         let enclosing: BTreeSet<String> = f.params.iter().cloned().collect();
-        let rew_body = rw_block(
+        // Module variables use live binding cells, so lambdas must not capture
+        // them as function locals. Retain normal capture handling inside each
+        // statement (including loop variables and nested block locals).
+        let rew_body = rw_block_with_bindings(
             &f.body,
             &mut used,
             &mut counter,
             &enclosing,
             &mut out_funcs,
             &mut lam_captures,
+            f.name != "__toplevel__",
         );
         out_funcs.push(FuncDecl {
             fid: FuncId(next_id()),
@@ -1254,11 +1293,13 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
             body: rew_body,
             is_async: f.is_async,
             meta: f.meta.clone(),
+            types: f.types.clone(),
         });
     }
 
     (
         Program {
+            type_decls: prog.type_decls.clone(),
             functions: out_funcs,
             classes: prog.classes.clone(),
             imports: prog.imports.clone(),

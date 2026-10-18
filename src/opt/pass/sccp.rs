@@ -812,36 +812,14 @@ fn fold_int_bin(op: IntBinOp, la: Lat, lb: Lat) -> Lat {
     use Lat::*;
     match (la, lb) {
         (Const(Constant::Int32(x)), Const(Constant::Int32(y))) => {
-            let c = match op {
-                IntBinOp::Add => Some(x.wrapping_add(y)),
-                IntBinOp::Sub => Some(x.wrapping_sub(y)),
-                IntBinOp::Mul => Some(x.wrapping_mul(y)),
-                IntBinOp::DivS => {
-                    if y == 0 || (x == i32::MIN && y == -1) {
-                        None
-                    } else {
-                        Some(x.wrapping_div(y))
-                    }
-                }
-                IntBinOp::RemS => {
-                    if y == 0 {
-                        None
-                    } else {
-                        Some(x.wrapping_rem(y))
-                    }
-                }
-                IntBinOp::And => Some(x & y),
-                IntBinOp::Or => Some(x | y),
-                IntBinOp::Xor => Some(x ^ y),
-                IntBinOp::Shl => Some(x.wrapping_shl((y as u32) & 31)),
-                IntBinOp::ShrU => Some(((x as u32) >> ((y as u32) & 31)) as i32),
-                IntBinOp::Sar => Some(x >> ((y as u32) & 31)),
-                IntBinOp::Not => None, // unary
-            };
-            c.map(|v| Const(Constant::Int32(v))).unwrap_or(Overdef)
+            crate::opt::helpers::fold_js_int_bin(op, x, y)
+                .map(|v| Const(Constant::Int32(v)))
+                .unwrap_or(Overdef)
         }
         (Overdef, _) | (_, Overdef) => Overdef,
-        _ => Undef,
+        (Undef, _) | (_, Undef) => Undef,
+        // Non-integer constants (strings, floats, ...) are evaluated at runtime.
+        _ => Overdef,
     }
 }
 
@@ -919,8 +897,17 @@ fn fold_num_bin(iop: IntBinOp, la: Lat, lb: Lat) -> Lat {
 
 fn fold_cmp_int(kind: CmpKind, la: Lat, lb: Lat) -> Lat {
     use Lat::*;
+    // Mirrors the JIT, which compares booleans as 0/1.
+    let as_int = |c: &Constant| match c {
+        Constant::Int32(x) => Some(*x as i64),
+        Constant::Bool(b) => Some(*b as i64),
+        _ => None,
+    };
     match (la, lb) {
-        (Const(Constant::Int32(x)), Const(Constant::Int32(y))) => {
+        (Const(ca), Const(cb)) => {
+            let (Some(x), Some(y)) = (as_int(&ca), as_int(&cb)) else {
+                return Overdef;
+            };
             let r = match kind {
                 CmpKind::Eq => x == y,
                 CmpKind::Ne => x != y,

@@ -18,7 +18,7 @@ use crate::diag::Node;
 use crate::front::{
     BinOp, Block, CatchClause, ClassDecl, ClassMember, DeferKind, ExportDecl, Expr, ExprKind,
     FuncDecl, ImportDecl, ImportItem, LValue, LValueKind, ListenDecl, ObjItem, ObjPattern,
-    OptionalAccess, Program, PropKey, RouteDecl, Stmt, StmtKind, UnOp,
+    OptionalAccess, Program, PropKey, RouteDecl, RtCheck, Stmt, StmtKind, TypedOp, UnOp,
 };
 
 use crate::hoister::hoist_fn_lits_program;
@@ -518,6 +518,8 @@ pub struct EnumBinding {
 
 #[derive(Debug, Clone, Default)]
 pub struct LinkInfo {
+    /// Private and exported module variables share live cells across functions.
+    pub module_bindings: HashMap<String, (Vec<crate::diag::Span>, BindingId)>,
     /// Module-level enum bindings, including private declarations.
     pub enum_bindings: HashMap<String, EnumBinding>,
     /// import { a as x } from "m"   →   "x" -> binding(m,a)
@@ -585,6 +587,36 @@ impl<'m> Lowerer<'m> {
     }
 
     pub fn lower_program(&mut self, prog: &Program) -> LResult<Vec<FuncId>> {
+        self.lowering_ctx.links.module_bindings.clear();
+        if let Some(toplevel) = prog.functions.iter().find(|f| f.name == "__toplevel__") {
+            for statement in &toplevel.body.stmts {
+                let names: Vec<&String> = match statement.kind() {
+                    StmtKind::Var { name, .. } => vec![name],
+                    StmtKind::VarDestruct { pattern, .. } => pattern
+                        .fields
+                        .iter()
+                        .map(|field| &field.binding)
+                        .chain(pattern.rest.iter())
+                        .collect(),
+                    _ => continue,
+                };
+                for name in names {
+                    if let Some((declarations, _)) =
+                        self.lowering_ctx.links.module_bindings.get_mut(name)
+                    {
+                        declarations.push(statement.meta.span.clone());
+                        continue;
+                    }
+                    let cell = self.lowering_ctx.links.export_bindings.get(name)
+                        .copied()
+                        .unwrap_or_else(|| self.module.fresh_binding());
+                    self.lowering_ctx.links.module_bindings.insert(
+                        name.clone(),
+                        (vec![statement.meta.span.clone()], cell),
+                    );
+                }
+            }
+        }
         self.lowering_ctx.links.enum_bindings.clear();
         if let Some(toplevel) = prog.functions.iter().find(|f| f.name == "__toplevel__") {
             for statement in &toplevel.body.stmts {
@@ -653,6 +685,7 @@ impl<'m> Lowerer<'m> {
                         getter,
                         setter_param,
                         setter_body,
+                        ..
                     } => {
                         if *is_static {
                             continue;
@@ -671,6 +704,7 @@ impl<'m> Lowerer<'m> {
                         params,
                         body,
                         is_async,
+                        ..
                     } => {
                         if *is_static {
                             ci.static_methods.push((
@@ -995,6 +1029,7 @@ where
                         StmtKind::Var {
                             name: original.clone(),
                             init: Some(expr_unknown(ExprKind::Ident(binding.clone()))),
+                            ty: None,
                         },
                     ));
                 }
@@ -1047,6 +1082,23 @@ where
     Ok(())
 }
 
+fn initialize_variable(
+    b: &mut Builder<'_>,
+    locals: &mut HashMap<String, ValueId>,
+    name: &str,
+    value: ValueId,
+    statement: &Stmt,
+    ctx: &LoweringContext,
+) {
+    if let Some((declarations, cell)) = ctx.links.module_bindings.get(name) {
+        if declarations.contains(&statement.meta.span) {
+            b.store_binding(*cell, value);
+            return;
+        }
+    }
+    locals.insert(name.to_string(), value);
+}
+
 fn lower_stmt_free<'m>(
     b: &mut Builder<'m>,
     locals: &mut HashMap<String, ValueId>,
@@ -1071,13 +1123,13 @@ fn lower_stmt_free<'m>(
                 }
             }
         }
-        StmtKind::Var { name, init } => {
+        StmtKind::Var { name, init, .. } => {
             let val = if let Some(e) = init {
                 lower_expr_free(b, locals, fields, next_field, e, lowering_ctx)? // <-- pass
             } else {
                 b.const_i32(0)
             };
-            locals.insert(name.clone(), val);
+            initialize_variable(b, locals, name, val, s, lowering_ctx);
 
             #[cfg(debug_assertions)]
             {
@@ -1111,9 +1163,6 @@ fn lower_stmt_free<'m>(
                     lowering_ctx.links.namespace_cells
                 );
             }
-            if let Some(&bid) = lowering_ctx.links.export_bindings.get(name) {
-                b.store_binding(bid, val);
-            }
         }
         StmtKind::VarDestruct { pattern, init } => {
             let obj_val = lower_expr_free(b, locals, fields, next_field, init, lowering_ctx)?;
@@ -1124,10 +1173,7 @@ fn lower_stmt_free<'m>(
                     PropKey::Str(name) => name.as_str(),
                 };
                 let value = lower_general_getprop(b, obj_val, prop_name, fields, next_field);
-                locals.insert(field.binding.clone(), value);
-                if let Some(&bid) = lowering_ctx.links.export_bindings.get(&field.binding) {
-                    b.store_binding(bid, value);
-                }
+                initialize_variable(b, locals, &field.binding, value, s, lowering_ctx);
             }
 
             if let Some(rest_name) = &pattern.rest {
@@ -1201,10 +1247,7 @@ fn lower_stmt_free<'m>(
                     }
                 }
 
-                locals.insert(rest_name.clone(), rest_obj);
-                if let Some(&bid) = lowering_ctx.links.export_bindings.get(rest_name) {
-                    b.store_binding(bid, rest_obj);
-                }
+                initialize_variable(b, locals, rest_name, rest_obj, s, lowering_ctx);
             }
         }
         StmtKind::If {
@@ -1598,6 +1641,25 @@ fn lower_general_getprop<'m>(
     b.jump(cont, &[proxy_res[0]]);
 
     b.position_at(normal_block);
+    // Arrays and other non-object values do not have the BoxedObj layout.
+    let (_, is_object) = b.push_node(
+        Inst::CallNative {
+            name: "wir_is_obj".into(),
+            args: vec![obj],
+            pure: true,
+            can_throw: false,
+        },
+        Some(Type::Bool),
+        1,
+        false,
+    );
+    let object_block = b.block();
+    let missing_block = b.block();
+    b.branch(is_object[0], object_block, missing_block);
+    b.position_at(missing_block);
+    let missing = b.const_null();
+    b.jump(cont, &[missing]);
+    b.position_at(object_block);
     let (_nid_hs, has_str) = b.push_node(
         Inst::CallNative {
             name: "wir_obj_has_str".into(),
@@ -1738,6 +1800,11 @@ fn collect_mut_locals_in_expr(e: &Expr, out: &mut BTreeSet<String>) {
         ExprKind::Unary { e: inner, .. } => collect_mut_locals_in_expr(inner, out),
         ExprKind::Call { callee, args } => {
             collect_mut_locals_in_expr(callee, out);
+            for a in args {
+                collect_mut_locals_in_expr(a, out);
+            }
+        }
+        ExprKind::Typed { args, .. } => {
             for a in args {
                 collect_mut_locals_in_expr(a, out);
             }
@@ -2054,7 +2121,7 @@ fn lower_stmt_free_async<'m>(
                 StmtKind::Enum { .. } => {
                     lower_stmt_free(b, locals, fields, next_field, s, lowering_ctx, active_try)
                 }
-                StmtKind::Var { name, init } => {
+                StmtKind::Var { name, init, .. } => {
                     let val = if let Some(e) = init {
                         lower_expr_free_async(
                             b,
@@ -2068,10 +2135,7 @@ fn lower_stmt_free_async<'m>(
                     } else {
                         b.const_i32(0)
                     };
-                    locals.insert(name.clone(), val);
-                    if let Some(&bid) = lowering_ctx.links.export_bindings.get(name) {
-                        b.store_binding(bid, val);
-                    }
+                    initialize_variable(b, locals, name, val, s, lowering_ctx);
                     Ok(())
                 }
                 StmtKind::VarDestruct { pattern, init } => {
@@ -2092,10 +2156,7 @@ fn lower_stmt_free_async<'m>(
                         };
                         let value =
                             lower_general_getprop(b, obj_val, prop_name, fields, next_field);
-                        locals.insert(field.binding.clone(), value);
-                        if let Some(&bid) = lowering_ctx.links.export_bindings.get(&field.binding) {
-                            b.store_binding(bid, value);
-                        }
+                        initialize_variable(b, locals, &field.binding, value, s, lowering_ctx);
                     }
 
                     if let Some(rest_name) = &pattern.rest {
@@ -2169,10 +2230,7 @@ fn lower_stmt_free_async<'m>(
                             }
                         }
 
-                        locals.insert(rest_name.clone(), rest_obj);
-                        if let Some(&bid) = lowering_ctx.links.export_bindings.get(rest_name) {
-                            b.store_binding(bid, rest_obj);
-                        }
+                        initialize_variable(b, locals, rest_name, rest_obj, s, lowering_ctx);
                     }
                     Ok(())
                 }
@@ -2473,19 +2531,189 @@ fn lower_expr_free_async<'m>(
     }
 }
 
+/// Whether `name(args...)` with `argc` arguments matches a builtin string or
+/// array method lowered by `lower_string_method_call` / `lower_array_method_call`.
+fn builtin_method_arity_ok(name: &str, argc: usize) -> bool {
+    match name {
+        "length" | "pop" | "shift" | "toUpperCase" | "toLowerCase" | "trim" | "trimEnd"
+        | "trimStart" => argc == 0,
+        "setLength" | "push" | "unshift" | "fill" | "map" | "filter" | "forEach" | "find"
+        | "findIndex" | "concat" | "repeat" | "endsWith" => argc == 1,
+        "reduce" | "indexOf" | "includes" | "lastIndexOf" | "padEnd" | "padStart" | "startsWith" => {
+            argc == 1 || argc == 2
+        }
+        "replace" | "replaceAll" => argc == 2,
+        "split" | "slice" | "substring" => argc <= 2,
+        _ => false,
+    }
+}
+
+fn require_callable(b: &mut Builder<'_>, fun_v: ValueId, message: &str) {
+    let (_, callable) = b.push_node(
+        Inst::CallNative {
+            name: "wir_is_closure".into(),
+            args: vec![fun_v],
+            pure: true,
+            can_throw: false,
+        },
+        Some(Type::Bool),
+        1,
+        false,
+    );
+    let call = b.block();
+    let invalid = b.block();
+    b.branch(callable[0], call, invalid);
+    b.position_at(invalid);
+    let error = b.const_str(message);
+    b.push_node(Inst::Throw(error), None, 0, true);
+    b.position_at(call);
+}
+
+/// `recv.name(args...)` through a property lookup, passing `recv` as `this`.
+fn lower_dynamic_method_call<'m>(
+    b: &mut Builder<'m>,
+    recv_v: ValueId,
+    name: &str,
+    args: Vec<ValueId>,
+    fields: &mut HashMap<String, FieldId>,
+    next_field: &mut u32,
+) -> ValueId {
+    let fun_v = lower_general_getprop(b, recv_v, name, fields, next_field);
+    require_callable(
+        b, fun_v, &format!("TypeError: method '{name}' is not callable"),
+    );
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push(recv_v);
+    argv.extend(args);
+    let (_nid, res) = b.push_node(
+        Inst::CallClosure {
+            conv: crate::wir::CallConv::Fast,
+            fun: fun_v,
+            args: argv,
+        },
+        Some(Type::Int32),
+        1,
+        true,
+    );
+    res[0]
+}
+
+/// Map/Set builtin call (`m.get(k)`, `s.add(v)`, ...). Objects and proxies may
+/// define methods with these names, so they are dispatched dynamically instead.
+fn lower_collection_method_call<'m>(
+    b: &mut Builder<'m>,
+    recv_v: ValueId,
+    method_name: &str,
+    native_name: &str,
+    is_chainable: bool,
+    args: Vec<ValueId>,
+    fields: &mut HashMap<String, FieldId>,
+    next_field: &mut u32,
+) -> ValueId {
+    use crate::wir::{Inst, Type};
+    let (join, out) = begin_builtin_method_dispatch(b, recv_v, method_name, &args, fields, next_field);
+    let mut call_args = Vec::with_capacity(args.len() + 1);
+    call_args.push(recv_v);
+    call_args.extend(args.iter().copied());
+    let (_nid, res) = b.push_node(
+        Inst::CallNative {
+            name: native_name.into(),
+            args: call_args,
+            pure: false,
+            can_throw: false,
+        },
+        None,
+        1,
+        true,
+    );
+    // Chainable builtins (`map.set`, `set.add`) evaluate to the collection itself.
+    let builtin = if is_chainable { recv_v } else { res[0] };
+    b.jump(join, &[builtin]);
+    b.position_at(join);
+    out
+}
+
+/// Starts a `recv.name(args)` call whose name matches a builtin method. Objects and
+/// proxies that actually have a `name` property call it (with `this`); everything
+/// else (strings, arrays, maps, objects without such a property, ...) falls through
+/// to the builtin. Leaves the builder positioned in the builtin block: the caller
+/// emits the builtin, jumps to the returned join block with its result and then
+/// positions at the join, whose parameter is the returned value.
+fn begin_builtin_method_dispatch<'m>(
+    b: &mut Builder<'m>,
+    recv_v: ValueId,
+    name: &str,
+    args: &[ValueId],
+    fields: &mut HashMap<String, FieldId>,
+    next_field: &mut u32,
+) -> (crate::wir::BlockId, ValueId) {
+    use crate::wir::{Inst, Type};
+    let native_bool = |b: &mut Builder<'m>, native: &str, v: ValueId| {
+        let (_n, r) = b.push_node(
+            Inst::CallNative {
+                name: native.into(),
+                args: vec![v],
+                pure: true,
+                can_throw: false,
+            },
+            Some(Type::Bool),
+            1,
+            false,
+        );
+        r[0]
+    };
+    let is_obj = native_bool(b, "wir_is_obj", recv_v);
+    let lookup_blk = b.block();
+    let check_proxy_blk = b.block();
+    let call_blk = b.block();
+    let builtin_blk = b.block();
+    let join = b.block();
+    let out = b.add_block_param(join, Type::Int32);
+    b.branch(is_obj, lookup_blk, check_proxy_blk);
+
+    b.position_at(check_proxy_blk);
+    let is_proxy = native_bool(b, "wir_is_proxy", recv_v);
+    b.branch(is_proxy, lookup_blk, builtin_blk);
+
+    b.position_at(lookup_blk);
+    let fun_v = lower_general_getprop(b, recv_v, name, fields, next_field);
+    // Missing properties read as SMI 0, so test for an actual closure.
+    let callable = native_bool(b, "wir_is_closure", fun_v);
+    b.branch(callable, call_blk, builtin_blk);
+
+    b.position_at(call_blk);
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push(recv_v);
+    argv.extend_from_slice(args);
+    let (_nid, res) = b.push_node(
+        Inst::CallClosure {
+            conv: crate::wir::CallConv::Fast,
+            fun: fun_v,
+            args: argv,
+        },
+        Some(Type::Int32),
+        1,
+        true,
+    );
+    b.jump(join, &[res[0]]);
+
+    b.position_at(builtin_blk);
+    (join, out)
+}
+
 fn lower_array_method_call<'m>(
     b: &mut Builder<'m>,
     locals: &mut HashMap<String, ValueId>,
     _fields: &mut HashMap<String, FieldId>,
     _next_field: &mut u32,
-    recv: &Expr,
+    recv_v: ValueId,
     name: &str,
-    args: &[Expr],
+    args: &[ValueId],
     lowering_ctx: &LoweringContext,
 ) -> LResult<Option<ValueId>> {
     use crate::wir::{Inst, Type};
 
-    let arr = lower_expr_free(b, locals, _fields, _next_field, recv, lowering_ctx)?;
+    let arr = recv_v;
 
     // Small helper to call a simple native
     macro_rules! cn {
@@ -2519,14 +2747,14 @@ fn lower_array_method_call<'m>(
             if args.len() != 1 {
                 return Err(LowerError::NotLowerable("setLength expects 1 arg"));
             }
-            let n = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let n = args[0];
             return cn!("wir_array_set_len", [arr, n], Some(Type::Int32));
         }
         "push" => {
             if args.len() != 1 {
                 return Err(LowerError::NotLowerable("push expects 1 arg"));
             }
-            let v = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let v = args[0];
             return cn!("wir_array_push", [arr, v], Some(Type::Int32));
         }
         "pop" => {
@@ -2545,14 +2773,14 @@ fn lower_array_method_call<'m>(
             if args.len() != 1 {
                 return Err(LowerError::NotLowerable("unshift expects 1 arg"));
             }
-            let v = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let v = args[0];
             return cn!("wir_array_unshift", [arr, v], Some(Type::Int32));
         }
         "fill" => {
             if args.len() != 1 {
                 return Err(LowerError::NotLowerable("fill expects 1 arg"));
             }
-            let v = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let v = args[0];
             return cn!("wir_array_fill", [arr, v], None);
         }
 
@@ -2561,7 +2789,7 @@ fn lower_array_method_call<'m>(
             if args.len() != 1 {
                 return Err(LowerError::NotLowerable("map expects 1 arg"));
             }
-            let fun = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let fun = args[0];
 
             // len
             let (_nid, len_res) = b.push_node(
@@ -2664,7 +2892,7 @@ fn lower_array_method_call<'m>(
             if args.len() != 1 {
                 return Err(LowerError::NotLowerable("filter expects 1 arg"));
             }
-            let fun = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let fun = args[0];
 
             let (_nid, len_res) = b.push_node(
                 Inst::CallNative {
@@ -2771,7 +2999,7 @@ fn lower_array_method_call<'m>(
             if args.len() != 1 {
                 return Err(LowerError::NotLowerable("forEach expects 1 arg"));
             }
-            let fun = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let fun = args[0];
 
             let (_nid, len_res) = b.push_node(
                 Inst::CallNative {
@@ -2851,7 +3079,7 @@ fn lower_array_method_call<'m>(
                 ));
             }
 
-            let fun = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let fun = args[0];
 
             let (_nid, len_res) = b.push_node(
                 Inst::CallNative {
@@ -2877,7 +3105,7 @@ fn lower_array_method_call<'m>(
 
             if args.len() == 2 {
                 let init =
-                    lower_expr_free(b, locals, _fields, _next_field, &args[1], lowering_ctx)?;
+                    args[1];
                 b.jump(seed_join, &[zero, init]);
             } else {
                 let empty_b = b.block();
@@ -2979,7 +3207,7 @@ fn lower_array_method_call<'m>(
             if args.len() != 1 {
                 return Err(LowerError::NotLowerable("find expects 1 arg"));
             }
-            let fun = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let fun = args[0];
 
             let (_nid, len_res) = b.push_node(
                 Inst::CallNative {
@@ -3067,7 +3295,7 @@ fn lower_array_method_call<'m>(
             if args.len() != 1 {
                 return Err(LowerError::NotLowerable("findIndex expects 1 arg"));
             }
-            let fun = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let fun = args[0];
 
             let (_nid, len_res) = b.push_node(
                 Inst::CallNative {
@@ -3160,9 +3388,9 @@ fn lower_string_method_call<'m>(
     locals: &mut HashMap<String, ValueId>,
     _fields: &mut HashMap<String, FieldId>,
     _next_field: &mut u32,
-    recv: &Expr,
+    recv_v: ValueId,
     name: &str,
-    args: &[Expr],
+    args: &[ValueId],
     lowering_ctx: &LoweringContext,
 ) -> LResult<Option<ValueId>> {
     use crate::wir::{Inst, Type};
@@ -3214,19 +3442,19 @@ fn lower_string_method_call<'m>(
     }
 
     // All string methods require lowering the receiver `s`.
-    let s = lower_expr_free(b, locals, _fields, _next_field, recv, lowering_ctx)?;
+    let s = recv_v;
 
     match name {
         "concat" => {
             if args.len() != 1 {
                 return Err(LowerError::NotLowerable("concat expects 1 argument"));
             }
-            let other = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let other = args[0];
             cn!("wir_string_concat", [s, other], Some(Type::Str))
         }
         "split" => {
             let separator = if let Some(sep_expr) = args.get(0) {
-                lower_expr_free(b, locals, _fields, _next_field, sep_expr, lowering_ctx)?
+                *sep_expr
             } else {
                 b.const_undef() // `undefined` separator splits by nothing.
             };
@@ -3240,9 +3468,9 @@ fn lower_string_method_call<'m>(
             if args.is_empty() || args.len() > 2 {
                 return Err(LowerError::NotLowerable("indexOf expects 1 or 2 arguments"));
             }
-            let search = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let search = args[0];
             let pos = if let Some(pos_expr) = args.get(1) {
-                lower_expr_free(b, locals, _fields, _next_field, pos_expr, lowering_ctx)?
+                *pos_expr
             } else {
                 b.const_i32(0) // Default start position is 0
             };
@@ -3254,9 +3482,9 @@ fn lower_string_method_call<'m>(
                     "lastIndexOf expects 1 or 2 arguments",
                 ));
             }
-            let search = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let search = args[0];
             let pos = if let Some(pos_expr) = args.get(1) {
-                lower_expr_free(b, locals, _fields, _next_field, pos_expr, lowering_ctx)?
+                *pos_expr
             } else {
                 b.const_i32(-1) // Sentinel for "from the end"
             };
@@ -3272,9 +3500,9 @@ fn lower_string_method_call<'m>(
                     "padEnd/padStart expect 1 or 2 arguments",
                 ));
             }
-            let max_len = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let max_len = args[0];
             let fill_str = if let Some(fill_expr) = args.get(1) {
-                lower_expr_free(b, locals, _fields, _next_field, fill_expr, lowering_ctx)?
+                *fill_expr
             } else {
                 b.const_str(" ") // Default fill is a space
             };
@@ -3289,16 +3517,16 @@ fn lower_string_method_call<'m>(
             if args.len() != 1 {
                 return Err(LowerError::NotLowerable("repeat expects 1 argument"));
             }
-            let count = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let count = args[0];
             cn!("wir_string_repeat", [s, count], Some(Type::Str))
         }
         "replace" => {
             if args.len() != 2 {
                 return Err(LowerError::NotLowerable("replace expects 2 arguments"));
             }
-            let search = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let search = args[0];
             let replacement =
-                lower_expr_free(b, locals, _fields, _next_field, &args[1], lowering_ctx)?;
+                args[1];
             cn!(
                 "wir_string_replace",
                 [s, search, replacement],
@@ -3309,9 +3537,9 @@ fn lower_string_method_call<'m>(
             if args.len() != 2 {
                 return Err(LowerError::NotLowerable("replaceAll expects 2 arguments"));
             }
-            let search = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let search = args[0];
             let replacement =
-                lower_expr_free(b, locals, _fields, _next_field, &args[1], lowering_ctx)?;
+                args[1];
             cn!(
                 "wir_string_replace_all",
                 [s, search, replacement],
@@ -3320,12 +3548,12 @@ fn lower_string_method_call<'m>(
         }
         "slice" | "substring" => {
             let start = if let Some(start_expr) = args.get(0) {
-                lower_expr_free(b, locals, _fields, _next_field, start_expr, lowering_ctx)?
+                *start_expr
             } else {
                 b.const_i32(0)
             };
             let end = if let Some(end_expr) = args.get(1) {
-                lower_expr_free(b, locals, _fields, _next_field, end_expr, lowering_ctx)?
+                *end_expr
             } else {
                 b.const_i32(-1) // Use -1 SMI as a sentinel for "to the end".
             };
@@ -3354,22 +3582,32 @@ fn lower_string_method_call<'m>(
                     "startsWith expects 1 or 2 arguments",
                 ));
             }
-            let search = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let search = args[0];
             cn!("wir_string_starts_with", [s, search], Some(Type::Bool))
         }
         "endsWith" => {
             if args.len() != 1 {
                 return Err(LowerError::NotLowerable("endsWith expects 1 argument"));
             }
-            let search = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
+            let search = args[0];
             cn!("wir_string_ends_with", [s, search], Some(Type::Bool))
         }
         "includes" => {
-            if args.len() != 1 {
-                return Err(LowerError::NotLowerable("includes expects 1 argument"));
+            if args.is_empty() || args.len() > 2 {
+                return Err(LowerError::NotLowerable("includes expects 1 or 2 arguments"));
             }
-            let search = lower_expr_free(b, locals, _fields, _next_field, &args[0], lowering_ctx)?;
-            cn!("wir_string_includes", [s, search], Some(Type::Bool))
+            let search = args[0];
+            if args.len() == 1 {
+                cn!("wir_string_includes", [s, search], Some(Type::Bool))
+            } else {
+                let index = typed_native(b, "wir_string_index_of", vec![s, search, args[1]], Type::Int32, false);
+                let zero = b.const_i32(0);
+                let (_, found) = b.push_node(
+                    Inst::CmpInt { kind: crate::wir::CmpKind::Ge, a: index, b: zero },
+                    Some(Type::Bool), 1, false,
+                );
+                Ok(Some(found[0]))
+            }
         }
         "trim" => {
             if !args.is_empty() {
@@ -3516,6 +3754,10 @@ fn lower_expr_free_impl<'m>(
             // 2) Plain local
             if let Some(&v) = locals.get(name) {
                 return Ok(v);
+            }
+
+            if let Some((_, cell)) = lowering_ctx.links.module_bindings.get(name) {
+                return Ok(b.load_binding(*cell, None));
             }
 
             if let Some(binding) = lowering_ctx.links.enum_bindings.get(name) {
@@ -3755,9 +3997,10 @@ fn lower_expr_free_impl<'m>(
                 Add => {
                     let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
                     if left_is_str_lit || right_is_str_lit {
+                        // `"lit" + x` concatenates with `x` converted to a string.
                         let (_nid, res) = b.push_node(
                             Inst::CallNative {
-                                name: "wir_string_concat".into(),
+                                name: "wir_string_concat_coerce".into(),
                                 args: vec![va, vb],
                                 pure: false,
                                 can_throw: false,
@@ -3792,6 +4035,10 @@ fn lower_expr_free_impl<'m>(
                     let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
                     Ok(b.int_bin(IntBinOp::Shl, va, vb))
                 }
+                BitOr => {
+                    let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
+                    Ok(b.int_bin(IntBinOp::Or, va, vb))
+                }
                 Shr => {
                     // a >> b  (arithmetic right shift, sign-propagating)
                     let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
@@ -3799,13 +4046,11 @@ fn lower_expr_free_impl<'m>(
                 }
                 ShrU => {
                     // handle `>>>`
-                    let va = lower_expr_free(b, locals, fields, next_field, a, lowering_ctx)?;
                     let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
                     Ok(b.int_bin(IntBinOp::ShrU, va, vb)) // ShrU = Unsigned (Logical) Shift Right
                 }
                 StrConcat => {
                     // handle `__`
-                    let va = lower_expr_free(b, locals, fields, next_field, a, lowering_ctx)?;
                     let vb = lower_expr_free(b, locals, fields, next_field, bb, lowering_ctx)?;
 
                     // We need to ensure both operands are strings before concatenating.
@@ -3871,8 +4116,18 @@ fn lower_expr_free_impl<'m>(
                             true,
                         );
                         let str_res = if *op == BinOp::Ne {
-                            let one = b.const_i32(1);
-                            b.int_bin(IntBinOp::Xor, str_eq_res[0], one)
+                            let falsev = b.const_bool(false);
+                            let (_nid, negated) = b.push_node(
+                                Inst::CmpInt {
+                                    kind: crate::wir::CmpKind::Eq,
+                                    a: str_eq_res[0],
+                                    b: falsev,
+                                },
+                                Some(Type::Bool),
+                                1,
+                                false,
+                            );
+                            negated[0]
                         } else {
                             str_eq_res[0]
                         };
@@ -3992,8 +4247,26 @@ fn lower_expr_free_impl<'m>(
                 LValueKind::GetProp { recv, name } => {
                     let obj = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
 
-                    // Special-case: arr.length = n
+                    // Special-case: arr.length = n (only for real arrays; other values
+                    // get a regular property store below).
+                    let mut length_join = None;
                     if name == "length" {
+                        let (_nid, is_arr) = b.push_node(
+                            Inst::CallNative {
+                                name: "wir_is_array".into(),
+                                args: vec![obj],
+                                pure: true,
+                                can_throw: false,
+                            },
+                            Some(Type::Bool),
+                            1,
+                            false,
+                        );
+                        let arr_b = b.block();
+                        let prop_b = b.block();
+                        let join = b.block();
+                        b.branch(is_arr[0], arr_b, prop_b);
+                        b.position_at(arr_b);
                         let (_nid, _r) = b.push_node(
                             Inst::CallNative {
                                 name: "wir_array_set_len".into(),
@@ -4005,7 +4278,9 @@ fn lower_expr_free_impl<'m>(
                             1,
                             true,
                         );
-                        return Ok(rv);
+                        b.jump(join, &[]);
+                        b.position_at(prop_b);
+                        length_join = Some(join);
                     }
 
                     // 1) Store fast field
@@ -4041,6 +4316,10 @@ fn lower_expr_free_impl<'m>(
                         true,
                     );
 
+                    if let Some(join) = length_join {
+                        b.jump(join, &[]);
+                        b.position_at(join);
+                    }
                     Ok(rv)
                 }
 
@@ -4146,6 +4425,12 @@ fn lower_expr_free_impl<'m>(
 
                 // x = rv          (local write, with capture boxing support)
                 LValueKind::Ident(name) => {
+                    if !locals.contains_key(name) {
+                        if let Some((_, cell)) = lowering_ctx.links.module_bindings.get(name) {
+                            b.store_binding(*cell, rv);
+                            return Ok(rv);
+                        }
+                    }
                     #[cfg(debug_assertions)]
                     {
                         eprintln!("lower_expr_free() LValue::Ident({})", name);
@@ -4194,9 +4479,11 @@ fn lower_expr_free_impl<'m>(
                         ));
                     }
                     // c) export propio: live update
-                    if let Some(&bid) = lowering_ctx.links.export_bindings.get(name) {
-                        b.store_binding(bid, rv);
-                        return Ok(rv);
+                    if !locals.contains_key(name) {
+                        if let Some(&bid) = lowering_ctx.links.export_bindings.get(name) {
+                            b.store_binding(bid, rv);
+                            return Ok(rv);
+                        }
                     }
 
                     // import x from "m";  x = ...  → error de compilación
@@ -4207,9 +4494,11 @@ fn lower_expr_free_impl<'m>(
                     }
 
                     // export let x;  x = rv  → StoreBinding(binding(this,x), rv)
-                    if let Some(&bid) = lowering_ctx.links.export_bindings.get(name) {
-                        b.store_binding(bid, rv);
-                        return Ok(rv);
+                    if !locals.contains_key(name) {
+                        if let Some(&bid) = lowering_ctx.links.export_bindings.get(name) {
+                            b.store_binding(bid, rv);
+                            return Ok(rv);
+                        }
                     }
 
                     // resto: igual que tenías (boxed locals / locals normales / error)
@@ -4327,47 +4616,25 @@ fn lower_expr_free_impl<'m>(
                 );
                 b.jump(cont, &[len_res[0]]);
 
-                // Not a string: prefer real user property if present, else fallback to array length.
+                // Not a string: arrays use the builtin length; anything else is a
+                // regular property read (never reinterpret an array as an object).
                 b.position_at(not_string_b);
-                let (_nid_k, k) = b.push_node(
-                    Inst::Const(Constant::Str(name.clone())),
-                    Some(Type::Str),
-                    1,
-                    false,
-                );
-                let (_nid_has, has_prop) = b.push_node(
+                let (_nid_is_arr, is_arr) = b.push_node(
                     Inst::CallNative {
-                        name: "wir_obj_has_str".into(),
-                        args: vec![recv_v, k[0]],
-                        pure: false,
+                        name: "wir_is_array".into(),
+                        args: vec![recv_v],
+                        pure: true,
                         can_throw: false,
                     },
                     Some(Type::Bool),
                     1,
-                    true,
+                    false,
                 );
+                let arr_b = b.block();
+                let other_b = b.block();
+                b.branch(is_arr[0], arr_b, other_b);
 
-                let hit_b = b.block();
-                let miss_b = b.block();
-                b.branch(has_prop[0], hit_b, miss_b);
-
-                // Hit: actual property shadows builtin
-                b.position_at(hit_b);
-                let (_nid_get, got) = b.push_node(
-                    Inst::CallNative {
-                        name: "wir_obj_get_str".into(),
-                        args: vec![recv_v, k[0]],
-                        pure: false,
-                        can_throw: false,
-                    },
-                    None,
-                    1,
-                    true,
-                );
-                b.jump(cont, &[got[0]]);
-
-                // Miss: treat as array length (arrays OK; plain objects typically yield 0)
-                b.position_at(miss_b);
+                b.position_at(arr_b);
                 let (_nid_a, arr_res) = b.push_node(
                     Inst::CallNative {
                         name: "wir_array_len".into(),
@@ -4380,6 +4647,10 @@ fn lower_expr_free_impl<'m>(
                     true,
                 );
                 b.jump(cont, &[arr_res[0]]);
+
+                b.position_at(other_b);
+                let ov = lower_general_getprop(b, recv_v, name, fields, next_field);
+                b.jump(cont, &[ov]);
 
                 b.position_at(cont);
                 return Ok(out);
@@ -4471,8 +4742,8 @@ fn lower_expr_free_impl<'m>(
                 b.jump(join, &[ss[0]]);
 
                 b.position_at(other_b);
-                let zero = b.const_i32(0);
-                b.jump(join, &[zero]);
+                let v = lower_general_getprop(b, recv_v, name, fields, next_field);
+                b.jump(join, &[v]);
 
                 b.position_at(join);
                 return Ok(out);
@@ -4633,36 +4904,17 @@ fn lower_expr_free_impl<'m>(
 
         // Calls / builtins
         ExprKind::Call { callee, args } => {
-            // --- Bracket-literal method call: o["m"](... ) -> inject receiver as first arg ---
+            // Literal bracket calls have the same dispatch and evaluation order
+            // as property calls, including array/string builtins and type errors.
             if let ExprKind::Index { recv, index } = callee.kind() {
-                if matches!(index.kind(), ExprKind::Str(_)) {
-                    let this_v =
-                        lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
-                    let fun_v =
-                        lower_expr_free(b, locals, fields, next_field, callee, lowering_ctx)?;
-                    let mut argv = Vec::with_capacity(args.len() + 1);
-                    argv.push(this_v);
-                    for a in args {
-                        argv.push(lower_expr_free(
-                            b,
-                            locals,
-                            fields,
-                            next_field,
-                            a,
-                            lowering_ctx,
-                        )?);
-                    }
-                    let (_nid, res) = b.push_node(
-                        Inst::CallClosure {
-                            conv: crate::wir::CallConv::Fast,
-                            fun: fun_v,
-                            args: argv,
-                        },
-                        Some(Type::Int32),
-                        1,
-                        true,
-                    );
-                    return Ok(res[0]);
+                if let ExprKind::Str(name) = index.kind() {
+                    let property = expr_with_meta(callee, ExprKind::GetProp {
+                        recv: recv.clone(), name: name.clone(),
+                    });
+                    let call = expr_with_meta(e, ExprKind::Call {
+                        callee: SmallBox::new(property), args: args.clone(),
+                    });
+                    return lower_expr_free(b, locals, fields, next_field, &call, lowering_ctx);
                 }
             }
 
@@ -4927,61 +5179,45 @@ fn lower_expr_free_impl<'m>(
                     }
                 }
 
-                // 0d) String instance methods
-                if let Some(v) = lower_string_method_call(
-                    b,
-                    locals,
-                    fields,
-                    next_field,
-                    recv,
-                    name,
-                    args,
-                    lowering_ctx,
-                )? {
-                    return Ok(v);
-                }
-
-                // 0e) Array instance methods (map/filter/etc.)
-                if let Some(v) = lower_array_method_call(
-                    b,
-                    locals,
-                    fields,
-                    next_field,
-                    recv,
-                    name,
-                    args,
-                    lowering_ctx,
-                )? {
-                    return Ok(v);
-                }
-
-                // 0e) Generic property call: Distinguish between static and instance calls.
                 let is_static_call = if let ExprKind::Ident(id_name) = recv.kind() {
-                    // This is now valid! We use the passed-in context.
                     lowering_ctx.is_class_ident(id_name)
                 } else {
                     false
                 };
 
-                // The function to be called is the result of the property lookup.
-                let fun_v = lower_expr_free(b, locals, fields, next_field, callee, lowering_ctx)?;
-
-                let mut argv = Vec::new();
-
                 if is_static_call {
                     // Static call: `Counter.times3(7)` -> args are just `[7]`
-                    argv.reserve(args.len());
-                } else {
-                    // Instance call: `c.inc()` -> args are `[c]`
-                    argv.reserve(args.len() + 1);
-                    let this_v =
-                        lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
-                    argv.push(this_v);
+                    let fun_v =
+                        lower_expr_free(b, locals, fields, next_field, callee, lowering_ctx)?;
+                    let mut argv = Vec::with_capacity(args.len());
+                    for a in args {
+                        argv.push(lower_expr_free(
+                            b,
+                            locals,
+                            fields,
+                            next_field,
+                            a,
+                            lowering_ctx,
+                        )?);
+                    }
+                    let (_nid, res) = b.push_node(
+                        Inst::CallClosure {
+                            conv: crate::wir::CallConv::Fast,
+                            fun: fun_v,
+                            args: argv,
+                        },
+                        Some(Type::Int32),
+                        1,
+                        true,
+                    );
+                    return Ok(res[0]);
                 }
 
-                // Append the explicit arguments.
+                // Instance call: evaluate the receiver exactly once, then the arguments.
+                let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
+                let mut arg_vals = Vec::with_capacity(args.len());
                 for a in args {
-                    argv.push(lower_expr_free(
+                    arg_vals.push(lower_expr_free(
                         b,
                         locals,
                         fields,
@@ -4991,17 +5227,66 @@ fn lower_expr_free_impl<'m>(
                     )?);
                 }
 
-                let (_nid, res) = b.push_node(
-                    Inst::CallClosure {
-                        conv: crate::wir::CallConv::Fast,
-                        fun: fun_v,
-                        args: argv,
-                    },
-                    Some(Type::Int32),
-                    1,
-                    true,
-                );
-                return Ok(res[0]);
+                // 0d/0e) Builtin string/array methods. Objects (class instances, object
+                // literals, proxies) may define methods with the same names, so those
+                // receivers are dispatched dynamically at runtime.
+                if builtin_method_arity_ok(name, args.len()) {
+                    let (join, out) = begin_builtin_method_dispatch(
+                        b, recv_v, name, &arg_vals, fields, next_field,
+                    );
+                    if matches!(name.as_str(), "indexOf" | "includes") {
+                        let (_, is_array) = b.push_node(
+                            Inst::CallNative {
+                                name: "wir_is_array".into(), args: vec![recv_v],
+                                pure: true, can_throw: false,
+                            }, Some(Type::Bool), 1, false,
+                        );
+                        let array_block = b.block();
+                        let string_block = b.block();
+                        b.branch(is_array[0], array_block, string_block);
+                        b.position_at(array_block);
+                        let from = arg_vals.get(1).copied().unwrap_or_else(|| b.const_i32(0));
+                        let (_, result) = b.push_node(
+                            Inst::CallNative {
+                                name: if name == "includes" { "wir_array_includes" } else { "wir_array_index_of" }.into(),
+                                args: vec![recv_v, arg_vals[0], from], pure: false, can_throw: false,
+                            }, Some(if name == "includes" { Type::Bool } else { Type::Int32 }), 1, true,
+                        );
+                        b.jump(join, &[result[0]]);
+                        b.position_at(string_block);
+                    }
+                    let builtin = match lower_string_method_call(
+                        b,
+                        locals,
+                        fields,
+                        next_field,
+                        recv_v,
+                        name,
+                        &arg_vals,
+                        lowering_ctx,
+                    )? {
+                        Some(v) => v,
+                        None => lower_array_method_call(
+                            b,
+                            locals,
+                            fields,
+                            next_field,
+                            recv_v,
+                            name,
+                            &arg_vals,
+                            lowering_ctx,
+                        )?
+                        .ok_or(LowerError::NotLowerable("builtin method"))?,
+                    };
+                    b.jump(join, &[builtin]);
+                    b.position_at(join);
+                    return Ok(out);
+                }
+
+                // 0e) Generic property call with `this`.
+                return Ok(lower_dynamic_method_call(
+                    b, recv_v, name, arg_vals, fields, next_field,
+                ));
             }
 
             // 0f) Bracket-call: o["m"](...)
@@ -5085,6 +5370,7 @@ fn lower_expr_free_impl<'m>(
                     1,
                     true,
                 );
+                require_callable(b, sv[0], "TypeError: indexed value is not callable");
                 let mut with_this = Vec::with_capacity(1 + argvals.len());
                 with_this.push(obj);
                 with_this.extend_from_slice(&argvals);
@@ -5113,6 +5399,7 @@ fn lower_expr_free_impl<'m>(
                     1,
                     true,
                 );
+                require_callable(b, av[0], "TypeError: indexed value is not callable");
                 let (_nid_call_a, aret) = b.push_node(
                     Inst::CallClosure {
                         conv: crate::wir::CallConv::Fast,
@@ -6161,6 +6448,34 @@ fn lower_expr_free_impl<'m>(
         ExprKind::In { key, obj } => {
             let o = lower_expr_free(b, locals, fields, next_field, obj, lowering_ctx)?;
 
+            // Dynamic key (`k in o` with a bound variable `k`, or any other expression).
+            let dynamic_key = match key.kind() {
+                ExprKind::Str(_) => None,
+                ExprKind::Ident(_) => {
+                    match lower_expr_free(b, locals, fields, next_field, key, lowering_ctx) {
+                        Ok(kv) => Some(kv),
+                        // Unbound identifier: legacy `name in o` meaning the literal name.
+                        Err(LowerError::UnknownVar(_)) => None,
+                        Err(e) => return Err(e),
+                    }
+                }
+                _ => Some(lower_expr_free(b, locals, fields, next_field, key, lowering_ctx)?),
+            };
+            if let Some(kv) = dynamic_key {
+                let (_nid_s, hs) = b.push_node(
+                    Inst::CallNative {
+                        name: "wir_obj_has_str".into(),
+                        args: vec![o, kv],
+                        pure: false,
+                        can_throw: false,
+                    },
+                    Some(Type::Bool),
+                    1,
+                    true,
+                );
+                return Ok(hs[0]);
+            }
+
             match key.kind() {
                 // identifier key:  a in o
                 ExprKind::Ident(name) => {
@@ -6323,21 +6638,22 @@ fn lower_expr_free_impl<'m>(
         ExprKind::CallBuiltinMapMethod { recv, method, args } => {
             let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
 
-            // The AST gives us the exact method. No string matching, no runtime checks.
-            let (native_name, is_chainable) = match method {
-                crate::front::BuiltinMapMethod::Get => ("wir_map_get", false),
-                crate::front::BuiltinMapMethod::Set => ("wir_map_set", true),
-                crate::front::BuiltinMapMethod::Has => ("wir_map_has", false),
-                crate::front::BuiltinMapMethod::Delete => ("wir_map_delete", false),
-                crate::front::BuiltinMapMethod::Clear => ("wir_map_clear", false),
-                crate::front::BuiltinMapMethod::Keys => ("wir_builtin_keys", false),
-                crate::front::BuiltinMapMethod::Values => ("wir_builtin_values", false),
-                crate::front::BuiltinMapMethod::Entries => ("wir_builtin_entries", false),
+            let (native_name, method_name, is_chainable) = match method {
+                crate::front::BuiltinMapMethod::Get => ("wir_map_get", "get", false),
+                crate::front::BuiltinMapMethod::Set => ("wir_map_set", "set", true),
+                crate::front::BuiltinMapMethod::Has => ("wir_map_has", "has", false),
+                crate::front::BuiltinMapMethod::Delete => ("wir_map_delete", "delete", false),
+                crate::front::BuiltinMapMethod::Clear => ("wir_map_clear", "clear", false),
+                crate::front::BuiltinMapMethod::Keys => ("wir_builtin_keys", "keys", false),
+                crate::front::BuiltinMapMethod::Values => ("wir_builtin_values", "values", false),
+                crate::front::BuiltinMapMethod::Entries => {
+                    ("wir_builtin_entries", "entries", false)
+                }
             };
 
-            let mut call_args: smallvec::SmallVec<[ValueId; 4]> = smallvec::smallvec![recv_v];
+            let mut arg_vals = Vec::with_capacity(args.len());
             for arg_expr in args {
-                call_args.push(lower_expr_free(
+                arg_vals.push(lower_expr_free(
                     b,
                     locals,
                     fields,
@@ -6346,41 +6662,32 @@ fn lower_expr_free_impl<'m>(
                     lowering_ctx,
                 )?);
             }
-
-            let (_nid, res) = b.push_node(
-                Inst::CallNative {
-                    name: native_name.into(),
-                    args: call_args.into_vec(),
-                    pure: false,
-                    can_throw: false,
-                },
-                None,
-                1,
-                true,
-            );
-
-            if is_chainable {
-                // For `set`, the value of the expression is the map itself.
-                Ok(recv_v)
-            } else {
-                Ok(res[0])
-            }
+            Ok(lower_collection_method_call(
+                b,
+                recv_v,
+                method_name,
+                native_name,
+                is_chainable,
+                arg_vals,
+                fields,
+                next_field,
+            ))
         }
 
         ExprKind::CallBuiltinSetMethod { recv, method, args } => {
             let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
 
-            let (native_name, is_chainable) = match method {
-                crate::front::BuiltinSetMethod::Add => ("wir_set_add", true),
-                crate::front::BuiltinSetMethod::Has => ("wir_set_has", false),
-                crate::front::BuiltinSetMethod::Delete => ("wir_set_delete", false),
-                crate::front::BuiltinSetMethod::Clear => ("wir_set_clear", false),
-                crate::front::BuiltinSetMethod::Values => ("wir_builtin_values", false),
+            let (native_name, method_name, is_chainable) = match method {
+                crate::front::BuiltinSetMethod::Add => ("wir_set_add", "add", true),
+                crate::front::BuiltinSetMethod::Has => ("wir_set_has", "has", false),
+                crate::front::BuiltinSetMethod::Delete => ("wir_set_delete", "delete", false),
+                crate::front::BuiltinSetMethod::Clear => ("wir_set_clear", "clear", false),
+                crate::front::BuiltinSetMethod::Values => ("wir_builtin_values", "values", false),
             };
 
-            let mut call_args: smallvec::SmallVec<[ValueId; 4]> = smallvec::smallvec![recv_v];
+            let mut arg_vals = Vec::with_capacity(args.len());
             for arg_expr in args {
-                call_args.push(lower_expr_free(
+                arg_vals.push(lower_expr_free(
                     b,
                     locals,
                     fields,
@@ -6389,42 +6696,35 @@ fn lower_expr_free_impl<'m>(
                     lowering_ctx,
                 )?);
             }
-
-            let (_nid, res) = b.push_node(
-                Inst::CallNative {
-                    name: native_name.into(),
-                    args: call_args.into_vec(),
-                    pure: false,
-                    can_throw: false,
-                },
-                None,
-                1,
-                true,
-            );
-
-            // For `add`, the value of the expression is the set itself.
-            if is_chainable { Ok(recv_v) } else { Ok(res[0]) }
+            Ok(lower_collection_method_call(
+                b,
+                recv_v,
+                method_name,
+                native_name,
+                is_chainable,
+                arg_vals,
+                fields,
+                next_field,
+            ))
         }
 
         ExprKind::CallBuiltinCommonMethod { recv, method } => {
             let recv_v = lower_expr_free(b, locals, fields, next_field, recv, lowering_ctx)?;
-            let native_name = match method {
-                crate::front::BuiltinCommonMethod::Keys => "wir_builtin_keys",
-                crate::front::BuiltinCommonMethod::Values => "wir_builtin_values",
-                crate::front::BuiltinCommonMethod::Entries => "wir_builtin_entries",
+            let (native_name, method_name) = match method {
+                crate::front::BuiltinCommonMethod::Keys => ("wir_builtin_keys", "keys"),
+                crate::front::BuiltinCommonMethod::Values => ("wir_builtin_values", "values"),
+                crate::front::BuiltinCommonMethod::Entries => ("wir_builtin_entries", "entries"),
             };
-            let (_nid, res) = b.push_node(
-                Inst::CallNative {
-                    name: native_name.into(),
-                    args: vec![recv_v],
-                    pure: false,
-                    can_throw: false,
-                },
-                None,
-                1,
-                true,
-            );
-            Ok(res[0])
+            Ok(lower_collection_method_call(
+                b,
+                recv_v,
+                method_name,
+                native_name,
+                false,
+                Vec::new(),
+                fields,
+                next_field,
+            ))
         }
 
         ExprKind::GetBuiltinSize(recv) => {
@@ -6482,8 +6782,175 @@ fn lower_expr_free_impl<'m>(
             Ok(result)
         }
 
+        ExprKind::Typed { op, args } => {
+            lower_typed(b, locals, fields, next_field, op, args, lowering_ctx)
+        }
+
         _ => Err(LowerError::NotLowerable("expression type not supported")),
     }
+}
+
+fn typed_native(b: &mut Builder<'_>, name: &str, args: Vec<ValueId>, ty: Type, pure: bool) -> ValueId {
+    let (_nid, res) = b.push_node(
+        Inst::CallNative {
+            name: name.into(),
+            args,
+            pure,
+            can_throw: false,
+        },
+        Some(ty),
+        1,
+        !pure,
+    );
+    res[0]
+}
+
+fn const_bool(b: &mut Builder<'_>, value: bool) -> ValueId {
+    let (_nid, res) = b.push_node(Inst::Const(Constant::Bool(value)), Some(Type::Bool), 1, false);
+    res[0]
+}
+
+/// Selects between two boolean constants; keeps tagged booleans canonical.
+fn bool_select(b: &mut Builder<'_>, cond: ValueId, if_true: bool) -> ValueId {
+    let yes = b.block();
+    let no = b.block();
+    let done = b.block();
+    let result = b.add_block_param(done, Type::Bool);
+    b.branch(cond, yes, no);
+    b.position_at(yes);
+    let value = const_bool(b, if_true);
+    b.jump(done, &[value]);
+    b.position_at(no);
+    let value = const_bool(b, !if_true);
+    b.jump(done, &[value]);
+    b.position_at(done);
+    result
+}
+
+/// Compiled runtime test for a type-checker boundary guard.
+fn lower_rt_check(
+    b: &mut Builder<'_>,
+    fields: &mut HashMap<String, FieldId>,
+    next_field: &mut u32,
+    value: ValueId,
+    check: &RtCheck,
+) -> ValueId {
+    let predicate = match check {
+        RtCheck::Number => "wir_is_number",
+        RtCheck::Str => "wir_is_str",
+        RtCheck::Bool => "wir_is_bool",
+        RtCheck::Null => "wir_is_null",
+        RtCheck::Array => "wir_is_array",
+        RtCheck::Function => "wir_is_closure",
+        RtCheck::Map => "wir_is_map",
+        RtCheck::Set => "wir_is_set",
+        RtCheck::AnyOf(checks) => {
+            let mut result = None;
+            for check in checks {
+                let next = lower_rt_check(b, fields, next_field, value, check);
+                result = Some(match result {
+                    Some(previous) => build_bool_or(b, previous, next),
+                    None => next,
+                });
+            }
+            return result.unwrap_or_else(|| const_bool(b, false));
+        }
+        RtCheck::Shape(names) => {
+            let is_object = typed_native(b, "wir_is_obj", vec![value], Type::Bool, true);
+            if names.is_empty() {
+                return is_object;
+            }
+            let done = b.block();
+            let result = b.add_block_param(done, Type::Bool);
+            let missing = b.block();
+            let mut next = b.block();
+            b.branch(is_object, next, missing);
+            for name in names {
+                b.position_at(next);
+                // Probe by name: function-local field ids are not globally unique.
+                let key = b.const_str(name);
+                let has = typed_native(b, "wir_obj_has_str", vec![value, key], Type::Bool, false);
+                next = b.block();
+                b.branch(has, next, missing);
+            }
+            b.position_at(next);
+            let pass = const_bool(b, true);
+            b.jump(done, &[pass]);
+            b.position_at(missing);
+            let fail = const_bool(b, false);
+            b.jump(done, &[fail]);
+            b.position_at(done);
+            return result;
+        }
+        other => {
+            let schema = b.const_str(&serde_json::to_string(other).expect("serializable type schema"));
+            return typed_native(b, "wir_type_matches", vec![value, schema], Type::Bool, false);
+        }
+    };
+    typed_native(b, predicate, vec![value], Type::Bool, true)
+}
+
+fn lower_typed<'m>(
+    b: &mut Builder<'m>,
+    locals: &mut HashMap<String, ValueId>,
+    fields: &mut HashMap<String, FieldId>,
+    next_field: &mut u32,
+    op: &TypedOp,
+    args: &[Expr],
+    lowering_ctx: &LoweringContext,
+) -> LResult<ValueId> {
+    if let TypedOp::ArraySet = op {
+        // Same evaluation order as untyped `a[i] = v`: value first.
+        let value = lower_expr_free(b, locals, fields, next_field, &args[2], lowering_ctx)?;
+        let array = lower_expr_free(b, locals, fields, next_field, &args[0], lowering_ctx)?;
+        let index = lower_expr_free(b, locals, fields, next_field, &args[1], lowering_ctx)?;
+        typed_native(b, "wir_array_set", vec![array, index, value], Type::Top, false);
+        return Ok(value);
+    }
+    let mut values = Vec::with_capacity(args.len());
+    for arg in args {
+        values.push(lower_expr_free(b, locals, fields, next_field, arg, lowering_ctx)?);
+    }
+    Ok(match op {
+        TypedOp::Assert { check, message } => {
+            let value = values[0];
+            let ok = lower_rt_check(b, fields, next_field, value, check);
+            let pass = b.block();
+            let fail = b.block();
+            b.branch(ok, pass, fail);
+            b.position_at(fail);
+            snapshot_try_locals(b, locals);
+            let error = b.const_str(message);
+            let _ = b.push_node(Inst::Throw(error), None, 0, true);
+            b.position_at(pass);
+            value
+        }
+        TypedOp::StrConcat => {
+            typed_native(b, "wir_string_concat", vec![values[0], values[1]], Type::Str, false)
+        }
+        TypedOp::StrEq { negate } => {
+            let equal =
+                typed_native(b, "wir_string_equals", vec![values[0], values[1]], Type::Bool, false);
+            if *negate { bool_select(b, equal, false) } else { equal }
+        }
+        TypedOp::PrimEq { negate } => {
+            let kind = if *negate { crate::wir::CmpKind::Ne } else { crate::wir::CmpKind::Eq };
+            let (_nid, res) = b.push_node(
+                Inst::CmpInt { kind, a: values[0], b: values[1] },
+                Some(Type::Bool),
+                1,
+                false,
+            );
+            res[0]
+        }
+        TypedOp::ArrayLen => typed_native(b, "wir_array_len", vec![values[0]], Type::Int32, false),
+        TypedOp::StrLen => typed_native(b, "wir_string_len", vec![values[0]], Type::Int32, false),
+        TypedOp::ArrayGet => {
+            typed_native(b, "wir_array_get", vec![values[0], values[1]], Type::Top, false)
+        }
+        TypedOp::TypeArgs(_) | TypedOp::Cast(_) => values[0],
+        TypedOp::ArraySet => unreachable!("handled above"),
+    })
 }
 
 impl<'m> Lowerer<'m> {
@@ -6557,6 +7024,9 @@ impl<'m> Lowerer<'m> {
             // 0) Inicializa SOLO las celdas de export de este módulo a `undefined` (TDZ-safe).
             //    NO tocar import_bindings: son celdas del proveedor.
             let undef = b.const_undef();
+            for (_, cell) in links.module_bindings.values() {
+                b.store_binding(*cell, undef);
+            }
             for &bid in links.export_bindings.values() {
                 b.store_binding(bid, undef);
             }
@@ -6905,11 +7375,12 @@ impl<'m> Lowerer<'m> {
                         init: rw_expr(init, f),
                     },
                 ),
-                StmtKind::Var { name, init } => stmt_with_meta(
+                StmtKind::Var { name, init, ty } => stmt_with_meta(
                     s,
                     StmtKind::Var {
                         name: name.clone(),
                         init: init.as_ref().map(|e| rw_expr(e, f)),
+                        ty: ty.clone(),
                     },
                 ),
                 StmtKind::VarDestruct { pattern, init } => stmt_with_meta(
@@ -7038,6 +7509,13 @@ impl<'m> Lowerer<'m> {
                     &m,
                     ExprKind::Call {
                         callee: SmallBox::new(rw_expr(callee, f)),
+                        args: args.iter().map(|x| rw_expr(x, f)).collect(),
+                    },
+                ),
+                ExprKind::Typed { op, args } => expr_with_meta(
+                    &m,
+                    ExprKind::Typed {
+                        op: op.clone(),
                         args: args.iter().map(|x| rw_expr(x, f)).collect(),
                     },
                 ),

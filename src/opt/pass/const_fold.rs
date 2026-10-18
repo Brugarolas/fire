@@ -76,10 +76,7 @@ impl OptimizationWIR for ConstFold {
 
         // Helpers (pure, no mutable borrows)
         let is_commutative_int = |op: IntBinOp| {
-            matches!(
-                op,
-                IntBinOp::Add | IntBinOp::Mul | IntBinOp::And | IntBinOp::Or | IntBinOp::Xor
-            )
+            matches!(op, IntBinOp::Mul | IntBinOp::And | IntBinOp::Or | IntBinOp::Xor)
         };
 
         let kind = cur.cur_kind(); // clone snapshot
@@ -96,7 +93,8 @@ impl OptimizationWIR for ConstFold {
             }
 
             // ===== INT rules =====
-            // Put constant on RHS for commutative ops
+            // Put constant on RHS for commutative ops. `+` is excluded because it may be
+            // string concatenation.
             IntBin { op, a, b } if is_commutative_int(op) => {
                 let (a_is_c, b_is_c) =
                     cur.with_func(|f| (value_as_i32(f, a).is_some(), value_as_i32(f, b).is_some()));
@@ -109,164 +107,36 @@ impl OptimizationWIR for ConstFold {
             IntBin { op, a, b } => {
                 let (ac, bc) = cur.with_func(|f| (value_as_i32(f, a), value_as_i32(f, b)));
 
-                // Same-operand simplifications (no new const values required)
-                if a == b {
-                    match op {
-                        IntBinOp::Sub | IntBinOp::Xor => {
-                            act = Action::ReplaceKind(Const(Constant::Int32(0)), Some(Type::Int32))
-                        }
-                        IntBinOp::And | IntBinOp::Or => act = Action::ReplaceKind(Mov(a), None),
-                        // Shifts with same SSA are not a standard identity; leave alone.
-                        _ => {}
-                    }
+                // Same-operand simplifications that hold for every number (incl. floats,
+                // which bitwise ops truncate to integers first).
+                if a == b && op == IntBinOp::Xor {
+                    act = Action::ReplaceKind(Const(Constant::Int32(0)), Some(Type::Int32))
                 }
 
                 // One-constant identities
                 if matches!(act, Action::None) && (ac.is_some() || bc.is_some()) {
                     match op {
-                        IntBinOp::Add => {
-                            if bc == Some(0) {
-                                act = Action::ReplaceKind(Mov(a), None);
-                            } else if ac == Some(0) {
-                                act = Action::ReplaceKind(Mov(b), None);
-                            }
+                        // Only identities that hold for every number (SMI or float) are
+                        // applied: `x + 0` may be a string concat, `x % 1` keeps fractions,
+                        // `x | 0` truncates floats and `x * 0` is NaN for infinities.
+                        IntBinOp::Sub if bc == Some(0) => act = Action::ReplaceKind(Mov(a), None),
+                        IntBinOp::Mul if bc == Some(1) => act = Action::ReplaceKind(Mov(a), None),
+                        IntBinOp::Mul if ac == Some(1) => act = Action::ReplaceKind(Mov(b), None),
+                        IntBinOp::DivS if bc == Some(1) => act = Action::ReplaceKind(Mov(a), None),
+                        IntBinOp::And if bc == Some(0) || ac == Some(0) => {
+                            act = Action::ReplaceKind(Const(Constant::Int32(0)), Some(Type::Int32));
                         }
-                        IntBinOp::Sub => {
-                            if bc == Some(0) {
-                                act = Action::ReplaceKind(Mov(a), None);
-                            }
+                        IntBinOp::Or if bc == Some(-1) || ac == Some(-1) => {
+                            act = Action::ReplaceKind(Const(Constant::Int32(-1)), Some(Type::Int32));
                         }
-                        IntBinOp::Mul => {
-                            if let Some(y) = bc {
-                                if y == 0 {
-                                    act = Action::ReplaceKind(
-                                        Const(Constant::Int32(0)),
-                                        Some(Type::Int32),
-                                    );
-                                } else if y == 1 {
-                                    act = Action::ReplaceKind(Mov(a), None);
-                                }
-                            } else if let Some(x) = ac {
-                                if x == 0 {
-                                    act = Action::ReplaceKind(
-                                        Const(Constant::Int32(0)),
-                                        Some(Type::Int32),
-                                    );
-                                } else if x == 1 {
-                                    act = Action::ReplaceKind(Mov(b), None);
-                                }
-                            }
-                        }
-                        IntBinOp::DivS => {
-                            // x/1 -> x   (avoid /-1 unless both consts)
-                            if bc == Some(1) {
-                                act = Action::ReplaceKind(Mov(a), None);
-                            }
-                        }
-                        IntBinOp::RemS => {
-                            // x%1 -> 0 ; x%-1 -> 0
-                            if bc == Some(1) || bc == Some(-1) {
-                                act = Action::ReplaceKind(
-                                    Const(Constant::Int32(0)),
-                                    Some(Type::Int32),
-                                );
-                            }
-                        }
-                        IntBinOp::And => {
-                            if let Some(y) = bc {
-                                if y == 0 {
-                                    act = Action::ReplaceKind(
-                                        Const(Constant::Int32(0)),
-                                        Some(Type::Int32),
-                                    );
-                                } else if y == -1 {
-                                    act = Action::ReplaceKind(Mov(a), None);
-                                }
-                            } else if let Some(x) = ac {
-                                if x == 0 {
-                                    act = Action::ReplaceKind(
-                                        Const(Constant::Int32(0)),
-                                        Some(Type::Int32),
-                                    );
-                                } else if x == -1 {
-                                    act = Action::ReplaceKind(Mov(b), None);
-                                }
-                            }
-                        }
-                        IntBinOp::Or => {
-                            if let Some(y) = bc {
-                                if y == 0 {
-                                    act = Action::ReplaceKind(Mov(a), None);
-                                } else if y == -1 {
-                                    act = Action::ReplaceKind(
-                                        Const(Constant::Int32(-1)),
-                                        Some(Type::Int32),
-                                    );
-                                }
-                            } else if let Some(x) = ac {
-                                if x == 0 {
-                                    act = Action::ReplaceKind(Mov(b), None);
-                                } else if x == -1 {
-                                    act = Action::ReplaceKind(
-                                        Const(Constant::Int32(-1)),
-                                        Some(Type::Int32),
-                                    );
-                                }
-                            }
-                        }
-                        IntBinOp::Xor => {
-                            if bc == Some(0) {
-                                act = Action::ReplaceKind(Mov(a), None);
-                            } else if ac == Some(0) {
-                                act = Action::ReplaceKind(Mov(b), None);
-                            }
-                        }
-                        IntBinOp::Shl | IntBinOp::ShrU | IntBinOp::Sar => {
-                            if let Some(y) = bc {
-                                if ((y as u32) & 31) == 0 {
-                                    act = Action::ReplaceKind(Mov(a), None);
-                                } else if y != ((y as u32) & 31) as i32 {
-                                    // Canonicalize large/neg shift immediates to masked amount
-                                    let m = ((y as u32) & 31) as i32;
-                                    // Can't synthesize a new constant ValueId for `m` here,
-                                    // so only handle the zero case; keep others as-is.
-                                }
-                            }
-                        }
-                        IntBinOp::Not => {}
+                        _ => {}
                     }
                 }
 
-                // Both-constant fold (wrap semantics)
+                // Both-constant fold (JS number semantics, only when the result stays an i32)
                 if matches!(act, Action::None) {
                     if let (Some(x), Some(y)) = (ac, bc) {
-                        let folded = match op {
-                            IntBinOp::Add => Some(x.wrapping_add(y)),
-                            IntBinOp::Sub => Some(x.wrapping_sub(y)),
-                            IntBinOp::Mul => Some(x.wrapping_mul(y)),
-                            IntBinOp::DivS => {
-                                if y == 0 || (x == i32::MIN && y == -1) {
-                                    None
-                                } else {
-                                    Some(x.wrapping_div(y))
-                                }
-                            }
-                            IntBinOp::RemS => {
-                                if y == 0 {
-                                    None
-                                } else {
-                                    Some(x.wrapping_rem(y))
-                                }
-                            }
-                            IntBinOp::And => Some(x & y),
-                            IntBinOp::Or => Some(x | y),
-                            IntBinOp::Xor => Some(x ^ y),
-                            IntBinOp::Shl => Some(x.wrapping_shl((y as u32) & 31)),
-                            IntBinOp::ShrU => Some(((x as u32) >> ((y as u32) & 31)) as i32),
-                            IntBinOp::Sar => Some(x >> ((y as u32) & 31)),
-                            IntBinOp::Not => None, // unary
-                        };
-                        if let Some(v) = folded {
+                        if let Some(v) = crate::opt::helpers::fold_js_int_bin(op, x, y) {
                             act = Action::ReplaceKind(Const(Constant::Int32(v)), Some(Type::Int32));
                         }
                     }
@@ -405,16 +275,9 @@ impl OptimizationWIR for ConstFold {
             }
 
             // ===== Comparisons =====
-            CmpInt { kind, a, b } if a == b => {
-                let v = match kind {
-                    CmpKind::Eq => true,
-                    CmpKind::Ne => false,
-                    CmpKind::Lt => false,
-                    CmpKind::Le => true,
-                    CmpKind::Gt => false,
-                    CmpKind::Ge => true,
-                };
-                act = Action::ReplaceKind(Const(Constant::Bool(v)), Some(Type::Bool));
+            // Operands may be NaN at runtime, so only `x < x` / `x > x` are always false.
+            CmpInt { kind, a, b } if a == b && matches!(kind, CmpKind::Lt | CmpKind::Gt) => {
+                act = Action::ReplaceKind(Const(Constant::Bool(false)), Some(Type::Bool));
             }
             CmpF64 { kind, a, b } if a == b => {
                 if let Some(x) = cur.with_func(|f| value_as_f64(f, a)) {

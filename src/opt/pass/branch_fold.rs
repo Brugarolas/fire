@@ -242,14 +242,9 @@ impl BranchFold {
 
                         // ---------- Int compare canonicalize + fold ----------
                         Inst::CmpInt { kind, a, b } => {
-                            // a ? a  (always decidable for integers)
-                            if a == b {
-                                use CmpKind::*;
-                                let res = match kind {
-                                    Eq | Le | Ge => true,
-                                    Ne | Lt | Gt => false,
-                                };
-                                q.replace_kind(nid, Inst::Const(Constant::Bool(res)));
+                            // a ? a: operands may be NaN at runtime, so only `<`/`>` decide.
+                            if a == b && matches!(kind, CmpKind::Lt | CmpKind::Gt) {
+                                q.replace_kind(nid, Inst::Const(Constant::Bool(false)));
                                 changed = true;
                                 continue;
                             }
