@@ -346,29 +346,6 @@ pub extern "C" fn napalm_rt_try_finally_exit(func_id: i64, region_id: i64) -> i6
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn napalm_rt_schedule_defer(kind: i32, action: i64) -> i64 {
-    let kind = match kind {
-        0 => WirDeferKind::Always,
-        1 => WirDeferKind::OnError,
-        _ => WirDeferKind::Always,
-    };
-    TRY_STACK.with(|stack| {
-        let mut stack = stack.borrow_mut();
-        if let Some(frame) = stack.last_mut() {
-            frame.defers.push(DeferredAction {
-                kind,
-                closure: action,
-            });
-        } else {
-            unsafe {
-                let _ = wir_call_closure(action, ptr::null(), 0);
-            }
-        }
-    });
-    0
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn napalm_rt_throw(func_id: i64, error: i64) -> i64 {
     RETURN_SLOT.with(|slot| {
         slot.borrow_mut().take();

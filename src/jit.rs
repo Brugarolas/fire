@@ -335,7 +335,7 @@ use crate::native_timers::{
 use crate::runtime::{
     CatchStubEntry, RuntimeResumeInfo, RuntimeTryDescriptor, napalm_rt_clear_resume,
     napalm_rt_clear_return, napalm_rt_mark_return, napalm_rt_prepare_resume,
-    napalm_rt_register_try_descriptor, napalm_rt_schedule_defer, napalm_rt_stub_unimplemented,
+    napalm_rt_register_try_descriptor, napalm_rt_stub_unimplemented,
     napalm_rt_take_resume, napalm_rt_throw, napalm_rt_try_enter, napalm_rt_try_finally_enter,
     napalm_rt_try_finally_exit, napalm_rt_try_leave, napalm_yieldpoint, wir_builtin_entries,
     wir_builtin_keys, wir_builtin_size, wir_builtin_values, wir_field_register_name, wir_is_map,
@@ -823,10 +823,6 @@ impl Default for JIT {
             jb.symbol(
                 "napalm_rt_try_finally_exit",
                 napalm_rt_try_finally_exit as *const extern "C" fn(i64, i64) -> i64 as *const u8,
-            );
-            jb.symbol(
-                "napalm_rt_schedule_defer",
-                napalm_rt_schedule_defer as *const extern "C" fn(i32, i64) -> i64 as *const u8,
             );
             jb.symbol(
                 "napalm_rt_throw",

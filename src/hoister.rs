@@ -159,7 +159,15 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                 }
             }
             StmtKind::Throw(expr) => collect_uses_expr(expr, uses),
-            StmtKind::Defer { expr, .. } => collect_uses_expr(expr, uses),
+            StmtKind::Defer { binding, body, .. } => {
+                let mut cleanup_defs = BTreeSet::new();
+                let mut cleanup_uses = BTreeSet::new();
+                collect_defs_uses_block(body, &mut cleanup_defs, &mut cleanup_uses);
+                if let Some(binding) = binding {
+                    cleanup_defs.insert(binding.clone());
+                }
+                uses.extend(cleanup_uses.difference(&cleanup_defs).cloned());
+            }
             StmtKind::Expr(e) => collect_uses_expr(e, uses),
             StmtKind::Listen(ld) => {
                 for r in &ld.routes {
@@ -609,20 +617,24 @@ pub fn hoist_fn_lits_program(prog: &Program) -> (Program, HashMap<String, Vec<St
                     lam_caps_out,
                 )),
             ),
-            StmtKind::Defer { kind, expr } => stmt_with_meta(
-                s,
-                StmtKind::Defer {
-                    kind: *kind,
-                    expr: rw_expr(
-                        expr,
-                        used,
-                        counter,
-                        enclosing_locals,
-                        out_funcs,
-                        lam_caps_out,
-                    ),
-                },
-            ),
+            StmtKind::Defer {
+                kind,
+                binding,
+                body,
+            } => {
+                let mut scope = enclosing_locals.clone();
+                if let Some(binding) = binding {
+                    scope.insert(binding.clone());
+                }
+                stmt_with_meta(
+                    s,
+                    StmtKind::Defer {
+                        kind: *kind,
+                        binding: binding.clone(),
+                        body: rw_block(body, used, counter, &scope, out_funcs, lam_caps_out),
+                    },
+                )
+            }
             StmtKind::Return(expr_opt) => stmt_with_meta(
                 s,
                 StmtKind::Return(expr_opt.as_ref().map(|expr| {

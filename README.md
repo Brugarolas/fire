@@ -31,7 +31,7 @@ Language features (Done/Planned):
 - A small, concise, powerful eDSL for creating server services. [x]
 - Enums. [x]
 - Try/Catch/Finally. [x]
-- Defer/Errdefer. [ ]
+- Defer/Errdefer. [x]
 - Dates and dates methods. [ ]
 - Proxies a là JavaScript. [ ]
 - Generators. [ ]
@@ -76,6 +76,29 @@ Exception handling:
 
 Run the exception example with `cargo run -- scripts/trycatch.napalm` and the regression suite with `cargo test --test trycatch`.
 If MMTk cannot reserve its heap address range on Windows, the same suite can be run without GC using `cargo test --no-default-features --test trycatch`.
+
+Deferred cleanup (Zig-style):
+```text
+fn work(fail) {
+    var value = 1;
+    defer print(["last cleanup", value]);
+    errdefer |error| print(["failed", error]);
+    defer { print("first cleanup"); value = value + 1; }
+    value = 7;
+    if (fail) { throw "failure"; }
+    return value; // result is 7; the last cleanup sees 8
+}
+```
+- `defer expression;` and `defer { statements }` run at the end of the enclosing lexical scope, in reverse registration order. Expressions are evaluated at exit, using the latest values of locals visible at registration. Block bodies accept an optional trailing semicolon.
+- `errdefer expression;` and `errdefer { statements }` run only when an exception escapes that scope. Napalm uses thrown exceptions, not Zig error-union return values: normal returns (including null/false) do not trigger `errdefer`, and exceptions caught inside the scope do not trigger it.
+- `errdefer |error| expression;` or `errdefer |error| { statements }` binds the original thrown value inside the cleanup. Reassigning that binding does not change the propagated exception.
+- Registrations only take effect when reached. Function bodies, branches, loop iterations, and try/catch/finally bodies each have their own cleanup scope. A loop body finishes its cleanup before the next iteration or `for` step.
+- A return expression is evaluated before cleanup starts. Deferred mutations affect subsequent cleanups and enclosing scopes but do not replace the already-computed return value (ordinary object-reference semantics still apply).
+- `return` cannot escape a cleanup body; returns inside nested function literals are allowed. A cleanup that throws replaces the pending return/exception, while remaining outer cleanups still run. This follows Napalm's `finally` semantics rather than Zig's restriction on fallible cleanup.
+- Cleanup works in closures, instance/static methods, module initializers, and async functions. Async cleanup, including `await`, finishes before the promise settles. Module-level cleanup runs when that module's initializer exits, not at process shutdown.
+- Cleanup control flow is compiled with Cranelift using lexical handler/finalizer regions. No runtime defer scheduler, cleanup closures, or new unsafe C helpers are required. As with explicit try regions, WIR optimization passes currently bypass these functions; Cranelift still compiles them.
+
+Run `cargo run -- scripts/defer.napalm` for the example and `cargo test --test defer -- --test-threads=1` for cleanup regressions. Add `--no-default-features` to test without GC when MMTk cannot reserve its Windows heap range.
 
 JIT core intrinsics:
 - 26 runtime helpers now have shared Cranelift fast paths, used by native calls and the corresponding WIR array instructions.

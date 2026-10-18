@@ -231,7 +231,14 @@ impl Resolver {
             }
             StmtKind::Return(Some(expr)) => self.resolve_expr(expr)?,
             StmtKind::Throw(expr) => self.resolve_expr(expr)?,
-            StmtKind::Defer { expr, .. } => self.resolve_expr(expr)?,
+            StmtKind::Defer { binding, body, .. } => {
+                self.enter_scope();
+                if let Some(binding) = binding {
+                    self.declare(binding.clone(), stmt.meta.span.clone())?;
+                }
+                self.resolve_block(body)?;
+                self.exit_scope()?;
+            }
             StmtKind::Try {
                 try_block,
                 catch,

@@ -1,0 +1,21 @@
+fn work(fail) {
+    var value = 1;
+    defer print(["last cleanup", value]);
+    errdefer |error| print(["failure cleanup", error]);
+    defer {
+        print(["first cleanup", value]);
+        value = value + 1;
+    }
+
+    value = 7;
+    if (fail) { throw "work failed"; }
+    return value;
+}
+
+print(work(false));
+try { work(true); } catch (error) { print(error); }
+
+for (var i = 0; i < 2; i = i + 1) {
+    defer print(["iteration cleanup", i]);
+    print(["iteration", i]);
+}

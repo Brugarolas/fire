@@ -20,6 +20,7 @@ use compact_str::CompactString;
 
 use smallvec::SmallVec;
 
+mod defers;
 mod enums;
 
 // Bring in the WIR types from your other file/module.
@@ -486,7 +487,8 @@ pub enum StmtKind {
     Throw(Expr),
     Defer {
         kind: DeferKind,
-        expr: Expr,
+        binding: Option<String>,
+        body: Block,
     },
     Return(Option<Expr>),
     Expr(Expr),
@@ -2231,20 +2233,8 @@ impl<'src> Parser<'src> {
             let value = self.expr()?;
             self.expect(Tok::Semi, "expected ';' after throw expression")?;
             Ok(stmt_unknown(StmtKind::Throw(value)))
-        } else if self.matches(&Tok::Defer) {
-            let expr = self.expr()?;
-            self.expect(Tok::Semi, "expected ';' after defer expression")?;
-            Ok(stmt_unknown(StmtKind::Defer {
-                kind: DeferKind::Defer,
-                expr,
-            }))
-        } else if self.matches(&Tok::ErrDefer) {
-            let expr = self.expr()?;
-            self.expect(Tok::Semi, "expected ';' after errdefer expression")?;
-            Ok(stmt_unknown(StmtKind::Defer {
-                kind: DeferKind::ErrDefer,
-                expr,
-            }))
+        } else if self.check(&Tok::Defer) || self.check(&Tok::ErrDefer) {
+            self.defer_stmt()
         } else if self.matches(&Tok::Return) {
             if self.matches(&Tok::Semi) {
                 Ok(stmt_unknown(StmtKind::Return(None)))

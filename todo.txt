@@ -1,5 +1,4 @@
 Features I still have not implemented:
-- Defer/Errdefer (a là Zig)
 - When detecting an error, return a beautiful error report ('ariadne'), both in the front and in the lowerer (and modules - "import not found.."?), containing the line of code that failed in number and in code
 - Add Dates (a là JavaScript: get/set of properties .date, .day, .fullYear, .hours, .milliseconds, .seconds, .time; constructors new Date(), Date(), Date.now(), Date.parse())
 - Interfaces (a là TypeScript)

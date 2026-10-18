@@ -937,11 +937,112 @@ fn lower_block_free<'m>(
     lowering_ctx: &LoweringContext,
     active_try: &mut Vec<TryScope>,
 ) -> LResult<()> {
-    for s in &blk.stmts {
+    lower_cleanup_scope(
+        b,
+        locals,
+        fields,
+        next_field,
+        blk,
+        lowering_ctx,
+        active_try,
+        &mut lower_stmt_free,
+    )
+}
+
+fn lower_cleanup_scope<'m, F>(
+    b: &mut Builder<'m>,
+    locals: &mut HashMap<String, ValueId>,
+    fields: &mut HashMap<String, FieldId>,
+    next_field: &mut u32,
+    blk: &Block,
+    lowering_ctx: &LoweringContext,
+    active_try: &mut Vec<TryScope>,
+    lower_stmt: &mut F,
+) -> LResult<()>
+where
+    F: FnMut(
+        &mut Builder<'m>,
+        &mut HashMap<String, ValueId>,
+        &mut HashMap<String, FieldId>,
+        &mut u32,
+        &Stmt,
+        &LoweringContext,
+        &mut Vec<TryScope>,
+    ) -> LResult<()>,
+{
+    for (index, s) in blk.stmts.iter().enumerate() {
         if b.current_block_terminated() {
             break;
         }
-        lower_stmt_free(b, locals, fields, next_field, s, lowering_ctx, active_try)?; // <-- pass
+        if let StmtKind::Defer {
+            kind,
+            binding,
+            body,
+        } = s.kind()
+        {
+            // Only the remaining statements are protected, so an unreached
+            // registration never runs. Nesting supplies LIFO cleanup order.
+            let remaining = Block {
+                stmts: blk.stmts[index + 1..].to_vec(),
+            };
+            let catch = if *kind == DeferKind::ErrDefer {
+                let original = format!("\0errdefer_{}", crate::wir::next_id());
+                let error = expr_unknown(ExprKind::Ident(original.clone()));
+                let mut stmts = Vec::new();
+                if let Some(binding) = binding {
+                    stmts.push(stmt_with_meta(
+                        s,
+                        StmtKind::Var {
+                            name: original.clone(),
+                            init: Some(expr_unknown(ExprKind::Ident(binding.clone()))),
+                        },
+                    ));
+                }
+                // The original throw resumes outside the cleanup body's scope;
+                // inner errdefers must not mistake it for a cleanup failure.
+                stmts.push(stmt_with_meta(
+                    s,
+                    StmtKind::Try {
+                        try_block: body.clone(),
+                        catch: None,
+                        finally_block: Some(Block { stmts: Vec::new() }),
+                    },
+                ));
+                stmts.push(stmt_with_meta(s, StmtKind::Throw(error)));
+                Some(CatchClause {
+                    binding: Some(binding.clone().unwrap_or(original)),
+                    body: Block { stmts },
+                    meta: s.meta.clone(),
+                })
+            } else {
+                None
+            };
+            lower_try_stmt_generic(
+                b,
+                locals,
+                fields,
+                next_field,
+                &remaining,
+                catch.as_ref(),
+                (*kind == DeferKind::Defer).then_some(body),
+                lowering_ctx,
+                active_try,
+                |b, locals, fields, next_field, block, lowering_ctx, active_try| {
+                    lower_cleanup_scope(
+                        b,
+                        locals,
+                        fields,
+                        next_field,
+                        block,
+                        lowering_ctx,
+                        active_try,
+                        lower_stmt,
+                    )
+                },
+            )?;
+            return Ok(());
+        }
+        lower_stmt(b, locals, fields, next_field, s, lowering_ctx, active_try)?;
     }
     Ok(())
 }
@@ -1215,6 +1316,7 @@ fn lower_stmt_free<'m>(
             let c = lower_expr_free(b, locals, fields, next_field, cond, lowering_ctx)?; // <-- pass
             b.branch(c, body_b, exit);
 
+            let exit_locals = locals.clone();
             b.position_at(body_b);
             lower_block_free(
                 b,
@@ -1230,6 +1332,7 @@ fn lower_stmt_free<'m>(
             b.jump(head, &back_args);
 
             b.position_at(exit);
+            *locals = exit_locals;
             for (nm, p) in mut_names.into_iter().zip(phi_vals.into_iter()) {
                 locals.insert(nm, p);
             }
@@ -1286,6 +1389,7 @@ fn lower_stmt_free<'m>(
             };
             b.branch(c, body_b, exit);
 
+            let exit_locals = locals.clone();
             b.position_at(body_b);
             lower_block_free(
                 b,
@@ -1304,6 +1408,7 @@ fn lower_stmt_free<'m>(
             b.jump(head, &back_args);
 
             b.position_at(exit);
+            *locals = exit_locals;
             for (nm, p) in mut_names.into_iter().zip(phi_vals.into_iter()) {
                 locals.insert(nm, p);
             }
@@ -1341,23 +1446,10 @@ fn lower_stmt_free<'m>(
             let _ = emit_try_leave_chain(b, active_try, locals, TryExitKind::Exception);
             let _ = b.push_node(Inst::Throw(val), None, 0, true);
         }
-        StmtKind::Defer { kind, expr } => {
-            let action = lower_expr_free(b, locals, fields, next_field, expr, lowering_ctx)?;
-            let kind_val = match kind {
-                DeferKind::Defer => b.const_i32(0),
-                DeferKind::ErrDefer => b.const_i32(1),
-            };
-            let _ = b.push_node(
-                Inst::CallNative {
-                    name: "napalm_rt_schedule_defer".into(),
-                    args: vec![kind_val, action],
-                    pure: false,
-                    can_throw: false,
-                },
-                Some(Type::Top),
-                1,
-                true,
-            );
+        StmtKind::Defer { .. } => {
+            return Err(LowerError::NotLowerable(
+                "defer declaration must belong to a cleanup scope",
+            ));
         }
         StmtKind::Return(e) => {
             if let Some(e) = e {
@@ -1767,7 +1859,9 @@ fn collect_mut_locals_in_stmt(s: &Stmt, out: &mut BTreeSet<String>) {
             }
         }
         StmtKind::Throw(expr) => collect_mut_locals_in_expr(expr, out),
-        StmtKind::Defer { expr, .. } => collect_mut_locals_in_expr(expr, out),
+        StmtKind::Defer { body, .. } => {
+            out.extend(collect_mut_locals_in_block(body));
+        }
         StmtKind::Listen(ld) => {
             for r in &ld.routes {
                 collect_mut_locals_in_expr(&r.pattern, out);
@@ -1795,22 +1889,20 @@ fn lower_block_free_async<'m>(
     in_async: bool,
     active_try: &mut Vec<TryScope>,
 ) -> LResult<()> {
-    for s in &blk.stmts {
-        if b.current_block_terminated() {
-            break;
-        }
-        lower_stmt_free_async(
-            b,
-            locals,
-            fields,
-            next_field,
-            s,
-            lowering_ctx,
-            in_async,
-            active_try,
-        )?;
-    }
-    Ok(())
+    lower_cleanup_scope(
+        b,
+        locals,
+        fields,
+        next_field,
+        blk,
+        lowering_ctx,
+        active_try,
+        &mut |b, locals, fields, next_field, s, lowering_ctx, active_try| {
+            lower_stmt_free_async(
+                b, locals, fields, next_field, s, lowering_ctx, in_async, active_try,
+            )
+        },
+    )
 }
 
 fn lower_stmt_free_async<'m>(
@@ -1956,33 +2048,9 @@ fn lower_stmt_free_async<'m>(
                     let _ = b.push_node(Inst::Throw(val), None, 0, true);
                     Ok(())
                 }
-                StmtKind::Defer { kind, expr } => {
-                    let action = lower_expr_free_async(
-                        b,
-                        locals,
-                        fields,
-                        next_field,
-                        expr,
-                        lowering_ctx,
-                        in_async,
-                    )?;
-                    let kind_val = match kind {
-                        DeferKind::Defer => b.const_i32(0),
-                        DeferKind::ErrDefer => b.const_i32(1),
-                    };
-                    let _ = b.push_node(
-                        Inst::CallNative {
-                            name: "napalm_rt_schedule_defer".into(),
-                            args: vec![kind_val, action],
-                            pure: false,
-                            can_throw: false,
-                        },
-                        Some(Type::Top),
-                        1,
-                        true,
-                    );
-                    Ok(())
-                }
+                StmtKind::Defer { .. } => Err(LowerError::NotLowerable(
+                    "defer declaration must belong to a cleanup scope",
+                )),
                 StmtKind::Enum { .. } => {
                     lower_stmt_free(b, locals, fields, next_field, s, lowering_ctx, active_try)
                 }
@@ -2242,6 +2310,7 @@ fn lower_stmt_free_async<'m>(
                     )?;
                     b.branch(c, body_b, exit);
 
+                    let exit_locals = locals.clone();
                     b.position_at(body_b);
                     lower_block_free_async(
                         b,
@@ -2258,6 +2327,7 @@ fn lower_stmt_free_async<'m>(
                     b.jump(head, &back_args);
 
                     b.position_at(exit);
+                    *locals = exit_locals;
                     for (nm, p) in mut_names.into_iter().zip(phi_vals.into_iter()) {
                         locals.insert(nm, p);
                     }
@@ -2332,6 +2402,7 @@ fn lower_stmt_free_async<'m>(
                     };
                     b.branch(c, body_b, exit);
 
+                    let exit_locals = locals.clone();
                     b.position_at(body_b);
                     lower_block_free_async(
                         b,
@@ -2359,6 +2430,7 @@ fn lower_stmt_free_async<'m>(
                     b.jump(head, &back_args);
 
                     b.position_at(exit);
+                    *locals = exit_locals;
                     for (nm, p) in mut_names.into_iter().zip(phi_vals.into_iter()) {
                         locals.insert(nm, p);
                     }
@@ -6897,11 +6969,16 @@ impl<'m> Lowerer<'m> {
                     },
                 ),
                 StmtKind::Throw(expr) => stmt_with_meta(s, StmtKind::Throw(rw_expr(expr, f))),
-                StmtKind::Defer { kind, expr } => stmt_with_meta(
+                StmtKind::Defer {
+                    kind,
+                    binding,
+                    body,
+                } => stmt_with_meta(
                     s,
                     StmtKind::Defer {
                         kind: *kind,
-                        expr: rw_expr(expr, f),
+                        binding: binding.clone(),
+                        body: rw_block(body, f),
                     },
                 ),
                 StmtKind::Return(e) => {
