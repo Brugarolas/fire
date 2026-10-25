@@ -1,4 +1,4 @@
-This is Napalm programming language.
+This is Fire programming language.
 
 It is a new scripting programming language inspired by JavaScript, TypeScript and Wren.
 
@@ -198,7 +198,7 @@ Known bugs:
 - When a function is natively memoized, it can cause use-after-free errors if memoized values are not primitives (like an object), since complex values allocate on the GC that can free them in any moment while the native memoization thinks they are still there.
 
 Limitations:
-Napalm, by design, does not have an interpreter, but just a JIT. I opted for a single JIT without re-compilations instead of a complex architecture with an interpreter and a multi-tier JIT, because I am a single developer working on this and I would have not enough time. I opted for simplicity instead of complexity. Also, I find a waste of time and resources, to develop them, since they are only going to run for a fraction of a second until the top-tier JIT kicks-in. This sadly mean that:
+Fire, by design, does not have an interpreter, but just a JIT. I opted for a single JIT without re-compilations instead of a complex architecture with an interpreter and a multi-tier JIT, because I am a single developer working on this and I would have not enough time. I opted for simplicity instead of complexity. Also, I find a waste of time and resources, to develop them, since they are only going to run for a fraction of a second until the top-tier JIT kicks-in. This sadly mean that:
 - Cold start time might be somewhat slower than very fast engines like Wren or LuaJIT (but still faster than CPython or Node).
 - I can't do a lot of speculative optimizations nor PGO, so it's unlikely Napalm gets as fast as top-tier JavaScript engines and LuaJIT (though still competitive, in some benchmarks we are even faster than Node).
 - Napalm won't work on platforms where JIT compilation isn't allowed (like iOS, consoles, or running in WebAssembly)
